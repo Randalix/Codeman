@@ -5,7 +5,78 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { buildMuxAttachEnv } from '../src/session-cli-builder.js';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { buildMuxAttachEnv, buildShellEnv, resolveSessionLocale } from '../src/session-cli-builder.js';
+
+/**
+ * The locale every pane runs under.
+ *
+ * The bug: `LANG`/`LC_ALL` were hardcoded to `en_US.UTF-8`, which does not exist
+ * on a host that only generated another UTF-8 locale — a German Debian with just
+ * `de_DE.UTF-8`, measured on Albus where /etc/locale.gen leaves en_US commented
+ * out. Every pane then printed `setlocale: LC_ALL: cannot change locale
+ * (en_US.UTF-8)` and ran in the C locale, i.e. exactly the non-UTF-8 state the
+ * docker path pins `C.UTF-8` to avoid (tmux renders box drawing as `qqqq…`).
+ */
+describe('resolveSessionLocale', () => {
+  it('keeps a UTF-8 locale the host already advertises', () => {
+    expect(resolveSessionLocale({ LANG: 'de_DE.UTF-8' })).toBe('de_DE.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'en_GB.utf8' })).toBe('en_GB.utf8');
+  });
+
+  it('prefers LC_ALL, then LC_CTYPE, then LANG — the same order as detectGlyphTier', () => {
+    expect(resolveSessionLocale({ LC_ALL: 'a.UTF-8', LC_CTYPE: 'b.UTF-8', LANG: 'c.UTF-8' })).toBe('a.UTF-8');
+    expect(resolveSessionLocale({ LC_CTYPE: 'b.UTF-8', LANG: 'c.UTF-8' })).toBe('b.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'c.UTF-8' })).toBe('c.UTF-8');
+  });
+
+  it('falls back to C.UTF-8, which needs no locale-gen, when nothing UTF-8 is inherited', () => {
+    expect(resolveSessionLocale({})).toBe('C.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'C' })).toBe('C.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'POSIX' })).toBe('C.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'de_DE.ISO-8859-1' })).toBe('C.UTF-8');
+  });
+
+  it('refuses a name that could break out of the pane shell command', () => {
+    // tmux-manager interpolates this into `export LANG=<value>`.
+    expect(resolveSessionLocale({ LANG: 'de_DE.UTF-8; rm -rf /' })).toBe('C.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'de_DE.UTF-8$(id)' })).toBe('C.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'de DE.UTF-8' })).toBe('C.UTF-8');
+    expect(resolveSessionLocale({ LANG: 'de_DE.UTF-8`id`' })).toBe('C.UTF-8');
+  });
+
+  it('accepts the modifier form, which is legal locale syntax', () => {
+    expect(resolveSessionLocale({ LANG: 'sr_RS.UTF-8@latin' })).toBe('sr_RS.UTF-8@latin');
+  });
+
+  it('is what the session env builders put in LANG and LC_ALL', () => {
+    const saved = { LANG: process.env.LANG, LC_ALL: process.env.LC_ALL };
+    try {
+      process.env.LC_ALL = 'de_DE.UTF-8';
+      expect(buildShellEnv('sess-1').LANG).toBe('de_DE.UTF-8');
+      expect(buildShellEnv('sess-1').LC_ALL).toBe('de_DE.UTF-8');
+      expect(buildMuxAttachEnv().LANG).toBe('de_DE.UTF-8');
+
+      delete process.env.LC_ALL;
+      delete process.env.LANG;
+      expect(buildShellEnv('sess-1').LANG).toBe('C.UTF-8');
+    } finally {
+      if (saved.LANG === undefined) delete process.env.LANG;
+      else process.env.LANG = saved.LANG;
+      if (saved.LC_ALL === undefined) delete process.env.LC_ALL;
+      else process.env.LC_ALL = saved.LC_ALL;
+    }
+  });
+
+  it('is what the tmux pane wrapper exports, not a literal', () => {
+    const source = readFileSync(resolve(import.meta.dirname, '../src/tmux-manager.ts'), 'utf8');
+    expect(source).not.toContain("'export LANG=en_US.UTF-8'");
+    expect(source).not.toContain("'export LC_ALL=en_US.UTF-8'");
+    expect(source).toContain('`export LANG=${locale}`');
+    expect(source).toContain('`export LC_ALL=${locale}`');
+  });
+});
 
 describe('buildMuxAttachEnv', () => {
   it('does not pass an inherited tmux context into tmux attach clients', () => {
