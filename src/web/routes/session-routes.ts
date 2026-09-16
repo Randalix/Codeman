@@ -30,7 +30,13 @@ import {
   type OmpConfig,
   type RemoteHost,
 } from '../../types.js';
-import { Session, isAltScreenStripMode, isExternalCliMode, isMuxAltScreenOnlyStripMode } from '../../session.js';
+import {
+  Session,
+  isAltScreenStripMode,
+  isExternalCliMode,
+  isMuxAltScreenOnlyStripMode,
+  isMuxMouseStripMode,
+} from '../../session.js';
 import { SseEvent } from '../sse-events.js';
 import { webviewCapabilities } from '../../webview-capabilities.js';
 import {
@@ -2924,8 +2930,15 @@ export function registerSessionRoutes(
         .replace(ALT_SCREEN_TOGGLE_PATTERN, '')
         .replace(ERASE_SCROLLBACK_PATTERN, '')
         .replace(MOUSE_TRACKING_PATTERN, '');
+    } else if (isMuxMouseStripMode(session.mode, session.usesMux)) {
+      // tmux-backed mouse-capable TUI (opencode): drop smcup AND the mouse DECSETs.
+      // Replaying a mouse-tracking enable re-parks xterm in report mode, where a
+      // drag is sent to the CLI instead of selecting text — mark-and-copy dies
+      // silently (and Ctrl+C without a selection is opencode's app_exit). 3J stays,
+      // a TUI is not a `clear` consumer.
+      strippedBuffer = strippedBuffer.replace(ALT_SCREEN_TOGGLE_PATTERN, '').replace(MOUSE_TRACKING_PATTERN, '');
     } else if (isMuxAltScreenOnlyStripMode(session.mode, session.usesMux)) {
-      // tmux-backed shell/opencode/antigravity: drop tmux's own client smcup only.
+      // tmux-backed shell/antigravity: drop tmux's own client smcup only.
       // A byte buffer recorded before the live-side strip existed can still carry
       // it, and one replayed `\x1b[?1049h` re-parks xterm in the alt buffer (#205).
       strippedBuffer = strippedBuffer.replace(ALT_SCREEN_TOGGLE_PATTERN, '');

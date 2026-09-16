@@ -391,7 +391,7 @@ const OPENCODE: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
-    altScreen: 'strip-mux-only',
+    altScreen: 'strip-mux-and-mouse',
     echo: { policy: 'buffer', anchor: { kind: 'cursor' }, predictProfile: undefined },
     // Verified by hand against a real llama.cpp server. Reuses the SAME env var opencode's
     // own `env.configContentVar` already declares — the builder in custom-model-injection.ts
