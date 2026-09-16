@@ -376,11 +376,15 @@ export interface CliCapabilities {
    */
   transcript: 'claude-jsonl' | 'codex-rollout' | 'deepseek-zstd' | 'omp-jsonl' | 'none';
   /**
-   * 'strip-full'     — alt-screen + erase-scrollback + mouse DECSETs stripped (Ink TUIs).
-   * 'strip-mux-only' — only tmux's own attach-time smcup (the safe default).
-   * 'preserve'       — leave everything (a direct-PTY shell running vim/less/htop).
+   * 'strip-full'           — alt-screen + erase-scrollback + mouse DECSETs stripped (Ink TUIs).
+   * 'strip-mux-only'       — only tmux's own attach-time smcup (the safe default).
+   * 'strip-mux-and-mouse'  — smcup AND mouse DECSETs stripped, `3J` kept: a mouse-capable
+   *                          full-screen TUI whose own mouse handling must not reach the
+   *                          browser, where it eats text selection. The browser hand-encodes
+   *                          clicks instead (`_sendSyntheticSgrTap`).
+   * 'preserve'             — leave everything (a direct-PTY shell running vim/less/htop).
    */
-  altScreen: 'strip-full' | 'strip-mux-only' | 'preserve';
+  altScreen: 'strip-full' | 'strip-mux-only' | 'strip-mux-and-mouse' | 'preserve';
   echo: {
     policy: 'buffer' | 'predict' | 'off';
     /** How the local-echo overlay locates the composer row. */

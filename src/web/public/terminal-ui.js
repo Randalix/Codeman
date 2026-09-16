@@ -4565,9 +4565,11 @@ Object.assign(CodemanApp.prototype, {
    * Two conditions, and dropping either one is a bug that has already happened:
    *
    * 1. The session's mode is one whose mouse DECSETs the server STRIPS out of
-   *    the stream (claude/codex/gemini, `isAltScreenStripMode`), which is why
-   *    xterm's own encoder is permanently idle here and something has to stand
-   *    in for it.
+   *    the stream (claude/codex/gemini `isAltScreenStripMode`, and opencode
+   *    `isMuxMouseStripMode`), which is why xterm's own encoder is permanently
+   *    idle here and something has to stand in for it. opencode joins that list
+   *    because its TUI enables tracking itself: the DECSETs reached xterm, every
+   *    drag became a mouse report instead of a selection, and mark-and-copy died.
    * 2. The CLI actually has a mouse-tracking mode on right now. The server
    *    records that as it strips (`_recordStrippedMouseMode` in session.ts) and
    *    publishes it as `cliMouseTracking`. Without this half the browser
@@ -4583,7 +4585,7 @@ Object.assign(CodemanApp.prototype, {
   _shouldReportMouseToCli() {
     const session = this.sessions?.get(this.activeSessionId);
     const mode = session?.mode || 'claude';
-    if (mode !== 'claude' && mode !== 'codex' && mode !== 'gemini') return false;
+    if (mode !== 'claude' && mode !== 'codex' && mode !== 'gemini' && mode !== 'opencode') return false;
     return session?.cliMouseTracking === true;
   },
 

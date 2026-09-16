@@ -291,7 +291,31 @@ export function isAltScreenStripMode(mode: SessionMode): boolean {
  * `\x1b[3J` from a user's own `clear` is a deliberate "wipe my scrollback".
  */
 export function isMuxAltScreenOnlyStripMode(mode: SessionMode, useMux: boolean): boolean {
-  return useMux && !isAltScreenStripMode(mode);
+  if (!useMux) return false;
+  const altScreen = getCli(mode)?.capabilities.altScreen;
+  return altScreen !== 'strip-full' && altScreen !== 'strip-mux-and-mouse';
+}
+
+/**
+ * Modes whose mouse-tracking DECSETs must be stripped, leaving `3J` alone:
+ * `altScreen: 'strip-mux-and-mouse'`, i.e. a mouse-capable full-screen TUI.
+ *
+ * Why this exists (opencode, measured 2026-09-16): the TUI enables tracking
+ * DECSETs, tmux runs with `mouse off` and therefore passes the PANE's DECSETs
+ * straight through to the tmux client, and the browser's xterm obeyed them —
+ * `mouseTrackingMode` flipped to `'any'` and xterm then reported DRAGS to the TUI
+ * instead of selecting locally. "Mark text, copy on select" silently did nothing
+ * (measured 62 `none` / 18 `any` over 16s, and 5/5 dead drags while `any`), and
+ * the obvious fallback — Ctrl+C — is opencode's `app_exit`, so the failure also
+ * ended sessions. Stripping at the source keeps xterm in selection mode; clicks
+ * still reach the CLI through the browser's hand-encoded tap, which this strip
+ * publishes as `cliMouseTracking` (`_recordStrippedMouseMode`).
+ *
+ * Gated on `useMux` for the same reason as the narrow strip: on the direct-PTY
+ * fallback the program's own DECSETs really do reach xterm and must be honoured.
+ */
+export function isMuxMouseStripMode(mode: SessionMode, useMux: boolean): boolean {
+  return useMux && getCli(mode)?.capabilities.altScreen === 'strip-mux-and-mouse';
 }
 
 // Note: Claude CLI PATH resolution moved to session-cli-builder.ts (buildClaudeEnv)
@@ -2075,9 +2099,16 @@ export class Session extends EventEmitter {
     // scrollback there is tmux's own client-side smcup at attach, not anything the
     // program in the pane emitted (issue #205, see isMuxAltScreenOnlyStripMode).
     // 3J and the mouse DECSETs stay, so `clear` and mouse-aware TUIs keep working.
+    //
+    // The MIDDLE case (isMuxMouseStripMode) is a mouse-capable full-screen TUI:
+    // it needs smcup AND the mouse DECSETs gone — otherwise the pane's tracking
+    // reaches xterm and every drag becomes a mouse report instead of a text
+    // selection, which is what killed mark-and-copy in opencode — while 3J stays,
+    // because a TUI is not a `clear` consumer.
     const fullStrip = isAltScreenStripMode(this.mode);
-    const altOnlyStrip = !fullStrip && isMuxAltScreenOnlyStripMode(this.mode, this._useMux);
-    if (fullStrip || altOnlyStrip) {
+    const mouseStrip = isMuxMouseStripMode(this.mode, this._useMux);
+    const altOnlyStrip = !fullStrip && !mouseStrip && isMuxAltScreenOnlyStripMode(this.mode, this._useMux);
+    if (fullStrip || mouseStrip || altOnlyStrip) {
       // Reassemble sequences split across PTY chunk boundaries first: a chunk
       // ending mid-sequence ('\x1b[?104' now, '9h' next) would slip past the
       // strip below and leave xterm stuck in the scrollback-less alt buffer
@@ -2096,14 +2127,18 @@ export class Session extends EventEmitter {
       // eslint-disable-next-line no-control-regex
       data = data.replace(/\x1b\[\?(?:47|1047|1049)[hl]/g, '');
       if (fullStrip) {
-        data = data
+        // eslint-disable-next-line no-control-regex
+        data = data.replace(/\x1b\[3J/g, '');
+      }
+      if (fullStrip || mouseStrip) {
+        data = data.replace(
           // eslint-disable-next-line no-control-regex
-          .replace(/\x1b\[3J/g, '')
-          // eslint-disable-next-line no-control-regex
-          .replace(/\x1b\[\?(?:1000|1001|1002|1003|1005|1006|1007)[hl]/g, (seq) => {
+          /\x1b\[\?(?:1000|1001|1002|1003|1005|1006|1007)[hl]/g,
+          (seq) => {
             this._recordStrippedMouseMode(seq);
             return '';
-          });
+          }
+        );
       }
     }
 
