@@ -240,6 +240,22 @@ describe('compose dialog: desktop entry point', () => {
     expect(second.textarea.value).toBe('');
   });
 
+  it('never delivers a draft to a session the user switched to mid-compose', () => {
+    const harness = loadKeyboardAccessory('sess-A');
+    const { overlay, textarea, send } = openDialog(harness, 'desktop');
+    textarea.value = 'prompt for A';
+    textarea.fire('input');
+
+    harness.app.activeSessionId = 'sess-B'; // user clicked another tab
+    send.fire('click');
+
+    expect(harness.sent).toEqual([]); // nothing reaches B
+    expect(overlay.removed).toBe(true);
+    // …and the text is still there when A is opened again.
+    harness.app.activeSessionId = 'sess-A';
+    expect(openDialog(harness, 'desktop').textarea.value).toBe('prompt for A');
+  });
+
   it('Use terminal keyboard closes the dialog and refocuses the terminal', () => {
     const harness = loadKeyboardAccessory();
     let focused = false;

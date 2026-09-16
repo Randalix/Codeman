@@ -1226,6 +1226,17 @@ const KeyboardAccessoryBar = {
 
     const sendText = () => {
       const text = textarea.value;
+      // The overlay lives on `document`, so switching tabs while it is open would
+      // otherwise deliver this prompt to whatever session is active NOW — a
+      // prompt handed to the wrong agent. Desktop only: the draft (also desktop
+      // only) is what makes refusing safe, since nothing is lost. Mobile keeps
+      // its existing behaviour.
+      if (desktop && app.activeSessionId !== draftKey) {
+        rememberDraft();
+        overlay.remove();
+        app.showToast?.('Session switched — draft kept for the original session', 'warning');
+        return;
+      }
       this._composeDrafts?.delete(draftKey);
       overlay.remove();
       if (text) {
