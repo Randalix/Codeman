@@ -902,6 +902,8 @@ const KeyboardAccessoryBar = {
 
   _confirmTimer: null,
   _confirmAction: null,
+  /** sessionId → ungesendeter Composer-Text (nur Desktop, in-memory; s. _openComposeDialog) */
+  _composeDrafts: null,
 
   /** Handle accessory button actions */
   handleAction(action, btn) {
@@ -1142,16 +1144,56 @@ const KeyboardAccessoryBar = {
    *  All image paths reuse app._uploadAndInsertImages() (image-input.js), which
    *  uploads to /api/sessions/:id/paste-image and inserts the saved path. */
   pasteFromClipboard() {
+    this._openComposeDialog({ desktop: false });
+  },
+
+  /**
+   * Desktop entry point for the same dialog — the composer as far as it exists
+   * today (upstream #359 plans to promote this dialog into a full prompt
+   * composer).
+   *
+   * Why the desktop needs it at all: on a desktop there is no accessory bar, so
+   * this dialog was unreachable, and with it the only place Codeman holds text in
+   * a real textarea until Send. That is exactly what OS-level dictation needs —
+   * macOS/Windows dictation types into whatever field has focus, so dictating
+   * straight into the terminal emits provisional text the OS can then only
+   * append to (the same duplication an accepted autocorrection causes), and the
+   * CJK field is not an alternative because it auto-flushes after 150ms.
+   *
+   * Reached from the toolbar button (#composePromptBtn) and Ctrl+Shift+Enter.
+   */
+  openComposer() {
+    this._openComposeDialog({ desktop: true });
+  },
+
+  /**
+   * The shared dialog. `desktop` only changes the copy and adds the
+   * "use terminal keyboard" escape hatch plus the per-session draft — mobile is
+   * deliberately untouched (the accessory bar keeps calling
+   * pasteFromClipboard(), and its behaviour stays byte-for-byte the same).
+   */
+  _openComposeDialog({ desktop = false } = {}) {
     if (typeof app === 'undefined' || !app.activeSessionId) return;
+
+    const draftKey = app.activeSessionId;
 
     // Create overlay
     const overlay = document.createElement('div');
     overlay.className = 'paste-overlay';
     overlay.innerHTML = `
       <div class="paste-dialog">
-        <textarea class="paste-textarea" placeholder="Long-press to paste text — or tap 🖼 to attach an image"></textarea>
+        <textarea class="paste-textarea" placeholder="${
+          desktop
+            ? 'Type or dictate here — Enter makes a new line, Send delivers it'
+            : 'Long-press to paste text — or tap 🖼 to attach an image'
+        }"></textarea>
         <div class="paste-actions">
           <button class="paste-image">🖼 Image</button>
+          ${
+            desktop
+              ? '<button class="paste-terminal" title="Close and type directly in the terminal">Use terminal keyboard</button>'
+              : ''
+          }
           <button class="paste-cancel">Cancel</button>
           <button class="paste-send">Send</button>
         </div>
@@ -1162,11 +1204,30 @@ const KeyboardAccessoryBar = {
     const textarea = overlay.querySelector('.paste-textarea');
     const fileInput = overlay.querySelector('.paste-file-input');
 
-    const close = () => overlay.remove();
+    // Per-session draft, in memory: closing the dialog (Cancel, Escape, backdrop)
+    // must not throw away a half-dictated prompt. Send clears it. Desktop only —
+    // the mobile dialog's behaviour is left exactly as it was.
+    if (desktop) {
+      const draft = this._composeDrafts?.get(draftKey);
+      if (draft) textarea.value = draft;
+    }
+    const rememberDraft = () => {
+      if (!desktop) return;
+      if (!this._composeDrafts) this._composeDrafts = new Map();
+      if (textarea.value) this._composeDrafts.set(draftKey, textarea.value);
+      else this._composeDrafts.delete(draftKey);
+    };
+    textarea.addEventListener('input', rememberDraft);
+
+    const close = () => {
+      rememberDraft();
+      overlay.remove();
+    };
 
     const sendText = () => {
       const text = textarea.value;
-      close();
+      this._composeDrafts?.delete(draftKey);
+      overlay.remove();
       if (text) {
         app.sendInput(text);
         setTimeout(() => app.sendInput('\r'), 80);
@@ -1206,6 +1267,19 @@ const KeyboardAccessoryBar = {
 
     overlay.querySelector('.paste-cancel').addEventListener('click', close);
     overlay.querySelector('.paste-send').addEventListener('click', sendText);
+    overlay.querySelector('.paste-terminal')?.addEventListener('click', () => {
+      close();
+      app.terminal?.focus?.();
+    });
+    // Escape closes without sending. A dialog that swallows Escape is a trap —
+    // and it must not fall through to the page's own Escape handling either.
+    overlay.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        close();
+      }
+    });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
     document.body.appendChild(overlay);

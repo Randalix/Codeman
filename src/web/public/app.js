@@ -399,6 +399,16 @@ const DEFAULT_SHORTCUTS = [
     action: 'toggleVoiceInput',
   },
   {
+    // The compose dialog as a desktop entry point: type or dictate into a real
+    // textarea, review, then Send. OS-level dictation (macOS fn-fn) types into
+    // the focused field, so it needs a field that does not auto-flush.
+    id: 'compose-prompt',
+    group: 'Terminal',
+    label: 'Compose Prompt',
+    bindings: [{ modifiers: ['ctrl', 'shift'], key: 'Enter' }],
+    action: 'openComposePrompt',
+  },
+  {
     id: 'restore-terminal-size',
     group: 'Terminal',
     label: 'Restore Terminal Size',
@@ -1121,6 +1131,7 @@ class CodemanApp {
       increaseFontSize: () => this.increaseFontSize(),
       decreaseFontSize: () => this.decreaseFontSize(),
       toggleVoiceInput: () => VoiceInput.toggle(),
+      openComposePrompt: () => KeyboardAccessoryBar.openComposer(),
       moveActiveTabLeft: () => this.moveActiveTabLeft(),
       moveActiveTabRight: () => this.moveActiveTabRight(),
       toggleSessionSidebar: () => this.toggleSessionSidebar(),

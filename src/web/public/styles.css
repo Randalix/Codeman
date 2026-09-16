@@ -5514,6 +5514,23 @@ body.touch-device .terminal-container .xterm .xterm-helper-textarea {
   animation: voice-pulse 1.2s ease-in-out infinite;
 }
 
+/* Compose Button — desktop only: mobile reaches the same dialog through the
+   accessory bar's Paste action (.btn-voice-mobile is the mobile counterpart). */
+.btn-toolbar.btn-compose {
+  padding: 0.3rem 0.5rem;
+}
+
+@media (max-width: 1023px) {
+  .toolbar-center .btn-toolbar.btn-compose {
+    display: none !important;
+  }
+}
+
+.btn-toolbar.btn-compose:hover {
+  color: var(--text);
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
 .btn-toolbar.btn-voice.recording:hover {
   background: rgba(239, 68, 68, 0.3);
   border-color: rgba(239, 68, 68, 0.8);
@@ -13489,7 +13506,7 @@ body.touch-device.cjk-input-visible .main {
   margin-top: 10px;
 }
 
-.paste-cancel, .paste-new, .paste-send, .paste-image {
+.paste-cancel, .paste-new, .paste-send, .paste-image, .paste-terminal {
   padding: 8px 18px;
   border: none;
   border-radius: 8px;
@@ -13519,6 +13536,12 @@ body.touch-device.cjk-input-visible .main {
   background: var(--accent);
   color: #fff;
   font-weight: 600;
+}
+
+/* Desktop-only escape hatch: close the composer and type in the terminal. */
+.paste-terminal {
+  background: var(--bg-input);
+  color: var(--text-dim);
 }
 
 /* Shared lazy filesystem path picker (case linking + mobile input). */
