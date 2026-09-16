@@ -34,6 +34,7 @@ import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
 import { dirname, join } from 'node:path';
 import { LAUNCHD_LABEL, SYSTEMD_UNIT } from './config/service-names.js';
+import { resolveSessionLocale } from './session-cli-builder.js';
 import { CODEMAN_INSTANCE } from './config/instance.js';
 import { EXEC_TIMEOUT_MS } from './config/exec-timeout.js';
 import {
@@ -136,7 +137,11 @@ export function buildServiceEnv(
   const env: Record<string, string> = {
     PATH: buildServicePath(nodeDir, currentPath, home),
     HOME: home,
-    LANG: lang || 'en_US.UTF-8',
+    // Same rule as the panes (see resolveSessionLocale): a UTF-8 locale that the
+    // host actually has, never a hardcoded en_US.UTF-8 — the daemon's environment
+    // is what every session inherits, so a non-existent locale here warns in
+    // every pane AND defeats the panes' own fallback.
+    LANG: lang || resolveSessionLocale(),
   };
   if (CODEMAN_INSTANCE) env.CODEMAN_INSTANCE = CODEMAN_INSTANCE;
   return env;
