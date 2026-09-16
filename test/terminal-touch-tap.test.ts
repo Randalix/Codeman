@@ -376,6 +376,21 @@ describe('terminal touch tap mouse guard', () => {
     expect(app._shouldReportMouseToCli()).toBe(false);
   });
 
+  it('hand-reports for opencode, whose DECSETs the server now strips', () => {
+    // opencode's TUI enables mouse tracking, tmux passes the DECSETs through, and
+    // xterm used to report DRAGS to the TUI instead of selecting — so marking text
+    // copied nothing. The server strips them now (isMuxMouseStripMode), which makes
+    // the hand-encoded tap the only way a click still reaches opencode.
+    const { app } = loadTerminalUiHarness();
+    app.activeSessionId = 'sess-1';
+
+    app.sessions = new Map([['sess-1', { mode: 'opencode' }]]);
+    expect(app._shouldReportMouseToCli()).toBe(false);
+
+    app.sessions = new Map([['sess-1', { mode: 'opencode', cliMouseTracking: true }]]);
+    expect(app._shouldReportMouseToCli()).toBe(true);
+  });
+
   it('hand-reports only while the CLI actually has mouse tracking on', () => {
     // The server strips the DECSETs, so xterm can never see them and the browser
     // reported EVERY click. A claude pane sitting at its composer, or one that
