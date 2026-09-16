@@ -15,6 +15,7 @@ import {
   xmlEscape,
   type ServicePlan,
 } from '../src/service-installer.js';
+import { resolveSessionLocale } from '../src/session-cli-builder.js';
 
 function plan(overrides: Partial<ServicePlan> = {}): ServicePlan {
   return {
@@ -71,10 +72,13 @@ describe('buildServicePath', () => {
 });
 
 describe('buildServiceEnv', () => {
-  it('carries PATH, HOME and a LANG default', () => {
+  it('carries PATH, HOME and a LANG default the host actually has', () => {
+    // Never a hardcoded en_US.UTF-8: the daemon's env is what every pane
+    // inherits, so a locale this host never generated warns in every pane and
+    // defeats the panes' own C.UTF-8 fallback (see resolveSessionLocale).
     const env = buildServiceEnv('/usr/bin', '/usr/bin:/bin', '/home/u');
     expect(env.HOME).toBe('/home/u');
-    expect(env.LANG).toBe('en_US.UTF-8');
+    expect(env.LANG).toBe(resolveSessionLocale());
     expect(env.PATH).toContain('/usr/bin');
   });
 

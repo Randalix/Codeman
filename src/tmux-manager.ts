@@ -38,6 +38,7 @@ import {
   SAFE_TMUX_SOCKET_PATTERN,
   resolveTmuxSocketName,
 } from './config/instance.js';
+import { resolveSessionLocale } from './session-cli-builder.js';
 import {
   ProcessStats,
   PersistedRespawnConfig,
@@ -1711,9 +1712,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       if (value !== undefined) cliEnv.push(`export ${item.name}=${value}`);
     }
 
+    const locale = resolveSessionLocale();
     return [
-      'export LANG=en_US.UTF-8',
-      'export LC_ALL=en_US.UTF-8',
+      `export LANG=${locale}`,
+      `export LC_ALL=${locale}`,
       ...cliEnv,
       'export CODEMAN_MUX=1',
       `export CODEMAN_SESSION_ID=${sessionId}`,

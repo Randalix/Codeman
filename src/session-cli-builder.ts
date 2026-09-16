@@ -154,6 +154,43 @@ export function buildPromptArgs(
 }
 
 /**
+ * The locale every agent pane runs under.
+ *
+ * It MUST be UTF-8: tmux in a non-UTF-8 locale renders the CLIs' box drawing as
+ * raw VT100 ACS glyphs (`qqqq…`) instead of `─│┌┐` — the same reason the docker
+ * path pins `C.UTF-8` (tmux-manager.ts).
+ *
+ * It must also EXIST. The old hardcoded `en_US.UTF-8` does not guarantee that:
+ * on a host that only generated another UTF-8 locale — a German Debian with just
+ * `de_DE.UTF-8`, measured on Albus where /etc/locale.gen leaves en_US commented
+ * out — every pane printed `setlocale: LC_ALL: cannot change locale
+ * (en_US.UTF-8)` and silently fell back to the C locale, i.e. to exactly the
+ * non-UTF-8 state this function exists to prevent.
+ *
+ * So: keep a UTF-8 locale the process already advertises (the daemon inherits the
+ * host's, e.g. `de_DE.UTF-8` from /etc/default/locale), else `C.UTF-8`, which is
+ * built into glibc and needs no locale-gen. The name check mirrors
+ * `detectGlyphTier()` in tui-render.ts — it reads the name, not the locale
+ * database, so a host whose env names a locale it never generated still gets it
+ * (and still falls back to C); that is the pre-existing behaviour, not a
+ * regression.
+ *
+ * The name is also SHAPE-checked, because tmux-manager interpolates it into the
+ * pane's shell command: an inherited `LC_ALL` is attacker-reachable in principle
+ * (anyone who can set the daemon's environment), and `export LANG=<value>` must
+ * not become an injection point. The pattern is the locale syntax bash accepts
+ * (language[_territory][.codeset][@modifier]).
+ */
+const SAFE_LOCALE_RE = /^[A-Za-z0-9_]+(?:\.[A-Za-z0-9-]+)?(?:@[A-Za-z0-9_-]+)?$/;
+
+export function resolveSessionLocale(env: Record<string, string | undefined> = process.env): string {
+  for (const candidate of [env.LC_ALL, env.LC_CTYPE, env.LANG]) {
+    if (candidate && /utf-?8/i.test(candidate) && SAFE_LOCALE_RE.test(candidate)) return candidate;
+  }
+  return 'C.UTF-8';
+}
+
+/**
  * Build environment variables for Claude CLI processes (direct PTY, non-mux).
  *
  * Augments process.env with:
@@ -166,10 +203,11 @@ export function buildPromptArgs(
  * @returns Environment variables object for pty.spawn
  */
 export function buildClaudeEnv(sessionId: string): Record<string, string | undefined> {
+  const locale = resolveSessionLocale();
   const env: Record<string, string | undefined> = {
     ...process.env,
-    LANG: 'en_US.UTF-8',
-    LC_ALL: 'en_US.UTF-8',
+    LANG: locale,
+    LC_ALL: locale,
   };
 
   // The colour and identity vars come from the registry entry, the same source
@@ -225,10 +263,11 @@ export function buildClaudeEnv(sessionId: string): Record<string, string | undef
  * @returns Environment variables object for pty.spawn
  */
 export function buildMuxAttachEnv(truecolorEnabled?: boolean): Record<string, string | undefined> {
+  const locale = resolveSessionLocale();
   const env: Record<string, string | undefined> = {
     ...process.env,
-    LANG: 'en_US.UTF-8',
-    LC_ALL: 'en_US.UTF-8',
+    LANG: locale,
+    LC_ALL: locale,
     TERM: 'xterm-256color',
   };
   // COD-115: keys to UNSET must be `delete`d, NOT set to `undefined`. On a
@@ -255,10 +294,11 @@ export function buildMuxAttachEnv(truecolorEnabled?: boolean): Record<string, st
  * @returns Environment variables object for pty.spawn
  */
 export function buildShellEnv(sessionId: string): Record<string, string | undefined> {
+  const locale = resolveSessionLocale();
   return {
     ...process.env,
-    LANG: 'en_US.UTF-8',
-    LC_ALL: 'en_US.UTF-8',
+    LANG: locale,
+    LC_ALL: locale,
     TERM: 'xterm-256color',
     CODEMAN_MUX: '1',
     CODEMAN_SESSION_ID: sessionId,
