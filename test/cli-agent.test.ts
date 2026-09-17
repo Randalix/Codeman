@@ -17,17 +17,22 @@ import {
   agentLs,
   agentPost,
   agentRead,
+  agentRestore,
   agentRm,
   agentSend,
   agentSpawn,
   agentWait,
   buildInterruptBody,
   buildSendBody,
+  buildSpawnExtras,
   deleteRefusal,
   describeFailure,
   httpRequest,
   inputRefusal,
   isSelfSession,
+  opencodePermissionEnv,
+  parseEnvPairs,
+  probeAlive,
   parsePositiveInt,
   readCodemanEnvFile,
   resolveAgentContext,
@@ -512,6 +517,115 @@ describe('agent post / inbox (mailbox)', () => {
     ]);
     expect(await agentInbox(deps, { peek: false })).toBe(EXIT.error);
     expect(deps.err.join('')).toMatch(/could not acknowledge/);
+  });
+});
+
+describe('spawn --env / --permission / --resume', () => {
+  const base = { caseName: 'c', mode: 'opencode', ready: false, timeoutMs: 1000 };
+
+  it('parses KEY=VALUE pairs (values may contain =) and refuses malformed ones', () => {
+    expect(parseEnvPairs(['A=1', 'B=x=y', 'C='])).toEqual({ A: '1', B: 'x=y', C: '' });
+    expect(parseEnvPairs(undefined)).toEqual({});
+    expect(() => parseEnvPairs(['NOEQUALS'])).toThrow(/KEY=VALUE/);
+    expect(() => parseEnvPairs(['=v'])).toThrow(/KEY=VALUE/);
+  });
+
+  it('--permission allow sets a GRANULAR OPENCODE_PERMISSION (bash+edit), never *', () => {
+    expect(JSON.parse(opencodePermissionEnv('allow'))).toEqual({ bash: 'allow', edit: 'allow' });
+    expect(JSON.parse(opencodePermissionEnv('ask'))).toEqual({ bash: 'ask', edit: 'ask' });
+    const extras = buildSpawnExtras({ ...base, permission: 'allow', env: ['OPENCODE_MODEL=deepseek/x'] });
+    expect(extras.envOverrides).toEqual({
+      OPENCODE_MODEL: 'deepseek/x',
+      OPENCODE_PERMISSION: opencodePermissionEnv('allow'),
+    });
+    expect(() => buildSpawnExtras({ ...base, mode: 'codex', permission: 'allow' })).toThrow(/opencode option/);
+  });
+
+  it("--resume lands in the mode's config field; claude refuses via quick-start", () => {
+    expect(buildSpawnExtras({ ...base, resume: 'ses_abc' })).toEqual({
+      openCodeConfig: { continueSession: 'ses_abc' },
+    });
+    expect(buildSpawnExtras({ ...base, mode: 'codex', resume: 'r1' })).toEqual({
+      codexConfig: { resumeSessionId: 'r1' },
+    });
+    expect(() => buildSpawnExtras({ ...base, mode: 'claude', resume: 'x' })).toThrow(/not available for mode "claude"/);
+  });
+
+  it("agentSpawn merges extras into the quick-start body, keeping deepseek's permission posture", async () => {
+    const deps = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' })]);
+    expect(
+      await agentSpawn(deps, {
+        caseName: 'c',
+        mode: 'deepseek',
+        ready: false,
+        timeoutMs: 1000,
+        resume: 'd1',
+        env: ['DSH_X=1'],
+      })
+    ).toBe(EXIT.ok);
+    expect(deps.calls[0].body).toMatchObject({
+      deepSeekConfig: { permissionMode: 'danger-full-access', resumeSessionId: 'd1' },
+      envOverrides: { DSH_X: '1' },
+    });
+    const refused = fakeDeps([]);
+    expect(await agentSpawn(refused, { ...base, mode: 'claude', resume: 'x' })).toBe(EXIT.refused);
+    expect(refused.calls).toEqual([]);
+  });
+});
+
+describe('agent restore / ls --alive', () => {
+  const deadWait = ok({ wait: { signal: 'exit', immediate: true } });
+  const aliveWait = ok({ wait: { timedOut: true, timeoutMs: 1000 } });
+
+  it('probeAlive: an immediate exit is dead, a timeout is alive, an error is unknown', async () => {
+    expect(await probeAlive(fakeDeps([deadWait]), OTHER)).toBe('dead');
+    expect(await probeAlive(fakeDeps([aliveWait]), OTHER)).toBe('alive');
+    expect(await probeAlive(fakeDeps([{ status: 500, text: 'boom' }]), OTHER)).toBe('unknown');
+  });
+
+  it('restore refuses a live worker and never calls the runner', async () => {
+    const deps = fakeDeps([aliveWait]);
+    let ran = false;
+    expect(await agentRestore(deps, { id: OTHER, runner: async () => ((ran = true), { code: 0, output: '' }) })).toBe(
+      EXIT.refused
+    );
+    expect(ran).toBe(false);
+    expect(deps.err.join('')).toMatch(/is alive/);
+  });
+
+  it('restore hands a dead session (and the --resume id) to the runner and reports its result', async () => {
+    const deps = fakeDeps([deadWait]);
+    const seen: unknown[] = [];
+    const runner = async (id: string, resume: string | undefined) => (
+      seen.push([id, resume]),
+      { code: 0, output: 'respawned' }
+    );
+    expect(await agentRestore(deps, { id: OTHER, resume: 'ses_1', runner })).toBe(EXIT.ok);
+    expect(seen).toEqual([[OTHER, 'ses_1']]);
+    expect(deps.out.join('')).toMatch(/restored .*respawned/s);
+    const failing = fakeDeps([deadWait]);
+    expect(await agentRestore(failing, { id: OTHER, runner: async () => ({ code: 1, output: 'no tool' }) })).toBe(
+      EXIT.error
+    );
+    expect(failing.err.join('')).toMatch(/restore failed .*no tool/);
+  });
+
+  it('ls --alive adds a PANE column and marks a dead worker', async () => {
+    const deps = fakeDeps((o) =>
+      o.path === '/api/v1/sessions'
+        ? ok([
+            { id: SELF, mode: 'claude' },
+            { id: OTHER, mode: 'opencode' },
+          ])
+        : o.path.includes(OTHER)
+          ? deadWait
+          : aliveWait
+    );
+    expect(await agentLs(deps, { alive: true })).toBe(EXIT.ok);
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/PANE/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+\?\s+DEAD/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+\?\s+alive/);
   });
 });
 
