@@ -806,11 +806,16 @@ export async function agentInbox(deps: AgentDeps, options: InboxOptions): Promis
     timeoutMs: (options.waitMs ?? 0) + 30_000,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
-  const data = res.json.data as { messages?: InboxMessage[]; pending?: number; timedOut?: boolean } | undefined;
+  const data = res.json.data as
+    | { messages?: InboxMessage[]; pending?: number; timedOut?: boolean; waitedMs?: number }
+    | undefined;
   const messages = data?.messages ?? [];
   if (deps.json) emitJson(deps, data ?? {});
   else if (messages.length === 0) {
-    deps.io.err(palette.muted(data?.timedOut ? `(nothing arrived within ${options.waitMs} ms)` : '(inbox empty)'));
+    // waitedMs is the APPLIED (clamped) budget; the requested one may have been 1 or 9e9.
+    deps.io.err(
+      palette.muted(data?.timedOut ? `(nothing arrived within ${data.waitedMs ?? options.waitMs} ms)` : '(inbox empty)')
+    );
   } else {
     for (const m of messages) {
       deps.io.out(
@@ -1038,7 +1043,19 @@ export function registerAgentCommands(program: Command): Command {
     )
     .option('--json', 'Machine-readable output')
     .action(async (id: string, words: string[], options: { json?: boolean }) => {
-      const text = words.length === 0 || (words.length === 1 && words[0] === '-') ? await readStdin() : words.join(' ');
+      const fromStdin = words.length === 0 || (words.length === 1 && words[0] === '-');
+      // An agent's shell tool has a TTY on stdin: waiting for EOF there hangs the tool
+      // until its own timeout. Only read stdin when something is actually piped in.
+      if (fromStdin && process.stdin.isTTY) {
+        console.error(
+          palette.err(
+            `${GLYPH.fail} no message text: pass it as arguments, or pipe it in (\`… | codeman agent post <id> -\`)`
+          )
+        );
+        process.exitCode = EXIT.refused;
+        return;
+      }
+      const text = fromStdin ? await readStdin() : words.join(' ');
       await run(Boolean(options.json), (deps) => agentPost(deps, { id, text }));
     });
 

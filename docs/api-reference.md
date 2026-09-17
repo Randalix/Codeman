@@ -427,7 +427,7 @@ A per-session mailbox for agent-to-agent messages that must NOT be typed into th
 | `POST` | `/api/sessions/:id/inbox/ack` | `{ids: string[]}` | `{removed, pending}` |
 | `DELETE` | `/api/sessions/:id/inbox` | — | `{removed, pending:0}` |
 
-Ownership is the session rule (`findSessionOrFail`): a session the caller cannot see is a `404`. Every post broadcasts `inbox:message` `{sessionId, from, messageId, pending}` on SSE (routed per owner in multi-user mode). The store is persisted whole to `<data dir>/agent-inbox.json` (debounced, atomic rename) and restored at boot, and a session's inbox is dropped when the session is cleaned up. The inbox never writes to the pane: delivery is the receiver polling.
+Ownership is the session rule (`findSessionOrFail`): a session the caller cannot see is a `404`. Every post broadcasts `inbox:message` `{sessionId, from, messageId, pending}` on SSE (routed per owner in multi-user mode). The store is persisted whole to `<data dir>/agent-inbox.json` (debounced, atomic rename) and restored at boot, a session's inbox is dropped on delete (kept on a detach, so a re-adopted session finds its mail), and inboxes of sessions that did not come back after a restart are pruned once at boot. The inbox never writes to the pane: delivery is the receiver polling.
 
 ## Session lineage (`parentSessionId`)
 
