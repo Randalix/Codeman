@@ -33,7 +33,12 @@ Workers in **every other mode** never receive this preamble, but they have the s
 environment: tell them *"other sessions: `codeman agent --help`"* — the bundled CLI
 (`ls`, `spawn`, `send`, `wait`, `read`, `interrupt`, `rm`) is the same verbs over the
 same endpoints, with the guards below (no control bytes, no self-delete, no guessed
-URL) enforced in code.
+URL) enforced in code. It also carries the **mailbox**: `codeman agent post <id> <text>`
+stores a message for a session without typing anything into its pane, and the receiver
+reads it with `codeman agent inbox [--wait <ms>]` when it wants to (HTTP:
+`POST/GET /api/v1/sessions/:id/inbox`, `POST …/inbox/ack`). Prefer it over `input` for
+anything that is a message rather than a prompt — it never starts a billed turn and
+never risks a control byte in a fullscreen TUI.
 
 ## 0. Guard and bootstrap
 

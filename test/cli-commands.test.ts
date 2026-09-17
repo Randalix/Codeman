@@ -54,7 +54,7 @@ const SUBCOMMANDS: Record<string, Record<string, string[]>> = {
   task: { add: [], list: ['ls'], status: [], remove: ['rm'], clear: [] },
   ralph: { start: [], stop: [], status: [] },
   skill: { install: [], uninstall: [] },
-  agent: { ls: ['list'], spawn: [], send: [], wait: [], read: [], interrupt: [], rm: [] },
+  agent: { ls: ['list'], spawn: [], send: [], wait: [], read: [], interrupt: [], rm: [], post: [], inbox: [] },
   service: { install: [], uninstall: [], status: [] },
   users: { add: [], passwd: [], list: ['ls'], rm: [] },
 };

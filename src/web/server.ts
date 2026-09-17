@@ -101,6 +101,7 @@ import { sessionWaits } from './session-wait-registry.js';
 import { intentStore } from '../intent-store.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
+import { agentInbox } from './agent-inbox.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -172,6 +173,7 @@ import {
   registerScheduledRoutes,
   registerHookEventRoutes,
   registerApprovalRoutes,
+  registerInboxRoutes,
   registerReadMyMindRoutes,
   registerStatusTelemetryRoutes,
   registerSystemRoutes,
@@ -404,6 +406,15 @@ export class WebServer extends EventEmitter {
     approvalInbox.onPending = (item) => this.broadcast(SseEvent.ApprovalPending, { ...item });
     approvalInbox.onUpdated = (item) => this.broadcast(SseEvent.ApprovalUpdated, { ...item });
     approvalInbox.onResolved = (info) => this.broadcast(SseEvent.ApprovalResolved, { ...info });
+
+    // Agent inbox → SSE + persistence. Same shape: the singleton only sees these
+    // callbacks. The payload carries sessionId, so `inbox:` routes per owner. The
+    // store is restored here (before routes answer) and written debounced on every
+    // mutation, so a message posted right before a deploy restart is still there.
+    this.restoreAgentInbox();
+    agentInbox.onMessage = (sessionId, message, pending) =>
+      this.broadcast(SseEvent.InboxMessage, { sessionId, from: message.from, messageId: message.id, pending });
+    agentInbox.onChange = () => this.persistAgentInboxSoon();
 
     // Set up mux event listeners
     this.mux.on('sessionCreated', (session) => {
@@ -1061,6 +1072,7 @@ export class WebServer extends EventEmitter {
     registerScheduledRoutes(this.app, ctx);
     registerHookEventRoutes(this.app, ctx);
     registerApprovalRoutes(this.app, ctx);
+    registerInboxRoutes(this.app, ctx);
     registerReadMyMindRoutes(this.app, ctx);
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
@@ -1456,6 +1468,7 @@ export class WebServer extends EventEmitter {
     sessionWaits.notifySignal(sessionId, 'exit');
     sessionWaits.cancelAll(sessionId);
     approvalInbox.resolveForSession(sessionId, 'session_ended');
+    agentInbox.drop(sessionId);
 
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
@@ -2319,6 +2332,7 @@ export class WebServer extends EventEmitter {
       'orchestrator:',
       'hook:',
       'approval:',
+      'inbox:',
       'image:',
       'scheduled:',
       'team:',
@@ -2344,6 +2358,52 @@ export class WebServer extends EventEmitter {
 
   private batchTerminalData(sessionId: string, data: string): void {
     this.sse.batchTerminalData(sessionId, data);
+  }
+
+  // ========== Agent inbox persistence ==========
+
+  private agentInboxPersistTimer: NodeJS.Timeout | null = null;
+
+  /** The whole-store snapshot file; small, rewritten atomically. */
+  private agentInboxPath(): string {
+    return dataPath('agent-inbox.json');
+  }
+
+  private restoreAgentInbox(): void {
+    if (this.testMode) return;
+    try {
+      const restored = agentInbox.restore(JSON.parse(readFileSync(this.agentInboxPath(), 'utf-8')));
+      if (restored > 0) console.log(`[Inbox] Restored ${restored} pending agent message(s)`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(`[Inbox] Could not restore agent inbox: ${getErrorMessage(err)}`);
+      }
+    }
+  }
+
+  private persistAgentInboxSoon(): void {
+    if (this.testMode) return;
+    if (this.agentInboxPersistTimer) return;
+    this.agentInboxPersistTimer = setTimeout(() => {
+      this.agentInboxPersistTimer = null;
+      void this.persistAgentInboxNow();
+    }, 250);
+  }
+
+  private async persistAgentInboxNow(): Promise<void> {
+    if (this.testMode) return;
+    if (this.agentInboxPersistTimer) {
+      clearTimeout(this.agentInboxPersistTimer);
+      this.agentInboxPersistTimer = null;
+    }
+    const path = this.agentInboxPath();
+    const tmp = `${path}.tmp`;
+    try {
+      await fs.writeFile(tmp, JSON.stringify(agentInbox.snapshot()), { mode: 0o600 });
+      await fs.rename(tmp, path);
+    } catch (err) {
+      console.warn(`[Inbox] Could not persist agent inbox: ${getErrorMessage(err)}`);
+    }
   }
 
   private batchTaskUpdate(sessionId: string, task: BackgroundTask): void {
@@ -3343,6 +3403,8 @@ export class WebServer extends EventEmitter {
     // response), so without this a 10-minute wait holds shutdown open.
     sessionWaits.cancelEverything();
     approvalInbox.stop();
+    agentInbox.stop();
+    await this.persistAgentInboxNow();
 
     this.lastRecordedTokens.clear();
 
