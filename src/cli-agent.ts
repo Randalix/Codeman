@@ -453,8 +453,8 @@ export interface SpawnOptions {
   timeoutMs: number;
   /** `KEY=VALUE` pairs → quick-start `envOverrides` (the server allowlists the prefixes). */
   env?: string[];
-  /** opencode only: writes `OPENCODE_PERMISSION` so the worker never stops on a bash/edit dialog. */
-  permission?: 'allow' | 'ask';
+  /** opencode only: writes `OPENCODE_PERMISSION` so the worker never stops on a bash/edit dialog. Validated here, not in commander, so a bad value is a `refused` exit with the JSON envelope. */
+  permission?: string;
   /** Continue an existing CLI conversation (the CLI's own session id, not Codeman's). */
   resume?: string;
 }
@@ -462,14 +462,17 @@ export interface SpawnOptions {
 /**
  * Where each mode's quick-start body carries a resume id. The server's registry maps
  * these onto the CLI flag (`opencode --session`, `codex resume`, …); the CLI only has
- * to know the field. claude is absent on purpose: quick-start has no resume field for
+ * to know the field — and it has to match `schemas.ts` EXACTLY: the config schemas are
+ * plain `z.object`s that STRIP unknown keys, so a misspelled field is not a 400, it is a
+ * worker that silently starts a fresh conversation (gemini is `resumeSession`,
+ * antigravity `resumeConversationId`). claude is absent on purpose: quick-start has no resume field for
  * it (the create path does, via `POST /api/sessions`), so `--resume` refuses there.
  */
 export const RESUME_FIELD_BY_MODE: Record<string, { config: string; field: string }> = {
   opencode: { config: 'openCodeConfig', field: 'continueSession' },
   codex: { config: 'codexConfig', field: 'resumeSessionId' },
-  gemini: { config: 'geminiConfig', field: 'resumeSessionId' },
-  antigravity: { config: 'antigravityConfig', field: 'resumeSessionId' },
+  gemini: { config: 'geminiConfig', field: 'resumeSession' },
+  antigravity: { config: 'antigravityConfig', field: 'resumeConversationId' },
   pi: { config: 'piConfig', field: 'resumeSessionId' },
   grok: { config: 'grokConfig', field: 'resumeSessionId' },
   deepseek: { config: 'deepSeekConfig', field: 'resumeSessionId' },
@@ -501,9 +504,15 @@ export const PERMISSION_ENV_BY_MODE: Record<string, { name: string; value: (mode
 export function buildSpawnExtras(options: SpawnOptions): Record<string, unknown> {
   const extras: Record<string, unknown> = {};
   const env = parseEnvPairs(options.env);
-  if (options.permission) {
+  if (options.permission !== undefined) {
+    if (options.permission !== 'allow' && options.permission !== 'ask') {
+      throw new Error(`--permission expects allow or ask, got "${options.permission}"`);
+    }
     const slot = PERMISSION_ENV_BY_MODE[options.mode];
     if (!slot) throw new Error('--permission is an opencode option (it sets OPENCODE_PERMISSION)');
+    // An explicit --env for the same variable is a richer policy the user wrote by hand;
+    // overriding it silently would hand them {bash,edit} and no hint. Refuse instead.
+    if (slot.name in env) throw new Error(`--permission conflicts with --env ${slot.name}=…; pass one of them`);
     env[slot.name] = slot.value(options.permission);
   }
   if (Object.keys(env).length > 0) extras.envOverrides = env;
@@ -855,12 +864,19 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
  * truthful probe is a short `wait?until=exit`: an immediate `exit` means dead.
  */
 export async function probeAlive(deps: AgentDeps, id: string): Promise<'alive' | 'dead' | 'unknown'> {
-  const res = await deps.request(deps.ctx, {
-    method: 'GET',
-    path: `/api/v1/sessions/${encodeURIComponent(id)}/wait`,
-    query: { until: 'exit', timeout: 1000 },
-    timeoutMs: 15_000,
-  });
+  let res: ApiResponse;
+  try {
+    res = await deps.request(deps.ctx, {
+      method: 'GET',
+      path: `/api/v1/sessions/${encodeURIComponent(id)}/wait`,
+      query: { until: 'exit', timeout: 1000 },
+      timeoutMs: 15_000,
+    });
+  } catch {
+    // A socket timeout or reset is a probe that did not answer, not a dead worker —
+    // and inside `ls --alive`'s Promise.all it must not take the other N-1 rows down.
+    return 'unknown';
+  }
   if (!res.json?.success) return 'unknown';
   const wait = (res.json.data as { wait?: WaitResult } | undefined)?.wait;
   if (!wait) return 'unknown';
@@ -906,6 +922,15 @@ export async function agentRestore(
     return fail(
       deps,
       `refusing: ${target.id} is alive — restore would kill the running worker (use interrupt, or rm + spawn --resume)`,
+      EXIT.refused
+    );
+  }
+  // Only a PROVEN corpse is respawned: an unanswered probe (waiter cap, 5xx, timeout) may
+  // hide a live worker, and the external tool's own live check is not this code's to rely on.
+  if (state !== 'dead') {
+    return fail(
+      deps,
+      `refusing: could not prove ${target.id} is dead (probe answered "${state}") — retry, or check \`agent ls --alive\``,
       EXIT.refused
     );
   }
@@ -1134,9 +1159,6 @@ export function registerAgentCommands(program: Command): Command {
         }
       ) =>
         run(Boolean(options.json), (deps) => {
-          if (options.permission !== undefined && options.permission !== 'allow' && options.permission !== 'ask') {
-            throw new Error(`--permission expects allow or ask, got "${options.permission}"`);
-          }
           return agentSpawn(deps, {
             caseName,
             mode: options.mode,
@@ -1144,7 +1166,7 @@ export function registerAgentCommands(program: Command): Command {
             ready: options.ready,
             timeoutMs: parsePositiveInt(options.timeout, DEFAULT_WAIT_MS),
             env: options.env,
-            permission: options.permission as 'allow' | 'ask' | undefined,
+            permission: options.permission,
             resume: options.resume,
           });
         })
