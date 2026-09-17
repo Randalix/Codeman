@@ -417,3 +417,63 @@ describe('lineage colours, as actually rendered', () => {
     expect(colors.w2).not.toBe(colors.w3);
   });
 });
+
+describe('lineage mode (off / hover / always)', () => {
+  const chain = { planer: null, b1: 'planer', b2: 'planer', other: null } as Record<string, string | null>;
+
+  function appWith(mode: unknown) {
+    const { app } = loadLineageApp();
+    app.sessions = new Map(
+      Object.entries(chain).map(([id, parentSessionId]) => [id, { parentSessionId, status: 'idle' }])
+    );
+    app.sessionOrder = Object.keys(chain);
+    app.loadAppSettingsFromStorage = () => ({ sessionLineageLines: mode });
+    app.getDefaultSettings = () => ({});
+    app.updateConnectionLines = () => {};
+    return app;
+  }
+
+  it('defaults to OFF, and maps the old boolean: true → always, false → off', () => {
+    const { app } = loadLineageApp();
+    expect(app.normalizeLineageMode(undefined)).toBe('off');
+    expect(app.normalizeLineageMode(true)).toBe('always');
+    expect(app.normalizeLineageMode(false)).toBe('off');
+    expect(app.normalizeLineageMode('hover')).toBe('hover');
+    expect(app.normalizeLineageMode('garbage')).toBe('off');
+    expect(appWith(undefined)._lineageLinesEnabled()).toBe(false);
+    expect(appWith('always')._lineageLinesEnabled()).toBe(true);
+  });
+
+  it('always: every edge; hover: none without a hovered tab, then only the edges touching it', () => {
+    expect(
+      appWith('always')
+        ._collectLineageEdges()
+        .map((e: { childId: string }) => e.childId)
+    ).toEqual(['b1', 'b2']);
+    const hover = appWith('hover');
+    expect(hover._lineageLinesEnabled()).toBe(true);
+    expect(hover._collectLineageEdges()).toEqual([]);
+    hover._lineageHoverId = 'b1';
+    expect(hover._collectLineageEdges().map((e: { childId: string }) => e.childId)).toEqual(['b1']);
+    hover._lineageHoverId = 'planer'; // the parent: both children
+    expect(hover._collectLineageEdges().map((e: { childId: string }) => e.childId)).toEqual(['b1', 'b2']);
+    // Sibling depth is computed over ALL siblings, so b2 keeps depth 1 even when b1 is filtered out.
+    hover._lineageHoverId = 'b2';
+    expect(hover._collectLineageEdges()).toEqual([{ parentId: 'planer', childId: 'b2', depth: 1, status: 'idle' }]);
+  });
+
+  it('a mode change clears the hover and redraws; the same mode does not redraw', () => {
+    const app = appWith('hover');
+    app._lineageLinesEnabled();
+    let redraws = 0;
+    app.updateConnectionLines = () => void redraws++;
+    app._lineageHoverId = 'b1';
+    app.applyLineageLineSettings();
+    expect(redraws).toBe(0);
+    app.loadAppSettingsFromStorage = () => ({ sessionLineageLines: 'off' });
+    app.applyLineageLineSettings();
+    expect(redraws).toBe(1);
+    expect(app._lineageHoverId).toBeNull();
+    expect(app._lineageLinesEnabled()).toBe(false);
+  });
+});
