@@ -751,10 +751,103 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mailbox: post to another session's inbox, read your own
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface InboxMessage {
+  id: string;
+  from: string;
+  text: string;
+  createdAt: number;
+}
+
+/**
+ * `agent post` — leave a message in another session's inbox. Nothing is typed into
+ * its pane: the receiver reads it with `agent inbox` when it wants to. Multi-line
+ * text is fine here (it is stored, not sent as keystrokes).
+ */
+export async function agentPost(deps: AgentDeps, options: { id: string; text: string }): Promise<number> {
+  if (isSelfSession(deps.ctx.selfId, options.id)) {
+    return fail(deps, `refusing: ${options.id} is me — a note to self goes in a file, not the mailbox`, EXIT.refused);
+  }
+  if (options.text.trim().length === 0) return fail(deps, 'refusing: empty message', EXIT.refused);
+  const target = await resolveSessionId(deps, options.id);
+  if ('error' in target) return fail(deps, target.error);
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
+    body: { text: options.text, from: deps.ctx.selfId },
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  const data = res.json.data as { message?: InboxMessage; pending?: number } | undefined;
+  if (deps.json) emitJson(deps, data ?? {});
+  else deps.io.out(palette.ok(`${GLYPH.ok} posted to ${target.id} (${data?.pending ?? '?'} pending there)`));
+  return EXIT.ok;
+}
+
+export interface InboxOptions {
+  /** Block up to this long while the inbox is empty; absent = return at once. */
+  waitMs?: number;
+  /** Read without acknowledging: the messages stay for the next read. */
+  peek: boolean;
+}
+
+/**
+ * `agent inbox` — read this session's mailbox. Messages are acknowledged (removed)
+ * after they were printed, unless `--peek`; a crash between read and ack leaves
+ * them in place. Exit 2 when a `--wait` ran out with nothing arriving.
+ */
+export async function agentInbox(deps: AgentDeps, options: InboxOptions): Promise<number> {
+  const self = encodeURIComponent(deps.ctx.selfId);
+  const res = await deps.request(deps.ctx, {
+    method: 'GET',
+    path: `/api/v1/sessions/${self}/inbox`,
+    query: { wait: options.waitMs },
+    timeoutMs: (options.waitMs ?? 0) + 30_000,
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  const data = res.json.data as { messages?: InboxMessage[]; pending?: number; timedOut?: boolean } | undefined;
+  const messages = data?.messages ?? [];
+  if (deps.json) emitJson(deps, data ?? {});
+  else if (messages.length === 0) {
+    deps.io.err(palette.muted(data?.timedOut ? `(nothing arrived within ${options.waitMs} ms)` : '(inbox empty)'));
+  } else {
+    for (const m of messages) {
+      deps.io.out(
+        `${palette.emph(`from ${m.from.slice(0, 8)}`)} ${palette.muted(new Date(m.createdAt).toISOString())} ${palette.muted(`#${m.id.slice(0, 8)}`)}`
+      );
+      deps.io.out(m.text);
+      deps.io.out('');
+    }
+  }
+  if (messages.length > 0 && !options.peek) {
+    const ack = await deps.request(deps.ctx, {
+      method: 'POST',
+      path: `/api/v1/sessions/${self}/inbox/ack`,
+      body: { ids: messages.map((m) => m.id) },
+    });
+    if (!ack.json?.success)
+      return fail(deps, `read ${messages.length} message(s) but could not acknowledge them: ${describeFailure(ack)}`);
+  }
+  if (messages.length === 0 && options.waitMs !== undefined) return EXIT.timeout;
+  return EXIT.ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Commander wiring
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_WAIT_MS = 60_000;
+
+/** Whole stdin as text (for `post -` and heredocs). */
+function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    process.stdin.on('data', (c: Buffer) => chunks.push(c));
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8').replace(/\n$/, '')));
+    process.stdin.on('error', reject);
+  });
+}
 
 /** Build deps from the live environment; the guard's message is the only thing a non-session caller sees. */
 function liveDeps(json: boolean): AgentDeps | undefined {
@@ -793,7 +886,9 @@ async function run(json: boolean, verb: (deps: AgentDeps) => Promise<number>): P
 export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
-    .description('Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, read, interrupt, rm');
+    .description(
+      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, read, interrupt, rm, post, inbox'
+    );
 
   agent
     .command('ls')
@@ -935,6 +1030,34 @@ export function registerAgentCommands(program: Command): Command {
     .description('Delete a session you created (refuses your own id)')
     .option('--json', 'Machine-readable output')
     .action((id: string, options: { json?: boolean }) => run(Boolean(options.json), (deps) => agentRm(deps, { id })));
+
+  agent
+    .command('post <id> [text...]')
+    .description(
+      "Leave a message in another session's mailbox (nothing is typed; it reads it with `agent inbox`). Text from stdin when omitted or `-`"
+    )
+    .option('--json', 'Machine-readable output')
+    .action(async (id: string, words: string[], options: { json?: boolean }) => {
+      const text = words.length === 0 || (words.length === 1 && words[0] === '-') ? await readStdin() : words.join(' ');
+      await run(Boolean(options.json), (deps) => agentPost(deps, { id, text }));
+    });
+
+  agent
+    .command('inbox')
+    .description(
+      "Read this session's mailbox and acknowledge what was read; --wait blocks while it is empty (exit 2 on timeout)"
+    )
+    .option('-w, --wait <ms>', 'Block up to <ms> while the inbox is empty')
+    .option('--peek', 'Read without acknowledging')
+    .option('--json', 'Machine-readable output')
+    .action((options: { wait?: string; peek?: boolean; json?: boolean }) =>
+      run(Boolean(options.json), (deps) =>
+        agentInbox(deps, {
+          waitMs: options.wait === undefined ? undefined : parsePositiveInt(options.wait, 1, '--wait'),
+          peek: Boolean(options.peek),
+        })
+      )
+    );
 
   return agent;
 }

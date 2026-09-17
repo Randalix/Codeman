@@ -29,6 +29,7 @@
  *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook)
  * - **Approvals** (3): pending, updated, resolved (cross-session Approvals Inbox)
  * - **Custom Model Endpoint Profiles** (1): swapped-out (a session's model got evicted by another session on the same llama-swap endpoint)
+ * - **Agent inbox** (1): message (a post to a session's agent mailbox)
  * - **Orchestrator** (12): stateChanged, planProgress, planReady, phase*, verification, task*, completed, error
  * - **Clipboard** (1): write
  * - **Cases** (4): created, linked, deleted, order-changed
@@ -436,6 +437,11 @@ export const OrchestratorCompleted = 'orchestrator:completed' as const;
 /** Orchestrator error. */
 export const OrchestratorError = 'orchestrator:error' as const;
 
+// ─── Agent inbox ─────────────────────────────────────────────────────────────
+
+/** A message was posted to a session's agent inbox (`{sessionId, from, messageId, pending}`). */
+export const InboxMessage = 'inbox:message' as const;
+
 // ─── Clipboard ──────────────────────────────────────────────────────────────
 
 /** Clipboard content pushed to browser. */
@@ -669,6 +675,8 @@ export const SseEvent = {
 
   // Custom Model Endpoint Profiles
   CustomModelSwappedOut,
+  // Agent inbox
+  InboxMessage,
 
   // Orchestrator
   OrchestratorStateChanged,

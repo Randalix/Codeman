@@ -56,7 +56,7 @@ own head: the worker enforcing the cap is the one who has to be told about it.
 | synchronize on end of turn | HTTP `wait until=stop` (fires for message-initiated turns too, verified live) |
 | liveness / death check | HTTP `wait?until=exit` |
 | interrupt a running turn (break-glass) | HTTP input, a bare `\x1b` with no `\r` |
-| non-claude modes (`shell`/`opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`deepseek`/`omp`) | HTTP only (no other CLI has messaging) |
+| non-claude modes (`shell`/`opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`deepseek`/`omp`) | HTTP only (no other CLI has messaging) — for a MESSAGE rather than a prompt use the agent inbox (`POST /api/v1/sessions/:id/inbox`, read with `codeman agent inbox`), which stores instead of typing |
 | delete | HTTP, via SKILL.md's `delete_session` guard |
 
 ## Availability: probe, never assume
