@@ -539,6 +539,11 @@ describe('spawn --env / --permission / --resume', () => {
       OPENCODE_PERMISSION: opencodePermissionEnv('allow'),
     });
     expect(() => buildSpawnExtras({ ...base, mode: 'codex', permission: 'allow' })).toThrow(/opencode option/);
+    expect(() => buildSpawnExtras({ ...base, permission: 'yes' })).toThrow(/expects allow or ask/);
+    // A hand-written policy via --env is not silently replaced by the flag's {bash,edit}.
+    expect(() =>
+      buildSpawnExtras({ ...base, permission: 'allow', env: ['OPENCODE_PERMISSION={"*":"allow"}'] })
+    ).toThrow(/conflicts with --env/);
   });
 
   it("--resume lands in the mode's config field; claude refuses via quick-start", () => {
@@ -547,6 +552,14 @@ describe('spawn --env / --permission / --resume', () => {
     });
     expect(buildSpawnExtras({ ...base, mode: 'codex', resume: 'r1' })).toEqual({
       codexConfig: { resumeSessionId: 'r1' },
+    });
+    // The config schemas STRIP unknown keys, so a wrong field name would silently start a
+    // fresh conversation: these two names differ from the rest and are pinned on purpose.
+    expect(buildSpawnExtras({ ...base, mode: 'gemini', resume: 'g1' })).toEqual({
+      geminiConfig: { resumeSession: 'g1' },
+    });
+    expect(buildSpawnExtras({ ...base, mode: 'antigravity', resume: 'a1' })).toEqual({
+      antigravityConfig: { resumeConversationId: 'a1' },
     });
     expect(() => buildSpawnExtras({ ...base, mode: 'claude', resume: 'x' })).toThrow(/not available for mode "claude"/);
   });
@@ -570,6 +583,10 @@ describe('spawn --env / --permission / --resume', () => {
     const refused = fakeDeps([]);
     expect(await agentSpawn(refused, { ...base, mode: 'claude', resume: 'x' })).toBe(EXIT.refused);
     expect(refused.calls).toEqual([]);
+    // A bad --permission takes the same refused path (exit 4 + JSON envelope), not a thrown error.
+    const badPerm = fakeDeps([], true);
+    expect(await agentSpawn(badPerm, { ...base, permission: 'maybe' })).toBe(EXIT.refused);
+    expect(JSON.parse(badPerm.out.join(''))).toMatchObject({ success: false });
   });
 });
 
@@ -581,6 +598,13 @@ describe('agent restore / ls --alive', () => {
     expect(await probeAlive(fakeDeps([deadWait]), OTHER)).toBe('dead');
     expect(await probeAlive(fakeDeps([aliveWait]), OTHER)).toBe('alive');
     expect(await probeAlive(fakeDeps([{ status: 500, text: 'boom' }]), OTHER)).toBe('unknown');
+    // A REJECTED request (socket timeout, reset) is unknown too — inside ls --alive's
+    // Promise.all it must not take the other rows down.
+    const rejecting = fakeDeps([]);
+    rejecting.request = async () => {
+      throw new Error('ECONNRESET');
+    };
+    expect(await probeAlive(rejecting, OTHER)).toBe('unknown');
   });
 
   it('restore refuses a live worker and never calls the runner', async () => {
@@ -591,6 +615,29 @@ describe('agent restore / ls --alive', () => {
     );
     expect(ran).toBe(false);
     expect(deps.err.join('')).toMatch(/is alive/);
+  });
+
+  it('restore refuses an UNKNOWN probe (capacity, 5xx, timeout) — only a proven corpse is respawned', async () => {
+    const deps = fakeDeps([apiError(409, 'SESSION_BUSY', 'waiter cap')]);
+    let ran = false;
+    expect(await agentRestore(deps, { id: OTHER, runner: async () => ((ran = true), { code: 0, output: '' }) })).toBe(
+      EXIT.refused
+    );
+    expect(ran).toBe(false);
+    expect(deps.err.join('')).toMatch(/could not prove .* is dead/);
+  });
+
+  it('ls --alive survives one rejected probe: that row is "unknown", the others still list', async () => {
+    const deps = fakeDeps((o) => (o.path === '/api/v1/sessions' ? ok([{ id: SELF }, { id: OTHER }]) : aliveWait));
+    const inner = deps.request;
+    deps.request = async (c, o) => {
+      if (o.path.includes(OTHER)) throw new Error('socket hang up');
+      return inner(c, o);
+    };
+    expect(await agentLs(deps, { alive: true })).toBe(EXIT.ok);
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/058ee7b5\s+\?\s+\?\s+alive/);
+    expect(text).toMatch(/94990c6d\s+\?\s+\?\s+unknown/);
   });
 
   it('restore hands a dead session (and the --resume id) to the runner and reports its result', async () => {
