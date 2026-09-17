@@ -103,6 +103,45 @@ describe('read with wait', () => {
     }
   });
 
+  it('detach() releases waiters but KEEPS the mail; drop() discards it', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'while away');
+    const waiting = inbox.read(B, 5_000);
+    inbox.detach(B);
+    expect((await waiting).timedOut).toBe(false);
+    inbox.detach(A);
+    expect(inbox.list(A).map((m) => m.text)).toEqual(['while away']); // still there after re-adoption
+    inbox.drop(A);
+    expect(inbox.list(A)).toEqual([]);
+  });
+
+  it('pruneExcept() drops inboxes of sessions that did not come back, once, with one change event', () => {
+    const { inbox } = make();
+    inbox.post(A, 'x', 'keep');
+    inbox.post(B, 'x', 'orphan');
+    const onChange = vi.fn();
+    inbox.onChange = onChange;
+    expect(inbox.pruneExcept([A])).toBe(1);
+    expect(inbox.list(A)).toHaveLength(1);
+    expect(inbox.list(B)).toEqual([]);
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(inbox.pruneExcept([A])).toBe(0);
+    expect(onChange).toHaveBeenCalledTimes(1); // nothing to prune → no write
+  });
+
+  it('timedOut names the release path, not a clock comparison', async () => {
+    vi.useFakeTimers();
+    try {
+      // The clock never advances, so a wall-clock check would say "not a timeout".
+      const inbox = new AgentInbox(() => 42);
+      const pending = inbox.read(A, MIN_WAIT_MS);
+      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
+      expect((await pending).timedOut).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('drop() and stop() release waiters without a timeout flag', async () => {
     const { inbox } = make();
     const dropped = inbox.read(A, 5_000);
