@@ -498,10 +498,11 @@ describe('agent post / inbox (mailbox)', () => {
     const peek = fakeDeps([ok({ messages: [{ id: 'm1', from: OTHER, text: 'x', createdAt: 0 }], pending: 1 })]);
     expect(await agentInbox(peek, { peek: true })).toBe(EXIT.ok);
     expect(peek.calls).toHaveLength(1);
+    // The server clamps: --wait 1 is a 1000 ms wait, and the message says so.
     const timeout = fakeDeps([ok({ messages: [], pending: 0, timedOut: true, waitedMs: 1000 })]);
-    expect(await agentInbox(timeout, { peek: false, waitMs: 1000 })).toBe(EXIT.timeout);
-    expect(timeout.calls[0].query).toMatchObject({ wait: 1000 });
-    expect(timeout.err.join('')).toMatch(/nothing arrived/);
+    expect(await agentInbox(timeout, { peek: false, waitMs: 1 })).toBe(EXIT.timeout);
+    expect(timeout.calls[0].query).toMatchObject({ wait: 1 });
+    expect(timeout.err.join('')).toMatch(/nothing arrived within 1000 ms/);
   });
 
   it('a failed ack is reported as such (the messages stay for the next read)', async () => {
