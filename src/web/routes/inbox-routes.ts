@@ -14,7 +14,7 @@
  * the reader, not an authorization claim.
  */
 
-import { FastifyInstance, FastifyRequest } from 'fastify';
+import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { InboxAckSchema, InboxPostSchema, InboxReadQuerySchema } from '../schemas.js';
 import { findSessionOrFail, parseBody } from '../route-helpers.js';
@@ -27,6 +27,19 @@ export function senderLabel(req: FastifyRequest, from: string | undefined): stri
   const header = req.headers['x-codeman-parent-session'];
   const value = Array.isArray(header) ? header[0] : header;
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, 128) : 'api';
+}
+
+/**
+ * Same shape as session-routes' `abortOnClientHangUp`: `reply.raw` emits `close` both
+ * when the response completes and when the socket dies; `writableFinished` tells
+ * them apart. Only observable over real HTTP (`app.inject()` never emits `close`).
+ */
+function abortOnClientHangUp(reply: FastifyReply): AbortController {
+  const controller = new AbortController();
+  reply.raw.on('close', () => {
+    if (!reply.raw.writableFinished) controller.abort();
+  });
+  return controller;
 }
 
 export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): void {
@@ -53,7 +66,7 @@ export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): voi
     return { message: result.message, pending: result.pending };
   });
 
-  app.get('/api/sessions/:id/inbox', async (req) => {
+  app.get('/api/sessions/:id/inbox', async (req, reply) => {
     const { id } = req.params as { id: string };
     findSessionOrFail(ctx, id, req);
     const query = parseBody(InboxReadQuerySchema, req.query ?? {});
@@ -63,7 +76,10 @@ export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): voi
         `Too many inbox waiters on ${id} (max ${MAX_INBOX_WAITERS_PER_SESSION})`
       );
     }
-    return agentInbox.read(id, query.wait);
+    // A client that hangs up mid-poll hands its waiter slot back at once (the cap
+    // above is small on purpose); nobody is reading the answer anyway.
+    const abort = query.wait === undefined ? undefined : abortOnClientHangUp(reply);
+    return agentInbox.read(id, query.wait, abort?.signal);
   });
 
   app.post('/api/sessions/:id/inbox/ack', async (req) => {
