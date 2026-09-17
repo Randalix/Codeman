@@ -27,7 +27,7 @@
  */
 import http from 'node:http';
 import https from 'node:https';
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import type { Command } from 'commander';
 import { dataPath } from './config/instance.js';
 import { GLYPH, palette, table } from './cli-style.js';
@@ -403,15 +403,24 @@ export async function resolveSessionId(deps: AgentDeps, id: string): Promise<{ i
   return { error: `"${id}" is ambiguous: ${matches.map((s) => s.id.slice(0, 13)).join(', ')}` };
 }
 
-/** `agent ls` — every session the caller can see, self marked. */
-export async function agentLs(deps: AgentDeps): Promise<number> {
+/** `agent ls` — every session the caller can see, self marked; `--alive` probes each pane. */
+export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}): Promise<number> {
   const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const sessions = (res.json.data as SessionRow[] | undefined) ?? [];
+  const alive = new Map<string, 'alive' | 'dead' | 'unknown'>();
+  if (options.alive) {
+    // One short probe per session, in parallel: `status` says busy for a corpse.
+    await Promise.all(sessions.map(async (s) => alive.set(s.id, await probeAlive(deps, s.id))));
+  }
   if (deps.json) {
     emitJson(
       deps,
-      sessions.map((s) => ({ ...s, self: isSelfSession(deps.ctx.selfId, s.id) }))
+      sessions.map((s) => ({
+        ...s,
+        self: isSelfSession(deps.ctx.selfId, s.id),
+        ...(options.alive ? { pane: alive.get(s.id) } : {}),
+      }))
     );
     return EXIT.ok;
   }
@@ -424,9 +433,11 @@ export async function agentLs(deps: AgentDeps): Promise<number> {
     s.id.slice(0, 8),
     s.mode ?? '?',
     s.status ?? '?',
+    ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
     s.name || s.workingDir || '',
   ]);
-  deps.io.out(table([[' ', 'ID', 'MODE', 'STATUS', 'NAME'], ...rows], { gap: 2 }));
+  const header = [' ', 'ID', 'MODE', 'STATUS', ...(options.alive ? ['PANE'] : []), 'NAME'];
+  deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(`* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal.`)
   );
@@ -440,6 +451,75 @@ export interface SpawnOptions {
   /** Wait for the composer before returning (claude/deepseek only; other modes return at once). */
   ready: boolean;
   timeoutMs: number;
+  /** `KEY=VALUE` pairs → quick-start `envOverrides` (the server allowlists the prefixes). */
+  env?: string[];
+  /** opencode only: writes `OPENCODE_PERMISSION` so the worker never stops on a bash/edit dialog. */
+  permission?: 'allow' | 'ask';
+  /** Continue an existing CLI conversation (the CLI's own session id, not Codeman's). */
+  resume?: string;
+}
+
+/**
+ * Where each mode's quick-start body carries a resume id. The server's registry maps
+ * these onto the CLI flag (`opencode --session`, `codex resume`, …); the CLI only has
+ * to know the field. claude is absent on purpose: quick-start has no resume field for
+ * it (the create path does, via `POST /api/sessions`), so `--resume` refuses there.
+ */
+export const RESUME_FIELD_BY_MODE: Record<string, { config: string; field: string }> = {
+  opencode: { config: 'openCodeConfig', field: 'continueSession' },
+  codex: { config: 'codexConfig', field: 'resumeSessionId' },
+  gemini: { config: 'geminiConfig', field: 'resumeSessionId' },
+  antigravity: { config: 'antigravityConfig', field: 'resumeSessionId' },
+  pi: { config: 'piConfig', field: 'resumeSessionId' },
+  grok: { config: 'grokConfig', field: 'resumeSessionId' },
+  deepseek: { config: 'deepSeekConfig', field: 'resumeSessionId' },
+  omp: { config: 'ompConfig', field: 'resumeSessionId' },
+};
+
+/** `KEY=VALUE` list → object; a pair without `=` or with an empty key is an error, not a silent drop. */
+export function parseEnvPairs(pairs: readonly string[] | undefined): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const pair of pairs ?? []) {
+    const eq = pair.indexOf('=');
+    if (eq <= 0) throw new Error(`--env expects KEY=VALUE, got "${pair}"`);
+    env[pair.slice(0, eq)] = pair.slice(eq + 1);
+  }
+  return env;
+}
+
+/** The `OPENCODE_PERMISSION` value for `--permission`. Granular: bash + edit, never `*`. */
+export function opencodePermissionEnv(mode: 'allow' | 'ask'): string {
+  return JSON.stringify(mode === 'allow' ? { bash: 'allow', edit: 'allow' } : { bash: 'ask', edit: 'ask' });
+}
+
+/** Which modes take `--permission`, and the env var it becomes — data, not a mode branch. */
+export const PERMISSION_ENV_BY_MODE: Record<string, { name: string; value: (mode: 'allow' | 'ask') => string }> = {
+  opencode: { name: 'OPENCODE_PERMISSION', value: opencodePermissionEnv },
+};
+
+/** Extra quick-start body from the spawn options; throws on a combination the server would refuse. */
+export function buildSpawnExtras(options: SpawnOptions): Record<string, unknown> {
+  const extras: Record<string, unknown> = {};
+  const env = parseEnvPairs(options.env);
+  if (options.permission) {
+    const slot = PERMISSION_ENV_BY_MODE[options.mode];
+    if (!slot) throw new Error('--permission is an opencode option (it sets OPENCODE_PERMISSION)');
+    env[slot.name] = slot.value(options.permission);
+  }
+  if (Object.keys(env).length > 0) extras.envOverrides = env;
+  if (options.resume) {
+    const slot = RESUME_FIELD_BY_MODE[options.mode];
+    if (!slot) {
+      throw new Error(
+        `--resume is not available for mode "${options.mode}" via quick-start (claude: run \`claude --resume <id>\` in the case, or POST /api/v1/sessions with resumeSessionId)`
+      );
+    }
+    extras[slot.config] = {
+      ...((extras[slot.config] as Record<string, unknown> | undefined) ?? {}),
+      [slot.field]: options.resume,
+    };
+  }
+  return extras;
 }
 
 /**
@@ -474,6 +554,21 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
   };
   if (options.name) body.sessionName = options.name;
   Object.assign(body, SPAWN_BODY_BY_MODE[options.mode] ?? {});
+  let extras: Record<string, unknown>;
+  try {
+    extras = buildSpawnExtras(options);
+  } catch (err) {
+    return fail(deps, getErrorMessage(err), EXIT.refused);
+  }
+  // Per-mode config objects merge (deepseek's permission posture + a resume id both
+  // live in deepSeekConfig); everything else overrides.
+  for (const [key, value] of Object.entries(extras)) {
+    const existing = body[key];
+    body[key] =
+      existing && typeof existing === 'object' && value && typeof value === 'object'
+        ? { ...(existing as Record<string, unknown>), ...(value as Record<string, unknown>) }
+        : value;
+  }
   const res = await deps.request(deps.ctx, { method: 'POST', path: '/api/v1/quick-start', body });
   const data = res.json?.data as { sessionId?: string; caseName?: string; casePath?: string } | undefined;
   if (!res.json?.success || !data?.sessionId) return fail(deps, describeFailure(res));
@@ -751,6 +846,96 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Liveness and restore
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Is the worker behind `id` alive? `status`/`pid` lie for a tmux session (the pid is
+ * the attach client, which outlives a worker that died in its pane); the one
+ * truthful probe is a short `wait?until=exit`: an immediate `exit` means dead.
+ */
+export async function probeAlive(deps: AgentDeps, id: string): Promise<'alive' | 'dead' | 'unknown'> {
+  const res = await deps.request(deps.ctx, {
+    method: 'GET',
+    path: `/api/v1/sessions/${encodeURIComponent(id)}/wait`,
+    query: { until: 'exit', timeout: 1000 },
+    timeoutMs: 15_000,
+  });
+  if (!res.json?.success) return 'unknown';
+  const wait = (res.json.data as { wait?: WaitResult } | undefined)?.wait;
+  if (!wait) return 'unknown';
+  if (wait.signal === 'exit' || wait.ended) return 'dead';
+  return 'alive';
+}
+
+/** How `restore` reaches a dead pane; injectable so the test never spawns a process. */
+export type RestoreRunner = (id: string, resume: string | undefined) => Promise<{ code: number; output: string }>;
+
+/** The host-local restore tool (`~/bin/codeman-restore-session`), or null when absent. */
+export function findRestoreTool(env: NodeJS.ProcessEnv = process.env): string | null {
+  const candidates = [
+    env.CODEMAN_RESTORE_TOOL,
+    ...(env.PATH ?? '').split(':').map((dir) => (dir ? `${dir}/codeman-restore-session` : '')),
+    env.HOME ? `${env.HOME}/bin/codeman-restore-session` : '',
+  ].filter((c): c is string => Boolean(c));
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).isFile()) return candidate;
+    } catch {
+      // not there
+    }
+  }
+  return null;
+}
+
+/**
+ * `agent restore` — bring a session whose pane died back, with its conversation.
+ * Codeman's own respawn refuses external CLIs (opencode, codex, …), so this delegates
+ * to the host's restore tool, which respawns the pane from the original launch
+ * command and re-attaches the CLI's last conversation (`opencode -c`, `claude
+ * --resume`, …). A live worker is never touched: restoring it would kill its turn.
+ */
+export async function agentRestore(
+  deps: AgentDeps,
+  options: { id: string; resume?: string; runner?: RestoreRunner }
+): Promise<number> {
+  const target = await resolveSessionId(deps, options.id);
+  if ('error' in target) return fail(deps, target.error);
+  const state = await probeAlive(deps, target.id);
+  if (state === 'alive') {
+    return fail(
+      deps,
+      `refusing: ${target.id} is alive — restore would kill the running worker (use interrupt, or rm + spawn --resume)`,
+      EXIT.refused
+    );
+  }
+  const runner: RestoreRunner =
+    options.runner ??
+    (async (id, resume) => {
+      const tool = findRestoreTool();
+      if (!tool) {
+        return {
+          code: EXIT.error,
+          output:
+            'no restore tool on this host (expected codeman-restore-session on PATH or ~/bin); respawn by hand: rm + spawn --resume <cli-session-id>',
+        };
+      }
+      const { execFile } = await import('node:child_process');
+      return new Promise((resolve) => {
+        execFile(tool, resume ? [id, '--resume', resume] : [id], { timeout: 120_000 }, (err, stdout, stderr) => {
+          resolve({ code: err ? EXIT.error : EXIT.ok, output: `${stdout}${stderr}`.trim() });
+        });
+      });
+    });
+  const result = await runner(target.id, options.resume);
+  if (deps.json) emitJson(deps, { sessionId: target.id, restored: result.code === EXIT.ok, output: result.output });
+  else if (result.code === EXIT.ok)
+    deps.io.out(palette.ok(`${GLYPH.ok} restored ${target.id}${result.output ? `\n${result.output}` : ''}`));
+  else deps.io.err(palette.err(`${GLYPH.fail} restore failed for ${target.id}: ${result.output}`));
+  return result.code;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Mailbox: post to another session's inbox, read your own
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -844,6 +1029,11 @@ export async function agentInbox(deps: AgentDeps, options: InboxOptions): Promis
 
 const DEFAULT_WAIT_MS = 60_000;
 
+/** commander collector for repeatable options. */
+function collect(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 /** Whole stdin as text (for `post -` and heredocs). */
 function readStdin(): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -899,8 +1089,11 @@ export function registerAgentCommands(program: Command): Command {
     .command('ls')
     .alias('list')
     .description('List sessions; * marks this one')
+    .option('--alive', 'Probe every pane (wait until=exit, 1 s each, in parallel): DEAD means the worker exited')
     .option('--json', 'Machine-readable output')
-    .action((options: { json?: boolean }) => run(Boolean(options.json), agentLs));
+    .action((options: { alive?: boolean; json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentLs(deps, { alive: Boolean(options.alive) }))
+    );
 
   agent
     .command('spawn <case>')
@@ -911,18 +1104,64 @@ export function registerAgentCommands(program: Command): Command {
     .option('-n, --name <name>', 'Session name shown in the UI')
     .option('--no-ready', 'Return as soon as the session exists, without the readiness wait')
     .option('-t, --timeout <ms>', 'Readiness budget in ms', String(DEFAULT_WAIT_MS))
+    .option(
+      '-e, --env <KEY=VALUE>',
+      'Environment for the worker (repeatable; server allowlists OPENCODE_*, CODEX_*, … prefixes)',
+      collect,
+      []
+    )
+    .option(
+      '--permission <allow|ask>',
+      'opencode: bash+edit auto-approve (sets OPENCODE_PERMISSION) — a worker that stops on a dialog is a worker nobody answers'
+    )
+    .option(
+      '--resume <cli-session-id>',
+      'Continue that CLI conversation (opencode --session, codex resume, …); claude is not supported here'
+    )
     .option('--json', 'Machine-readable output')
     .action(
-      (caseName: string, options: { mode: string; name?: string; ready: boolean; timeout?: string; json?: boolean }) =>
-        run(Boolean(options.json), (deps) =>
-          agentSpawn(deps, {
+      (
+        caseName: string,
+        options: {
+          mode: string;
+          name?: string;
+          ready: boolean;
+          timeout?: string;
+          env: string[];
+          permission?: string;
+          resume?: string;
+          json?: boolean;
+        }
+      ) =>
+        run(Boolean(options.json), (deps) => {
+          if (options.permission !== undefined && options.permission !== 'allow' && options.permission !== 'ask') {
+            throw new Error(`--permission expects allow or ask, got "${options.permission}"`);
+          }
+          return agentSpawn(deps, {
             caseName,
             mode: options.mode,
             name: options.name,
             ready: options.ready,
             timeoutMs: parsePositiveInt(options.timeout, DEFAULT_WAIT_MS),
-          })
-        )
+            env: options.env,
+            permission: options.permission as 'allow' | 'ask' | undefined,
+            resume: options.resume,
+          });
+        })
+    );
+
+  agent
+    .command('restore <id>')
+    .description(
+      "Bring back a session whose pane died (respawns it with its conversation via the host's codeman-restore-session); refuses a live one"
+    )
+    .option(
+      '--resume <cli-session-id>',
+      'Re-attach exactly this CLI conversation instead of the last one in the directory'
+    )
+    .option('--json', 'Machine-readable output')
+    .action((id: string, options: { resume?: string; json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentRestore(deps, { id, resume: options.resume }))
     );
 
   agent

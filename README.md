@@ -943,7 +943,13 @@ codeman agent interrupt "$SID"                            # a bare ESC, conversa
 codeman agent rm "$SID"                                   # refuses your own id
 codeman agent post "$SID" 'when you are done, ping me'    # MAILBOX: stored, never typed; multi-line ok, `-` reads stdin
 codeman agent inbox --wait 60000                          # read my own mailbox (acks what it printed; --peek to keep)
+codeman agent spawn worker-2 --mode opencode --permission allow --env OPENCODE_MODEL=deepseek/deepseek-v4-flash
+codeman agent spawn worker-2 --mode opencode --resume ses_abc   # continue that opencode conversation (codex: `resume`, …)
+codeman agent ls --alive                                  # PANE column: DEAD = the worker exited (status lies)
+codeman agent restore "$SID"                              # respawn a dead pane with its conversation; refuses a live one
 ```
+
+**Lifecycle rules for orchestrators.** (1) A worker you replaced is a worker you delete: after the successor is spawned and has its handoff, `rm` the predecessor — a finished session still holds a tmux pane, a case slot and, for opencode, a running MCP tree. (2) Spawn opencode workers with `--permission allow`: without it every new command pattern stops the worker on an "Allow once / Allow always / Reject" dialog that nobody answers (granting the permission is the operator's call — the flag only carries it). (3) `status` is a UI hint: use `ls --alive` (or `wait --until exit --timeout 1000`) before deciding a worker is done, and `restore` when its pane died (a stray `Ctrl+C` is `app_exit` in opencode). `restore` delegates to the host's `codeman-restore-session` tool, which respawns the pane from the original launch command and re-attaches the CLI's last conversation; `--resume <cli-session-id>` picks an exact one.
 
 **Mailbox vs. `send`.** `send` types into the receiver's composer: right for a prompt, wrong for a message — it starts or interrupts a billed turn, the receiver cannot defer it, and in a fullscreen TUI a stray byte is a dead session. `post` stores instead: the message sits in the receiver's inbox until it runs `codeman agent inbox` (between its own steps, or blocking with `--wait`), and it is removed only when acknowledged, so a crash between read and ack loses nothing. Inboxes are bounded (200 messages × 16 KB; a full inbox refuses the post so the sender knows), persisted in the data dir (`agent-inbox.json`, so they survive a server restart), dropped with the session, and announced to browsers as the `inbox:message` SSE event. Nothing is written to the pane — a receiver that never polls never sees the message, by design; put "check `codeman agent inbox` at the start of each turn" into the worker's brief.
 
