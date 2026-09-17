@@ -148,8 +148,14 @@ export function deleteRefusal(selfId: string, id: string): string | undefined {
  */
 export function inputRefusal(text: string): string | undefined {
   if (text.length === 0) return 'refusing: empty input (use `interrupt` for ESC, `send <id> ""` is never a prompt)';
+  // The composer is one line: the server strips newlines, which silently joins the
+  // lines into one prompt, and a tab reaches the pane as a keypress (claude: mode toggle).
+  if (/[\n\r\t]/.test(text)) {
+    return 'refusing: input must be a single line (the composer strips newlines and would join your lines) — join them yourself, or write a file into the workspace and send its path';
+  }
+  // C0, DEL and C1 (U+0080–U+009F: an 8-bit CSI is still a CSI to a terminal).
   // eslint-disable-next-line no-control-regex
-  const control = text.match(/[\x00-\x1f\x7f]/);
+  const control = text.match(/[\x00-\x1f\x7f-\x9f]/);
   if (control) {
     const code = control[0].charCodeAt(0).toString(16).padStart(2, '0');
     return `refusing: input contains control byte 0x${code}; send transmits printable text only (ESC is \`interrupt\`)`;
@@ -202,11 +208,17 @@ export function parsePositiveInt(raw: string | undefined, fallback: number, flag
   return n;
 }
 
-/** Exit code for a wait result: matched or a signal → ok, `exit` → dead, timeout → timeout. */
+/**
+ * Exit code for a wait result: matched or a signal → ok, `exit` or `ended` → dead,
+ * timeout → timeout. `ended` is checked BEFORE the happy paths: a worker that dies
+ * during `--until stop` comes back as `ended:true, signal:null` (the registry only
+ * satisfies waiters that listed `exit`, then cancels the rest), and a `--match` on
+ * a dead worker as `ended:true, matched:false` — both are "dead", never "done".
+ */
 export function waitExitCode(wait: WaitResult | undefined): number {
   if (!wait) return EXIT.error;
+  if (wait.signal === 'exit' || wait.ended) return EXIT.dead;
   if (wait.timedOut) return EXIT.timeout;
-  if (wait.signal === 'exit') return EXIT.dead;
   if (wait.matched === false) return EXIT.timeout;
   return EXIT.ok;
 }
@@ -230,8 +242,11 @@ export interface ApiResponse<T = unknown> {
 }
 
 export interface WaitResult {
-  signal?: string;
+  /** The signal that fired, or null when the wait ended without one. */
+  signal?: string | null;
   timedOut?: boolean;
+  /** The session went away (deleted / torn down / the write failed) before the wait resolved. */
+  ended?: boolean;
   timeoutMs?: number;
   until?: string[];
   matched?: boolean;
@@ -465,6 +480,7 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
   const sid = data.sessionId;
 
   let ready: boolean | undefined;
+  let readinessError: string | undefined;
   const mark = READY_MARK[options.mode];
   if (options.ready && mark) {
     const wait = await deps.request(deps.ctx, {
@@ -473,30 +489,37 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
       query: { match: mark, from: 'buffer', timeout: options.timeoutMs },
       timeoutMs: options.timeoutMs + 10_000,
     });
-    ready = Boolean((wait.json?.data as { wait?: WaitResult } | undefined)?.wait?.matched);
+    // A failed readiness call (waiter cap, 400, network) is its own error, not "the
+    // composer never showed up": report the real reason instead of the trust-dialog hint.
+    if (!wait.json?.success) readinessError = describeFailure(wait);
+    else ready = Boolean((wait.json.data as { wait?: WaitResult } | undefined)?.wait?.matched);
   }
 
   if (deps.json) {
-    emitJson(deps, { ...data, ready });
+    emitJson(deps, { ...data, ready, readinessError });
   } else {
-    deps.io.out(palette.ok(`${GLYPH.ok} spawned ${sid} (${options.mode}, case ${data.caseName ?? options.caseName})`));
-    if (ready === true) deps.io.out(palette.muted('  composer up: the worker can take a prompt'));
+    // Human lines go to stderr so `SID=$(codeman agent spawn …)` captures the id alone.
+    const say = (line: string) => deps.io.err(line);
+    say(palette.ok(`${GLYPH.ok} spawned ${sid} (${options.mode}, case ${data.caseName ?? options.caseName})`));
+    if (ready === true) say(palette.muted('  composer up: the worker can take a prompt'));
     if (ready === false) {
-      deps.io.err(
+      say(
         palette.warn(
           `${GLYPH.warn} composer not seen within ${options.timeoutMs} ms — read \`agent read ${sid.slice(0, 8)} --tail 2000\` before sending (trust dialog?)`
         )
       );
     }
-    if (ready === undefined && options.ready) {
-      deps.io.out(
+    if (readinessError) say(palette.err(`${GLYPH.fail} readiness check failed: ${readinessError}`));
+    if (ready === undefined && !readinessError && options.ready) {
+      say(
         palette.muted(
           `  ${options.mode} has no readiness mark; give it a moment, then use --match markers to synchronize`
         )
       );
     }
+    deps.io.out(sid);
   }
-  if (!deps.json) deps.io.out(sid);
+  if (readinessError) return EXIT.error;
   return ready === false ? EXIT.timeout : EXIT.ok;
 }
 
@@ -535,14 +558,27 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as { delivered?: boolean; duplicate?: boolean; wait?: WaitResult } | undefined;
-  if (deps.json) {
-    emitJson(deps, data ?? {});
-  } else {
-    const delivered = data?.delivered;
-    if (delivered === false && data?.duplicate) {
+  if (deps.json) emitJson(deps, data ?? {});
+  // `delivered:false` without `duplicate` is the route's "the bytes went nowhere":
+  // the PTY exited or send-keys hit a dead pane. The field exists so a client does not
+  // say "wait longer" when the truth is "restart the worker" — so it is a failure here.
+  if (data?.delivered === false && !data.duplicate) {
+    if (!deps.json) {
+      deps.io.err(
+        palette.err(`${GLYPH.fail} not delivered: ${target.id} has no live worker (pane exited) — restart it`)
+      );
+    }
+    return EXIT.dead;
+  }
+  if (!deps.json) {
+    const noEnter = options.enter ? '' : ' (no Enter)';
+    if (data?.duplicate) {
       deps.io.out(palette.warn(`${GLYPH.warn} duplicate (clientId/seq already applied): nothing typed`));
+    } else if (data?.delivered === true) {
+      deps.io.out(palette.ok(`${GLYPH.ok} delivered to ${target.id}${noEnter}`));
     } else {
-      deps.io.out(palette.ok(`${GLYPH.ok} delivered to ${target.id}${options.enter ? '' : ' (no Enter)'}`));
+      // Fire-and-forget answers before the write, so there is no delivery report here.
+      deps.io.out(palette.ok(`${GLYPH.ok} accepted for ${target.id}${noEnter} (no delivery report without --wait)`));
     }
     if (data?.wait) deps.io.out(describeWait(data.wait));
   }
@@ -551,15 +587,20 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
 }
 
 function describeWait(wait: WaitResult): string {
+  if (wait.signal === 'exit') return palette.err(`${GLYPH.fail} the session exited`);
+  if (wait.ended) {
+    return palette.err(
+      `${GLYPH.fail} the wait ended without an answer: the session went away (dead worker, deleted, or nothing was written)`
+    );
+  }
   if (wait.timedOut) return palette.warn(`${GLYPH.warn} timed out after ${wait.timeoutMs ?? '?'} ms`);
   if (wait.matched !== undefined) {
     return wait.matched
       ? palette.ok(`${GLYPH.ok} matched "${wait.match}"${wait.snippet ? `: ${wait.snippet}` : ''}`)
       : palette.warn(`${GLYPH.warn} not matched`);
   }
-  const tone = wait.signal === 'exit' ? palette.err : palette.ok;
-  return tone(
-    `${wait.signal === 'exit' ? GLYPH.fail : GLYPH.ok} signal: ${wait.signal}${wait.immediate ? ' (immediate: current state, not a transition)' : ''}`
+  return palette.ok(
+    `${GLYPH.ok} signal: ${wait.signal}${wait.immediate ? ' (immediate: current state, not a transition)' : ''}`
   );
 }
 
@@ -787,18 +828,23 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('send <id> <text...>')
     .description('Type a prompt into another session and press Enter (printable text only)')
-    .option('-w, --wait [signals]', 'Block until end of turn: default signal set, or a comma list such as stop,exit')
+    .option('-w, --wait', 'Block until end of turn (the default signal set; see --until)')
+    .option('-u, --until <signals>', 'Signals to wait for, comma list such as stop,exit (implies --wait)')
     .option('-t, --timeout <ms>', 'Wait budget in ms (with --wait)', String(DEFAULT_WAIT_MS))
     .option('--no-enter', 'Type the text without submitting it')
     .option('--client-id <id>', 'Exactly-once tag (default: one per calling session)')
-    .option('--seq <n>', 'Sequence number for the tag (default: the current epoch ms)')
+    .option(
+      '--seq <n>',
+      'Sequence number for the tag (default: the current epoch ms). Must stay monotonic per client id: a reused or lower value is a silent duplicate, nothing is typed'
+    )
     .option('--json', 'Machine-readable output')
     .action(
       (
         id: string,
         words: string[],
         options: {
-          wait?: string | true;
+          wait?: boolean;
+          until?: string;
           timeout?: string;
           enter: boolean;
           clientId?: string;
@@ -811,10 +857,10 @@ export function registerAgentCommands(program: Command): Command {
             id,
             text: words.join(' '),
             enter: options.enter,
-            wait: options.wait,
+            wait: options.until ?? (options.wait ? true : undefined),
             timeoutMs: parsePositiveInt(options.timeout, DEFAULT_WAIT_MS),
             clientId: options.clientId,
-            seq: options.seq === undefined ? undefined : Number(options.seq),
+            seq: options.seq === undefined ? undefined : parsePositiveInt(options.seq, 1, '--seq'),
           })
         )
     );

@@ -935,7 +935,7 @@ The skill above is claude-shaped (Codeman seeds its preamble for claude sessions
 ```bash
 codeman agent ls                                          # sessions; * marks this one
 SID=$(codeman agent spawn scratch-1 --mode claude)        # quick-start + wait for the composer (claude/deepseek)
-codeman agent send "$SID" 'review src/, then say DONE' --wait stop,exit --timeout 300000
+codeman agent send "$SID" 'review src/, then say DONE' --until stop,exit --timeout 300000   # --wait = default signal set
 codeman agent read "$SID"                                 # last answer (claude/codex/deepseek transcript)
 codeman agent read "$SID" --tail 3000                     # terminal tail, ANSI stripped (every mode)
 codeman agent wait "$SID" --match DONE_4711               # marker wait for hook-less modes (opencode, pi, …)
@@ -943,7 +943,7 @@ codeman agent interrupt "$SID"                            # a bare ESC, conversa
 codeman agent rm "$SID"                                   # refuses your own id
 ```
 
-Rules the commands enforce rather than document: they refuse outside a Codeman session and never guess a URL; `send` transmits printable text plus Enter only (a control byte such as `Ctrl+C` is `app_exit` in opencode — ESC exists solely as `interrupt`, which never appends Enter); `rm` refuses an empty id, an unprovable self id and a prefix match in either direction. Ids may be the 8-character prefixes `ls` prints (resolved through the list; an ambiguous prefix refuses). Exit codes: `0` delivered/matched/signal, `1` error, `2` timeout, `3` the worker exited, `4` refused. `--json` prints the envelope's `data` for every verb. `--until stop` on a mode without hook signals is the server's 400, passed through — the marker path (`--match`) is the answer there, exactly as for the skill.
+Rules the commands enforce rather than document: they refuse outside a Codeman session and never guess a URL; `send` transmits printable text plus Enter only (a control byte such as `Ctrl+C` is `app_exit` in opencode — ESC exists solely as `interrupt`, which never appends Enter); `rm` refuses an empty id, an unprovable self id and a prefix match in either direction. Ids may be the 8-character prefixes `ls` prints (resolved through the list; an ambiguous prefix refuses). Exit codes: `0` delivered/matched/signal, `1` error, `2` timeout, `3` the worker exited or the wait ended without an answer (`delivered:false`, `ended:true`), `4` refused. `spawn` prints the id alone on stdout (prose goes to stderr), so `SID=$(…)` captures exactly the id. `--json` prints the envelope's `data` for every verb. `--until stop` on a mode without hook signals is the server's 400, passed through — the marker path (`--match`) is the answer there, exactly as for the skill.
 
 ### Hooks (events flowing _back_ to Codeman)
 
