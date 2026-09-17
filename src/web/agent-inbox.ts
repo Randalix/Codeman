@@ -85,7 +85,7 @@ export class AgentInbox {
 
   /** A message landed: `{sessionId, message, pending}`. The server maps it to SSE. */
   onMessage: ((sessionId: string, message: InboxMessage, pending: number) => void) | undefined;
-  /** Any mutation (post, ack, clear, drop, restore). The server persists on it. */
+  /** Any mutation (post, ack, clear, drop, prune). The server persists on it. */
   onChange: (() => void) | undefined;
 
   constructor(private readonly now: () => number = Date.now) {}
@@ -128,15 +128,12 @@ export class AgentInbox {
       return { messages: existing, pending: existing.length, timedOut: false, waitedMs: 0 };
     }
     const applied = clampWait(waitMs);
-    const started = this.now();
-    const arrived = await this.waitForPost(sessionId, applied, abortSignal);
+    const ended = await this.waitForPost(sessionId, applied, abortSignal);
     const messages = this.list(sessionId);
-    return {
-      messages,
-      pending: messages.length,
-      timedOut: !arrived && messages.length === 0 && this.now() - started >= applied,
-      waitedMs: applied,
-    };
+    // `timedOut` is which path released the waiter, never a clock comparison: the
+    // timer runs on libuv's cached loop time and can fire a few ms before Date.now()
+    // agrees, which read as "not a timeout" and told the CLI the inbox was simply empty.
+    return { messages, pending: messages.length, timedOut: ended === 'timeout', waitedMs: applied };
   }
 
   /** How many waiters `sessionId` has right now (for the cap check in the route). */
@@ -165,6 +162,31 @@ export class AgentInbox {
     this.inboxes.delete(sessionId);
     this.onChange?.();
     return count;
+  }
+
+  /**
+   * The session was DETACHED (kept for recovery): release its waiters, keep its mail.
+   * A re-adopted session comes back to the messages posted while it was away.
+   */
+  detach(sessionId: string): void {
+    this.releaseWaiters(sessionId);
+  }
+
+  /**
+   * Boot-time sweep: discard inboxes whose session did not come back. Every route
+   * needs the session to exist, so an orphan could otherwise never be removed and
+   * would ride the snapshot forever. Returns how many inboxes were dropped.
+   */
+  pruneExcept(keep: Iterable<string>): number {
+    const alive = new Set(keep);
+    let dropped = 0;
+    for (const sessionId of [...this.inboxes.keys()]) {
+      if (alive.has(sessionId)) continue;
+      this.inboxes.delete(sessionId);
+      dropped++;
+    }
+    if (dropped > 0) this.onChange?.();
+    return dropped;
   }
 
   /** The session is gone: discard its inbox and release anyone waiting on it. */
@@ -217,11 +239,15 @@ export class AgentInbox {
   }
 
   /**
-   * One waiter, released by a post (`true`), by timeout, or by the caller's abort
-   * signal (`false`). The abort path matters for the waiter cap: a client that hangs
+   * One waiter, released by a post, by timeout, or by the caller's abort signal;
+   * the result names which. The abort path matters for the waiter cap: a client that hangs
    * up mid-poll must give its slot back now, not when the timeout fires.
    */
-  private waitForPost(sessionId: string, waitMs: number, abortSignal?: AbortSignal): Promise<boolean> {
+  private waitForPost(
+    sessionId: string,
+    waitMs: number,
+    abortSignal?: AbortSignal
+  ): Promise<'post' | 'timeout' | 'aborted'> {
     return new Promise((resolve) => {
       const set = this.waiters.get(sessionId) ?? new Set<Waiter>();
       const remove = () => {
@@ -231,17 +257,17 @@ export class AgentInbox {
       const onAbort = () => {
         clearTimeout(waiter.timer);
         remove();
-        resolve(false);
+        resolve('aborted');
       };
       const waiter: Waiter = {
         resolve: () => {
           abortSignal?.removeEventListener('abort', onAbort);
-          resolve(true);
+          resolve('post');
         },
         timer: setTimeout(() => {
           abortSignal?.removeEventListener('abort', onAbort);
           remove();
-          resolve(false);
+          resolve('timeout');
         }, waitMs),
       };
       abortSignal?.addEventListener('abort', onAbort, { once: true });

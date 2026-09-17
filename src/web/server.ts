@@ -1468,7 +1468,10 @@ export class WebServer extends EventEmitter {
     sessionWaits.notifySignal(sessionId, 'exit');
     sessionWaits.cancelAll(sessionId);
     approvalInbox.resolveForSession(sessionId, 'session_ended');
-    agentInbox.drop(sessionId);
+    // A detach keeps the session recoverable, so its mail is kept too; only a real
+    // delete discards the inbox. Waiters are released either way (the pane is gone).
+    if (killMux) agentInbox.drop(sessionId);
+    else agentInbox.detach(sessionId);
 
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
@@ -2363,6 +2366,10 @@ export class WebServer extends EventEmitter {
   // ========== Agent inbox persistence ==========
 
   private agentInboxPersistTimer: NodeJS.Timeout | null = null;
+  /** The write in flight, if any; writes are chained so two never share the tmp file. */
+  private agentInboxWrite: Promise<void> = Promise.resolve();
+  /** Set when a change arrived while a write was in flight: run once more afterwards. */
+  private agentInboxDirty = false;
 
   /** The whole-store snapshot file; small, rewritten atomically. */
   private agentInboxPath(): string {
@@ -2390,20 +2397,34 @@ export class WebServer extends EventEmitter {
     }, 250);
   }
 
-  private async persistAgentInboxNow(): Promise<void> {
-    if (this.testMode) return;
+  /**
+   * Write the snapshot, serialized: a second call while a write is in flight marks
+   * the store dirty and the running chain writes once more when it finishes. Two
+   * concurrent writers on the same tmp file interleave (both truncate, both write
+   * from offset 0) and the rename promotes a mix of two payloads — which then fails
+   * to parse at the next boot, losing every message the file exists to protect.
+   */
+  private persistAgentInboxNow(): Promise<void> {
+    if (this.testMode) return Promise.resolve();
     if (this.agentInboxPersistTimer) {
       clearTimeout(this.agentInboxPersistTimer);
       this.agentInboxPersistTimer = null;
     }
-    const path = this.agentInboxPath();
-    const tmp = `${path}.tmp`;
-    try {
-      await fs.writeFile(tmp, JSON.stringify(agentInbox.snapshot()), { mode: 0o600 });
-      await fs.rename(tmp, path);
-    } catch (err) {
-      console.warn(`[Inbox] Could not persist agent inbox: ${getErrorMessage(err)}`);
-    }
+    this.agentInboxDirty = true;
+    this.agentInboxWrite = this.agentInboxWrite.then(async () => {
+      while (this.agentInboxDirty) {
+        this.agentInboxDirty = false;
+        const path = this.agentInboxPath();
+        const tmp = `${path}.tmp`;
+        try {
+          await fs.writeFile(tmp, JSON.stringify(agentInbox.snapshot()), { mode: 0o600 });
+          await fs.rename(tmp, path);
+        } catch (err) {
+          console.warn(`[Inbox] Could not persist agent inbox: ${getErrorMessage(err)}`);
+        }
+      }
+    });
+    return this.agentInboxWrite;
   }
 
   private batchTaskUpdate(sessionId: string, task: BackgroundTask): void {
@@ -2644,6 +2665,14 @@ export class WebServer extends EventEmitter {
             /* best-effort — daemon may be absent */
           });
       }
+    }
+
+    // Same sweep for agent inboxes: a session that ended while the server was down
+    // never ran cleanupSession, and every inbox route needs the session to exist, so
+    // its mail would ride the snapshot forever. After restore, the keep set is complete.
+    if (!this.testMode) {
+      const pruned = agentInbox.pruneExcept(this.sessions.keys());
+      if (pruned > 0) console.log(`[Inbox] dropped ${pruned} inbox(es) of sessions that did not come back`);
     }
 
     // Sweep agent preamble caches whose sessions are gone (see
