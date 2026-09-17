@@ -122,14 +122,14 @@ export class AgentInbox {
    * ends by timeout, `drop()` or `stop()` answers with an empty list and `timedOut`
    * set only for the timeout case.
    */
-  async read(sessionId: string, waitMs?: number): Promise<InboxReadResult> {
+  async read(sessionId: string, waitMs?: number, abortSignal?: AbortSignal): Promise<InboxReadResult> {
     const existing = this.list(sessionId);
-    if (existing.length > 0 || waitMs === undefined || this.stopped) {
+    if (existing.length > 0 || waitMs === undefined || this.stopped || abortSignal?.aborted) {
       return { messages: existing, pending: existing.length, timedOut: false, waitedMs: 0 };
     }
     const applied = clampWait(waitMs);
     const started = this.now();
-    const arrived = await this.waitForPost(sessionId, applied);
+    const arrived = await this.waitForPost(sessionId, applied, abortSignal);
     const messages = this.list(sessionId);
     return {
       messages,
@@ -216,17 +216,35 @@ export class AgentInbox {
     this.onChange = undefined;
   }
 
-  private waitForPost(sessionId: string, waitMs: number): Promise<boolean> {
+  /**
+   * One waiter, released by a post (`true`), by timeout, or by the caller's abort
+   * signal (`false`). The abort path matters for the waiter cap: a client that hangs
+   * up mid-poll must give its slot back now, not when the timeout fires.
+   */
+  private waitForPost(sessionId: string, waitMs: number, abortSignal?: AbortSignal): Promise<boolean> {
     return new Promise((resolve) => {
       const set = this.waiters.get(sessionId) ?? new Set<Waiter>();
+      const remove = () => {
+        set.delete(waiter);
+        if (set.size === 0 && this.waiters.get(sessionId) === set) this.waiters.delete(sessionId);
+      };
+      const onAbort = () => {
+        clearTimeout(waiter.timer);
+        remove();
+        resolve(false);
+      };
       const waiter: Waiter = {
-        resolve: () => resolve(true),
+        resolve: () => {
+          abortSignal?.removeEventListener('abort', onAbort);
+          resolve(true);
+        },
         timer: setTimeout(() => {
-          set.delete(waiter);
-          if (set.size === 0) this.waiters.delete(sessionId);
+          abortSignal?.removeEventListener('abort', onAbort);
+          remove();
           resolve(false);
         }, waitMs),
       };
+      abortSignal?.addEventListener('abort', onAbort, { once: true });
       set.add(waiter);
       this.waiters.set(sessionId, set);
     });

@@ -114,6 +114,22 @@ describe('read with wait', () => {
     expect(inbox.post(B, A, 'late')).toEqual({ ok: false, reason: 'stopped' });
   });
 
+  it('an aborted wait gives its slot back at once and answers without a timeout flag', async () => {
+    const { inbox } = make();
+    const controller = new AbortController();
+    const pending = inbox.read(A, 5_000, controller.signal);
+    expect(inbox.waiterCount(A)).toBe(1);
+    controller.abort();
+    const result = await pending;
+    expect(result.timedOut).toBe(false);
+    expect(result.messages).toEqual([]);
+    expect(inbox.waiterCount(A)).toBe(0);
+    // An already-aborted signal never registers a waiter.
+    const dead = await inbox.read(A, 5_000, controller.signal);
+    expect(dead.waitedMs).toBe(0);
+    expect(inbox.waiterCount(A)).toBe(0);
+  });
+
   it('clamps the wait like the wait primitives', () => {
     expect(clampWait(undefined)).toBe(DEFAULT_WAIT_MS);
     expect(clampWait(1)).toBe(MIN_WAIT_MS);
