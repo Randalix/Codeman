@@ -1078,6 +1078,31 @@ export const ApprovalAnswerSchema = z
   .strict();
 
 /**
+ * Agent inbox (`/api/sessions/:id/inbox`, web/agent-inbox.ts). Caps mirror
+ * MAX_TEXT_LENGTH / MAX_FROM_LENGTH there; `wait` follows the agent-wait grammar
+ * (positive integer ms, clamped in the store, anything else a 400 — never "0 means
+ * forever").
+ */
+export const InboxPostSchema = z
+  .object({
+    text: z.string().min(1).max(16_384),
+    from: z.string().min(1).max(128).optional(),
+  })
+  .strict();
+
+export const InboxAckSchema = z
+  .object({
+    ids: z.array(z.string().min(1).max(64)).min(1).max(200),
+  })
+  .strict();
+
+export const InboxReadQuerySchema = z
+  .object({
+    wait: z.coerce.number().int().positive().optional(),
+  })
+  .strict();
+
+/**
  * Body of PUT /api/sessions/:id/intent (Read My Mind). The 8192 cap mirrors
  * MAX_GOALS_CHARS in intent-store.ts.
  */

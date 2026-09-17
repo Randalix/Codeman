@@ -28,6 +28,7 @@
  * - **Hooks** (10): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted
  *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook)
  * - **Approvals** (3): pending, updated, resolved (cross-session Approvals Inbox)
+ * - **Agent inbox** (1): message (a post to a session's agent mailbox)
  * - **Orchestrator** (12): stateChanged, planProgress, planReady, phase*, verification, task*, completed, error
  * - **Clipboard** (1): write
  * - **Cases** (4): created, linked, deleted, order-changed
@@ -411,6 +412,11 @@ export const OrchestratorCompleted = 'orchestrator:completed' as const;
 /** Orchestrator error. */
 export const OrchestratorError = 'orchestrator:error' as const;
 
+// ─── Agent inbox ─────────────────────────────────────────────────────────────
+
+/** A message was posted to a session's agent inbox (`{sessionId, from, messageId, pending}`). */
+export const InboxMessage = 'inbox:message' as const;
+
 // ─── Clipboard ──────────────────────────────────────────────────────────────
 
 /** Clipboard content pushed to browser. */
@@ -637,6 +643,9 @@ export const SseEvent = {
   ApprovalPending,
   ApprovalUpdated,
   ApprovalResolved,
+
+  // Agent inbox
+  InboxMessage,
 
   // Orchestrator
   OrchestratorStateChanged,

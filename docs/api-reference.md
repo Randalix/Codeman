@@ -416,6 +416,19 @@ client that opens many concurrent waits against one session will still hit the c
 
 `codeman agent ls|spawn|send|wait|read|interrupt|rm` (`src/cli-agent.ts`) is the command-line client for the endpoints above, for agents in modes that never receive the claude-only skill preamble. It adds no route: `spawn` is `POST /api/v1/quick-start` (+ `wait-output` on the composer mark for claude/deepseek), `send` is `POST …/input` with `clientId`+`seq` (and `wait`/`waitTimeout` for `--wait` / `--until <signals>`; `delivered:false` without `duplicate` and `wait.ended` both exit 3 — the CLI never reports a dead worker as done), `wait` is `GET …/wait` (`--until`) or `GET …/wait-output` (`--match`, `from=buffer` by default), `read` is `GET …/last-response` or `GET …/terminal?tail=`, `interrupt` is `POST …/input` with a bare `\u001b`, `rm` is `DELETE …/sessions/:id`. Every call carries `X-Codeman-Parent-Session` and `X-Codeman-Agent-Origin: codeman-agent-cli`, and Basic auth from `CODEMAN_PASSWORD` or the data dir's `.env`. Server-side error codes are shown verbatim (`INVALID_INPUT: until=stop …` on a hook-less mode is not hidden); exit codes are `0` ok, `1` error, `2` timeout, `3` the session exited, `4` refused by a client-side guard. See the README section "`codeman agent`" for the guards and `test/cli-agent.test.ts` for the pinned behaviour.
 
+## Agent inbox (`/api/sessions/:id/inbox`)
+
+A per-session mailbox for agent-to-agent messages that must NOT be typed into the receiver's pane (store: `web/agent-inbox.ts`, routes: `routes/inbox-routes.ts`, CLI: `codeman agent post` / `codeman agent inbox`).
+
+| Method | Endpoint | Body / query | Returns |
+|---|---|---|---|
+| `POST` | `/api/sessions/:id/inbox` | `{text: 1–16384 chars, from?: ≤128}` (`from` defaults to `X-Codeman-Parent-Session`, then `"api"`) | `{message:{id,from,text,createdAt}, pending}` — `422 OPERATION_FAILED` when the inbox holds 200 messages (nothing is evicted) |
+| `GET` | `/api/sessions/:id/inbox` | `?wait=<ms>` (positive integer, clamped to the agent-wait bounds) | `{messages[], pending, timedOut, waitedMs}` — never drains; with `wait`, blocks while empty and answers on the first post, on session teardown, or on timeout (a timeout is a 200 with `timedOut:true`, like `/wait`); `409 SESSION_BUSY` above 4 concurrent waiters |
+| `POST` | `/api/sessions/:id/inbox/ack` | `{ids: string[]}` | `{removed, pending}` |
+| `DELETE` | `/api/sessions/:id/inbox` | — | `{removed, pending:0}` |
+
+Ownership is the session rule (`findSessionOrFail`): a session the caller cannot see is a `404`. Every post broadcasts `inbox:message` `{sessionId, from, messageId, pending}` on SSE (routed per owner in multi-user mode). The store is persisted whole to `<data dir>/agent-inbox.json` (debounced, atomic rename) and restored at boot, and a session's inbox is dropped when the session is cleaned up. The inbox never writes to the pane: delivery is the receiver polling.
+
 ## Session lineage (`parentSessionId`)
 
 A create request may name the session that spawned it, which the web UI draws as a

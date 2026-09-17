@@ -1090,6 +1090,7 @@ const SSE_EVENTS = {
   HOOK_PROMPT_SUBMITTED: 'hook:prompt_submitted',
 
   // Approvals Inbox
+  INBOX_MESSAGE: 'inbox:message',
   APPROVAL_PENDING: 'approval:pending',
   APPROVAL_UPDATED: 'approval:updated',
   APPROVAL_RESOLVED: 'approval:resolved',

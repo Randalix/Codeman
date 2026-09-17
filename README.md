@@ -941,9 +941,13 @@ codeman agent read "$SID" --tail 3000                     # terminal tail, ANSI 
 codeman agent wait "$SID" --match DONE_4711               # marker wait for hook-less modes (opencode, pi, …)
 codeman agent interrupt "$SID"                            # a bare ESC, conversation intact
 codeman agent rm "$SID"                                   # refuses your own id
+codeman agent post "$SID" 'when you are done, ping me'    # MAILBOX: stored, never typed; multi-line ok, `-` reads stdin
+codeman agent inbox --wait 60000                          # read my own mailbox (acks what it printed; --peek to keep)
 ```
 
-Rules the commands enforce rather than document: they refuse outside a Codeman session and never guess a URL; `send` transmits printable text plus Enter only (a control byte such as `Ctrl+C` is `app_exit` in opencode — ESC exists solely as `interrupt`, which never appends Enter); `rm` refuses an empty id, an unprovable self id and a prefix match in either direction. Ids may be the 8-character prefixes `ls` prints (resolved through the list; an ambiguous prefix refuses). Exit codes: `0` delivered/matched/signal, `1` error, `2` timeout, `3` the worker exited or the wait ended without an answer (`delivered:false`, `ended:true`), `4` refused. `spawn` prints the id alone on stdout (prose goes to stderr), so `SID=$(…)` captures exactly the id. `--json` prints the envelope's `data` for every verb. `--until stop` on a mode without hook signals is the server's 400, passed through — the marker path (`--match`) is the answer there, exactly as for the skill.
+**Mailbox vs. `send`.** `send` types into the receiver's composer: right for a prompt, wrong for a message — it starts or interrupts a billed turn, the receiver cannot defer it, and in a fullscreen TUI a stray byte is a dead session. `post` stores instead: the message sits in the receiver's inbox until it runs `codeman agent inbox` (between its own steps, or blocking with `--wait`), and it is removed only when acknowledged, so a crash between read and ack loses nothing. Inboxes are bounded (200 messages × 16 KB; a full inbox refuses the post so the sender knows), persisted in the data dir (`agent-inbox.json`, so they survive a server restart), dropped with the session, and announced to browsers as the `inbox:message` SSE event. Nothing is written to the pane — a receiver that never polls never sees the message, by design; put "check `codeman agent inbox` at the start of each turn" into the worker's brief.
+
+Rules the commands enforce rather than document: they refuse outside a Codeman session and never guess a URL; `send` transmits printable text plus Enter only (a control byte such as `Ctrl+C` is `app_exit` in opencode — ESC exists solely as `interrupt`, which never appends Enter); `rm` refuses an empty id, an unprovable self id and a prefix match in either direction. Ids may be the 8-character prefixes `ls` prints (resolved through the list; an ambiguous prefix refuses). Exit codes: `0` delivered/matched/signal, `1` error, `2` timeout, `3` the worker exited or the wait ended without an answer (`delivered:false`, `ended:true`), `4` refused. `spawn` prints the id alone on stdout (prose goes to stderr), so `SID=$(…)` captures exactly the id. `--json` prints the envelope's `data` for every verb. `post`/`inbox` are the mailbox (below), the only pair that never touches a pane. `--until stop` on a mode without hook signals is the server's 400, passed through — the marker path (`--match`) is the answer there, exactly as for the skill.
 
 ### Hooks (events flowing _back_ to Codeman)
 
@@ -955,7 +959,7 @@ Codeman registers Claude Code hooks that `POST /api/hook-event` (`permission_pro
 
 ## API
 
-REST over Fastify — **~230 handlers across 25 route modules**, plus an SSE stream and a WebSocket terminal channel. All responses use the `ApiResponse<T>` envelope (`{success, data}` / `{success, error, errorCode}`); `/api/v1/*` is a stable alias. A representative subset:
+REST over Fastify — **~235 handlers across 27 route modules**, plus an SSE stream and a WebSocket terminal channel. All responses use the `ApiResponse<T>` envelope (`{success, data}` / `{success, error, errorCode}`); `/api/v1/*` is a stable alias. A representative subset:
 
 ### Sessions
 
@@ -973,6 +977,8 @@ REST over Fastify — **~230 handlers across 25 route modules**, plus an SSE str
 | `POST`   | `/api/sessions/:id/pin`    | Pin/unpin in the Session Manager (`{pinned}`)                                      |
 | `PUT`    | `/api/session-order`       | Sync tab order across devices (`{order: [ids]}`)                                   |
 | `POST`   | `/api/sessions/:id/custom-model` | Restart the session's CLI on a saved custom endpoint (`{endpointId, modelId}`; `{clear: true}` returns to the native backend) |
+| `POST`   | `/api/sessions/:id/inbox`  | Leave a message in the session's agent mailbox (`{text, from?}`); **nothing is typed** |
+| `GET`    | `/api/sessions/:id/inbox`  | Read the mailbox, non-destructive (`?wait=<ms>` long-polls while empty); `POST …/inbox/ack {ids}` removes, `DELETE …/inbox` clears |
 | `DELETE` | `/api/sessions/:id`        | Delete session                                                                     |
 
 ### Respawn
