@@ -43,26 +43,80 @@ Object.assign(CodemanApp.prototype, {
     return this._lineageLinesOn;
   },
 
+  /**
+   * The setting is a MODE: `off` (default), `hover` (only the arcs touching the tab
+   * under the pointer), `always`. It used to be a boolean, so a stored `true` reads
+   * as `always` and `false` as `off` — nobody's choice is lost by the migration.
+   * Default OFF: a strip with one or two arcs carries nothing the tab names do not,
+   * and the U-bridge paints over the terminal's first rows.
+   */
+  normalizeLineageMode(value) {
+    if (value === true || value === 'always') return 'always';
+    if (value === 'hover') return 'hover';
+    return 'off';
+  },
+
+  _lineageMode() {
+    if (this._lineageModeValue === undefined) this._syncLineageLinesEnabled();
+    return this._lineageModeValue;
+  },
+
   _syncLineageLinesEnabled() {
-    let on = false;
+    let mode = 'off';
     try {
       if (MobileDetection.getDeviceType() === 'desktop') {
         const settings = this.loadAppSettingsFromStorage ? this.loadAppSettingsFromStorage() : {};
         const defaults = this.getDefaultSettings ? this.getDefaultSettings() : {};
-        on = settings.sessionLineageLines ?? defaults.sessionLineageLines ?? true;
+        mode = this.normalizeLineageMode(settings.sessionLineageLines ?? defaults.sessionLineageLines);
       }
     } catch (_e) {
-      on = false;
+      mode = 'off';
     }
-    this._lineageLinesOn = !!on;
+    this._lineageModeValue = mode;
+    this._lineageLinesOn = mode !== 'off';
+    if (mode === 'hover') this._installLineageHoverListeners();
     return this._lineageLinesOn;
+  },
+
+  /**
+   * Hover mode: remember the tab under the pointer and redraw. One delegated pair of
+   * listeners on the strip (installed once), so re-rendered tabs need no re-wiring.
+   * `pointerover`/`pointerout` bubble; the relatedTarget check keeps a move between two
+   * children of the same tab from flickering the arcs off and on.
+   */
+  _installLineageHoverListeners() {
+    if (this._lineageHoverWired) return;
+    const strip = typeof document !== 'undefined' && document.getElementById('sessionTabs');
+    if (!strip) return;
+    this._lineageHoverWired = true;
+    const tabOf = (node) => (node && node.closest ? node.closest('.session-tab') : null);
+    strip.addEventListener('pointerover', (e) => {
+      if (this._lineageMode() !== 'hover') return;
+      const tab = tabOf(e.target);
+      const id = tab ? tab.getAttribute('data-id') : null;
+      if (!id || id === this._lineageHoverId) return;
+      this._lineageHoverId = id;
+      this.updateConnectionLines?.();
+    });
+    strip.addEventListener('pointerout', (e) => {
+      if (this._lineageMode() !== 'hover') return;
+      const from = tabOf(e.target);
+      const to = tabOf(e.relatedTarget);
+      if (from && to === from) return;
+      if (!this._lineageHoverId) return;
+      this._lineageHoverId = null;
+      this.updateConnectionLines?.();
+    });
   },
 
   /** Re-read the setting and redraw. Called from the settings apply pass and on resize. */
   applyLineageLineSettings() {
-    const prev = this._lineageLinesOn;
-    const next = this._syncLineageLinesEnabled();
-    if (prev !== next) this.updateConnectionLines();
+    const prevMode = this._lineageModeValue;
+    this._syncLineageLinesEnabled();
+    if (prevMode !== this._lineageModeValue) {
+      this._lineageHoverId = null;
+      this.updateConnectionLines();
+    }
   },
 
   /**
@@ -86,6 +140,14 @@ Object.assign(CodemanApp.prototype, {
       const depth = seenPerParent.get(parentId) || 0;
       seenPerParent.set(parentId, depth + 1);
       edges.push({ parentId, childId: id, depth, status: session.status || 'idle' });
+    }
+    // Hover mode: only the arcs touching the hovered tab — its children AND its parent.
+    // Depth is computed over ALL siblings first so the shape does not jump when the
+    // filter drops some of them.
+    if (this._lineageMode && this._lineageMode() === 'hover') {
+      const hover = this._lineageHoverId;
+      if (!hover) return [];
+      return edges.filter((e) => e.parentId === hover || e.childId === hover);
     }
     return edges;
   },

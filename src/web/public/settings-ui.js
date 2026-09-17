@@ -407,7 +407,10 @@ Object.assign(CodemanApp.prototype, {
     // Spawn lineage lines: desktop-only (the overlay sits UNDER the fixed mobile
     // header), so the row is hidden elsewhere rather than offering a toggle that
     // changes nothing. Default ON — only an explicit false turns it off.
-    document.getElementById('appSettingsLineageLines').checked = settings.sessionLineageLines ?? defaults.sessionLineageLines ?? true;
+    // Was a boolean (true = always); a stored one maps onto the select so nobody loses a choice.
+    document.getElementById('appSettingsLineageLines').value = this.normalizeLineageMode
+      ? this.normalizeLineageMode(settings.sessionLineageLines ?? defaults.sessionLineageLines)
+      : 'off';
     // Auto-name sessions: synced, default OFF (opt-in; only an explicit true enables).
     document.getElementById('appSettingsAutoNameSessions').checked = settings.autoNameSessions === true;
     const lineageItem = document.getElementById('appSettingsLineageLinesItem');
@@ -2112,7 +2115,7 @@ Object.assign(CodemanApp.prototype, {
       showPlanUsageLimits: document.getElementById('appSettingsShowPlanUsageLimits').checked,
       showRedrawButton: document.getElementById('appSettingsShowRedrawButton').checked,
       mobileOverviewEnabled: document.getElementById('appSettingsMobileOverview').checked,
-      sessionLineageLines: document.getElementById('appSettingsLineageLines').checked,
+      sessionLineageLines: document.getElementById('appSettingsLineageLines').value,
       autoNameSessions: document.getElementById('appSettingsAutoNameSessions').checked,
       showSessionButton: document.getElementById('appSettingsShowSessionButton').checked,
       showAwayDigestButton: document.getElementById('appSettingsShowAwayDigestButton').checked,

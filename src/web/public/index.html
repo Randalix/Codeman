@@ -2043,9 +2043,13 @@
                   <div class="set-row" id="appSettingsLineageLinesItem" data-search="lineage lines spawned worker parent connection">
                     <div class="set-row-text">
                       <span class="set-row-label">Spawn Lineage Lines <span class="set-tag">desktop</span></span>
-                      <span class="set-row-desc">Draw a line under the tab strip from a session to the sessions it spawned.</span>
+                      <span class="set-row-desc">Lines under the tab strip from a session to the sessions it spawned. Off by default; "On hover" shows only the lines of the tab under the pointer.</span>
                     </div>
-                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsLineageLines" checked><span class="slider"></span></label>
+                    <select class="set-select" id="appSettingsLineageLines">
+                      <option value="off">Off</option>
+                      <option value="hover">On hover</option>
+                      <option value="always">Always</option>
+                    </select>
                   </div>
                   <div class="set-row" id="appSettingsAutoNameSessionsItem" data-search="auto name session title first prompt tab rename">
                     <div class="set-row-text">
