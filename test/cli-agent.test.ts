@@ -138,7 +138,9 @@ describe('send transmits printable text only', () => {
     expect(inputRefusal('\u0003')).toMatch(/0x03/); // Ctrl+C: opencode's app_exit
     expect(inputRefusal('ls\u001b')).toMatch(/0x1b/);
     expect(inputRefusal('a\u007fb')).toMatch(/0x7f/);
-    expect(inputRefusal('two\nlines')).toMatch(/0x0a/);
+    expect(inputRefusal('two\nlines')).toMatch(/single line/); // not the ESC hint
+    expect(inputRefusal('a\tb')).toMatch(/single line/);
+    expect(inputRefusal('x\u009bmy')).toMatch(/0x9b/); // 8-bit CSI
     expect(inputRefusal('')).toMatch(/empty/);
   });
 
@@ -274,6 +276,20 @@ describe('agent send', () => {
     expect(await agentSend(dead, { id: OTHER, text: 'go', enter: true, wait: true })).toBe(EXIT.dead);
   });
 
+  it('delivered:false without duplicate is "the bytes went nowhere": exit 3, never a ✓', async () => {
+    const deps = fakeDeps([ok({ delivered: false, duplicate: false, wait: { ended: true, signal: null } })]);
+    expect(await agentSend(deps, { id: OTHER, text: 'go', enter: true, wait: true })).toBe(EXIT.dead);
+    expect(deps.out.join('')).not.toMatch(/delivered to/);
+    expect(deps.err.join('')).toMatch(/not delivered.*restart/);
+  });
+
+  it('fire-and-forget says "accepted", not "delivered" (the route answers before the write)', async () => {
+    const deps = fakeDeps([ok({})]);
+    expect(await agentSend(deps, { id: OTHER, text: 'go', enter: true })).toBe(EXIT.ok);
+    expect(deps.out.join('')).toMatch(/accepted for/);
+    expect(deps.out.join('')).not.toMatch(/delivered to/);
+  });
+
   it('reports a tagged duplicate instead of claiming delivery', async () => {
     const deps = fakeDeps([ok({ delivered: false, duplicate: true })]);
     await agentSend(deps, { id: OTHER, text: 'go', enter: true });
@@ -308,12 +324,23 @@ describe('agent wait', () => {
     expect(deps.calls).toEqual([]);
   });
 
+  it('a wait that ended without an answer is reported as dead, not as `signal: null`', async () => {
+    const deps = fakeDeps([ok({ wait: { ended: true, signal: null, timedOut: false } })]);
+    expect(await agentWait(deps, { id: OTHER, until: 'stop', timeoutMs: 1000 })).toBe(EXIT.dead);
+    expect(deps.out.join('')).toMatch(/went away/);
+    expect(deps.out.join('')).not.toMatch(/signal: null/);
+  });
+
   it('exit codes: matched/signal 0, timeout 2, exit 3', () => {
     expect(waitExitCode({ signal: 'stop' })).toBe(EXIT.ok);
     expect(waitExitCode({ matched: true })).toBe(EXIT.ok);
     expect(waitExitCode({ matched: false, timedOut: true })).toBe(EXIT.timeout);
     expect(waitExitCode({ timedOut: true })).toBe(EXIT.timeout);
     expect(waitExitCode({ signal: 'exit' })).toBe(EXIT.dead);
+    // A worker that dies during --until stop: the registry only satisfies waiters that
+    // listed `exit`, then cancels the rest → ended:true, signal:null. Never "done".
+    expect(waitExitCode({ ended: true, signal: null, timedOut: false })).toBe(EXIT.dead);
+    expect(waitExitCode({ ended: true, matched: false, timedOut: false })).toBe(EXIT.dead);
     expect(waitExitCode(undefined)).toBe(EXIT.error);
   });
 });
@@ -389,7 +416,8 @@ describe('agent spawn', () => {
       path: `/api/v1/sessions/${OTHER}/wait-output`,
       query: { match: 'shift+tab', from: 'buffer', timeout: 2000 },
     });
-    expect(deps.out.at(-1)).toBe(OTHER); // the id is the last line, for `$(…)`
+    expect(deps.out).toEqual([OTHER]); // stdout is the id ALONE, so `SID=$(…)` works; prose goes to stderr
+    expect(deps.err.join('')).toMatch(/spawned .*composer up/s);
   });
 
   it('a composer that never shows up is exit 2 and the session is left for inspection, not deleted', async () => {
@@ -406,6 +434,14 @@ describe('agent spawn', () => {
     const noReady = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' })]);
     expect(await agentSpawn(noReady, { caseName: 'c', mode: 'claude', ready: false, timeoutMs: 1000 })).toBe(EXIT.ok);
     expect(noReady.calls).toHaveLength(1);
+  });
+
+  it('a failed readiness call reports its own reason instead of the trust-dialog hint', async () => {
+    const deps = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' }), apiError(429, 'RATE_LIMITED', 'waiter pool full')]);
+    expect(await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.error);
+    expect(deps.err.join('')).toMatch(/readiness check failed: RATE_LIMITED/);
+    expect(deps.err.join('')).not.toMatch(/trust dialog/);
+    expect(deps.out).toEqual([OTHER]); // the session exists; the id is still handed back
   });
 
   it('a failed quick-start is terminal: the error code is shown and nothing else is called', async () => {
