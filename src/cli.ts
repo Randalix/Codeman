@@ -18,6 +18,7 @@ import { dataPath } from './config/instance.js';
 import { casePath } from './config/cases-dir.js';
 import { assertValidBasePath } from './config/base-path.js';
 import { installAgentSkillInto, removeAgentSkillFrom, type AgentSkillApplyResult } from './hooks-config.js';
+import { readCodemanEnvFile, registerAgentCommands } from './cli-agent.js';
 import { getSessionManager } from './session-manager.js';
 import { getTaskQueue } from './task-queue.js';
 import { getRalphLoop } from './ralph-loop.js';
@@ -42,27 +43,8 @@ function makeAttachmentMagicLink(filePath: string): string {
   return `codeman://attach?path=${encodeURIComponent(filePath)}`;
 }
 
-function readCodemanEnv(): Record<string, string> {
-  const envPath = dataPath('.env');
-  try {
-    const text = readFileSync(envPath, 'utf-8');
-    const result: Record<string, string> = {};
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-      if (!match) continue;
-      let value = match[2].trim();
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-      result[match[1]] = value;
-    }
-    return result;
-  } catch {
-    return {};
-  }
-}
+/** `.env` in the data dir — the same reader `codeman agent` uses. */
+const readCodemanEnv = (): Record<string, string> => readCodemanEnvFile();
 
 async function postAttachment(apiUrl: string, sessionId: string, filePath: string): Promise<boolean> {
   const envFile = readCodemanEnv();
@@ -245,6 +227,10 @@ skillCmd
       process.exit(1);
     }
   });
+
+// ============ Agent Commands (session-to-session, any CLI mode) ============
+
+registerAgentCommands(program);
 
 // ============ Session Commands ============
 
