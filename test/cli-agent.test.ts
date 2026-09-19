@@ -15,6 +15,7 @@ import {
   agentInbox,
   agentInterrupt,
   agentLs,
+  stalledPairLines,
   agentPost,
   agentRead,
   agentRestore,
@@ -224,22 +225,102 @@ describe('agent ls', () => {
     { id: OTHER, mode: 'opencode', status: 'idle', workingDir: '/home/joe/wiki' },
   ];
 
+  const SUMMARY = '/api/v1/agent-inbox/summary';
+  const withSummary =
+    (summary: unknown, list: unknown = sessions) =>
+    (o: RequestOptions): ApiResponse =>
+      o.path === SUMMARY ? ok(summary) : ok(list);
+
   it('marks this session and falls back to workingDir for the name', async () => {
-    const deps = fakeDeps([ok(sessions)]);
+    const deps = fakeDeps(withSummary({}));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+w1-Codeman/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+\/home\/joe\/wiki/);
+    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+0\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+0\s+-\s+\/home\/joe\/wiki/);
   });
 
-  it('--json is the envelope data plus a self flag', async () => {
-    const deps = fakeDeps([ok(sessions)], true);
+  it('--json is the envelope data plus a self flag and the mailbox state', async () => {
+    const deps = fakeDeps(withSummary({ [OTHER]: { pending: 2, waiting: false, waitingSince: null } }), true);
     await agentLs(deps);
-    const parsed = JSON.parse(deps.out.join('')) as Array<{ id: string; self: boolean }>;
-    expect(parsed.map((s) => [s.id.slice(0, 8), s.self])).toEqual([
-      ['058ee7b5', true],
-      ['94990c6d', false],
+    const parsed = JSON.parse(deps.out.join('')) as Array<{ id: string; self: boolean; inbox: unknown }>;
+    expect(parsed.map((s) => [s.id.slice(0, 8), s.self, s.inbox])).toEqual([
+      ['058ee7b5', true, { pending: 0, waiting: false, waitingSince: null }],
+      ['94990c6d', false, { pending: 2, waiting: false, waitingSince: null }],
     ]);
+  });
+
+  it('shows unread posts and since when a session is parked on its inbox', async () => {
+    const since = new Date(2026, 8, 19, 8, 43).toISOString(); // local 08:43
+    const deps = fakeDeps(
+      withSummary({
+        [SELF]: { pending: 0, waiting: true, waitingSince: since },
+        [OTHER]: { pending: 3, waiting: false, waitingSince: null },
+      })
+    );
+    await agentLs(deps);
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/INBOX\s+WAIT/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+0\s+since 08:43/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+3\s+-/);
+  });
+
+  it('names a stalled pair: the waiter and its idle, mail-less child', async () => {
+    const since = new Date(2026, 8, 19, 8, 43).toISOString();
+    const planner = { id: SELF, mode: 'claude', status: 'idle', name: 'w10 planner' };
+    const builder = { id: OTHER, mode: 'claude', status: 'idle', name: 'w12 builder', parentSessionId: SELF };
+    const deps = fakeDeps(
+      withSummary({ [SELF]: { pending: 0, waiting: true, waitingSince: since } }, [planner, builder])
+    );
+    await agentLs(deps);
+    const footer = deps.out.at(-1) ?? '';
+    expect(footer).toMatch(
+      /058ee7b5 \(w10 planner\) waits for mail since 08:43; 94990c6d \(w12 builder\) is idle with an empty inbox/
+    );
+    expect(footer).toMatch(/owes a post/);
+  });
+
+  it('degrades to "?" columns and no footer on a server without the summary route', async () => {
+    const deps = fakeDeps((o) => (o.path === SUMMARY ? { status: 404, text: 'Route not found' } : ok(sessions)));
+    expect(await agentLs(deps)).toBe(EXIT.ok);
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+\?\s+\?\s+w1-Codeman/);
+    expect(text).not.toMatch(/owes a post/);
+  });
+
+  describe('stalledPairLines', () => {
+    const since = new Date(2026, 8, 19, 8, 43).toISOString();
+    const waiting = { pending: 0, waiting: true, waitingSince: since };
+    const quiet = { pending: 0, waiting: false, waitingSince: null };
+
+    it('is silent while the peer is busy or has mail — someone is working', () => {
+      const a = { id: SELF, status: 'idle', parentSessionId: null };
+      const busyChild = { id: OTHER, status: 'busy', parentSessionId: SELF };
+      expect(stalledPairLines([a, busyChild], new Map([[SELF, waiting]]))).toEqual([]);
+      const childWithMail = { id: OTHER, status: 'idle', parentSessionId: SELF };
+      expect(
+        stalledPairLines(
+          [a, childWithMail],
+          new Map([
+            [SELF, waiting],
+            [OTHER, { ...quiet, pending: 1 }],
+          ])
+        )
+      ).toEqual([]);
+    });
+
+    it('looks both ways: a waiting child with an idle parent is the same stall', () => {
+      const parent = { id: SELF, status: 'idle', name: 'planner' };
+      const child = { id: OTHER, status: 'idle', name: 'builder', parentSessionId: SELF };
+      const lines = stalledPairLines([parent, child], new Map([[OTHER, waiting]]));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(/94990c6d \(builder\) waits for mail since 08:43; 058ee7b5 \(planner\) is idle/);
+    });
+
+    it('ignores unrelated sessions: only parent and children count as peers', () => {
+      const a = { id: SELF, status: 'idle' };
+      const stranger = { id: OTHER, status: 'idle' };
+      expect(stalledPairLines([a, stranger], new Map([[SELF, waiting]]))).toEqual([]);
+    });
   });
 
   it('surfaces a plain-text 401 as a credentials hint, not a parse error', async () => {

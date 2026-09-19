@@ -403,16 +403,74 @@ export async function resolveSessionId(deps: AgentDeps, id: string): Promise<{ i
   return { error: `"${id}" is ambiguous: ${matches.map((s) => s.id.slice(0, 13)).join(', ')}` };
 }
 
+/** One session's mailbox state, from `GET /api/agent-inbox/summary`. */
+interface InboxSummaryRow {
+  pending: number;
+  waiting: boolean;
+  waitingSince: string | null;
+}
+
+/**
+ * The mailbox summary for `ls`, or null on a server that predates the route (the
+ * columns then read `?` and the stalled-pair footer stays silent — never a failure,
+ * `ls` is the one verb that must always answer).
+ */
+async function fetchInboxSummary(deps: AgentDeps): Promise<Map<string, InboxSummaryRow> | null> {
+  const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/agent-inbox/summary' });
+  if (!res.json?.success) return null;
+  return new Map(Object.entries((res.json.data as Record<string, InboxSummaryRow> | undefined) ?? {}));
+}
+
+/** `HH:MM` local time of an ISO stamp, for the WAIT column. */
+function clockTime(iso: string): string {
+  const d = new Date(iso);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * Stalled pairs: a session waiting on its inbox whose parent or child is idle with an
+ * empty inbox. Nobody is working and nobody has mail — one of them owes the other a
+ * post. A heuristic over the UI status (which is a hint, so the line says "looks
+ * like"), pinned because exactly this shape cost a planner/builder pair 26 minutes
+ * with nothing on any screen. Returns one line per waiting session, oldest wait first.
+ */
+export function stalledPairLines(sessions: SessionRow[], summary: Map<string, InboxSummaryRow>): string[] {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  const label = (s: SessionRow) => `${s.id.slice(0, 8)}${s.name ? ` (${s.name})` : ''}`;
+  const idleAndEmpty = (s: SessionRow) => s.status === 'idle' && (summary.get(s.id)?.pending ?? 0) === 0;
+  const lines: Array<{ since: number; text: string }> = [];
+  for (const s of sessions) {
+    const entry = summary.get(s.id);
+    if (!entry?.waiting || !entry.waitingSince) continue;
+    const peers: SessionRow[] = [];
+    const parent = s.parentSessionId ? byId.get(s.parentSessionId) : undefined;
+    if (parent) peers.push(parent);
+    for (const other of sessions) if (other.parentSessionId === s.id) peers.push(other);
+    const stalled = peers.filter(idleAndEmpty);
+    if (stalled.length === 0) continue;
+    lines.push({
+      since: Date.parse(entry.waitingSince),
+      text: `${GLYPH.warn} ${label(s)} waits for mail since ${clockTime(entry.waitingSince)}; ${stalled
+        .map(label)
+        .join(', ')} ${stalled.length === 1 ? 'is' : 'are'} idle with an empty inbox — looks like someone owes a post`,
+    });
+  }
+  return lines.sort((a, b) => a.since - b.since).map((l) => l.text);
+}
+
 /** `agent ls` — every session the caller can see, self marked; `--alive` probes each pane. */
 export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}): Promise<number> {
   const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const sessions = (res.json.data as SessionRow[] | undefined) ?? [];
   const alive = new Map<string, 'alive' | 'dead' | 'unknown'>();
-  if (options.alive) {
+  const [summary] = await Promise.all([
+    fetchInboxSummary(deps),
     // One short probe per session, in parallel: `status` says busy for a corpse.
-    await Promise.all(sessions.map(async (s) => alive.set(s.id, await probeAlive(deps, s.id))));
-  }
+    options.alive ? Promise.all(sessions.map(async (s) => alive.set(s.id, await probeAlive(deps, s.id)))) : null,
+  ]);
+  const inboxOf = (id: string): InboxSummaryRow | null =>
+    summary ? (summary.get(id) ?? { pending: 0, waiting: false, waitingSince: null }) : null;
   if (deps.json) {
     emitJson(
       deps,
@@ -420,6 +478,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
         ...s,
         self: isSelfSession(deps.ctx.selfId, s.id),
         ...(options.alive ? { pane: alive.get(s.id) } : {}),
+        inbox: inboxOf(s.id),
       }))
     );
     return EXIT.ok;
@@ -428,19 +487,27 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
     deps.io.out(palette.muted('(no sessions)'));
     return EXIT.ok;
   }
-  const rows = sessions.map((s) => [
-    isSelfSession(deps.ctx.selfId, s.id) ? '*' : ' ',
-    s.id.slice(0, 8),
-    s.mode ?? '?',
-    s.status ?? '?',
-    ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
-    s.name || s.workingDir || '',
-  ]);
-  const header = [' ', 'ID', 'MODE', 'STATUS', ...(options.alive ? ['PANE'] : []), 'NAME'];
+  const rows = sessions.map((s) => {
+    const inbox = inboxOf(s.id);
+    return [
+      isSelfSession(deps.ctx.selfId, s.id) ? '*' : ' ',
+      s.id.slice(0, 8),
+      s.mode ?? '?',
+      s.status ?? '?',
+      ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
+      inbox ? String(inbox.pending) : '?',
+      inbox ? (inbox.waitingSince ? `since ${clockTime(inbox.waitingSince)}` : '-') : '?',
+      s.name || s.workingDir || '',
+    ];
+  });
+  const header = [' ', 'ID', 'MODE', 'STATUS', ...(options.alive ? ['PANE'] : []), 'INBOX', 'WAIT', 'NAME'];
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
-    palette.muted(`* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal.`)
+    palette.muted(
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since.`
+    )
   );
+  if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));
   return EXIT.ok;
 }
 
@@ -1114,7 +1181,10 @@ export function registerAgentCommands(program: Command): Command {
     .command('ls')
     .alias('list')
     .description('List sessions; * marks this one')
-    .option('--alive', 'Probe every pane (wait until=exit, 1 s each, in parallel): DEAD means the worker exited')
+    .option(
+      '--alive',
+      'Probe every pane (wait until=exit, 1 s each, in parallel): DEAD means the worker exited. Columns INBOX (unread posts) and WAIT (parked on `inbox --wait` since) come from the mailbox; a footer names a waiting session whose parent/child is idle with an empty inbox'
+    )
     .option('--json', 'Machine-readable output')
     .action((options: { alive?: boolean; json?: boolean }) =>
       run(Boolean(options.json), (deps) => agentLs(deps, { alive: Boolean(options.alive) }))

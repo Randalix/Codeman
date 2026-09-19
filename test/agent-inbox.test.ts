@@ -4,7 +4,13 @@
  */
 
 import { describe, expect, it, vi } from 'vitest';
-import { AgentInbox, MAX_MESSAGES_PER_INBOX, MAX_TEXT_LENGTH, clampWait } from '../src/web/agent-inbox.js';
+import {
+  AgentInbox,
+  MAX_MESSAGES_PER_INBOX,
+  MAX_TEXT_LENGTH,
+  WAITING_GRACE_MS,
+  clampWait,
+} from '../src/web/agent-inbox.js';
 import { MIN_WAIT_MS, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../src/config/agent-wait.js';
 
 const A = 'aaaaaaaa-0000-4000-8000-000000000000';
@@ -174,6 +180,90 @@ describe('read with wait', () => {
     expect(clampWait(1)).toBe(MIN_WAIT_MS);
     expect(clampWait(MAX_WAIT_MS * 10)).toBe(MAX_WAIT_MS);
     expect(clampWait(5_000)).toBe(5_000);
+  });
+});
+
+describe('summary — who is waiting for whom', () => {
+  // The state that cost a planner/builder pair 26 minutes: one side parked on its
+  // inbox, the other idle with nothing to read. The store records since WHEN a
+  // session has been waiting; the CLI folds it into `ls`.
+  it('reports pending counts and a wait that began with the first waiter', async () => {
+    const { inbox, tick } = make();
+    inbox.post(B, A, 'unread');
+    expect(inbox.summary().get(B)).toEqual({ pending: 1, waiting: false, waitingSince: null });
+
+    const pending = inbox.read(A, 5_000);
+    const since = 1_000;
+    expect(inbox.summary().get(A)).toEqual({ pending: 0, waiting: true, waitingSince: since });
+    tick(4_000);
+    expect(inbox.summary().get(A)?.waitingSince).toBe(since); // still the first one
+
+    inbox.post(A, B, 'here you go');
+    await pending;
+    // Released by a post: the wait is over.
+    expect(inbox.summary().get(A)).toEqual({ pending: 1, waiting: false, waitingSince: null });
+  });
+
+  it('keeps the wait clock across the timeout slices of a looping long-poll', async () => {
+    // `inbox --wait 590000` in a Monitor loops: each slice ends in a timeout and the
+    // next request follows within milliseconds. Resetting on every slice would make
+    // `ls` say "waiting since just now" every ten minutes.
+    vi.useFakeTimers();
+    try {
+      let t = 10_000;
+      const inbox = new AgentInbox(() => t);
+      const first = inbox.read(A, MIN_WAIT_MS);
+      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
+      t += MIN_WAIT_MS;
+      expect((await first).timedOut).toBe(true);
+      // Between slices: still waiting, inside the grace.
+      expect(inbox.summary().get(A)).toEqual({ pending: 0, waiting: true, waitingSince: 10_000 });
+      t += 50;
+      const second = inbox.read(A, MIN_WAIT_MS);
+      expect(inbox.summary().get(A)?.waitingSince).toBe(10_000);
+      inbox.post(A, B, 'x');
+      await second;
+      expect(inbox.summary().get(A)?.waiting).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forgets a wait whose last waiter left longer ago than the grace', async () => {
+    vi.useFakeTimers();
+    try {
+      let t = 10_000;
+      const inbox = new AgentInbox(() => t);
+      const pending = inbox.read(A, MIN_WAIT_MS);
+      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
+      t += MIN_WAIT_MS;
+      await pending;
+      t += WAITING_GRACE_MS + 1;
+      expect(inbox.summary().get(A)).toBeUndefined(); // no mail, no waiter: not listed at all
+      // A NEW wait after the grace starts a new clock.
+      const later = inbox.read(A, MIN_WAIT_MS);
+      expect(inbox.summary().get(A)?.waitingSince).toBe(t);
+      inbox.drop(A);
+      await later;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('an aborted wait counts as left, a drop as over', async () => {
+    const { inbox, tick } = make();
+    const controller = new AbortController();
+    const pending = inbox.read(A, 5_000, controller.signal);
+    controller.abort();
+    await pending;
+    expect(inbox.summary().get(A)?.waiting).toBe(true); // inside the grace
+    tick(WAITING_GRACE_MS + 1);
+    expect(inbox.summary().get(A)).toBeUndefined();
+
+    const other = inbox.read(B, 5_000);
+    inbox.drop(B);
+    await other;
+    expect(inbox.summary().get(B)).toBeUndefined();
   });
 });
 
