@@ -141,6 +141,33 @@ describe('agent inbox routes', () => {
     expect(res.json().data.timedOut).toBe(false);
   });
 
+  it('GET /api/agent-inbox/summary reports pending + wait state for sessions that exist', async () => {
+    await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox`, payload: { text: 'unread' } });
+    // A wait parked on the inbox shows up with its start time...
+    const parked = app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox?wait=5000` });
+    await new Promise((r) => setTimeout(r, 20));
+    // ...but the inbox has mail, so the wait resolves at once: the summary sees pending only.
+    await parked;
+    const withMail = (await app.inject({ method: 'GET', url: '/api/agent-inbox/summary' })).json().data;
+    expect(withMail[SESSION_ID]).toEqual({ pending: 1, waiting: false, waitingSince: null });
+
+    await app.inject({ method: 'DELETE', url: `/api/sessions/${SESSION_ID}/inbox` });
+    const waiting = app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox?wait=5000` });
+    await new Promise((r) => setTimeout(r, 20));
+    const summary = (await app.inject({ method: 'GET', url: '/api/agent-inbox/summary' })).json().data;
+    expect(summary[SESSION_ID].pending).toBe(0);
+    expect(summary[SESSION_ID].waiting).toBe(true);
+    expect(typeof summary[SESSION_ID].waitingSince).toBe('string');
+    expect(Number.isNaN(Date.parse(summary[SESSION_ID].waitingSince))).toBe(false);
+    agentInbox.drop(SESSION_ID);
+    await waiting;
+
+    // Mail for a session the server does not know (gone, or another user's) is not listed.
+    agentInbox.post('ghost-session', 'api', 'orphan');
+    const after = (await app.inject({ method: 'GET', url: '/api/agent-inbox/summary' })).json().data;
+    expect(after['ghost-session']).toBeUndefined();
+  });
+
   it('the per-session waiter cap answers SESSION_BUSY instead of queueing', async () => {
     const waits = Array.from({ length: MAX_INBOX_WAITERS_PER_SESSION }, () =>
       app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox?wait=5000` })
