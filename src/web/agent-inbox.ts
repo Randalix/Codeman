@@ -78,9 +78,35 @@ interface Waiter {
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
+/**
+ * How long a session keeps counting as "waiting" after its last waiter left without a
+ * post. A long-poll client loops in slices (`inbox --wait 590000` inside a Monitor):
+ * every slice ends in a timeout and a fresh request a few ms later, and without the
+ * grace `waitingSince` would reset every ten minutes and `ls` would forever say
+ * "waiting since just now".
+ */
+export const WAITING_GRACE_MS = 15_000;
+
+/** What `summary()` says about one session's mailbox. */
+export interface InboxSummary {
+  pending: number;
+  /** A long-poll waiter is parked on this inbox right now (or left within the grace). */
+  waiting: boolean;
+  /** When the current uninterrupted wait began (epoch ms), null when not waiting. */
+  waitingSince: number | null;
+}
+
+interface WaitingState {
+  since: number;
+  /** When the last waiter left without a post; null while one is parked. */
+  lastLeft: number | null;
+}
+
 export class AgentInbox {
   private readonly inboxes = new Map<string, InboxMessage[]>();
   private readonly waiters = new Map<string, Set<Waiter>>();
+  /** Per session: since when someone has been waiting for mail (see `summary`). */
+  private readonly waiting = new Map<string, WaitingState>();
   private stopped = false;
 
   /** A message landed: `{sessionId, message, pending}`. The server maps it to SSE. */
@@ -141,6 +167,37 @@ export class AgentInbox {
     return this.waiters.get(sessionId)?.size ?? 0;
   }
 
+  /**
+   * "Who is waiting for whom": pending count and wait state for every session that has
+   * mail or a waiter. A session that is idle AND has an empty inbox while its peer
+   * waits is the shape of a stalled pair (each side waiting for the other's post);
+   * the CLI's `ls` derives that from this plus the session list. Never blocks.
+   */
+  summary(): Map<string, InboxSummary> {
+    const out = new Map<string, InboxSummary>();
+    const ids = new Set([...this.inboxes.keys(), ...this.waiting.keys()]);
+    for (const id of ids) {
+      const w = this.waitingState(id);
+      const pending = this.pendingCount(id);
+      // Nothing to read and nobody waiting: not worth a row (an emptied inbox keeps its
+      // key until the session goes, and the grace expiry above is lazy).
+      if (pending === 0 && w === null) continue;
+      out.set(id, { pending, waiting: w !== null, waitingSince: w });
+    }
+    return out;
+  }
+
+  /** `waitingSince` for one session, after applying the grace; null when not waiting. */
+  private waitingState(sessionId: string): number | null {
+    const state = this.waiting.get(sessionId);
+    if (!state) return null;
+    if (state.lastLeft !== null && this.now() - state.lastLeft > WAITING_GRACE_MS) {
+      this.waiting.delete(sessionId);
+      return null;
+    }
+    return state.since;
+  }
+
   /** Remove the given messages. Unknown ids are ignored. Returns how many were removed. */
   ack(sessionId: string, ids: readonly string[]): number {
     const queue = this.inboxes.get(sessionId);
@@ -185,6 +242,8 @@ export class AgentInbox {
       this.inboxes.delete(sessionId);
       dropped++;
     }
+    // Wait state is in-memory only; a session that did not come back cannot be waiting.
+    for (const sessionId of [...this.waiting.keys()]) if (!alive.has(sessionId)) this.waiting.delete(sessionId);
     if (dropped > 0) this.onChange?.();
     return dropped;
   }
@@ -234,6 +293,7 @@ export class AgentInbox {
     this.stopped = false;
     this.inboxes.clear();
     this.waiters.clear();
+    this.waiting.clear();
     this.onMessage = undefined;
     this.onChange = undefined;
   }
@@ -253,6 +313,7 @@ export class AgentInbox {
       const remove = () => {
         set.delete(waiter);
         if (set.size === 0 && this.waiters.get(sessionId) === set) this.waiters.delete(sessionId);
+        this.noteWaiterLeft(sessionId);
       };
       const onAbort = () => {
         clearTimeout(waiter.timer);
@@ -273,10 +334,29 @@ export class AgentInbox {
       abortSignal?.addEventListener('abort', onAbort, { once: true });
       set.add(waiter);
       this.waiters.set(sessionId, set);
+      this.noteWaiterArrived(sessionId);
     });
   }
 
+  /** A waiter parked: start the wait clock, or resume it inside the grace. */
+  private noteWaiterArrived(sessionId: string): void {
+    const state = this.waiting.get(sessionId);
+    if (state && (state.lastLeft === null || this.now() - state.lastLeft <= WAITING_GRACE_MS)) {
+      state.lastLeft = null;
+      return;
+    }
+    this.waiting.set(sessionId, { since: this.now(), lastLeft: null });
+  }
+
+  /** The last waiter left without a post (timeout/abort): the clock keeps running for the grace. */
+  private noteWaiterLeft(sessionId: string): void {
+    const state = this.waiting.get(sessionId);
+    if (state && this.waiterCount(sessionId) === 0) state.lastLeft = this.now();
+  }
+
   private releaseWaiters(sessionId: string): void {
+    // Released by a post (or drop/stop): the wait is over, the clock stops for good.
+    this.waiting.delete(sessionId);
     const set = this.waiters.get(sessionId);
     if (!set) return;
     this.waiters.delete(sessionId);

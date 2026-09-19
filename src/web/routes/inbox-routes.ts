@@ -6,6 +6,8 @@
  *                                         while the inbox is empty
  * - `POST   /api/sessions/:id/inbox/ack`  remove messages the reader has processed
  * - `DELETE /api/sessions/:id/inbox`      discard everything pending
+ * - `GET    /api/agent-inbox/summary`     pending count + wait state per session the
+ *                                         caller can see ("who is waiting for whom")
  *
  * Store and invariants: `web/agent-inbox.ts`. Ownership is the session-route rule
  * (`findSessionOrFail`: a session the caller cannot see is a 404, never a 403). The
@@ -17,7 +19,8 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { InboxAckSchema, InboxPostSchema, InboxReadQuerySchema } from '../schemas.js';
-import { findSessionOrFail, parseBody } from '../route-helpers.js';
+import { canAccessOwned, findSessionOrFail, getAuthUser, parseBody } from '../route-helpers.js';
+import { isMultiUserMode } from '../../config/multiuser.js';
 import { agentInbox, MAX_INBOX_WAITERS_PER_SESSION, MAX_MESSAGES_PER_INBOX, MAX_TEXT_LENGTH } from '../agent-inbox.js';
 import type { SessionPort } from '../ports/index.js';
 
@@ -43,6 +46,27 @@ function abortOnClientHangUp(reply: FastifyReply): AbortController {
 }
 
 export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): void {
+  // "Who is waiting for whom": one read-only call the CLI's `ls` folds into its table.
+  // A session that waits on its inbox while its peer sits idle with an empty inbox is a
+  // stalled pair (each side waiting for the other's post) — the state that cost a
+  // planner/builder pair 26 minutes and was invisible in every UI surface. Filtered
+  // like `GET /api/sessions`: a session the caller cannot see is simply absent.
+  app.get('/api/agent-inbox/summary', async (req) => {
+    const user = isMultiUserMode() ? getAuthUser(req) : null;
+    const out: Record<string, { pending: number; waiting: boolean; waitingSince: string | null }> = {};
+    for (const [id, entry] of agentInbox.summary()) {
+      const session = ctx.sessions.get(id);
+      if (!session) continue;
+      if (user && user.role !== 'admin' && !canAccessOwned(user, session.owner)) continue;
+      out[id] = {
+        pending: entry.pending,
+        waiting: entry.waiting,
+        waitingSince: entry.waitingSince === null ? null : new Date(entry.waitingSince).toISOString(),
+      };
+    }
+    return out;
+  });
+
   app.post('/api/sessions/:id/inbox', async (req) => {
     const { id } = req.params as { id: string };
     findSessionOrFail(ctx, id, req);
