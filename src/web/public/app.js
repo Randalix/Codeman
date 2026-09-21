@@ -6174,6 +6174,53 @@ class CodemanApp {
     }
   }
 
+  /**
+   * Write a tab's canonical label and tooltip from a session name. The shared
+   * writer for the `prefix: suffix` markup — the incremental render and the
+   * inline rename both call it, so the two can never disagree about how a
+   * described session is drawn (the full render emits the same markup inline).
+   *
+   * ⚠️ The MARKUP is load-bearing, not the string. A described name (`w3-case:
+   * title`) renders as a `.tab-name-prefix` span plus the bare suffix, and CSS
+   * hides the span in the header strip (the vertical rail shows it). Writing the
+   * raw `prefix: suffix` string instead exposes the prefix the header is meant to
+   * hide — that is the short→long flip a rename used to leave behind for a frame.
+   *
+   * @param {HTMLElement|null} nameEl the `.tab-name` node
+   * @param {HTMLElement|null} tab the `.session-tab` (tooltip target; optional)
+   * @param {string} name the full session name
+   * @param {string|undefined} workingDir
+   * @param {string|undefined} clusterLabel the tab's case-cluster label, if clusters are
+   *   drawn: an undescribed name then hides its case part in `.tab-name-case`, exactly
+   *   as `_tabNameHtml()` renders it on a full render
+   */
+  _writeTabName(nameEl, tab, name, workingDir, clusterLabel) {
+    if (!nameEl) return;
+    const parsed = parseSessionPrefix(name);
+    const described = !!(parsed && parsed.suffix);
+    const split = !described && clusterLabel ? window.CodemanTabClusters?.nameSplit(name, clusterLabel) : null;
+    nameEl.replaceChildren();
+    if (described) {
+      const prefix = document.createElement('span');
+      prefix.className = 'tab-name-prefix';
+      prefix.textContent = `${parsed.prefix}: `;
+      nameEl.append(prefix, document.createTextNode(parsed.suffix));
+    } else if (split) {
+      const caseSpan = document.createElement('span');
+      caseSpan.className = 'tab-name-case';
+      caseSpan.textContent = split.hidden;
+      nameEl.append(document.createTextNode(split.shown), caseSpan);
+    } else {
+      nameEl.textContent = name;
+    }
+    nameEl.dataset.fullName = name;
+    if (tab) {
+      tab.title = described
+        ? (workingDir ? `${parsed.prefix} (${workingDir})` : parsed.prefix)
+        : (workingDir || '');
+    }
+  }
+
   _renderSessionTabsImmediate() {
     // Same guard as renderSessionTabs()/_fullRenderSessionTabs(): the incremental
     // branch below rewrites .tab-name's innerHTML, which destroys the inline rename
@@ -6339,31 +6386,12 @@ class CodemanApp {
         // Update name if changed. #232: a description (the `: suffix` part of the
         // name) is the whole tab label; the generated id lives in the tooltip. The
         // compare targets the DISPLAY text, or a described tab would re-render on
-        // every pass (textContent never equals the full name there).
+        // every pass (textContent never equals the full name there). The markup
+        // itself comes from _writeTabName(), shared with the inline rename so both
+        // paths agree.
         const nameEl = tab.querySelector('.tab-name');
-        if (nameEl) {
-          const _p = parseSessionPrefix(name);
-          if (nameEl.dataset.fullName !== name) {
-            nameEl.replaceChildren();
-            const _split = _p && _p.suffix ? null : window.CodemanTabClusters?.nameSplit(name, clusterLayout?.labelFor.get(id));
-            if (_p && _p.suffix) {
-              const prefix = document.createElement('span');
-              prefix.className = 'tab-name-prefix';
-              prefix.textContent = `${_p.prefix}: `;
-              nameEl.append(prefix, document.createTextNode(_p.suffix));
-            } else if (_split) {
-              const caseSpan = document.createElement('span');
-              caseSpan.className = 'tab-name-case';
-              caseSpan.textContent = _split.hidden;
-              nameEl.append(document.createTextNode(_split.shown), caseSpan);
-            } else {
-              nameEl.textContent = name;
-            }
-            nameEl.dataset.fullName = name;
-            tab.title = _p && _p.suffix
-              ? (session.workingDir ? `${_p.prefix} (${session.workingDir})` : _p.prefix)
-              : (session.workingDir || '');
-          }
+        if (nameEl && nameEl.dataset.fullName !== name) {
+          this._writeTabName(nameEl, tab, name, session.workingDir, clusterLayout?.labelFor.get(id));
         }
 
         // Update task badge
@@ -6772,6 +6800,8 @@ class CodemanApp {
     }
     this._lastTabGroupStructureKey = this._tabGroupStructureKey(groupProjection);
     this._lastTabClusterKey = clusterLayout ? clusterLayout.key : null;
+    // The inline rename writes a tab name between renders and needs the same label (_writeTabName).
+    this._lastTabClusterLabelFor = clusterLayout ? clusterLayout.labelFor : null;
 
     container.innerHTML = parts.join('');
     container.classList.toggle('session-tabs--grouped', !!groupProjection);
