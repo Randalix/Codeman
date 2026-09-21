@@ -2240,7 +2240,6 @@ Object.assign(CodemanApp.prototype, {
 
     const currentName = this.getSessionName(session);
     const parsed = parseSessionPrefix(session.name);
-    const originalContent = tabName.textContent;
     const originalChildren = [...tabName.childNodes].map((node) => node.cloneNode(true));
     const restoreOriginalChildren = () => {
       tabName.replaceChildren(...originalChildren.map((node) => node.cloneNode(true)));
@@ -2316,8 +2315,13 @@ Object.assign(CodemanApp.prototype, {
 
       const suffix = input.value.trim();
       const fullName = parsed ? parsed.prefix + (suffix ? ': ' + suffix : '') : suffix;
-      if (fullName === session.name) restoreOriginalChildren();
-      else tabName.textContent = fullName || originalContent;
+      // Write the SAME markup the renderer writes (prefix span + suffix), not the
+      // raw string: the header strip hides `.tab-name-prefix`, so a plain
+      // `prefix: suffix` write shows the prefix the header is meant to hide until
+      // the debounced re-render lands — the short→long flip reported after an
+      // inline rename. An empty result restores the previous children instead.
+      if (fullName === session.name || !fullName) restoreOriginalChildren();
+      else this._writeTabName(tabName, tabName.closest('.session-tab'), fullName, session.workingDir);
 
       // Skip the API call if the session vanished between focus and blur.
       const stillExists = this.sessions.has(sessionId);

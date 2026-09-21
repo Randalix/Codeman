@@ -441,10 +441,83 @@ describe('Inline rename input', () => {
     expect(result.renameClassActive).toBe(false);
   });
 
+  it('Commit keeps the canonical prefix-span markup, never the raw long name', async () => {
+    await resetState();
+    const id = 'commit-markup';
+
+    // The tab must live in the real #sessionTabs container with a described name
+    // rendered the canonical way (a hidden .tab-name-prefix span plus the bare
+    // suffix): the bug is that the commit wrote the raw `prefix: suffix` string,
+    // which exposes the prefix the header strip hides until the debounced render
+    // heals it — the short→long flip users reported after an inline rename.
+    await page.evaluate((sessionId) => {
+      const app = (
+        window as unknown as {
+          app: {
+            sessions: Map<string, { id: string; name: string; workingDir: string }>;
+            startInlineRename: (id: string) => void;
+          };
+        }
+      ).app;
+      const container = document.getElementById('sessionTabs') as HTMLElement;
+      const tab = document.createElement('div');
+      tab.setAttribute('data-test-tab', '1');
+      tab.className = 'session-tab';
+      tab.dataset.id = sessionId;
+      tab.innerHTML =
+        '<span class="tab-info"><span class="tab-name-row">' +
+        `<span class="tab-name" data-session-id="${sessionId}">` +
+        '<span class="tab-name-prefix">w9-case: </span>old</span>' +
+        '</span></span>';
+      container.appendChild(tab);
+      app.sessions.set(sessionId, { id: sessionId, name: 'w9-case: old', workingDir: '/tmp/w9' });
+      app.startInlineRename(sessionId);
+    }, id);
+
+    const result = await page.evaluate(async (sessionId) => {
+      const origFetch = window.fetch;
+      window.fetch = (async () =>
+        new Response('{"success":true,"data":{"name":"w9-case: fresh"}}', {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as typeof window.fetch;
+
+      const inputEl = document.querySelector('input.tab-rename-input') as HTMLInputElement;
+      inputEl.value = 'fresh';
+      // Enter blurs synchronously, so the commit's label write has already run
+      // before this returns — the debounced re-render has NOT healed anything yet.
+      inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+
+      const nameEl = document.querySelector(`.tab-name[data-session-id="${sessionId}"]`) as HTMLElement;
+      const immediate = {
+        hasPrefixSpan: !!nameEl.querySelector('.tab-name-prefix'),
+        prefixText: nameEl.querySelector('.tab-name-prefix')?.textContent ?? null,
+        label: nameEl.textContent,
+        datasetFull: nameEl.dataset.fullName ?? null,
+        tooltip: nameEl.closest('.session-tab')?.getAttribute('title') ?? null,
+      };
+
+      await new Promise((r) => setTimeout(r, 60));
+      window.fetch = origFetch;
+      const settled = {
+        hasPrefixSpan: !!nameEl.querySelector('.tab-name-prefix'),
+        label: nameEl.textContent,
+      };
+      return { immediate, settled };
+    }, id);
+
+    expect(result.immediate.hasPrefixSpan).toBe(true);
+    expect(result.immediate.prefixText).toBe('w9-case: ');
+    expect(result.immediate.label).toBe('w9-case: fresh');
+    expect(result.immediate.datasetFull).toBe('w9-case: fresh');
+    expect(result.immediate.tooltip).toBe('w9-case (/tmp/w9)');
+    expect(result.settled.hasPrefixSpan).toBe(true);
+    expect(result.settled.label).toBe('w9-case: fresh');
+  });
+
   it('A rejected rename restores the old label and leaves app.sessions untouched', async () => {
     await resetState();
     expect(await startRename('rename-500', 'w9-case')).toBe(true);
-
     // _apiPut turns a network error into a null Response and an API-level
     // failure arrives as a non-ok status, neither of which throws, so a
     // rejected rename has to be detected from the response, or it reports
