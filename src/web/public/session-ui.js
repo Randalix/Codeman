@@ -2946,7 +2946,6 @@ Object.assign(CodemanApp.prototype, {
     const shownName = this._inlineRenamePending?.get(sessionId) ?? session.name;
     const renameInFlight = shownName !== session.name;
     const parsed = parseSessionPrefix(shownName);
-    const originalContent = tabName.textContent;
     const originalChildren = [...tabName.childNodes].map((node) => node.cloneNode(true));
     const restoreOriginalChildren = () => {
       tabName.replaceChildren(...originalChildren.map((node) => node.cloneNode(true)));
@@ -3029,8 +3028,12 @@ Object.assign(CodemanApp.prototype, {
       // An unchanged confirm puts the old label back, unless the editor opened
       // over a rename in flight: that label was repainted from the server's
       // older name, so show the in-flight name rather than make it look lost.
-      if (fullName === shownName && !renameInFlight) restoreOriginalChildren();
-      else tabName.textContent = fullName || originalContent;
+      // Otherwise write the SAME markup the renderer writes (prefix span + suffix),
+      // not the raw string: the header strip hides `.tab-name-prefix`, so a plain
+      // `prefix: suffix` write shows the prefix the header is meant to hide until
+      // the debounced re-render lands. An empty result restores the old children.
+      if ((fullName === shownName && !renameInFlight) || !fullName) restoreOriginalChildren();
+      else this._writeTabName(tabName, tabName.closest('.session-tab'), fullName, session.workingDir);
 
       // Skip the API call if the session vanished between focus and blur. The
       // queue applies the confirmed name to this.sessions before the re-render
