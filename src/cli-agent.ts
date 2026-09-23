@@ -32,6 +32,12 @@ import type { Command } from 'commander';
 import { dataPath } from './config/instance.js';
 import { GLYPH, palette, table } from './cli-style.js';
 import { getErrorMessage } from './types.js';
+import {
+  discoverCliSessionId,
+  findDeletedSession,
+  readDeletedSessions,
+  type DeletedSessionRecord,
+} from './session-restore.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Context and guard
@@ -273,10 +279,11 @@ export function baseHeaders(ctx: AgentContext): Record<string, string> {
     Accept: 'application/json',
     // Tags sessions this caller spawns as its children (lineage in the web UI) and
     // labels case directories a spawn creates as agent scratch. Cosmetic, never
-    // fails a call, so there is no case for leaving them off.
-    'X-Codeman-Parent-Session': ctx.selfId,
+    // fails a call, so there is no case for leaving them off. Omitted when the
+    // caller has no session of its own (the root `codeman session restore`).
     'X-Codeman-Agent-Origin': 'codeman-agent-cli',
   };
+  if (ctx.selfId) headers['X-Codeman-Parent-Session'] = ctx.selfId;
   if (ctx.auth) {
     headers.Authorization = `Basic ${Buffer.from(`${ctx.auth.username}:${ctx.auth.password}`).toString('base64')}`;
   }
@@ -972,59 +979,188 @@ export function findRestoreTool(env: NodeJS.ProcessEnv = process.env): string | 
 }
 
 /**
- * `agent restore` — bring a session whose pane died back, with its conversation.
- * Codeman's own respawn refuses external CLIs (opencode, codex, …), so this delegates
- * to the host's restore tool, which respawns the pane from the original launch
- * command and re-attaches the CLI's last conversation (`opencode -c`, `claude
- * --resume`, …). A live worker is never touched: restoring it would kill its turn.
+ * The default dead-pane runner: the host's `codeman-restore-session`, or a clear error
+ * when it is absent. Codeman's own respawn refuses external CLIs (opencode, codex, …),
+ * so the pane can only come back through that tool.
  */
-export async function agentRestore(
-  deps: AgentDeps,
-  options: { id: string; resume?: string; runner?: RestoreRunner }
-): Promise<number> {
-  const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
-  const state = await probeAlive(deps, target.id);
-  if (state === 'alive') {
-    return fail(
-      deps,
-      `refusing: ${target.id} is alive — restore would kill the running worker (use interrupt, or rm + spawn --resume)`,
-      EXIT.refused
-    );
+const defaultRestoreRunner: RestoreRunner = async (id, resume) => {
+  const tool = findRestoreTool();
+  if (!tool) {
+    return {
+      code: EXIT.error,
+      output:
+        'no restore tool on this host (expected codeman-restore-session on PATH or ~/bin); respawn by hand: rm + spawn --resume <cli-session-id>',
+    };
   }
-  // Only a PROVEN corpse is respawned: an unanswered probe (waiter cap, 5xx, timeout) may
-  // hide a live worker, and the external tool's own live check is not this code's to rely on.
-  if (state !== 'dead') {
-    return fail(
-      deps,
-      `refusing: could not prove ${target.id} is dead (probe answered "${state}") — retry, or check \`agent ls --alive\``,
-      EXIT.refused
-    );
-  }
-  const runner: RestoreRunner =
-    options.runner ??
-    (async (id, resume) => {
-      const tool = findRestoreTool();
-      if (!tool) {
-        return {
-          code: EXIT.error,
-          output:
-            'no restore tool on this host (expected codeman-restore-session on PATH or ~/bin); respawn by hand: rm + spawn --resume <cli-session-id>',
-        };
-      }
-      const { execFile } = await import('node:child_process');
-      return new Promise((resolve) => {
-        execFile(tool, resume ? [id, '--resume', resume] : [id], { timeout: 120_000 }, (err, stdout, stderr) => {
-          resolve({ code: err ? EXIT.error : EXIT.ok, output: `${stdout}${stderr}`.trim() });
-        });
-      });
+  const { execFile } = await import('node:child_process');
+  return new Promise((resolve) => {
+    execFile(tool, resume ? [id, '--resume', resume] : [id], { timeout: 120_000 }, (err, stdout, stderr) => {
+      resolve({ code: err ? EXIT.error : EXIT.ok, output: `${stdout}${stderr}`.trim() });
     });
-  const result = await runner(target.id, options.resume);
-  if (deps.json) emitJson(deps, { sessionId: target.id, restored: result.code === EXIT.ok, output: result.output });
-  else if (result.code === EXIT.ok)
-    deps.io.out(palette.ok(`${GLYPH.ok} restored ${target.id}${result.output ? `\n${result.output}` : ''}`));
-  else deps.io.err(palette.err(`${GLYPH.fail} restore failed for ${target.id}: ${result.output}`));
-  return result.code;
+  });
+};
+
+/**
+ * The resume field for the CREATE route, per mode. `RESUME_FIELD_BY_MODE` covers the
+ * per-mode config objects quick-start uses; claude's conversation id is a TOP-LEVEL
+ * `resumeSessionId` on create (create supports claude, quick-start deliberately does
+ * not). A mode in neither map has no resume field at all — restore must refuse rather
+ * than send a body the schema would silently strip into a FRESH conversation.
+ */
+const RESUME_TOP_LEVEL_BY_MODE: Record<string, string> = { claude: 'resumeSessionId' };
+
+/** Body fragment that continues `cliSessionId` for `mode` on `POST /api/v1/sessions`, or null. */
+export function buildRestoreBody(mode: string, cliSessionId: string): Record<string, unknown> | null {
+  const slot = RESUME_FIELD_BY_MODE[mode];
+  if (slot) return { [slot.config]: { [slot.field]: cliSessionId } };
+  const top = RESUME_TOP_LEVEL_BY_MODE[mode];
+  if (top) return { [top]: cliSessionId };
+  return null;
+}
+
+export interface RestoreOptions {
+  /** Session id (prefix ok); omitted together with `last`. */
+  id?: string;
+  /** Restore the most recently deleted session instead of naming one. */
+  last?: boolean;
+  /** Explicit CLI conversation id — required for a deleted session whose mode has no discovery. */
+  resume?: string;
+  /** Injectable dead-pane runner (tests spawn nothing). */
+  runner?: RestoreRunner;
+  /** Injectable conversation discovery (tests do not run opencode). */
+  discover?: (o: { mode: string; workingDir: string }) => Promise<string | null>;
+  /** Injectable deleted-record source (tests use a fixture). */
+  deleted?: () => DeletedSessionRecord[];
+}
+
+/**
+ * `restore` — bring a session back, in either of the two shapes it can be gone:
+ *
+ * 1. **A live session whose pane died** (worker exited, tab survives): the host's restore
+ *    tool respawns the pane from the original launch command and re-attaches the CLI's
+ *    conversation. A live worker is never touched — restoring it would kill its turn.
+ * 2. **A session that was deleted** (the recommended step after a handoff): rebuild it
+ *    from the `deleted` lifecycle record, resuming the CLI conversation. The conversation
+ *    id comes from `--resume`, else the id the server recorded (claude/codex), else
+ *    per-mode discovery (opencode) — never a guess.
+ */
+export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Promise<number> {
+  if (!options.id && !options.last) {
+    return fail(
+      deps,
+      'refusing: give a session id (prefix ok), or --last for the most recently deleted session',
+      EXIT.refused
+    );
+  }
+
+  // 1) Still a live session? The list is the truthful check for a FULL id too —
+  //    `resolveSessionId` trusts any 36-char id, which is exactly what a deleted one is.
+  let liveId: string | undefined;
+  if (options.id) {
+    const id = options.id;
+    const list = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
+    if (!list.json?.success) return fail(deps, describeFailure(list));
+    const sessions = (list.json.data as SessionRow[] | undefined) ?? [];
+    const matches = sessions.filter((s) => s.id === id || (id.length < FULL_ID_LENGTH && s.id.startsWith(id)));
+    if (matches.length > 1) {
+      return fail(deps, `"${id}" is ambiguous: ${matches.map((s) => s.id.slice(0, 13)).join(', ')}`, EXIT.refused);
+    }
+    liveId = matches[0]?.id;
+  }
+
+  if (liveId) {
+    const state = await probeAlive(deps, liveId);
+    if (state === 'alive') {
+      return fail(
+        deps,
+        `refusing: ${liveId} is alive — restore would kill the running worker (use interrupt, or rm + spawn --resume)`,
+        EXIT.refused
+      );
+    }
+    // Only a PROVEN corpse is respawned: an unanswered probe (waiter cap, 5xx, timeout) may
+    // hide a live worker, and the external tool's own live check is not this code's to rely on.
+    if (state !== 'dead') {
+      return fail(
+        deps,
+        `refusing: could not prove ${liveId} is dead (probe answered "${state}") — retry, or check \`agent ls --alive\``,
+        EXIT.refused
+      );
+    }
+    const result = await (options.runner ?? defaultRestoreRunner)(liveId, options.resume);
+    if (deps.json) emitJson(deps, { sessionId: liveId, restored: result.code === EXIT.ok, output: result.output });
+    else if (result.code === EXIT.ok)
+      deps.io.out(palette.ok(`${GLYPH.ok} restored ${liveId}${result.output ? `\n${result.output}` : ''}`));
+    else deps.io.err(palette.err(`${GLYPH.fail} restore failed for ${liveId}: ${result.output}`));
+    return result.code;
+  }
+
+  // 2) Deleted: rebuild from the lifecycle record the server wrote at delete time.
+  const records = (options.deleted ?? readDeletedSessions)();
+  const record = findDeletedSession(records, options.id);
+  if (!record) {
+    return fail(
+      deps,
+      options.id
+        ? `no live session matches "${options.id}" and no deleted-session record does either (see \`agent ls\`)`
+        : 'no deleted session to restore (the lifecycle log has no `deleted` entry)',
+      EXIT.refused
+    );
+  }
+  if (record.remote) {
+    return fail(deps, `refusing: ${record.id} was a remote session — restore it on its own host`, EXIT.refused);
+  }
+  if (!record.workingDir) {
+    return fail(
+      deps,
+      `the delete record for ${record.id} has no workingDir (written before restore was supported) — rebuild it by hand`,
+      EXIT.refused
+    );
+  }
+  const mode = record.mode ?? 'claude';
+  const cliSessionId =
+    options.resume ??
+    (record.cliSessionId && record.cliSessionId !== record.id ? record.cliSessionId : undefined) ??
+    (await (options.discover ?? discoverCliSessionId)({ mode, workingDir: record.workingDir }));
+  if (!cliSessionId) {
+    return fail(
+      deps,
+      `no CLI conversation id for ${record.id} (${mode}) — pass --resume <cli-session-id>`,
+      EXIT.refused
+    );
+  }
+  const resumeBody = buildRestoreBody(mode, cliSessionId);
+  if (!resumeBody) {
+    return fail(
+      deps,
+      `mode "${mode}" has no resume field, so a deleted ${mode} session cannot continue its conversation`,
+      EXIT.refused
+    );
+  }
+  const body: Record<string, unknown> = { workingDir: record.workingDir, mode, ...resumeBody };
+  if (record.name) body.name = `${record.name} (Restore)`.slice(0, 100);
+  if (deps.ctx.selfId) body.parentSessionId = deps.ctx.selfId;
+  const res = await deps.request(deps.ctx, { method: 'POST', path: '/api/v1/sessions', body });
+  const created = res.json?.data as { session?: { id?: string } } | undefined;
+  const newId = created?.session?.id;
+  if (!res.json?.success || !newId) return fail(deps, describeFailure(res));
+  // Create alone registers a session but does NOT launch its pane — the frontend
+  // follows with `/interactive`, and so must a restore (a session that never starts is
+  // not a restored one).
+  const start = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(newId)}/interactive`,
+  });
+  if (!start.json?.success) {
+    return fail(deps, `restored ${newId} but could not start its pane: ${describeFailure(start)}`, EXIT.error);
+  }
+  if (deps.json) emitJson(deps, { sessionId: newId, restored: true, from: record.id, cliSessionId });
+  else
+    deps.io.out(
+      palette.ok(
+        `${GLYPH.ok} restored ${record.id.slice(0, 8)} as ${newId.slice(0, 8)} (${mode}, ${record.workingDir})${record.name ? ` — "${record.name} (Restore)"` : ''}`
+      )
+    );
+  return EXIT.ok;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1275,17 +1411,20 @@ export function registerAgentCommands(program: Command): Command {
     );
 
   agent
-    .command('restore <id>')
+    .command('restore [id]')
     .description(
-      "Bring back a session whose pane died (respawns it with its conversation via the host's codeman-restore-session); refuses a live one"
+      'Bring a session back: a live one whose pane died (respawned with its conversation), or a DELETED one (--last, rebuilt from the lifecycle log and resumed)'
     )
+    .option('--last', 'Restore the most recently deleted session')
     .option(
       '--resume <cli-session-id>',
       'Re-attach exactly this CLI conversation instead of the last one in the directory'
     )
     .option('--json', 'Machine-readable output')
-    .action((id: string, options: { resume?: string; json?: boolean }) =>
-      run(Boolean(options.json), (deps) => agentRestore(deps, { id, resume: options.resume }))
+    .action((id: string | undefined, options: { last?: boolean; resume?: string; json?: boolean }) =>
+      run(Boolean(options.json), (deps) =>
+        agentRestore(deps, { id, last: Boolean(options.last), resume: options.resume })
+      )
     );
 
   agent
