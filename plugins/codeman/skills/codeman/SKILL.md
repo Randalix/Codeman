@@ -35,7 +35,9 @@ environment: tell them *"other sessions: `codeman agent --help`"* — the bundle
 same endpoints, with the guards below (no control bytes, no self-delete, no guessed
 URL) enforced in code. It also carries the **mailbox**: `codeman agent post <id> <text>`
 stores a message for a session without typing anything into its pane, and the receiver
-reads it with `codeman agent inbox [--wait <ms>]` when it wants to — and `codeman agent ls`
+reads it with `codeman agent inbox [--wait <ms>]` when it wants to, then acknowledges it
+with `codeman agent ack` once handled — **reading is not acknowledging**, so an order
+that was read but not acted on stays in the inbox instead of vanishing. `codeman agent ls`
 shows who is parked on their inbox since when (`WAIT`), so two agents waiting for each
 other's post are visible instead of silently stalled (HTTP:
 `POST/GET /api/v1/sessions/:id/inbox`, `POST …/inbox/ack`). Prefer it over `input` for

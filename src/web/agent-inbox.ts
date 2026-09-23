@@ -17,8 +17,10 @@
  * - Bounded: `MAX_MESSAGES_PER_INBOX` per session and `MAX_TEXT_LENGTH` per message.
  *   A full inbox REJECTS the post (the sender learns) rather than dropping the
  *   oldest (the receiver would never know what it missed).
- * - Reads are non-destructive. `ack(ids)` removes; a client that crashes between
- *   read and ack sees the message again, never loses it.
+ * - Reads are non-destructive AND do not acknowledge: they only mark the returned
+ *   messages as "seen" so `ackSeen()` can remove exactly those. A client that crashes
+ *   between read and ack sees the message again, never loses it; a message that
+ *   arrives after a read is never swept away by an `ackSeen()`. `peek` marks nothing.
  * - Long-poll waiters are bounded per session (`MAX_INBOX_WAITERS_PER_SESSION`) and
  *   resolve on the first post, on `drop()`, on `stop()`, or on timeout — never hang.
  * - Persistence is a whole-store snapshot the server writes on `onChange`; a message
@@ -67,6 +69,12 @@ export interface InboxReadResult {
   waitedMs: number;
 }
 
+/** How a read treats the "seen" set that `ackSeen()` later drains. */
+export interface InboxReadOptions {
+  /** Mark nothing as seen (the monitor's `--peek`: reading must not consume the mail). */
+  peek?: boolean;
+}
+
 export type PostResult =
   | { ok: true; message: InboxMessage; pending: number }
   | { ok: false; reason: 'full' | 'text-too-long' | 'text-empty' | 'from-too-long' | 'stopped' };
@@ -107,6 +115,15 @@ export class AgentInbox {
   private readonly waiters = new Map<string, Set<Waiter>>();
   /** Per session: since when someone has been waiting for mail (see `summary`). */
   private readonly waiting = new Map<string, WaitingState>();
+  /**
+   * Message ids a non-peek read handed out and that `ackSeen()` may remove. This is
+   * the whole point of the split: "the receiver has seen it" (read) is not "the
+   * receiver is done with it" (ack). A read that is never followed by an ack leaves
+   * the mail pending — visible in `summary`, re-delivered on the next read — instead
+   * of silently losing it. In-memory like `waiting`: a server restart empties it and
+   * `ackSeen()` becomes a no-op, which is the safe direction.
+   */
+  private readonly seen = new Map<string, Set<string>>();
   private stopped = false;
 
   /** A message landed: `{sessionId, message, pending}`. The server maps it to SSE. */
@@ -146,16 +163,25 @@ export class AgentInbox {
    * Read, blocking up to `waitMs` (clamped to the agent-wait bounds) while the inbox
    * is empty. Resolves at once with what is there when it is not empty; a wait that
    * ends by timeout, `drop()` or `stop()` answers with an empty list and `timedOut`
-   * set only for the timeout case.
+   * set only for the timeout case. Non-destructive: the messages stay and are only
+   * marked as seen (unless `peek`) so `ackSeen()` can remove exactly them later.
    */
-  async read(sessionId: string, waitMs?: number, abortSignal?: AbortSignal): Promise<InboxReadResult> {
+  async read(
+    sessionId: string,
+    waitMs?: number,
+    abortSignal?: AbortSignal,
+    options?: InboxReadOptions
+  ): Promise<InboxReadResult> {
+    const peek = options?.peek === true;
     const existing = this.list(sessionId);
     if (existing.length > 0 || waitMs === undefined || this.stopped || abortSignal?.aborted) {
+      if (!peek) this.markSeen(sessionId, existing);
       return { messages: existing, pending: existing.length, timedOut: false, waitedMs: 0 };
     }
     const applied = clampWait(waitMs);
     const ended = await this.waitForPost(sessionId, applied, abortSignal);
     const messages = this.list(sessionId);
+    if (!peek) this.markSeen(sessionId, messages);
     // `timedOut` is which path released the waiter, never a clock comparison: the
     // timer runs on libuv's cached loop time and can fire a few ms before Date.now()
     // agrees, which read as "not a timeout" and told the CLI the inbox was simply empty.
@@ -198,10 +224,38 @@ export class AgentInbox {
     return state.since;
   }
 
+  /** Remember the messages a non-peek read handed out, so `ackSeen()` can remove them. */
+  private markSeen(sessionId: string, messages: readonly InboxMessage[]): void {
+    if (messages.length === 0) return;
+    const set = this.seen.get(sessionId) ?? new Set<string>();
+    for (const m of messages) set.add(m.id);
+    this.seen.set(sessionId, set);
+  }
+
+  /**
+   * Remove every message a read has handed out but not acknowledged. This is the verb
+   * behind `codeman agent ack`: read, do the work, then acknowledge — so a read that
+   * is never acted on keeps the message pending instead of losing it. A message posted
+   * after the read was never marked seen and survives. Returns how many were removed.
+   */
+  ackSeen(sessionId: string): number {
+    const ids = this.seen.get(sessionId);
+    if (!ids || ids.size === 0) return 0;
+    return this.ack(sessionId, [...ids]);
+  }
+
   /** Remove the given messages. Unknown ids are ignored. Returns how many were removed. */
   ack(sessionId: string, ids: readonly string[]): number {
     const queue = this.inboxes.get(sessionId);
-    if (!queue || ids.length === 0) return 0;
+    if (ids.length === 0) return 0;
+    // Drop the ids from the seen set regardless of whether they were still queued, so a
+    // stale seen id can never acknowledge a later message that happens to reuse it.
+    const seen = this.seen.get(sessionId);
+    if (seen) {
+      for (const id of ids) seen.delete(id);
+      if (seen.size === 0) this.seen.delete(sessionId);
+    }
+    if (!queue) return 0;
     const drop = new Set(ids);
     const kept = queue.filter((m) => !drop.has(m.id));
     const removed = queue.length - kept.length;
@@ -214,6 +268,7 @@ export class AgentInbox {
 
   /** Empty one inbox. Returns how many messages were discarded. */
   clear(sessionId: string): number {
+    this.seen.delete(sessionId);
     const count = this.pendingCount(sessionId);
     if (count === 0) return 0;
     this.inboxes.delete(sessionId);
@@ -244,6 +299,7 @@ export class AgentInbox {
     }
     // Wait state is in-memory only; a session that did not come back cannot be waiting.
     for (const sessionId of [...this.waiting.keys()]) if (!alive.has(sessionId)) this.waiting.delete(sessionId);
+    for (const sessionId of [...this.seen.keys()]) if (!alive.has(sessionId)) this.seen.delete(sessionId);
     if (dropped > 0) this.onChange?.();
     return dropped;
   }
@@ -251,6 +307,7 @@ export class AgentInbox {
   /** The session is gone: discard its inbox and release anyone waiting on it. */
   drop(sessionId: string): void {
     const had = this.inboxes.delete(sessionId);
+    this.seen.delete(sessionId);
     this.releaseWaiters(sessionId);
     if (had) this.onChange?.();
   }
@@ -294,6 +351,7 @@ export class AgentInbox {
     this.inboxes.clear();
     this.waiters.clear();
     this.waiting.clear();
+    this.seen.clear();
     this.onMessage = undefined;
     this.onChange = undefined;
   }

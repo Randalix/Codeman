@@ -64,6 +64,7 @@ const SUBCOMMANDS: Record<string, Record<string, string[]>> = {
     rm: [],
     post: [],
     inbox: [],
+    ack: [],
     restore: [],
   },
   service: { install: [], uninstall: [], status: [] },
