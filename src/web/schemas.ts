@@ -1116,13 +1116,17 @@ export const InboxPostSchema = z
 
 export const InboxAckSchema = z
   .object({
-    ids: z.array(z.string().min(1).max(64)).min(1).max(200),
+    // Omitted/empty = acknowledge everything this session has read (`ackSeen`); explicit
+    // ids stay for callers that need to acknowledge a subset.
+    ids: z.array(z.string().min(1).max(64)).min(1).max(200).optional(),
   })
   .strict();
 
 export const InboxReadQuerySchema = z
   .object({
     wait: z.coerce.number().int().positive().optional(),
+    // 1 = mark nothing as seen (a monitor's non-consuming peek).
+    peek: z.coerce.number().int().min(0).max(1).optional(),
   })
   .strict();
 

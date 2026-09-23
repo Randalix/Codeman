@@ -3,8 +3,10 @@
  *
  * - `POST   /api/sessions/:id/inbox`      store a message for the session (never types)
  * - `GET    /api/sessions/:id/inbox`      read, non-destructive; `?wait=<ms>` long-polls
- *                                         while the inbox is empty
- * - `POST   /api/sessions/:id/inbox/ack`  remove messages the reader has processed
+ *                                         while the inbox is empty; `?peek=1` marks nothing
+ * - `POST   /api/sessions/:id/inbox/ack`  remove messages the reader is done with: an
+ *                                         empty body acknowledges everything it has read
+ *                                         (`ackSeen`), explicit `ids` a subset
  * - `DELETE /api/sessions/:id/inbox`      discard everything pending
  * - `GET    /api/agent-inbox/summary`     pending count + wait state per session the
  *                                         caller can see ("who is waiting for whom")
@@ -103,14 +105,14 @@ export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): voi
     // A client that hangs up mid-poll hands its waiter slot back at once (the cap
     // above is small on purpose); nobody is reading the answer anyway.
     const abort = query.wait === undefined ? undefined : abortOnClientHangUp(reply);
-    return agentInbox.read(id, query.wait, abort?.signal);
+    return agentInbox.read(id, query.wait, abort?.signal, { peek: query.peek === 1 });
   });
 
   app.post('/api/sessions/:id/inbox/ack', async (req) => {
     const { id } = req.params as { id: string };
     findSessionOrFail(ctx, id, req);
-    const body = parseBody(InboxAckSchema, req.body);
-    const removed = agentInbox.ack(id, body.ids);
+    const body = parseBody(InboxAckSchema, req.body ?? {});
+    const removed = body.ids ? agentInbox.ack(id, body.ids) : agentInbox.ackSeen(id);
     return { removed, pending: agentInbox.pendingCount(id) };
   });
 

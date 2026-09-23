@@ -12,6 +12,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   AgentGuardError,
   EXIT,
+  agentAck,
   agentInbox,
   agentInterrupt,
   agentLs,
@@ -561,29 +562,26 @@ describe('agent post / inbox (mailbox)', () => {
     expect(self.calls.concat(empty.calls)).toEqual([]);
   });
 
-  it("inbox reads the caller's own mailbox, prints, then acks exactly what it printed", async () => {
+  it("inbox reads the caller's own mailbox WITHOUT acknowledging; it only marks it seen", async () => {
     const msgs = [
       { id: 'm1', from: OTHER, text: 'first', createdAt: 0 },
       { id: 'm2', from: 'label', text: 'second', createdAt: 0 },
     ];
-    const deps = fakeDeps([
-      ok({ messages: msgs, pending: 2, timedOut: false, waitedMs: 0 }),
-      ok({ removed: 2, pending: 0 }),
-    ]);
+    const deps = fakeDeps([ok({ messages: msgs, pending: 2, timedOut: false, waitedMs: 0 })]);
     expect(await agentInbox(deps, { peek: false })).toBe(EXIT.ok);
+    expect(deps.calls).toHaveLength(1); // no ack call: reading is not processing
     expect(deps.calls[0]).toMatchObject({ method: 'GET', path: `/api/v1/sessions/${SELF}/inbox` });
-    expect(deps.calls[1]).toMatchObject({
-      method: 'POST',
-      path: `/api/v1/sessions/${SELF}/inbox/ack`,
-      body: { ids: ['m1', 'm2'] },
-    });
+    expect(deps.calls[0].query).toMatchObject({ peek: undefined });
     expect(deps.out.join('\n')).toMatch(/from 94990c6d[\s\S]*first[\s\S]*from label[\s\S]*second/);
+    // The read output tells the receiver how to acknowledge once it has handled the mail.
+    expect(deps.err.join('\n')).toMatch(/codeman agent ack/);
   });
 
-  it('--peek never acks; an empty --wait is exit 2', async () => {
+  it('--peek asks the server to mark nothing; an empty --wait is exit 2', async () => {
     const peek = fakeDeps([ok({ messages: [{ id: 'm1', from: OTHER, text: 'x', createdAt: 0 }], pending: 1 })]);
     expect(await agentInbox(peek, { peek: true })).toBe(EXIT.ok);
     expect(peek.calls).toHaveLength(1);
+    expect(peek.calls[0].query).toMatchObject({ peek: 1 });
     // The server clamps: --wait 1 is a 1000 ms wait, and the message says so.
     const timeout = fakeDeps([ok({ messages: [], pending: 0, timedOut: true, waitedMs: 1000 })]);
     expect(await agentInbox(timeout, { peek: false, waitMs: 1 })).toBe(EXIT.timeout);
@@ -591,12 +589,23 @@ describe('agent post / inbox (mailbox)', () => {
     expect(timeout.err.join('')).toMatch(/nothing arrived within 1000 ms/);
   });
 
+  it('agentAck with no ids acknowledges everything seen; with ids it acknowledges exactly those', async () => {
+    const all = fakeDeps([ok({ removed: 2, pending: 0 })]);
+    expect(await agentAck(all, { ids: [] })).toBe(EXIT.ok);
+    expect(all.calls[0]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${SELF}/inbox/ack`,
+      body: {},
+    });
+    expect(all.out.join('')).toMatch(/acknowledged 2/);
+    const some = fakeDeps([ok({ removed: 1, pending: 1 })]);
+    expect(await agentAck(some, { ids: ['m1'] })).toBe(EXIT.ok);
+    expect(some.calls[0]).toMatchObject({ body: { ids: ['m1'] } });
+  });
+
   it('a failed ack is reported as such (the messages stay for the next read)', async () => {
-    const deps = fakeDeps([
-      ok({ messages: [{ id: 'm1', from: OTHER, text: 'x', createdAt: 0 }], pending: 1 }),
-      { status: 500, text: 'boom' },
-    ]);
-    expect(await agentInbox(deps, { peek: false })).toBe(EXIT.error);
+    const deps = fakeDeps([{ status: 500, text: 'boom' }]);
+    expect(await agentAck(deps, { ids: ['m1'] })).toBe(EXIT.error);
     expect(deps.err.join('')).toMatch(/could not acknowledge/);
   });
 });

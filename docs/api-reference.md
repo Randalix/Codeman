@@ -418,15 +418,17 @@ client that opens many concurrent waits against one session will still hit the c
 
 ## Agent inbox (`/api/sessions/:id/inbox`)
 
-A per-session mailbox for agent-to-agent messages that must NOT be typed into the receiver's pane (store: `web/agent-inbox.ts`, routes: `routes/inbox-routes.ts`, CLI: `codeman agent post` / `codeman agent inbox`).
+A per-session mailbox for agent-to-agent messages that must NOT be typed into the receiver's pane (store: `web/agent-inbox.ts`, routes: `routes/inbox-routes.ts`, CLI: `codeman agent post` / `codeman agent inbox` / `codeman agent ack`).
 
 | Method | Endpoint | Body / query | Returns |
 |---|---|---|---|
 | `POST` | `/api/sessions/:id/inbox` | `{text: 1–16384 chars, from?: ≤128}` (`from` defaults to `X-Codeman-Parent-Session`, then `"api"`) | `{message:{id,from,text,createdAt}, pending}` — `422 OPERATION_FAILED` when the inbox holds 200 messages (nothing is evicted) |
-| `GET` | `/api/sessions/:id/inbox` | `?wait=<ms>` (positive integer, clamped to the agent-wait bounds) | `{messages[], pending, timedOut, waitedMs}` — never drains; with `wait`, blocks while empty and answers on the first post, on session teardown, or on timeout (a timeout is a 200 with `timedOut:true`, like `/wait`); `409 SESSION_BUSY` above 4 concurrent waiters |
-| `POST` | `/api/sessions/:id/inbox/ack` | `{ids: string[]}` | `{removed, pending}` |
+| `GET` | `/api/sessions/:id/inbox` | `?wait=<ms>` (positive integer, clamped to the agent-wait bounds); `?peek=1` marks nothing | `{messages[], pending, timedOut, waitedMs}` — never drains; a plain read marks what it hands out as **seen** (so a later ack removes exactly that), `peek=1` marks nothing; with `wait`, blocks while empty and answers on the first post, on session teardown, or on timeout (a timeout is a 200 with `timedOut:true`, like `/wait`); `409 SESSION_BUSY` above 4 concurrent waiters |
+| `POST` | `/api/sessions/:id/inbox/ack` | `{ids?: string[]}` — omitted/empty acknowledges everything the session has read, explicit ids acknowledge a subset | `{removed, pending}` |
 | `DELETE` | `/api/sessions/:id/inbox` | — | `{removed, pending:0}` |
 | `GET` | `/api/agent-inbox/summary` | — | `{ [sessionId]: {pending, waiting, waitingSince} }` for every session the caller can see that has mail or a parked `?wait` — `waitingSince` (ISO) is when the current uninterrupted wait began; a waiter that times out and returns within 15 s (the looping `inbox --wait` pattern) keeps its start. Read-only, never blocks. `codeman agent ls` folds it into its `INBOX`/`WAIT` columns and names a stalled pair (a waiter whose parent/child is idle with an empty inbox) |
+
+Reading and acknowledging are deliberately separate: `GET` is non-destructive and only marks its result as seen, `POST …/ack` removes. A receiver that reads an order but never acts on it leaves it `pending` — visible in `summary`/`ls` and re-delivered on the next read — instead of the message vanishing with the read. A message posted after a read was never marked seen and survives an ack-all. (The seen set is in-memory, like the wait state: a server restart empties it and an ack-all becomes a no-op, which keeps unsent mail rather than dropping it.)
 
 Ownership is the session rule (`findSessionOrFail`): a session the caller cannot see is a `404`. Every post broadcasts `inbox:message` `{sessionId, from, messageId, pending}` on SSE (routed per owner in multi-user mode). The store is persisted whole to `<data dir>/agent-inbox.json` (debounced, atomic rename) and restored at boot, a session's inbox is dropped on delete (kept on a detach, so a re-adopted session finds its mail), and inboxes of sessions that did not come back after a restart are pruned once at boot. The inbox never writes to the pane: delivery is the receiver polling.
 
