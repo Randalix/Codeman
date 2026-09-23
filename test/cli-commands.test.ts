@@ -50,7 +50,7 @@ const TOP_LEVEL: Record<string, string[]> = {
 
 /** Subcommands per parent, with their aliases. */
 const SUBCOMMANDS: Record<string, Record<string, string[]>> = {
-  session: { start: [], stop: [], list: ['ls'], logs: [] },
+  session: { start: [], stop: [], list: ['ls'], logs: [], restore: [] },
   task: { add: [], list: ['ls'], status: [], remove: ['rm'], clear: [] },
   ralph: { start: [], stop: [], status: [] },
   skill: { install: [], uninstall: [] },

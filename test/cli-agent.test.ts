@@ -25,6 +25,7 @@ import {
   agentSpawn,
   agentWait,
   buildInterruptBody,
+  buildRestoreBody,
   buildSendBody,
   buildSpawnExtras,
   deleteRefusal,
@@ -684,6 +685,17 @@ describe('agent restore / ls --alive', () => {
   const deadWait = ok({ wait: { signal: 'exit', immediate: true } });
   const aliveWait = ok({ wait: { timedOut: true, timeoutMs: 1000 } });
 
+  it('buildRestoreBody: claude is top-level, the rest use their config object, unknown modes refuse', () => {
+    expect(buildRestoreBody('claude', '11111111-2222-3333-4444-555555555555')).toEqual({
+      resumeSessionId: '11111111-2222-3333-4444-555555555555',
+    });
+    expect(buildRestoreBody('opencode', 'ses_x')).toEqual({ openCodeConfig: { continueSession: 'ses_x' } });
+    expect(buildRestoreBody('gemini', 'g')).toEqual({ geminiConfig: { resumeSession: 'g' } });
+    // A mode with no resume field returns null so the caller refuses — sending a body the
+    // schema would strip would silently start a FRESH conversation.
+    expect(buildRestoreBody('shell', 'x')).toBeNull();
+  });
+
   it('probeAlive: an immediate exit is dead, a timeout is alive, an error is unknown', async () => {
     expect(await probeAlive(fakeDeps([deadWait]), OTHER)).toBe('dead');
     expect(await probeAlive(fakeDeps([aliveWait]), OTHER)).toBe('alive');
@@ -698,7 +710,7 @@ describe('agent restore / ls --alive', () => {
   });
 
   it('restore refuses a live worker and never calls the runner', async () => {
-    const deps = fakeDeps([aliveWait]);
+    const deps = fakeDeps([ok([{ id: OTHER }]), aliveWait]);
     let ran = false;
     expect(await agentRestore(deps, { id: OTHER, runner: async () => ((ran = true), { code: 0, output: '' }) })).toBe(
       EXIT.refused
@@ -708,7 +720,7 @@ describe('agent restore / ls --alive', () => {
   });
 
   it('restore refuses an UNKNOWN probe (capacity, 5xx, timeout) — only a proven corpse is respawned', async () => {
-    const deps = fakeDeps([apiError(409, 'SESSION_BUSY', 'waiter cap')]);
+    const deps = fakeDeps([ok([{ id: OTHER }]), apiError(409, 'SESSION_BUSY', 'waiter cap')]);
     let ran = false;
     expect(await agentRestore(deps, { id: OTHER, runner: async () => ((ran = true), { code: 0, output: '' }) })).toBe(
       EXIT.refused
@@ -731,7 +743,7 @@ describe('agent restore / ls --alive', () => {
   });
 
   it('restore hands a dead session (and the --resume id) to the runner and reports its result', async () => {
-    const deps = fakeDeps([deadWait]);
+    const deps = fakeDeps([ok([{ id: OTHER }]), deadWait]);
     const seen: unknown[] = [];
     const runner = async (id: string, resume: string | undefined) => (
       seen.push([id, resume]),
@@ -740,11 +752,124 @@ describe('agent restore / ls --alive', () => {
     expect(await agentRestore(deps, { id: OTHER, resume: 'ses_1', runner })).toBe(EXIT.ok);
     expect(seen).toEqual([[OTHER, 'ses_1']]);
     expect(deps.out.join('')).toMatch(/restored .*respawned/s);
-    const failing = fakeDeps([deadWait]);
+    const failing = fakeDeps([ok([{ id: OTHER }]), deadWait]);
     expect(await agentRestore(failing, { id: OTHER, runner: async () => ({ code: 1, output: 'no tool' }) })).toBe(
       EXIT.error
     );
     expect(failing.err.join('')).toMatch(/restore failed .*no tool/);
+  });
+
+  it('restore refuses without an id or --last, and refuses an ambiguous prefix', async () => {
+    const bare = fakeDeps([]);
+    expect(await agentRestore(bare, {})).toBe(EXIT.refused);
+    expect(bare.err.join('')).toMatch(/give a session id/);
+
+    const ambiguous = fakeDeps([
+      ok([{ id: '94990c6d-aaaa-4a29-aa83-89275327732c' }, { id: '94990c6d-bbbb-4a29-aa83-89275327732c' }]),
+    ]);
+    expect(await agentRestore(ambiguous, { id: '94990c6d' })).toBe(EXIT.refused);
+    expect(ambiguous.err.join('')).toMatch(/ambiguous/);
+  });
+
+  it('restore rebuilds a DELETED session from the lifecycle record via the create route', async () => {
+    const record = {
+      id: '2fa5c528-9412-454c-99c2-cf00a0fab975',
+      name: 'w35-NeonGetaway',
+      mode: 'opencode',
+      workingDir: '/cases/NeonGetaway',
+      ts: 1,
+    };
+    const deps = fakeDeps((o) => {
+      if (o.path === '/api/v1/sessions' && o.method === 'GET') return ok([]);
+      return ok({ session: { id: OTHER } });
+    });
+    const seen: { mode: string; workingDir: string }[] = [];
+    expect(
+      await agentRestore(deps, {
+        id: '2fa5c528',
+        deleted: () => [record],
+        discover: async (o) => (seen.push(o), 'ses_f30a8504fffe4JG3YNIuQcBFdJ'),
+      })
+    ).toBe(EXIT.ok);
+    expect(seen).toEqual([{ mode: 'opencode', workingDir: '/cases/NeonGetaway' }]);
+    const create = deps.calls.find((c) => c.method === 'POST');
+    expect(create?.path).toBe('/api/v1/sessions');
+    expect(create?.body).toMatchObject({
+      workingDir: '/cases/NeonGetaway',
+      mode: 'opencode',
+      name: 'w35-NeonGetaway (Restore)',
+      openCodeConfig: { continueSession: 'ses_f30a8504fffe4JG3YNIuQcBFdJ' },
+      parentSessionId: SELF,
+    });
+    // Create registers the session; `/interactive` is what actually launches the pane.
+    expect(deps.calls.find((c) => c.path.endsWith('/interactive'))?.path).toBe(`/api/v1/sessions/${OTHER}/interactive`);
+    expect(deps.out.join('')).toMatch(/restored 2fa5c528 as 94990c6d/);
+  });
+
+  it('restore reports a created-but-unstartable session instead of claiming success', async () => {
+    const deps = fakeDeps((o) => {
+      if (o.method === 'GET') return ok([]);
+      if (o.path.endsWith('/interactive')) return apiError(500, 'OPERATION_FAILED', 'pane died');
+      return ok({ session: { id: OTHER } });
+    });
+    expect(
+      await agentRestore(deps, {
+        id: '2fa5c528',
+        deleted: () => [{ id: '2fa5c528', mode: 'opencode', workingDir: '/cases/A', ts: 1 }],
+        discover: async () => 'ses_x',
+      })
+    ).toBe(EXIT.error);
+    expect(deps.err.join('')).toMatch(/could not start its pane/);
+  });
+
+  it('restore --last takes the newest deleted record and prefers an explicit --resume over discovery', async () => {
+    const records = [
+      { id: 'aaaa0000-0000-0000-0000-000000000000', mode: 'claude', workingDir: '/cases/A', ts: 2 },
+      { id: 'bbbb0000-0000-0000-0000-000000000000', mode: 'claude', workingDir: '/cases/B', ts: 1 },
+    ];
+    const deps = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
+    let discovered = false;
+    expect(
+      await agentRestore(deps, {
+        last: true,
+        resume: '11111111-2222-3333-4444-555555555555',
+        deleted: () => records,
+        discover: async () => ((discovered = true), null),
+      })
+    ).toBe(EXIT.ok);
+    expect(discovered).toBe(false);
+    expect(deps.calls.find((c) => c.method === 'POST')?.body).toMatchObject({
+      workingDir: '/cases/A',
+      mode: 'claude',
+      resumeSessionId: '11111111-2222-3333-4444-555555555555',
+    });
+  });
+
+  it('restore refuses a deleted session it cannot resume: no conversation id, remote, or no workingDir', async () => {
+    const noId = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
+    expect(
+      await agentRestore(noId, {
+        id: '2fa5c528',
+        deleted: () => [{ id: '2fa5c528', mode: 'opencode', workingDir: '/cases/A', ts: 1 }],
+        discover: async () => null,
+      })
+    ).toBe(EXIT.refused);
+    expect(noId.err.join('')).toMatch(/no CLI conversation id .* pass --resume/);
+
+    const remote = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
+    expect(
+      await agentRestore(remote, {
+        id: '2fa5c528',
+        deleted: () => [{ id: '2fa5c528', mode: 'opencode', workingDir: '/cases/A', remote: true, ts: 1 }],
+      })
+    ).toBe(EXIT.refused);
+    expect(remote.err.join('')).toMatch(/remote session/);
+
+    const noDir = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
+    expect(
+      await agentRestore(noDir, { id: '2fa5c528', deleted: () => [{ id: '2fa5c528', mode: 'opencode', ts: 1 }] })
+    ).toBe(EXIT.refused);
+    expect(noDir.err.join('')).toMatch(/no workingDir/);
   });
 
   it('ls --alive adds a PANE column and marks a dead worker', async () => {
