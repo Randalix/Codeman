@@ -1307,6 +1307,18 @@ export class WebServer extends EventEmitter {
       name: session?.name,
       mode: session?.mode,
       reason: reason || 'unknown',
+      // Enough to REBUILD this session from the log alone: `codeman agent restore` /
+      // `codeman session restore` read it back for a session that is already gone, and
+      // `workingDir` is the one field the create route needs. `cliSessionId` is the real
+      // conversation for claude/codex (a fresh opencode session knows only its Codeman id,
+      // which the restore path detects and replaces via `opencode session list`).
+      extra: session
+        ? {
+            workingDir: session.workingDir,
+            cliSessionId: session.claudeSessionId ?? undefined,
+            remote: Boolean(session.remote),
+          }
+        : undefined,
     });
 
     // Stop watching @fix_plan.md for this session

@@ -18,7 +18,8 @@ import { dataPath } from './config/instance.js';
 import { casePath } from './config/cases-dir.js';
 import { assertValidBasePath } from './config/base-path.js';
 import { installAgentSkillInto, removeAgentSkillFrom, type AgentSkillApplyResult } from './hooks-config.js';
-import { readCodemanEnvFile, registerAgentCommands } from './cli-agent.js';
+import { readCodemanEnvFile, registerAgentCommands, agentRestore, httpRequest } from './cli-agent.js';
+import type { AgentContext, AgentDeps } from './cli-agent.js';
 import { getSessionManager } from './session-manager.js';
 import { getTaskQueue } from './task-queue.js';
 import { getRalphLoop } from './ralph-loop.js';
@@ -357,8 +358,58 @@ sessionCmd
     console.log(output);
   });
 
-// ============ Task Commands ============
+/**
+ * An `AgentContext` for the root CLI, which runs OUTSIDE a Codeman session (no
+ * `CODEMAN_MUX`): the URL comes from `--url`, then `CODEMAN_API_URL`, then the local
+ * port, and there is no self id. Credentials follow the same `.env` fallback the agent
+ * path uses.
+ */
+function rootAgentContext(options: { url?: string }): AgentContext {
+  const apiUrl =
+    options.url?.trim() ||
+    process.env.CODEMAN_API_URL?.trim() ||
+    `http://127.0.0.1:${process.env.CODEMAN_PORT || '3000'}`;
+  const envFile = readCodemanEnvFile();
+  const password = process.env.CODEMAN_PASSWORD || envFile.CODEMAN_PASSWORD;
+  const username = process.env.CODEMAN_USERNAME || envFile.CODEMAN_USERNAME || 'admin';
+  return {
+    apiUrl,
+    selfId: process.env.CODEMAN_SESSION_ID?.trim() || '',
+    auth: password ? { username, password } : undefined,
+  };
+}
 
+sessionCmd
+  .command('restore [id]')
+  .description(
+    'Bring a session back: a live one whose pane died, or a DELETED one (--last) — resumes its CLI conversation'
+  )
+  .option('--last', 'Restore the most recently deleted session')
+  .option('--resume <cli-session-id>', 'Re-attach exactly this CLI conversation')
+  .option('--url <url>', 'Codeman server URL (defaults to CODEMAN_API_URL, then the local port)')
+  .option('--json', 'Machine-readable output')
+  .action(
+    async (id: string | undefined, options: { last?: boolean; resume?: string; url?: string; json?: boolean }) => {
+      const deps: AgentDeps = {
+        ctx: rootAgentContext(options),
+        request: httpRequest,
+        json: Boolean(options.json),
+        io: { out: (line) => console.log(line), err: (line) => console.error(line) },
+      };
+      try {
+        process.exitCode = await agentRestore(deps, {
+          id,
+          last: Boolean(options.last),
+          resume: options.resume,
+        });
+      } catch (err) {
+        console.error(palette.err(`✗ ${getErrorMessage(err)}`));
+        process.exitCode = 1;
+      }
+    }
+  );
+
+// ============ Task Commands ============
 const taskCmd = program.command('task').alias('t').description('Manage tasks');
 
 taskCmd
