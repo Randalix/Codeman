@@ -1065,21 +1065,24 @@ export async function agentPost(deps: AgentDeps, options: { id: string; text: st
 export interface InboxOptions {
   /** Block up to this long while the inbox is empty; absent = return at once. */
   waitMs?: number;
-  /** Read without acknowledging: the messages stay for the next read. */
+  /** Read without even marking the mail as seen: the monitor's non-consuming peek. */
   peek: boolean;
 }
 
 /**
- * `agent inbox` — read this session's mailbox. Messages are acknowledged (removed)
- * after they were printed, unless `--peek`; a crash between read and ack leaves
- * them in place. Exit 2 when a `--wait` ran out with nothing arriving.
+ * `agent inbox` — read this session's mailbox. Reading does NOT acknowledge: the
+ * messages stay until `codeman agent ack` (a plain read only marks them seen, so
+ * `ack` removes exactly what was read). A read that is never followed by an ack
+ * leaves the mail pending — the receiver visibly still owes the work instead of the
+ * order silently vanishing. `--peek` skips the seen-marking too (a monitor loop must
+ * not consume the mail a later turn should read). Exit 2 when `--wait` ran out.
  */
 export async function agentInbox(deps: AgentDeps, options: InboxOptions): Promise<number> {
   const self = encodeURIComponent(deps.ctx.selfId);
   const res = await deps.request(deps.ctx, {
     method: 'GET',
     path: `/api/v1/sessions/${self}/inbox`,
-    query: { wait: options.waitMs },
+    query: { wait: options.waitMs, peek: options.peek ? 1 : undefined },
     timeoutMs: (options.waitMs ?? 0) + 30_000,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
@@ -1102,16 +1105,45 @@ export async function agentInbox(deps: AgentDeps, options: InboxOptions): Promis
       deps.io.out('');
     }
   }
-  if (messages.length > 0 && !options.peek) {
-    const ack = await deps.request(deps.ctx, {
-      method: 'POST',
-      path: `/api/v1/sessions/${self}/inbox/ack`,
-      body: { ids: messages.map((m) => m.id) },
-    });
-    if (!ack.json?.success)
-      return fail(deps, `read ${messages.length} message(s) but could not acknowledge them: ${describeFailure(ack)}`);
-  }
   if (messages.length === 0 && options.waitMs !== undefined) return EXIT.timeout;
+  if (messages.length > 0 && !deps.json) {
+    // The read is not the job: say so right in the tool output, where the receiver reads it.
+    deps.io.err(
+      palette.muted(
+        options.peek
+          ? `(peek: ${messages.length} message(s) left unread — no ack)`
+          : `${messages.length} message(s) read, NOT acknowledged — handle them, reply with \`codeman agent post\`, then \`codeman agent ack\``
+      )
+    );
+  }
+  return EXIT.ok;
+}
+
+export interface AckOptions {
+  /** Message ids to acknowledge; empty means "everything this session has read". */
+  ids: string[];
+}
+
+/**
+ * `agent ack [ids…]` — acknowledge mail this session read, removing it from the
+ * mailbox. No ids acknowledges everything the read marked as seen; explicit ids
+ * acknowledge a subset. This is the second half of `inbox`: reading alone leaves the
+ * message pending, so an order that was read but not handled stays visible.
+ */
+export async function agentAck(deps: AgentDeps, options: AckOptions): Promise<number> {
+  const self = encodeURIComponent(deps.ctx.selfId);
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${self}/inbox/ack`,
+    body: options.ids.length > 0 ? { ids: options.ids } : {},
+  });
+  if (!res.json?.success) return fail(deps, `could not acknowledge: ${describeFailure(res)}`);
+  const data = res.json.data as { removed?: number; pending?: number } | undefined;
+  if (deps.json) emitJson(deps, data ?? {});
+  else
+    deps.io.out(
+      palette.ok(`${GLYPH.ok} acknowledged ${data?.removed ?? 0} message(s) (${data?.pending ?? 0} still pending)`)
+    );
   return EXIT.ok;
 }
 
@@ -1393,10 +1425,10 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('inbox')
     .description(
-      "Read this session's mailbox and acknowledge what was read; --wait blocks while it is empty (exit 2 on timeout)"
+      "Read this session's mailbox WITHOUT acknowledging; --wait blocks while it is empty (exit 2 on timeout)"
     )
     .option('-w, --wait <ms>', 'Block up to <ms> while the inbox is empty')
-    .option('--peek', 'Read without acknowledging')
+    .option('--peek', 'Read without even marking the mail as seen (for monitor loops)')
     .option('--json', 'Machine-readable output')
     .action((options: { wait?: string; peek?: boolean; json?: boolean }) =>
       run(Boolean(options.json), (deps) =>
@@ -1405,6 +1437,16 @@ export function registerAgentCommands(program: Command): Command {
           peek: Boolean(options.peek),
         })
       )
+    );
+
+  agent
+    .command('ack [ids...]')
+    .description(
+      'Acknowledge mail this session has read (all of it, or just the given ids) — the second half of `inbox`'
+    )
+    .option('--json', 'Machine-readable output')
+    .action((ids: string[], options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentAck(deps, { ids }))
     );
 
   return agent;

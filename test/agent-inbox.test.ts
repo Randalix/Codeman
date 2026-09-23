@@ -72,6 +72,72 @@ describe('post / list / ack', () => {
   });
 });
 
+describe('seen / ackSeen — reading no longer acknowledges', () => {
+  it('read marks exactly the returned messages as seen; ackSeen removes them', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'one');
+    inbox.post(A, B, 'two');
+    await inbox.read(A);
+    expect(inbox.pendingCount(A)).toBe(2); // a plain read is non-destructive
+    expect(inbox.ackSeen(A)).toBe(2);
+    expect(inbox.pendingCount(A)).toBe(0);
+  });
+
+  it('ackSeen never removes a message that arrived after the read', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'order');
+    await inbox.read(A);
+    inbox.post(A, B, 'please stop'); // the sender posts again while the receiver works
+    expect(inbox.ackSeen(A)).toBe(1);
+    expect(inbox.list(A).map((m) => m.text)).toEqual(['please stop']);
+  });
+
+  it('peek marks nothing, so ackSeen leaves the message in place', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'order');
+    await inbox.read(A, 60_000, undefined, { peek: true });
+    expect(inbox.ackSeen(A)).toBe(0);
+    expect(inbox.pendingCount(A)).toBe(1);
+  });
+
+  it('a second read of the same message stays seen; an empty ackSeen is a no-op with no change event', async () => {
+    const { inbox } = make();
+    const onChange = vi.fn();
+    inbox.onChange = onChange;
+    inbox.post(A, B, 'x'); // one change event
+    await inbox.read(A);
+    await inbox.read(A);
+    expect(inbox.ackSeen(A)).toBe(1); // exactly one removal
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(inbox.ackSeen(A)).toBe(0); // nothing seen anymore: no mutation
+    expect(onChange).toHaveBeenCalledTimes(2);
+  });
+
+  it('clear() and drop() forget the seen set so stale ids cannot acknowledge a later message', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'x');
+    await inbox.read(A);
+    inbox.clear(A);
+    inbox.post(A, B, 'y');
+    expect(inbox.ackSeen(A)).toBe(0);
+    expect(inbox.list(A).map((m) => m.text)).toEqual(['y']);
+
+    inbox.drop(A);
+    inbox.post(A, B, 'z');
+    await inbox.read(A);
+    expect(inbox.ackSeen(A)).toBe(1);
+  });
+
+  it('an explicit ack removes the id from the seen set too', async () => {
+    const { inbox } = make();
+    const r = inbox.post(A, B, 'x');
+    if (!r.ok) throw new Error('unreachable');
+    await inbox.read(A);
+    expect(inbox.ack(A, [r.message.id])).toBe(1);
+    expect(inbox.ackSeen(A)).toBe(0); // already acked, no double count
+  });
+});
+
 describe('read with wait', () => {
   it('answers at once when something is pending, without waiting', async () => {
     const { inbox } = make();
