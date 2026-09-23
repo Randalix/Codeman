@@ -104,6 +104,26 @@ describe('agent inbox routes', () => {
     }
   });
 
+  it('ack with no ids removes exactly what a read saw; ?peek marks nothing and a later post survives', async () => {
+    await app.inject({
+      method: 'POST',
+      url: `/api/sessions/${SESSION_ID}/inbox`,
+      payload: { text: 'order' },
+    });
+    // A peeked read marks nothing: an ack-all then removes nothing.
+    await app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox?peek=1` });
+    const noop = await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox/ack`, payload: {} });
+    expect(noop.json().data).toEqual({ removed: 0, pending: 1 });
+
+    // A normal read marks the order seen; a message posted afterwards is never swept away.
+    await app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox` });
+    await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox`, payload: { text: 'late' } });
+    const ack = await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox/ack`, payload: {} });
+    expect(ack.json().data).toEqual({ removed: 1, pending: 1 });
+    const rest = await app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox` });
+    expect(rest.json().data.messages.map((m: { text: string }) => m.text)).toEqual(['late']);
+  });
+
   it('validates the body and query: empty text, unknown fields, non-positive wait are 400', async () => {
     const empty = await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox`, payload: { text: '' } });
     expect(empty.statusCode).toBe(400);
