@@ -23,9 +23,54 @@
  * `CODEMAN_TMUX_SOCKET` (socket name, validated in tmux-manager).
  */
 
-import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, userInfo } from 'node:os';
+import { join, resolve, sep } from 'node:path';
 import { mkdirSync } from 'node:fs';
+
+/**
+ * Refuse to run under Vitest against the REAL home directory.
+ *
+ * `test/setup.ts` points `$HOME` at a throwaway dir before any application module
+ * loads; everything that persists (`~/.codeman`, `~/codeman-cases`, `~/.claude`)
+ * derives from `homedir()`, so that one redirect is the whole isolation. A run that
+ * skips the setup file — `npx vitest run` in a checkout, which finds no root config
+ * — writes straight into the live tree. That happened on 2026-09-24: fixtures
+ * overwrote `remote-hosts.json`/`settings.json`, deleted the user's cases and their
+ * `linked-cases.json`, and replaced the agent skill.
+ *
+ * The real home is taken from the passwd entry (`os.userInfo()`), which `$HOME`
+ * cannot move. Vitest sets `VITEST` itself, with or without our setup file, so the
+ * check holds however the suite was started. Throwing at import is deliberate:
+ * nearly every module imports this one, so the run dies before its first write.
+ */
+export function assertTestIsolation(
+  env: NodeJS.ProcessEnv = process.env,
+  home: string = homedir(),
+  realHome: string | undefined = readRealHome()
+): void {
+  if (!env.VITEST || !realHome) return;
+  const real = resolve(realHome);
+  const inRealHome = (p: string) => resolve(p) === real || resolve(p).startsWith(real + sep);
+  if (resolve(home) === real) {
+    throw new Error(
+      `Refusing to run tests against the real home (${real}): test/setup.ts did not run. ` +
+        'Use `npm test` (or `npx vitest run --config config/vitest.ci.config.ts`).'
+    );
+  }
+  if (env.CODEMAN_DATA_DIR && inRealHome(env.CODEMAN_DATA_DIR)) {
+    throw new Error(`Refusing to run tests with CODEMAN_DATA_DIR inside the real home (${env.CODEMAN_DATA_DIR}).`);
+  }
+}
+
+function readRealHome(): string | undefined {
+  try {
+    return userInfo().homedir || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+assertTestIsolation();
 
 /**
  * Instance name. Empty string (the default) = production layout (`~/.codeman`,

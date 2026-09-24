@@ -76,6 +76,17 @@ delete process.env.CODEMAN_BASE_URL;
 // imported. A setup file runs before any application module loads; a beforeEach
 // would already be too late.
 delete process.env.CODEMAN_INSTANCE;
+
+// A suite started from inside a Codeman session inherits that session's wiring to
+// the LIVE server: `CODEMAN_API_URL` (loopback, the real port), the session id and
+// the hook secret. Any code path that follows them — the agent CLI, hooks, the
+// statusline exporter — would drive production sessions from a test. Gone before any
+// module loads, like the instance vars above (incident 2026-09-24).
+delete process.env.CODEMAN_API_URL;
+delete process.env.CODEMAN_SESSION_ID;
+delete process.env.CODEMAN_MUX;
+delete process.env.CODEMAN_MUX_NAME;
+delete process.env.CODEMAN_HOOK_SECRET_FILE;
 delete process.env.CODEMAN_DATA_DIR;
 delete process.env.CODEMAN_TMUX_SOCKET;
 
