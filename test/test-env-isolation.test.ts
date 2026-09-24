@@ -36,6 +36,11 @@ const STRIPPED_ENV_VARS: Array<[name: string, why: string]> = [
   ['CODEMAN_TMUX_SOCKET', 'renames the socket resolveTmuxSocketName() returns'],
   ['CLAUDE_CONFIG_DIR', 'relocates the Claude tree, so transcript fixtures under the temp HOME read as missing'],
   ['CODEMAN_CASES_PATH', 'bypasses the temporary HOME and points case routes at a deployment bind mount'],
+  ['CODEMAN_API_URL', "a session's wiring to the LIVE server (loopback, real port): a test must never reach it"],
+  ['CODEMAN_SESSION_ID', 'names a live session the agent CLI / hooks would act on'],
+  ['CODEMAN_MUX', 'marks the process as inside a live Codeman session (agent CLI guard)'],
+  ['CODEMAN_MUX_NAME', "the live session's tmux name"],
+  ['CODEMAN_HOOK_SECRET_FILE', "the live server's hook secret"],
 ];
 
 const SETUP_SOURCE = readFileSync(fileURLToPath(new URL('./setup.ts', import.meta.url)), 'utf-8');
