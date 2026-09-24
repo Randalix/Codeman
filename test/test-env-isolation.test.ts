@@ -34,6 +34,11 @@ const STRIPPED_ENV_VARS: Array<[name: string, why: string]> = [
   ['CODEMAN_INSTANCE', 'moves the data dir to ~/.codeman-<name> and the tmux socket to codeman-<name>'],
   ['CODEMAN_DATA_DIR', 'ABSOLUTE override: bypasses the temp HOME and points the suite at a real data dir'],
   ['CODEMAN_TMUX_SOCKET', 'renames the socket resolveTmuxSocketName() returns'],
+  ['CODEMAN_API_URL', "a session's wiring to the LIVE server (loopback, real port): a test must never reach it"],
+  ['CODEMAN_SESSION_ID', 'names a live session the agent CLI / hooks would act on'],
+  ['CODEMAN_MUX', 'marks the process as inside a live Codeman session (agent CLI guard)'],
+  ['CODEMAN_MUX_NAME', "the live session's tmux name"],
+  ['CODEMAN_HOOK_SECRET_FILE', "the live server's hook secret"],
 ];
 
 const SETUP_SOURCE = readFileSync(fileURLToPath(new URL('./setup.ts', import.meta.url)), 'utf-8');
