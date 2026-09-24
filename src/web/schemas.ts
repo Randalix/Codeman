@@ -23,6 +23,7 @@ import { WEBHOOK_KINDS, WEBHOOK_SCOPES } from '../types/push.js';
 import { MIN_MATCH_LENGTH, MAX_MATCH_LENGTH } from '../config/agent-wait.js';
 import { MAX_WAKE_MACS } from '../config/remote-wake-limits.js';
 import { MAX_INPUT_LENGTH } from '../config/terminal-limits.js';
+import { AGENT_API_URL_PATTERN } from '../remote-agent-cli.js';
 import { enabledCliIds, enabledClis } from '../config/cli-registry/registry.js';
 import type { SessionMode } from '../types.js';
 import { isAdvisorModel } from '../types/session.js';
@@ -810,6 +811,14 @@ export const RemoteHostSchema = z.object({
     .refine((value) => value.split(',').length <= MAX_WAKE_MACS, {
       message: `Wake MAC accepts at most ${MAX_WAKE_MACS} comma-separated addresses`,
     })
+    .optional(),
+  // URL under which THIS host reaches the Codeman server; opts remote sessions into
+  // the `codeman agent` CLI (env + binary, see remote-agent-cli.ts). Exported into a
+  // shell command, hence the narrow pattern (no `$`/backtick/space).
+  agentApiUrl: z
+    .string()
+    .max(2048)
+    .regex(AGENT_API_URL_PATTERN, 'Agent API URL must be http(s)://host[:port][/path]')
     .optional(),
 });
 
