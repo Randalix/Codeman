@@ -19,6 +19,7 @@ import {
 } from '../config/terminal-history.js';
 import { MAX_EDITABLE_BYTES } from '../config/file-editing.js';
 import { MIN_MATCH_LENGTH, MAX_MATCH_LENGTH } from '../config/agent-wait.js';
+import { AGENT_API_URL_PATTERN } from '../remote-agent-cli.js';
 import { enabledCliIds, enabledClis } from '../config/cli-registry/registry.js';
 import type { SessionMode } from '../types.js';
 
@@ -760,6 +761,14 @@ export const RemoteHostSchema = z.object({
       /^[0-9a-fA-F]{2}([:-][0-9a-fA-F]{2}){5}(\s*,\s*[0-9a-fA-F]{2}([:-][0-9a-fA-F]{2}){5})*$/,
       'Wake MAC must be one or more MAC addresses, comma-separated'
     )
+    .optional(),
+  // URL under which THIS host reaches the Codeman server; opts remote sessions into
+  // the `codeman agent` CLI (env + binary, see remote-agent-cli.ts). Exported into a
+  // shell command, hence the narrow pattern (no `$`/backtick/space).
+  agentApiUrl: z
+    .string()
+    .max(2048)
+    .regex(AGENT_API_URL_PATTERN, 'Agent API URL must be http(s)://host[:port][/path]')
     .optional(),
 });
 

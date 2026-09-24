@@ -550,20 +550,26 @@ export function remoteDisplayPath(
  * silently do nothing until the session is relaunched (which for an owned remote
  * session means killing the remote tmux).
  *
- * Deliberately narrow: ONLY `wakeCommand`/`wakeMac` are taken from the host config,
- * and the host is authoritative for them (removing one in the config turns that
- * wake path off again). The other host-level fields (`commands`, ssh options) stay as
- * persisted so this cannot silently change how an existing pane connects.
+ * Deliberately narrow: ONLY `wakeCommand`/`wakeMac`/`agentApiUrl` are taken from the
+ * host config, and the host is authoritative for them (removing one in the config
+ * turns that path off again; `agentApiUrl` reaches the pane on its next launch). The
+ * other host-level fields (`commands`, ssh options) stay as persisted so this cannot
+ * silently change how an existing pane connects.
  */
-export function rehydrateRemoteHostFields<T extends { hostId: string; wakeCommand?: string; wakeMac?: string }>(
-  remote: T | undefined,
-  hostsById: ReadonlyMap<string, RemoteHost>
-): T | undefined {
+export function rehydrateRemoteHostFields<
+  T extends { hostId: string; wakeCommand?: string; wakeMac?: string; agentApiUrl?: string },
+>(remote: T | undefined, hostsById: ReadonlyMap<string, RemoteHost>): T | undefined {
   if (!remote) return remote;
   const host = hostsById.get(remote.hostId);
   if (!host) return remote;
-  if (remote.wakeCommand === host.wakeCommand && remote.wakeMac === host.wakeMac) return remote;
-  return { ...remote, wakeCommand: host.wakeCommand, wakeMac: host.wakeMac };
+  if (
+    remote.wakeCommand === host.wakeCommand &&
+    remote.wakeMac === host.wakeMac &&
+    remote.agentApiUrl === host.agentApiUrl
+  ) {
+    return remote;
+  }
+  return { ...remote, wakeCommand: host.wakeCommand, wakeMac: host.wakeMac, agentApiUrl: host.agentApiUrl };
 }
 
 export function toSessionRemote(host: RemoteHost, remoteCase: RemoteCase): SessionRemote {
@@ -579,6 +585,9 @@ export function toSessionRemote(host: RemoteHost, remoteCase: RemoteCase): Sessi
     // sleeping host without a second config read (see remote-wake.ts).
     wakeCommand: host.wakeCommand,
     wakeMac: host.wakeMac,
+    // The URL this host reaches us under: remote agents get `codeman agent` (see
+    // remote-agent-cli.ts). Attached sessions below do not — another Codeman owns them.
+    agentApiUrl: host.agentApiUrl,
     // COD-105 — the COD-104 launch path creates the remote session, so we own it
     // (an explicit kill may propagate a remote kill-session). Discovered+attached
     // sessions go through `toAttachedSessionRemote` with `owned: false`.

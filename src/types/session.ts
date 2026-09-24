@@ -116,6 +116,13 @@ export interface RemoteHost extends RemoteSshOptions {
    * after each suspend.
    */
   wakeCommand?: string;
+  /**
+   * Optional URL under which THIS host reaches the Codeman server (e.g.
+   * `http://192.168.50.194:3459`). Set = remote sessions get the `codeman agent`
+   * env and the standalone agent CLI in `~/.local/bin/codeman` (see
+   * remote-agent-cli.ts). Absent = no agent CLI remotely, today's behavior.
+   */
+  agentApiUrl?: string;
 }
 
 export interface RemoteCase {
@@ -163,6 +170,8 @@ export interface SessionRemote extends RemoteSshOptions {
   wakeCommand?: string;
   /** Wake-on-LAN MAC address(es) from the host config (see `RemoteHost.wakeMac`). */
   wakeMac?: string;
+  /** Agent API URL from the host config (see `RemoteHost.agentApiUrl`). */
+  agentApiUrl?: string;
 }
 
 /**

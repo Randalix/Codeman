@@ -80,6 +80,7 @@ import {
   remoteSshTarget,
   remoteTmuxSessionAlive,
 } from './remote-hosts.js';
+import { installRemoteAgentCli, remoteAgentEnvPrefix } from './remote-agent-cli.js';
 import {
   buildDockerBaseArgs,
   buildDockerCreateArgs,
@@ -913,7 +914,11 @@ export function buildRemoteLaunchCommand(options: {
   // Innermost: the command tmux runs in the new pane. Run via `/bin/sh -c` by
   // tmux, so the path needs shell-quoting here. `exec` replaces the shell with
   // the CLI so the pane PID is the agent itself.
-  const paneCommand = `cd ${shellescape(remote.remotePath)} && ${modeCommand}`;
+  //
+  // With the host's `agentApiUrl`, the env `codeman agent` needs is exported first
+  // (see remote-agent-cli.ts); it survives the login-shell wrapper. Without it the
+  // prefix is empty and the command is byte-identical to before.
+  const paneCommand = `${remoteAgentEnvPrefix(remote, sessionId)}cd ${shellescape(remote.remotePath)} && ${modeCommand}`;
 
   // The tmux command line, with `\;` separating commands so the config `set`s
   // apply on the SAME connection (and are idempotent on reattach). Options are
@@ -2013,6 +2018,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : remote
           ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
           : localFullCmd;
+      // Best-effort, in the background: the agent CLI is only needed once the agent
+      // is asked to use it, and a failed copy must never block the launch.
+      if (remote && remote.owned !== false) void installRemoteAgentCli(remote);
 
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
@@ -2274,6 +2282,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : remote
         ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
         : localFullCmd;
+    if (remote && remote.owned !== false) void installRemoteAgentCli(remote);
 
     try {
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.

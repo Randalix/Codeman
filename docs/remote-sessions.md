@@ -27,7 +27,7 @@ Types live in `src/types/session.ts`; persistence in `src/remote-hosts.ts`.
 | Type                                         | Role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `RemoteSshOptions`                           | The **HOW-to-reach** fields, shared by host + session: `identityFile`, `socksProxy` (`host:port`), `jumpHost` (`[user@]host[:port]`), `extraSshOptions` (`KEY=VALUE[]`). Every field optional — all-absent reproduces port-22, default-identity, directly-SSH-able behavior.                                                                                                                                                                                                               |
-| `RemoteHost` (extends `RemoteSshOptions`)    | A saved host: `id`, `label`, `host`, `username`, `port?`, `commands?` (per-mode launch command override).                                                                                                                                                                                                                                                                                                                                                                                  |
+| `RemoteHost` (extends `RemoteSshOptions`)    | A saved host: `id`, `label`, `host`, `username`, `port?`, `commands?` (per-mode launch command override), `agentApiUrl?` (see [`codeman agent` on the remote host](#codeman-agent-on-the-remote-host)).                                                                                                                                                                                                                                                                                    |
 | `RemoteCase`                                 | A working directory on a host: `name`, `type: 'remote'`, `hostId`, `remotePath`.                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `SessionRemote` (extends `RemoteSshOptions`) | The resolved bundle stamped onto a live session: host coordinates + `remotePath` + `commands`, plus **`owned?`** and **`remoteSessionName?`** (COD-105 — see [Ownership](#ownership-launched-vs-discovered-and-attached-cod-105)). Built by `toSessionRemote(host, case)` (sets `owned: true`) for the launch path, or `toAttachedSessionRemote(host, name, path)` (sets `owned: false`) for the attach path. Both copy the advanced SSH options through so every connection is identical. |
 | `RemoteCommandMode`                          | `Extract<SessionMode, 'shell' \| 'claude' \| 'opencode' \| 'codex' \| 'gemini' \| 'antigravity' \| 'pi' \| 'grok' \| 'deepseek' \| 'omp'>` — the modes that can run remotely.                                                                                                                                                                                                                                                                                                              |
@@ -447,6 +447,45 @@ buffering + flush order, MAC parsing/magic packet, live host-config resolution, 
 guard) and `test/routes/session-remote-wake.test.ts` (the input route buffers instead of writing
 into a sleeping host, the reachability route never wakes, and the wake route reports the
 no-target case the UI turns into "configure WoL").
+
+## `codeman agent` on the remote host
+
+A local session's agent finds `codeman` on PATH and inherits `CODEMAN_MUX`,
+`CODEMAN_API_URL` and `CODEMAN_SESSION_ID`, so it can use the mailbox and the other
+`codeman agent` verbs. A remote agent runs on another machine and has none of that —
+and the server's own `CODEMAN_API_URL` is loopback, wrong over there. Guessing a LAN
+address is exactly what the agent CLI refuses to do, so this is **opt-in per host**:
+
+```json
+{ "id": "hufflepuff", "host": "192.168.50.137", "username": "j", "agentApiUrl": "http://192.168.50.194:3459" }
+```
+
+`agentApiUrl` is the URL under which **that host** reaches this server. With it
+(`src/remote-agent-cli.ts`):
+
+- **Env** — the launch exports `CODEMAN_MUX=1 CODEMAN_SESSION_ID=<id>
+CODEMAN_API_URL=<agentApiUrl>` before `cd … && <cli>`. Env survives the
+  `$SHELL -i -l -c` wrapper; a PATH prefix would not (the login profile rebuilds PATH).
+  Without the field the launch command is byte-identical to before.
+- **Binary** — `npm run build` bundles `src/remote-agent-cli-entry.ts` (only the `agent`
+  verbs) into one file, `dist/remote/codeman-agent.cjs`, that runs on a bare `node`
+  (18+) on the remote host. On every owned launch/respawn the server pipes it over
+  ssh (same connection args as the launch) into `~/.local/bin/codeman` — in the
+  background, best-effort, once per host and bundle hash per server process. A
+  `codeman` there without the bundle's marker line (a real install) is never
+  replaced.
+- **Validation** — `agentApiUrl` must match `http(s)://host[:port][/path]` with no `$`,
+  backtick, quote or space: it is exported into shell code that crosses the local
+  `bash -c "…"` layer. Checked by the schema and again by the launch builder.
+- Host config is authoritative (`rehydrateRemoteHostFields`), like the wake fields; a
+  running pane gets the env on its next launch. Attached (non-owned) sessions do not
+  get it — another Codeman owns them.
+
+Not covered: a password-protected server (the remote pane gets no
+`CODEMAN_PASSWORD`). Tests: `test/remote-agent-cli.test.ts` (URL validation, env
+export in a real `sh`, install script against a fake `HOME` including the
+foreign-file guard, install memo/failure, and the bundle running without
+`node_modules`).
 
 ## API
 
