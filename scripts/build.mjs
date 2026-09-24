@@ -29,6 +29,24 @@ function run(label, cmd) {
 run('tsc', 'tsc');
 run('chmod dist/index.js', 'chmod +x dist/index.js');
 
+// 1b. Standalone `codeman agent` CLI for SSH-remote hosts (src/remote-agent-cli.ts
+// copies it to ~/.local/bin/codeman there). One self-contained file that runs on a
+// bare `node`: a remote host has no checkout and no node_modules. Line 2 is the
+// marker the remote install checks before it replaces a file.
+console.log('\n[build] remote agent cli');
+const { build: esbuild } = await import('esbuild');
+await esbuild({
+  entryPoints: [join(ROOT, 'src/remote-agent-cli-entry.ts')],
+  bundle: true,
+  platform: 'node',
+  target: 'node18',
+  format: 'cjs',
+  outfile: join(ROOT, 'dist/remote/codeman-agent.cjs'),
+  banner: { js: '#!/usr/bin/env node\n// codeman-remote-agent-cli' },
+  logLevel: 'warning',
+});
+run('chmod remote agent cli', 'chmod +x dist/remote/codeman-agent.cjs');
+
 // 2. Copy static assets (clean first to remove stale hashed files from previous builds)
 run('clean public', 'rm -rf dist/web/public');
 run('prepare dirs', 'mkdir -p dist/web dist/templates dist/web/public/vendor');
