@@ -165,7 +165,7 @@ import {
 import { LRUMap } from '../../utils/lru-map.js';
 import { findLatestOmpSessionId } from '../../utils/omp-session-resolver.js';
 import { scanOmpSessionsHistory } from '../../omp-transcript.js';
-import { scanCodexSessionsHistory, codexThreadBySessionId } from '../../codex-transcript.js';
+import { scanCodexSessionsHistory, codexThreadBySessionId, codemanOwnerOfRollout } from '../../codex-transcript.js';
 import {
   getLastTranscriptResponse,
   isExternalCliTranscriptMode,
@@ -2509,19 +2509,21 @@ export function registerSessionRoutes(
   // ── Codex response-viewer support ───────────────────────────────────────────────────────
   // Read the rollout's session_meta identity fields (plus turn_context cwd as
   // a fallback when the huge session_meta line got truncated by the head read).
-  function readCodexRolloutMeta(head: string): { cwd?: string; originator?: string } {
+  function readCodexRolloutMeta(head: string): { cwd?: string; originator?: string; source?: string } {
     let cwd: string | undefined;
     let originator: string | undefined;
+    let source: string | undefined;
     for (const line of head.split('\n')) {
       if (!line) continue;
       try {
         const entry = JSON.parse(line) as {
           type?: string;
-          payload?: { cwd?: string; originator?: string };
+          payload?: { cwd?: string; originator?: string; source?: unknown };
         };
         if (entry.type === 'session_meta') {
           cwd ??= entry.payload?.cwd;
           originator ??= entry.payload?.originator;
+          if (typeof entry.payload?.source === 'string') source ??= entry.payload.source;
         } else if (entry.type === 'turn_context') {
           cwd ??= entry.payload?.cwd;
         }
@@ -2530,7 +2532,7 @@ export function registerSessionRoutes(
       }
       if (cwd && originator) break;
     }
-    return { cwd, originator };
+    return { cwd, originator, source };
   }
 
   // The pane's last Enter (Session.lastSubmitAt) correlated against
@@ -2650,7 +2652,6 @@ export function registerSessionRoutes(
     // still scanned — a /new rollout may land in the same clock tick). The
     // 128 KiB head budget covers the session_meta line, which embeds full
     // base_instructions (observed max ~22 KiB on codex 0.144).
-    const originator = `codeman_${session.id}`;
     const wantCwd = session.workingDir.toLowerCase();
     const headBuf = Buffer.alloc(131072);
     let cwdFallback: { path: string; mtimeMs: number } | undefined;
@@ -2658,13 +2659,16 @@ export function registerSessionRoutes(
       if (idMatch && f.mtimeMs < idMatch.mtimeMs) break;
       const meta = await readCodexRolloutMetaCached(f.path, headBuf);
       if (!meta) continue;
-      if (meta.originator === originator) return f.path; // newest-first → first hit wins
+      // A daemon client's originator names the pane that started the daemon, not the
+      // pane that wrote the rollout — codemanOwnerOfRollout() leaves it unowned.
+      const owner = codemanOwnerOfRollout(meta);
+      if (owner === session.id) return f.path; // newest-first → first hit wins
       if (
         !cwdFallback &&
         !idMatch &&
         meta.cwd?.toLowerCase() === wantCwd &&
         // A rollout stamped by another codeman pane belongs to that pane.
-        !(meta.originator?.startsWith('codeman_') && meta.originator !== originator)
+        !(owner !== undefined && owner !== session.id)
       ) {
         cwdFallback = f;
       }
@@ -2677,11 +2681,13 @@ export function registerSessionRoutes(
   // rewritten (verified: resume appends without touching it), so the parsed
   // identity of a given path can be cached forever. This turns the per-request
   // scan into stat calls plus head reads for new files only.
-  const codexRolloutMetaCache = new LRUMap<string, { cwd?: string; originator?: string }>({ maxSize: 4096 });
+  const codexRolloutMetaCache = new LRUMap<string, { cwd?: string; originator?: string; source?: string }>({
+    maxSize: 4096,
+  });
   async function readCodexRolloutMetaCached(
     filePath: string,
     headBuf: Buffer
-  ): Promise<{ cwd?: string; originator?: string } | null> {
+  ): Promise<{ cwd?: string; originator?: string; source?: string } | null> {
     const cached = codexRolloutMetaCache.get(filePath);
     if (cached) return cached;
     const head = await readFileHead(filePath, headBuf);
