@@ -1,13 +1,16 @@
 /**
- * @fileoverview Host-local restore helpers: opencode conversation discovery and the
+ * @fileoverview Host-local restore helpers: per-mode conversation discovery (claude
+ * transcript, codex originator, opencode session list) and the
  * `deleted` records the server writes to the lifecycle log. Pure/injectable — nothing
  * here spawns opencode or touches the live server.
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { CodexHistorySession } from '../src/codex-transcript.js';
 import {
+  claudeTranscriptExists,
   DISCOVERY_BY_MODE,
   discoverCliSessionId,
   findDeletedSession,
@@ -45,7 +48,9 @@ describe('discoverCliSessionId', () => {
       calls.push([command, args, cwd]);
       return { code: 0, stdout: JSON.stringify([{ id: 'ses_x', directory: '/cases/A', updated: 1 }]) };
     };
-    expect(await discoverCliSessionId({ mode: 'opencode', workingDir: '/cases/A', runner })).toBe('ses_x');
+    expect(await discoverCliSessionId({ mode: 'opencode', workingDir: '/cases/A', sessionId: 'cm-1', runner })).toBe(
+      'ses_x'
+    );
     expect(calls[0][0]).toBe('opencode');
     expect(calls[0][1]).toContain('session');
     expect(calls[0][2]).toBe('/cases/A');
@@ -53,9 +58,84 @@ describe('discoverCliSessionId', () => {
 
   it('returns null for a failing runner and for a mode with no discovery', async () => {
     const failing: ConversationRunner = async () => ({ code: 1, stdout: '' });
-    expect(await discoverCliSessionId({ mode: 'opencode', workingDir: '/cases/A', runner: failing })).toBeNull();
-    expect(await discoverCliSessionId({ mode: 'claude', workingDir: '/cases/A' })).toBeNull();
+    expect(
+      await discoverCliSessionId({ mode: 'opencode', workingDir: '/cases/A', sessionId: 'cm-1', runner: failing })
+    ).toBeNull();
+    expect(await discoverCliSessionId({ mode: 'gemini', workingDir: '/cases/A', sessionId: 'cm-1' })).toBeNull();
     expect(DISCOVERY_BY_MODE.opencode).toBeDefined();
+  });
+});
+
+describe('claude discovery: the Codeman id is the conversation (--session-id)', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function projects(files: Record<string, string[]>): string {
+    const root = mkdtempSync(join(tmpdir(), 'codeman-claude-projects-'));
+    dirs.push(root);
+    for (const [dir, ids] of Object.entries(files)) {
+      mkdirSync(join(root, dir));
+      for (const id of ids) writeFileSync(join(root, dir, `${id}.jsonl`), '{}\n');
+    }
+    return root;
+  }
+
+  it('returns the Codeman id when Claude wrote a transcript for it, in any project folder', async () => {
+    const root = projects({ '-cases-A': ['other'], '-home-joe-wiki-Coding-Projects-Neon-Getaway': ['f2e180e8-x'] });
+    expect(claudeTranscriptExists(root, 'f2e180e8-x')).toBe(true);
+    expect(
+      await discoverCliSessionId({
+        mode: 'claude',
+        workingDir: '/whatever',
+        sessionId: 'f2e180e8-x',
+        claudeProjectsDir: root,
+      })
+    ).toBe('f2e180e8-x');
+  });
+
+  it('refuses (null) a session deleted before its first prompt: no transcript, nothing to resume', async () => {
+    const root = projects({ '-cases-A': ['other'] });
+    expect(
+      await discoverCliSessionId({
+        mode: 'claude',
+        workingDir: '/cases/A',
+        sessionId: 'never',
+        claudeProjectsDir: root,
+      })
+    ).toBeNull();
+    expect(claudeTranscriptExists(join(root, 'missing'), 'x')).toBe(false);
+  });
+});
+
+describe("codex discovery: the rollout stamped with this pane's originator", () => {
+  const row = (sessionId: string, originator?: string): CodexHistorySession =>
+    ({ sessionId, originator, workingDir: '/cases/A' }) as CodexHistorySession;
+
+  it('picks the newest rollout whose originator is codeman_<id>, ignoring other panes in the same dir', async () => {
+    const history = async () => [
+      row('thread-other-pane', 'codeman_cm-2'),
+      row('thread-after-new', 'codeman_cm-1'),
+      row('thread-first', 'codeman_cm-1'),
+      row('thread-manual', 'codex_cli_rs'),
+    ];
+    expect(
+      await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: history })
+    ).toBe('thread-after-new');
+  });
+
+  it('returns null when no rollout carries the originator, or the scan fails', async () => {
+    const none = async () => [row('thread-manual', 'codex_cli_rs')];
+    expect(
+      await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: none })
+    ).toBeNull();
+    const broken = async (): Promise<CodexHistorySession[]> => {
+      throw new Error('EACCES');
+    };
+    expect(
+      await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: broken })
+    ).toBeNull();
   });
 });
 
