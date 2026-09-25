@@ -474,6 +474,15 @@ CODEMAN_API_URL=<agentApiUrl>` before `cd … && <cli>`. Env survives the
   background, best-effort, once per host and bundle hash per server process. A
   `codeman` there without the bundle's marker line (a real install) is never
   replaced.
+- **Skill** — the binary alone is not enough: an agent that never heard of the
+  `codeman agent` CLI treats it as a missing tool (a remote claude asked to read its
+  mailbox went to Gmail). Next to the binary the server mirrors the skill its own agents load —
+  `~/.claude/skills/codeman` of the server user, `SKILL.md` plus `reference/` — as a
+  tar over the same ssh into `~/.claude/skills/codeman` on the host, stamped with a
+  `.codeman-remote-mirror` marker file and swapped in whole. Same rules as the binary:
+  background, best-effort, once per host and skill content per process (an edited
+  skill goes out with the next launch); no local skill → nothing is sent; a skill dir
+  there without the marker (the host user's own, or a symlink) is never touched.
 - **Validation** — `agentApiUrl` must match `http(s)://host[:port][/path]` with no `$`,
   backtick, quote or space: it is exported into shell code that crosses the local
   `bash -c "…"` layer. Checked by the schema and again by the launch builder.
@@ -484,8 +493,9 @@ CODEMAN_API_URL=<agentApiUrl>` before `cd … && <cli>`. Env survives the
 Not covered: a password-protected server (the remote pane gets no
 `CODEMAN_PASSWORD`). Tests: `test/remote-agent-cli.test.ts` (URL validation, env
 export in a real `sh`, install script against a fake `HOME` including the
-foreign-file guard, install memo/failure, and the bundle running without
-`node_modules`).
+foreign-file guard, install memo/failure, the bundle running without
+`node_modules`, the skill mirror against a fake `HOME` with real `tar`, and the
+wiring guard that every launch path mirrors the skill with the binary).
 
 ## API
 
