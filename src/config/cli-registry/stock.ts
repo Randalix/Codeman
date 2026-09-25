@@ -553,6 +553,12 @@ const CODEX: CliEntry = {
         id: 'default',
         args: [
           { lit: 'codex' },
+          // codex 0.157 runs its TUI against a shared app-server daemon that inherits the
+          // environment of the pane that STARTED it, so a later pane's rollout carries the
+          // starter's CODEX_INTERNAL_ORIGINATOR_OVERRIDE and Codeman reads the wrong
+          // transcript for both. Every pane keeps its own server. Gated: 0.154 rejects the
+          // flag (exit 2, dead pane).
+          { flag: '--no-daemon', when: { capabilityGate: 'noDaemon' } },
           { flag: '--dangerously-bypass-approvals-and-sandbox', when: { param: 'bypassApprovals', is: true } },
           { flag: '--config', value: 'tui.animations=true', when: { param: 'animations', is: true } },
           { flag: '--config', value: 'tui.animations=false', when: { param: 'animations', is: false } },
@@ -628,6 +634,8 @@ const CODEX: CliEntry = {
     // 160, 198, 235 and 282 columns the indents were 0, 2, 4, 6 and 8 at every one,
     // never 1, so the width is not a function of the pane.
     transcriptGutter: 2,
+    // `--no-daemon` (launch args above): absent in 0.154, present in 0.157.
+    gates: { noDaemon: { minVersion: '0.157.0', failClosed: true } },
     transcript: 'codex-rollout',
     altScreen: 'strip-full',
     echo: { policy: 'predict', anchor: { kind: 'cursor' }, predictProfile: 'codex' },

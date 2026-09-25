@@ -23,6 +23,7 @@ import { tmpdir } from 'node:os';
 import {
   scanCodexSessionsHistory,
   codexThreadBySessionId,
+  codemanOwnerOfRollout,
   __clearCodexIdentityCache,
 } from '../src/codex-transcript.js';
 
@@ -220,6 +221,23 @@ describe('scanCodexSessionsHistory', () => {
     ]);
     const rows = await scanCodexSessionsHistory();
     expect(rows[0].source).toBe('vscode');
+  });
+
+  it("trusts an originator only on a rollout the pane's own TUI wrote", () => {
+    expect(codemanOwnerOfRollout({ originator: 'codeman_abc', source: 'cli' })).toBe('abc');
+    // Older codex wrote no `source`: the originator keeps its old meaning.
+    expect(codemanOwnerOfRollout({ originator: 'codeman_abc' })).toBe('abc');
+    // A daemon client stamps the originator of whichever pane started the daemon.
+    expect(codemanOwnerOfRollout({ originator: 'codeman_abc', source: 'vscode' })).toBeUndefined();
+    expect(codemanOwnerOfRollout({ originator: 'codex_cli_rs', source: 'cli' })).toBeUndefined();
+  });
+
+  it('codexThreadBySessionId skips daemon-client rollouts', () => {
+    const rows = [
+      { sessionId: 'thread-throwaway', originator: 'codeman_w5', source: 'vscode' },
+      { sessionId: 'thread-w5', originator: 'codeman_w5', source: 'cli' },
+    ] as never;
+    expect(codexThreadBySessionId(rows).get('w5')).toBe('thread-w5');
   });
 
   it('drops a rollout that records no working directory', async () => {
