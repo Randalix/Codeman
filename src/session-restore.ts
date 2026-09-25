@@ -4,12 +4,10 @@
  * `codeman agent restore` (inside a session) and `codeman session restore` (from a
  * plain shell on the host) both need two things the HTTP API cannot give them:
  *
- * 1. **The CLI's own conversation id for a DELETED session.** Codeman does not track
- *    opencode's `ses_…` id — a fresh opencode pane is launched without `--session`, so
- *    `claudeSessionId` is just Codeman's own id (`src/session.ts`). opencode itself
- *    knows the conversation, and its supported `session list --format json` exposes it
- *    per directory. That is the discovery below; modes without one must be handed an
- *    explicit `--resume <cli-id>`.
+ * 1. **The CLI's own conversation id for a DELETED session.** For a fresh pane the
+ *    recorded `claudeSessionId` is just Codeman's own id (`src/session.ts`); which CLI
+ *    conversation that stands for is per mode — see `DISCOVERY_BY_MODE`. Modes without
+ *    a discovery must be handed an explicit `--resume <cli-id>`.
  * 2. **What the deleted session looked like.** The server writes `deleted` entries to
  *    `~/.codeman/session-lifecycle.jsonl` with `workingDir`/`cliSessionId`/`remote` in
  *    `extra` (see `WebServer._doCleanupSession`); the CLI reads that file back.
@@ -20,7 +18,9 @@
  * @module session-restore
  */
 import { execFile } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { codexThreadBySessionId, scanCodexSessionsHistory, type CodexHistorySession } from './codex-transcript.js';
 import { dataPath } from './config/instance.js';
 
 /** Runs a CLI (`opencode session list`) and returns its exit code + stdout; injectable for tests. */
@@ -62,15 +62,49 @@ export function pickOpenCodeSession(stdout: string, workingDir: string): string 
 }
 
 /**
- * Per-mode discovery of a CLI's own conversation id from a working directory. DATA, not
- * a `mode === '…'` branch (the repo guard forbids those outside the stock catalog): a
- * mode absent here has no discovery and its restore needs an explicit `--resume`.
+ * Whether Claude has a transcript for conversation `id` under `projectsDir` (any project
+ * folder: the folder name is Claude's own slug of the cwd, so it is matched by file, not
+ * derived). A session deleted before its first prompt has none, and resuming it fails.
  */
-export const DISCOVERY_BY_MODE: Record<
-  string,
-  (workingDir: string, run: ConversationRunner) => Promise<string | null>
-> = {
-  opencode: async (workingDir, run) => {
+export function claudeTranscriptExists(projectsDir: string, id: string): boolean {
+  let dirs: string[];
+  try {
+    dirs = readdirSync(projectsDir);
+  } catch {
+    return false;
+  }
+  return dirs.some((dir) => existsSync(join(projectsDir, dir, `${id}.jsonl`)));
+}
+
+/** What a discovery knows about the session, plus the IO it may do (injectable for tests). */
+export interface DiscoveryContext {
+  workingDir: string;
+  /** The Codeman session id of the deleted session. */
+  sessionId: string;
+  run: ConversationRunner;
+  /** Codex rollouts, newest first (`scanCodexSessionsHistory`). */
+  codexHistory: () => Promise<CodexHistorySession[]>;
+  /** Claude's transcript root (`~/.claude/projects`). */
+  claudeProjectsDir: string;
+}
+
+/**
+ * Per-mode discovery of a CLI's own conversation id. DATA, not a `mode === '…'` branch
+ * (the repo guard forbids those outside the stock catalog): a mode absent here has no
+ * discovery and its restore needs an explicit `--resume`.
+ *
+ * - claude runs with `--session-id <codeman-id>`, so the Codeman id IS the conversation —
+ *   once Claude has written a transcript for it.
+ * - codex mints its own thread id, but Codeman launches it with
+ *   `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=codeman_<id>`, which codex stamps into every
+ *   rollout it writes: the newest rollout carrying this session's originator is the one.
+ * - opencode is matched by directory (newest), from its own session list.
+ */
+export const DISCOVERY_BY_MODE: Record<string, (ctx: DiscoveryContext) => Promise<string | null>> = {
+  claude: async ({ sessionId, claudeProjectsDir }) =>
+    claudeTranscriptExists(claudeProjectsDir, sessionId) ? sessionId : null,
+  codex: async ({ sessionId, codexHistory }) => codexThreadBySessionId(await codexHistory()).get(sessionId) ?? null,
+  opencode: async ({ workingDir, run }) => {
     const { code, stdout } = await run('opencode', ['session', 'list', '--format', 'json', '-n', '50'], workingDir);
     if (code !== 0) return null;
     return pickOpenCodeSession(stdout, workingDir);
@@ -78,19 +112,28 @@ export const DISCOVERY_BY_MODE: Record<
 };
 
 /**
- * Discover the CLI conversation for `mode` in `workingDir`, or null when the mode has no
- * discovery (or it failed). Never throws: a restore that cannot discover falls back to
- * "pass --resume", not to an unrelated error.
+ * Discover the CLI conversation of deleted session `sessionId` (`mode`, `workingDir`), or
+ * null when the mode has no discovery (or it found nothing / failed). Never throws: a
+ * restore that cannot discover falls back to "pass --resume", not to an unrelated error.
  */
 export async function discoverCliSessionId(options: {
   mode: string;
   workingDir: string;
+  sessionId: string;
   runner?: ConversationRunner;
+  codexHistory?: () => Promise<CodexHistorySession[]>;
+  claudeProjectsDir?: string;
 }): Promise<string | null> {
   const discover = DISCOVERY_BY_MODE[options.mode];
   if (!discover) return null;
   try {
-    return await discover(options.workingDir, options.runner ?? defaultRunner);
+    return await discover({
+      workingDir: options.workingDir,
+      sessionId: options.sessionId,
+      run: options.runner ?? defaultRunner,
+      codexHistory: options.codexHistory ?? scanCodexSessionsHistory,
+      claudeProjectsDir: options.claudeProjectsDir ?? join(process.env.HOME || '/tmp', '.claude', 'projects'),
+    });
   } catch {
     return null;
   }

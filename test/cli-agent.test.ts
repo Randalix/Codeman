@@ -783,7 +783,7 @@ describe('agent restore / ls --alive', () => {
       if (o.path === '/api/v1/sessions' && o.method === 'GET') return ok([]);
       return ok({ session: { id: OTHER } });
     });
-    const seen: { mode: string; workingDir: string }[] = [];
+    const seen: { mode: string; workingDir: string; sessionId: string }[] = [];
     expect(
       await agentRestore(deps, {
         id: '2fa5c528',
@@ -791,7 +791,9 @@ describe('agent restore / ls --alive', () => {
         discover: async (o) => (seen.push(o), 'ses_f30a8504fffe4JG3YNIuQcBFdJ'),
       })
     ).toBe(EXIT.ok);
-    expect(seen).toEqual([{ mode: 'opencode', workingDir: '/cases/NeonGetaway' }]);
+    expect(seen).toEqual([
+      { mode: 'opencode', workingDir: '/cases/NeonGetaway', sessionId: '2fa5c528-9412-454c-99c2-cf00a0fab975' },
+    ]);
     const create = deps.calls.find((c) => c.method === 'POST');
     expect(create?.path).toBe('/api/v1/sessions');
     expect(create?.body).toMatchObject({
@@ -804,6 +806,32 @@ describe('agent restore / ls --alive', () => {
     // Create registers the session; `/interactive` is what actually launches the pane.
     expect(deps.calls.find((c) => c.path.endsWith('/interactive'))?.path).toBe(`/api/v1/sessions/${OTHER}/interactive`);
     expect(deps.out.join('')).toMatch(/restored 2fa5c528 as 94990c6d/);
+  });
+
+  // Regression (2026-09-24/25, f2e180e8 / ffbf2dee): a fresh session records its OWN
+  // Codeman id as cliSessionId. Restore used to drop that and, with discovery for
+  // opencode only, refused claude and codex. Now the id goes to discovery, which knows
+  // it IS claude's conversation and maps it to codex's thread via the originator.
+  it.each([
+    ['claude', 'f2e180e8-7d08-4764-8eca-6d4839f7ee8f', { resumeSessionId: 'f2e180e8-7d08-4764-8eca-6d4839f7ee8f' }],
+    [
+      'codex',
+      '01a0d755-4d46-78d0-a739-078a9650d3c6',
+      { codexConfig: { resumeSessionId: '01a0d755-4d46-78d0-a739-078a9650d3c6' } },
+    ],
+  ])('restore of a fresh deleted %s session resumes the discovered conversation', async (mode, conversation, body) => {
+    const id = 'f2e180e8-7d08-4764-8eca-6d4839f7ee8f';
+    const deps = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
+    const seen: { mode: string; sessionId: string }[] = [];
+    expect(
+      await agentRestore(deps, {
+        id: 'f2e180e8',
+        deleted: () => [{ id, mode, workingDir: '/cases/A', cliSessionId: id, ts: 1 }],
+        discover: async (o) => (seen.push({ mode: o.mode, sessionId: o.sessionId }), conversation),
+      })
+    ).toBe(EXIT.ok);
+    expect(seen).toEqual([{ mode, sessionId: id }]);
+    expect(deps.calls.find((c) => c.method === 'POST')?.body).toMatchObject({ mode, ...body });
   });
 
   it('restore reports a created-but-unstartable session instead of claiming success', async () => {

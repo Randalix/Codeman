@@ -1028,7 +1028,7 @@ export interface RestoreOptions {
   /** Injectable dead-pane runner (tests spawn nothing). */
   runner?: RestoreRunner;
   /** Injectable conversation discovery (tests do not run opencode). */
-  discover?: (o: { mode: string; workingDir: string }) => Promise<string | null>;
+  discover?: (o: { mode: string; workingDir: string; sessionId: string }) => Promise<string | null>;
   /** Injectable deleted-record source (tests use a fixture). */
   deleted?: () => DeletedSessionRecord[];
 }
@@ -1041,8 +1041,9 @@ export interface RestoreOptions {
  *    conversation. A live worker is never touched — restoring it would kill its turn.
  * 2. **A session that was deleted** (the recommended step after a handoff): rebuild it
  *    from the `deleted` lifecycle record, resuming the CLI conversation. The conversation
- *    id comes from `--resume`, else the id the server recorded (claude/codex), else
- *    per-mode discovery (opencode) — never a guess.
+ *    id comes from `--resume`, else the id the server recorded when it differs from the
+ *    Codeman id, else per-mode discovery (claude transcript, codex originator, opencode
+ *    session list) — never a guess.
  */
 export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Promise<number> {
   if (!options.id && !options.last) {
@@ -1120,7 +1121,7 @@ export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Pr
   const cliSessionId =
     options.resume ??
     (record.cliSessionId && record.cliSessionId !== record.id ? record.cliSessionId : undefined) ??
-    (await (options.discover ?? discoverCliSessionId)({ mode, workingDir: record.workingDir }));
+    (await (options.discover ?? discoverCliSessionId)({ mode, workingDir: record.workingDir, sessionId: record.id }));
   if (!cliSessionId) {
     return fail(
       deps,
