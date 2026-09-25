@@ -30,7 +30,7 @@ let home: string;
 let prevCodexHome: string | undefined;
 
 /** A rollout's opening line, as codex writes it. */
-const sessionMeta = (opts: { id: string; cwd?: string; threadSource?: string; originator?: string }) =>
+const sessionMeta = (opts: { id: string; cwd?: string; threadSource?: string; originator?: string; source?: string }) =>
   JSON.stringify({
     timestamp: '2026-09-02T07:05:37.421Z',
     type: 'session_meta',
@@ -40,6 +40,7 @@ const sessionMeta = (opts: { id: string; cwd?: string; threadSource?: string; or
       ...(opts.cwd ? { cwd: opts.cwd } : {}),
       originator: opts.originator ?? 'codex-tui',
       ...(opts.threadSource ? { thread_source: opts.threadSource } : {}),
+      ...(opts.source ? { source: opts.source } : {}),
       // The real thing embeds full base instructions here; padded so the file
       // clears the size floor and exercises the head window.
       base_instructions: { text: 'x'.repeat(500) },
@@ -210,6 +211,15 @@ describe('scanCodexSessionsHistory', () => {
 
     const rows = await scanCodexSessionsHistory();
     expect(rows[0].originator).toBe('codeman_2f1c9a44-1111-2222-3333-444455556666');
+  });
+
+  it("reports the rollout's source: a daemon client's originator names another pane", async () => {
+    await writeRollout('cccccccc-cccc-7ccc-8ccc-cccccccccccc', [
+      sessionMeta({ id: 'cccccccc-cccc-7ccc-8ccc-cccccccccccc', cwd: '/repo/ten', source: 'vscode' }),
+      itemCompletedUser('hello'),
+    ]);
+    const rows = await scanCodexSessionsHistory();
+    expect(rows[0].source).toBe('vscode');
   });
 
   it('drops a rollout that records no working directory', async () => {
