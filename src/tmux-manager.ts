@@ -274,6 +274,34 @@ export function resolveTmuxPaneTarget(muxName: string, paneTarget?: string): str
   return `${muxName}.${paneTarget}`;
 }
 
+let submitBufferSeq = 0;
+
+/**
+ * tmux commands that type `text` into `target` as ONE bracketed paste, ahead of a
+ * separately sent `Enter` that submits it. Exported for unit testing.
+ *
+ * Why a paste and not `send-keys -l`: Codex detects a paste that arrives WITHOUT
+ * bracketed-paste markers heuristically, from characters arriving in a fast burst,
+ * and folds an Enter that lands inside that burst window into the paste as a
+ * newline. `send-keys -l` types exactly such an unmarked burst, so a text+Enter
+ * pair sat in Codex's composer unsubmitted — always for long text (1500 chars
+ * still stuck at 250 ms), intermittently for short text at the old 50 ms gap.
+ * `paste-buffer -p` wraps the text in the markers (only when the pane asked for
+ * them, so an app without bracketed paste sees the same bytes as before) and the
+ * Enter after it is unambiguous. `-d` deletes the per-call buffer afterwards.
+ *
+ * tmux splits commands on an argument that ENDS in `;` (so `send-keys -l 'a;'`
+ * typed `a`); a final `\;` is its escape for a literal `;`.
+ */
+export function buildPasteTextCommands(tmux: string, target: string, text: string): string[] {
+  const buffer = `codeman-submit-${process.pid}-${++submitBufferSeq}`;
+  const data = text.endsWith(';') ? `${text.slice(0, -1)}\\;` : text;
+  return [
+    `${tmux} set-buffer -b ${buffer} -- ${shellescape(data)}`,
+    `${tmux} paste-buffer -p -d -b ${buffer} -t ${shellescape(target)}`,
+  ];
+}
+
 /**
  * Pick the active pane id from `tmux list-panes -F '#{pane_id}:#{pane_active}'`
  * output (lines like `%0:1`). Returns the pane id whose active flag is 1.
@@ -3215,10 +3243,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // Send text first, then Enter as a SEPARATE tmux command after a short delay.
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
-        // character in the input buffer rather than as form submission.
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        // character in the input buffer rather than as form submission. The text goes
+        // in as a bracketed paste so Codex cannot fold the Enter into it either
+        // (see buildPasteTextCommands).
+        for (const cmd of buildPasteTextCommands(this.tmux(), session.muxName, textPart)) {
+          await execAsync(cmd, { timeout: EXEC_TIMEOUT_MS });
+        }
         await new Promise((resolve) => setTimeout(resolve, 50));
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
           timeout: EXEC_TIMEOUT_MS,
@@ -3369,10 +3399,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
 
       if (textPart && hasCarriageReturn) {
-        execSync(`${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(textPart)}`, {
-          encoding: 'utf-8',
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        // Bracketed paste, same reason as sendInput (buildPasteTextCommands).
+        for (const cmd of buildPasteTextCommands(tmux, target, textPart)) {
+          execSync(cmd, { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS });
+        }
         execSync(`${tmux} send-keys -t ${shellescape(target)} Enter`, {
           encoding: 'utf-8',
           timeout: EXEC_TIMEOUT_MS,
