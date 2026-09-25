@@ -421,6 +421,22 @@ describe('installRemoteAgentSkill', () => {
     expect(calls).toBe(2);
   });
 
+  it('concurrent launches on one host share a single mirror run', async () => {
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const d = deps(async () => {
+      calls++;
+      await gate;
+      return 'installed';
+    });
+    const a = installRemoteAgentSkill({ ...host, agentApiUrl: URL }, d);
+    const b = installRemoteAgentSkill({ ...host, agentApiUrl: URL }, d);
+    release();
+    expect(await Promise.all([a, b])).toEqual(['installed', 'installed']);
+    expect(calls).toBe(1);
+  });
+
   it('reports a foreign skill', async () => {
     expect(
       await installRemoteAgentSkill(

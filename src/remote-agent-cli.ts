@@ -245,6 +245,14 @@ const defaultSkillDeps: InstallRemoteAgentSkillDeps = {
 };
 
 /**
+ * Mirrors in flight, by memo key. Two launches on one host at once (a batch of
+ * `agent spawn` workers) would otherwise race their `mv` swaps on the remote side: the
+ * second `mv tmp dir` finds the first one's fresh dir and moves INTO it. Sharing the
+ * run keeps it to one ssh per host and content.
+ */
+const skillInFlight = new Map<string, Promise<'installed' | 'foreign' | 'failed'>>();
+
+/**
  * Mirror the server's codeman skill to the remote host, if the host opted in
  * (`agentApiUrl` — without it there is no CLI there either). Never throws; a failed
  * copy costs only the skill. Once per host and skill content per process, so an edit
@@ -267,6 +275,25 @@ export async function installRemoteAgentSkill(
     }
     const key = `skill:${who}:${host.port ?? 22}#${createHash('sha256').update(skill).digest('hex')}`;
     if (installed.has(key)) return 'skipped';
+    const pending = skillInFlight.get(key);
+    if (pending) return pending;
+    const run = mirrorSkill(host, skill, key, d).finally(() => skillInFlight.delete(key));
+    skillInFlight.set(key, run);
+    return await run;
+  } catch (err) {
+    d.log(`[remote-agent-skill] mirror to ${who} failed: ${err instanceof Error ? err.message : String(err)}`);
+    return 'failed';
+  }
+}
+
+async function mirrorSkill(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  skill: Buffer,
+  key: string,
+  d: InstallRemoteAgentSkillDeps
+): Promise<'installed' | 'foreign' | 'failed'> {
+  const who = `${host.username}@${host.host}`;
+  try {
     const out = (await d.run(buildRemoteAgentSkillInstallCommand(host), skill)).trim();
     if (out.endsWith('foreign')) {
       d.log(`[remote-agent-skill] ${who}: ~/.claude/skills/codeman is not ours; left untouched`);
