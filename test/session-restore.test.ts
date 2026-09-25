@@ -110,8 +110,8 @@ describe('claude discovery: the Codeman id is the conversation (--session-id)', 
 });
 
 describe("codex discovery: the rollout stamped with this pane's originator", () => {
-  const row = (sessionId: string, originator?: string): CodexHistorySession =>
-    ({ sessionId, originator, workingDir: '/cases/A' }) as CodexHistorySession;
+  const row = (sessionId: string, originator?: string, extra: Partial<CodexHistorySession> = {}): CodexHistorySession =>
+    ({ sessionId, originator, workingDir: '/cases/A', source: 'cli', ...extra }) as CodexHistorySession;
 
   it('picks the newest rollout whose originator is codeman_<id>, ignoring other panes in the same dir', async () => {
     const history = async () => [
@@ -123,6 +123,31 @@ describe("codex discovery: the rollout stamped with this pane's originator", () 
     expect(
       await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: history })
     ).toBe('thread-after-new');
+  });
+
+  // Measured 2026-09-25: codex 0.157's shared app-server daemon inherited w5's env, and a
+  // throwaway pane attached to it wrote its rollout (other case, source "vscode") under
+  // w5's originator. Newest-by-originator would have resumed w5 into that thread.
+  it("ignores a daemon client's rollout that carries this pane's originator (source vscode)", async () => {
+    const history = async () => [
+      row('01a0d92c-throwaway', 'codeman_cm-1', { source: 'vscode', workingDir: '/cases/zz-origin-test' }),
+      row('01a0d8fa-same-dir-client', 'codeman_cm-1', { source: 'vscode' }),
+      row('01a0d755-own', 'codeman_cm-1'),
+    ];
+    expect(
+      await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: history })
+    ).toBe('01a0d755-own');
+  });
+
+  it('matches the directory case-blind, needs it to match, and trusts a rollout with no source field', async () => {
+    const other = async () => [row('t-elsewhere', 'codeman_cm-1', { workingDir: '/cases/B' })];
+    expect(
+      await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: other })
+    ).toBeNull();
+    const legacy = async () => [row('t-legacy', 'codeman_cm-1', { source: undefined, workingDir: '/Cases/a' })];
+    expect(
+      await discoverCliSessionId({ mode: 'codex', workingDir: '/cases/A', sessionId: 'cm-1', codexHistory: legacy })
+    ).toBe('t-legacy');
   });
 
   it('returns null when no rollout carries the originator, or the scan fails', async () => {
