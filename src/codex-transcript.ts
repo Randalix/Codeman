@@ -85,6 +85,13 @@ export interface CodexHistorySession {
    * is writing, since such a pane knows no thread id of its own.
    */
   originator?: string;
+  /**
+   * `session_meta.source`: `cli` for a rollout the pane's own codex TUI wrote. A TUI
+   * attached to codex's shared app-server daemon writes `vscode` — and that daemon
+   * stamps the originator of whichever pane STARTED it, so such a row's originator
+   * names the wrong pane.
+   */
+  source?: string;
   workingDir: string;
   sizeBytes: number;
   /** ISO timestamp, from the file's own mtime. */
@@ -101,6 +108,7 @@ interface RolloutIdentity {
   threadSource?: string;
   /** `codeman_<sessionId>` for a pane Codeman spawned; codex's own default otherwise. */
   originator?: string;
+  source?: string;
   firstPrompt?: string;
 }
 
@@ -247,6 +255,7 @@ function parseIdentity(head: string): RolloutIdentity {
         cwd?: string;
         thread_source?: string;
         originator?: string;
+        source?: unknown;
         type?: string;
         role?: string;
         content?: unknown;
@@ -265,6 +274,7 @@ function parseIdentity(head: string): RolloutIdentity {
       out.cwd ??= p.cwd;
       out.threadSource ??= p.thread_source;
       out.originator ??= p.originator;
+      if (typeof p.source === 'string') out.source ??= p.source;
     } else if (entry.type === 'turn_context' && p) {
       out.cwd ??= p.cwd;
     }
@@ -353,6 +363,7 @@ export async function scanCodexSessionsHistory(): Promise<CodexHistorySession[]>
     out.push({
       sessionId: identity.threadId,
       originator: identity.originator,
+      source: identity.source,
       workingDir: identity.cwd,
       sizeBytes: file.size,
       lastModified: new Date(file.mtimeMs).toISOString(),
