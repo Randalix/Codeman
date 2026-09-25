@@ -81,7 +81,7 @@ import {
   remoteSshTarget,
   remoteTmuxSessionAlive,
 } from './remote-hosts.js';
-import { installRemoteAgentCli, remoteAgentEnvPrefix } from './remote-agent-cli.js';
+import { installRemoteAgentCli, installRemoteAgentSkill, remoteAgentEnvPrefix } from './remote-agent-cli.js';
 import {
   buildDockerBaseArgs,
   buildDockerCreateArgs,
@@ -2196,9 +2196,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : remote
           ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
           : localFullCmd;
-      // Best-effort, in the background: the agent CLI is only needed once the agent
-      // is asked to use it, and a failed copy must never block the launch.
-      if (remote && remote.owned !== false) void installRemoteAgentCli(remote);
+      // Best-effort, in the background: the agent CLI (and the skill that tells the
+      // agent it exists) is only needed once the agent is asked to use it, and a
+      // failed copy must never block the launch.
+      if (remote && remote.owned !== false) {
+        void installRemoteAgentCli(remote);
+        void installRemoteAgentSkill(remote);
+      }
 
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
@@ -2462,7 +2466,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : remote
         ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
         : localFullCmd;
-    if (remote && remote.owned !== false) void installRemoteAgentCli(remote);
+    if (remote && remote.owned !== false) {
+      void installRemoteAgentCli(remote);
+      void installRemoteAgentSkill(remote);
+    }
 
     try {
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
