@@ -19,12 +19,19 @@
  *    (`dist/remote/codeman-agent.cjs`, built by scripts/build.mjs) over ssh into
  *    `~/.local/bin/codeman`. Best-effort, once per host and bundle hash per process.
  *    A `codeman` there WITHOUT our marker (a real install) is never overwritten.
+ * 3. `installRemoteAgentSkill` — mirrors the skill the server's own agents load
+ *    (`~/.claude/skills/codeman` of the server user) into the same path on the host,
+ *    so a remote agent knows `codeman agent` is a shell command at all. Without it a
+ *    remote claude asked to "read the mailbox" looked for a tool named codeman and
+ *    reached for Gmail (Joe, 2026-09-25). Same gate, memo and ownership rule as the
+ *    CLI: a skill dir there without our marker file is never touched.
  *
  * @module remote-agent-cli
  */
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildSshConnectionArgs, remoteSshTarget, shellescape } from './remote-hosts.js';
@@ -43,6 +50,12 @@ export const REMOTE_AGENT_CLI_MARKER = 'codeman-remote-agent-cli';
 
 /** Install target on the remote host. `~/.local/bin` is on the login PATH (XDG). */
 export const REMOTE_AGENT_CLI_PATH = '$HOME/.local/bin/codeman';
+
+/** Skill mirror target on the remote host (Claude Code's user-scope skill dir). */
+export const REMOTE_AGENT_SKILL_DIR = '$HOME/.claude/skills/codeman';
+
+/** File the mirror writes into the remote skill dir; only a dir carrying it is replaced. */
+export const REMOTE_AGENT_SKILL_MARKER_FILE = '.codeman-remote-mirror';
 
 /** Session ids are server-minted; validated anyway because they land in shell code. */
 const SESSION_ID_PATTERN = /^[A-Za-z0-9-]+$/;
@@ -168,6 +181,104 @@ export async function installRemoteAgentCli(
     d.log(
       `[remote-agent-cli] install on ${host.username}@${host.host} failed: ${err instanceof Error ? err.message : String(err)}`
     );
+    return 'failed';
+  }
+}
+
+/**
+ * The remote side of the skill mirror: unpack the tar on stdin into a temp dir next
+ * to the target, stamp our marker file, swap it into place. A skill dir WITHOUT the
+ * marker (the host user's own skill, or a symlink to one) is left alone: stdin is
+ * drained and `foreign` printed. A failed unpack removes the temp dir and exits
+ * non-zero; the old copy stays in place until the new one is complete.
+ */
+export function buildRemoteAgentSkillInstallScript(): string {
+  const m = REMOTE_AGENT_SKILL_MARKER_FILE;
+  return [
+    `d="${REMOTE_AGENT_SKILL_DIR}"`,
+    `if { [ -e "$d" ] || [ -L "$d" ]; } && [ ! -e "$d/${m}" ]; then cat >/dev/null; echo foreign; exit 0; fi`,
+    `t="$d.tmp.$$"`,
+    `mkdir -p "$t" || exit 1`,
+    `if ! tar -xf - -C "$t"; then rm -rf "$t"; exit 1; fi`,
+    `: > "$t/${m}"`,
+    `if [ -e "$d" ] || [ -L "$d" ]; then mv "$d" "$d.old.$$" || { rm -rf "$t"; exit 1; }; fi`,
+    `mv "$t" "$d" && rm -rf "$d.old.$$" && echo installed`,
+  ].join('; ');
+}
+
+/** Full local command for the skill mirror: same ssh connection args as the launch. */
+export function buildRemoteAgentSkillInstallCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
+): string {
+  const [ssh, ...connectionArgs] = buildSshConnectionArgs(host);
+  return [ssh, ...connectionArgs, remoteSshTarget(host), shellescape(buildRemoteAgentSkillInstallScript())].join(' ');
+}
+
+/** The skill the server's own agents load: Claude Code's user-scope dir of the server user. */
+export function defaultLocalAgentSkillDir(): string {
+  return join(homedir(), '.claude', 'skills', 'codeman');
+}
+
+/**
+ * Tar of `dir` (its contents, not the dir itself), or null when it holds no SKILL.md —
+ * then there is nothing worth mirroring and nothing is guessed.
+ */
+export function packAgentSkillDir(dir: string): Buffer | null {
+  if (!existsSync(join(dir, 'SKILL.md'))) return null;
+  return execFileSync('tar', ['-C', dir, `--exclude=./${REMOTE_AGENT_SKILL_MARKER_FILE}`, '-cf', '-', '.'], {
+    maxBuffer: 16 * 1024 * 1024,
+  });
+}
+
+export interface InstallRemoteAgentSkillDeps {
+  /** Tar of the skill dir, or null when there is none. */
+  readSkill: () => Buffer | null;
+  /** Run `command` through a shell with `stdin`; resolves stdout, rejects on failure. */
+  run: (command: string, stdin: Buffer) => Promise<string>;
+  log: (message: string) => void;
+}
+
+const defaultSkillDeps: InstallRemoteAgentSkillDeps = {
+  readSkill: () => packAgentSkillDir(defaultLocalAgentSkillDir()),
+  run: runWithStdin,
+  log: (message) => console.log(message),
+};
+
+/**
+ * Mirror the server's codeman skill to the remote host, if the host opted in
+ * (`agentApiUrl` — without it there is no CLI there either). Never throws; a failed
+ * copy costs only the skill. Once per host and skill content per process, so an edit
+ * to the local skill goes out with the next remote launch. No-op under VITEST unless
+ * deps are injected.
+ */
+export async function installRemoteAgentSkill(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions & { agentApiUrl?: string },
+  deps?: Partial<InstallRemoteAgentSkillDeps>
+): Promise<'installed' | 'foreign' | 'skipped' | 'failed'> {
+  if (!deps && process.env.VITEST) return 'skipped';
+  const d = { ...defaultSkillDeps, ...deps };
+  if (!host.agentApiUrl) return 'skipped';
+  const who = `${host.username}@${host.host}`;
+  try {
+    const skill = d.readSkill();
+    if (!skill) {
+      d.log('[remote-agent-skill] no local skill (~/.claude/skills/codeman/SKILL.md); skipping mirror');
+      return 'skipped';
+    }
+    const key = `skill:${who}:${host.port ?? 22}#${createHash('sha256').update(skill).digest('hex')}`;
+    if (installed.has(key)) return 'skipped';
+    const out = (await d.run(buildRemoteAgentSkillInstallCommand(host), skill)).trim();
+    if (out.endsWith('foreign')) {
+      d.log(`[remote-agent-skill] ${who}: ~/.claude/skills/codeman is not ours; left untouched`);
+      installed.add(key);
+      return 'foreign';
+    }
+    if (!out.endsWith('installed')) throw new Error(`unexpected output: ${out.slice(-200)}`);
+    installed.add(key);
+    d.log(`[remote-agent-skill] mirrored codeman skill to ${who}`);
+    return 'installed';
+  } catch (err) {
+    d.log(`[remote-agent-skill] mirror to ${who} failed: ${err instanceof Error ? err.message : String(err)}`);
     return 'failed';
   }
 }

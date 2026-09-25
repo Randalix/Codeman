@@ -1,14 +1,29 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   AGENT_API_URL_PATTERN,
   REMOTE_AGENT_CLI_MARKER,
+  REMOTE_AGENT_SKILL_MARKER_FILE,
   buildRemoteAgentCliInstallCommand,
   buildRemoteAgentCliInstallScript,
+  buildRemoteAgentSkillInstallCommand,
+  buildRemoteAgentSkillInstallScript,
   installRemoteAgentCli,
+  installRemoteAgentSkill,
+  packAgentSkillDir,
   remoteAgentEnvPrefix,
   resetRemoteAgentCliInstallMemo,
 } from '../src/remote-agent-cli.js';
@@ -251,4 +266,183 @@ describe('standalone bundle', () => {
     expect(ls.status).not.toBe(0);
     expect(ls.stderr).toContain('CODEMAN_MUX');
   }, 30_000);
+});
+
+// The CLI alone was not enough: a remote claude without the skill did not know
+// `codeman agent` is a shell command, looked for a tool named codeman and read Gmail
+// instead (Joe, 2026-09-25, session c24a931d). The launch mirrors the server's skill.
+describe('remote skill mirror script (real sh + tar, fake HOME)', () => {
+  let home: string;
+  let src: string;
+  const target = () => join(home, '.claude', 'skills', 'codeman');
+  const pack = (body: string) => {
+    writeFileSync(join(src, 'SKILL.md'), body);
+    return packAgentSkillDir(src)!;
+  };
+  const install = (stdin: Buffer) =>
+    spawnSync('/bin/sh', ['-c', buildRemoteAgentSkillInstallScript()], {
+      env: { HOME: home, PATH: process.env.PATH },
+      input: stdin,
+      encoding: 'utf8',
+    });
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'codeman-remote-skill-'));
+    src = mkdtempSync(join(tmpdir(), 'codeman-skill-src-'));
+    mkdirSync(join(src, 'reference'));
+    writeFileSync(join(src, 'reference', 'verbs.md'), 'verbs\n');
+  });
+  afterEach(() => {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(src, { recursive: true, force: true });
+  });
+
+  it('installs SKILL.md + reference/ and stamps the marker, creating ~/.claude/skills', () => {
+    const res = install(pack('v1'));
+    expect(res.stdout.trim()).toBe('installed');
+    expect(readFileSync(join(target(), 'SKILL.md'), 'utf8')).toBe('v1');
+    expect(readFileSync(join(target(), 'reference', 'verbs.md'), 'utf8')).toBe('verbs\n');
+    expect(existsSync(join(target(), REMOTE_AGENT_SKILL_MARKER_FILE))).toBe(true);
+  });
+
+  it('replaces its own earlier mirror completely (stale files go)', () => {
+    install(pack('v1'));
+    writeFileSync(join(target(), 'stale.md'), 'old');
+    expect(install(pack('v2')).stdout.trim()).toBe('installed');
+    expect(readFileSync(join(target(), 'SKILL.md'), 'utf8')).toBe('v2');
+    expect(existsSync(join(target(), 'stale.md'))).toBe(false);
+  });
+
+  it('never touches a foreign skill dir (no marker)', () => {
+    mkdirSync(target(), { recursive: true });
+    writeFileSync(join(target(), 'SKILL.md'), 'my own skill');
+    expect(install(pack('v1')).stdout.trim()).toBe('foreign');
+    expect(readFileSync(join(target(), 'SKILL.md'), 'utf8')).toBe('my own skill');
+  });
+
+  it('treats a symlinked skill dir without marker as foreign, even a dangling one', () => {
+    mkdirSync(join(home, '.claude', 'skills'), { recursive: true });
+    symlinkSync(join(home, 'nowhere'), target());
+    expect(install(pack('v1')).stdout.trim()).toBe('foreign');
+    expect(existsSync(join(home, 'nowhere'))).toBe(false);
+  });
+
+  it('a broken payload keeps the old mirror and leaves no temp dir', () => {
+    install(pack('v1'));
+    const res = install(Buffer.from('not a tar archive'));
+    expect(res.status).not.toBe(0);
+    expect(readFileSync(join(target(), 'SKILL.md'), 'utf8')).toBe('v1');
+    const left = readdirSync(join(home, '.claude', 'skills'));
+    expect(left).toEqual(['codeman']);
+  });
+
+  it('the local pack never ships a marker file of its own', () => {
+    writeFileSync(join(src, REMOTE_AGENT_SKILL_MARKER_FILE), '');
+    const listing = execFileSync('tar', ['-tf', '-'], { input: pack('v1'), encoding: 'utf8' });
+    expect(listing).toContain('SKILL.md');
+    expect(listing).not.toContain(REMOTE_AGENT_SKILL_MARKER_FILE);
+  });
+
+  it('packs nothing without a SKILL.md', () => {
+    rmSync(join(src, 'SKILL.md'), { force: true });
+    expect(packAgentSkillDir(src)).toBeNull();
+  });
+
+  it('connects with the launch connection args', () => {
+    const cmd = buildRemoteAgentSkillInstallCommand({ ...host, port: 2222 });
+    expect(cmd.startsWith('ssh -o BatchMode=yes ')).toBe(true);
+    expect(cmd).toContain('-p 2222');
+    expect(cmd).toContain('j@192.168.50.137');
+    expect(cmd).not.toContain(' -t ');
+  });
+});
+
+describe('installRemoteAgentSkill', () => {
+  beforeEach(() => resetRemoteAgentCliInstallMemo());
+  const deps = (run: (c: string, s: Buffer) => Promise<string>, skill: Buffer | null = Buffer.from('tar')) => ({
+    readSkill: () => skill,
+    run,
+    log: () => {},
+  });
+
+  it('skips a host without agentApiUrl (no ssh at all)', async () => {
+    let calls = 0;
+    expect(
+      await installRemoteAgentSkill(
+        host,
+        deps(async () => (calls++, 'installed'))
+      )
+    ).toBe('skipped');
+    expect(calls).toBe(0);
+  });
+
+  it('skips when the server has no skill', async () => {
+    let calls = 0;
+    expect(
+      await installRemoteAgentSkill(
+        { ...host, agentApiUrl: URL },
+        deps(async () => (calls++, 'installed'), null)
+      )
+    ).toBe('skipped');
+    expect(calls).toBe(0);
+  });
+
+  it('mirrors once per host and content; an edited skill goes out again', async () => {
+    let calls = 0;
+    const d = deps(async () => (calls++, 'installed\n'));
+    expect(await installRemoteAgentSkill({ ...host, agentApiUrl: URL }, d)).toBe('installed');
+    expect(await installRemoteAgentSkill({ ...host, agentApiUrl: URL }, d)).toBe('skipped');
+    expect(calls).toBe(1);
+    expect(
+      await installRemoteAgentSkill({ ...host, agentApiUrl: URL }, { ...d, readSkill: () => Buffer.from('tar2') })
+    ).toBe('installed');
+    expect(calls).toBe(2);
+  });
+
+  it('does not share the memo with the CLI install (same host, both go out)', async () => {
+    let calls = 0;
+    const run = async () => (calls++, 'installed');
+    await installRemoteAgentCli(
+      { ...host, agentApiUrl: URL },
+      { readBundle: () => Buffer.from('x'), run, log: () => {} }
+    );
+    await installRemoteAgentSkill({ ...host, agentApiUrl: URL }, deps(run, Buffer.from('x')));
+    expect(calls).toBe(2);
+  });
+
+  it('never throws on failure and retries next time', async () => {
+    let calls = 0;
+    const d = deps(async () => {
+      calls++;
+      throw new Error('ssh: No route to host');
+    });
+    expect(await installRemoteAgentSkill({ ...host, agentApiUrl: URL }, d)).toBe('failed');
+    expect(await installRemoteAgentSkill({ ...host, agentApiUrl: URL }, d)).toBe('failed');
+    expect(calls).toBe(2);
+  });
+
+  it('reports a foreign skill', async () => {
+    expect(
+      await installRemoteAgentSkill(
+        { ...host, agentApiUrl: URL },
+        deps(async () => 'foreign')
+      )
+    ).toBe('foreign');
+  });
+
+  it('is a no-op under vitest without injected deps (never touches the real home)', async () => {
+    expect(await installRemoteAgentSkill({ ...host, agentApiUrl: URL })).toBe('skipped');
+  });
+});
+
+describe('launch wiring', () => {
+  // Launch and respawn both push the CLI; the skill must ride along on each path,
+  // otherwise a respawned remote agent gets the binary but not the instructions.
+  it('every remote CLI install site also mirrors the skill', () => {
+    const src = readFileSync(join(__dirname, '..', 'src', 'tmux-manager.ts'), 'utf8');
+    const cli = src.match(/void installRemoteAgentCli\(remote\);/g) ?? [];
+    const skill = src.match(/void installRemoteAgentSkill\(remote\);/g) ?? [];
+    expect(cli.length).toBe(2);
+    expect(skill.length).toBe(cli.length);
+  });
 });
