@@ -376,6 +376,21 @@ export async function scanCodexSessionsHistory(): Promise<CodexHistorySession[]>
 }
 
 /**
+ * The Codeman session a rollout belongs to, read from its `codeman_<sessionId>`
+ * originator — or undefined when there is none, or when it cannot be trusted.
+ *
+ * It cannot be trusted on a rollout a DAEMON CLIENT wrote (`source` other than
+ * `cli`): codex 0.157's shared app-server daemon stamps the environment of the
+ * pane that STARTED it, so every pane attached later writes under the starter's
+ * id (measured 2026-09-25: the response viewer of the starter showed a throwaway
+ * pane's answer). A rollout without the field predates it and keeps the old rule.
+ */
+export function codemanOwnerOfRollout(meta: { originator?: string; source?: string }): string | undefined {
+  if (meta.source !== undefined && meta.source !== 'cli') return undefined;
+  return /^codeman_(.+)$/.exec(meta.originator ?? '')?.[1];
+}
+
+/**
  * Which codex thread each Codeman-spawned pane is writing, keyed by Codeman
  * session id.
  *
@@ -392,7 +407,7 @@ export async function scanCodexSessionsHistory(): Promise<CodexHistorySession[]>
 export function codexThreadBySessionId(rows: CodexHistorySession[]): Map<string, string> {
   const out = new Map<string, string>();
   for (const row of rows) {
-    const owner = /^codeman_(.+)$/.exec(row.originator ?? '')?.[1];
+    const owner = codemanOwnerOfRollout(row);
     if (owner && !out.has(owner)) out.set(owner, row.sessionId);
   }
   return out;

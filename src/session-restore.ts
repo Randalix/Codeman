@@ -77,16 +77,12 @@ export function claudeTranscriptExists(projectsDir: string, id: string): boolean
 }
 
 /**
- * Whether a codex rollout's originator can be trusted to name the pane that wrote it:
- * written by the pane's OWN codex TUI (`source` `cli`, or absent on codex versions that
- * predate the field) in the session's directory. codex 0.157's shared app-server daemon
- * breaks the originator for its clients (`source` `vscode`): it stamps the env of the
- * pane that started the daemon, so a later pane's thread would carry the starter's id —
- * measured 2026-09-25, a throwaway pane in another case under a live worker's
- * originator. Such a thread is left for an explicit `--resume` rather than guessed.
+ * Whether a codex rollout ran in the session's directory. Together with the originator
+ * (`codexThreadBySessionId`, which already ignores a daemon client's untrustworthy one —
+ * see `codemanOwnerOfRollout`) this is what ties a thread to a deleted pane; a thread it
+ * cannot tie is left for an explicit `--resume` rather than guessed.
  */
 export function isOwnCodexRollout(row: CodexHistorySession, workingDir: string): boolean {
-  if (row.source !== undefined && row.source !== 'cli') return false;
   // Case-blind like the server's own rollout matching: codex records the launch-time case.
   return row.workingDir.toLowerCase() === workingDir.toLowerCase();
 }

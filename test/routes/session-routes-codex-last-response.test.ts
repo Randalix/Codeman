@@ -69,9 +69,9 @@ async function createEnvelopeHarness(
 
 // ── Rollout fixture helpers (shapes observed on codex-cli 0.144) ──────────────
 
-const sessionMeta = (cwd: string, originator?: string) => ({
+const sessionMeta = (cwd: string, originator?: string, source?: string) => ({
   type: 'session_meta',
-  payload: { cwd, originator },
+  payload: { cwd, originator, ...(source ? { source } : {}) },
 });
 
 const assistantMsg = (text: string, timestamp = '2026-07-01T00:00:00Z') => ({
@@ -224,6 +224,44 @@ describe('GET /api/sessions/:id/last-response (codex)', () => {
 
     const { body } = await getLastResponse(session.id);
     expect(body.data.text).toBe('resumed answer');
+  });
+
+  // ── Locator: codex app-server daemon clients ─────────────────────────────
+
+  // Measured 2026-09-25 (w5 95274d44): codex 0.157's shared daemon inherited w5's env, so
+  // a throwaway pane attached to it wrote a NEWER rollout (other case, source "vscode")
+  // under w5's originator — and `agent read` on w5 returned the throwaway's "OK".
+  it("ignores a daemon client's rollout stamped with this pane's originator", async () => {
+    session.codexConfig = { resumeSessionId: UUID_A };
+    writeRollout(
+      `rollout-2026-06-30T12-00-00-${UUID_A}.jsonl`,
+      [sessionMeta(workdir, 'codeman_the-original-pane', 'cli'), assistantMsg('w5 review answer')],
+      BASE_MTIME
+    );
+    writeRollout(
+      `rollout-2026-07-01T00-00-00-${UUID_B}.jsonl`,
+      [sessionMeta('/cases/zz-enter-test', `codeman_${session.id}`, 'vscode'), assistantMsg('OK')],
+      BASE_MTIME + 100
+    );
+
+    const { body } = await getLastResponse(session.id);
+    expect(body.data.text).toBe('w5 review answer');
+  });
+
+  it("still trusts the pane's own TUI rollout (source cli) by originator", async () => {
+    writeRollout(
+      `rollout-2026-07-01T00-00-00-${UUID_A}.jsonl`,
+      [sessionMeta(workdir, `codeman_${session.id}`, 'cli'), assistantMsg('own answer')],
+      BASE_MTIME
+    );
+    writeRollout(
+      `rollout-2026-07-01T00-01-00-${UUID_B}.jsonl`,
+      [sessionMeta(workdir, 'codeman_some-other-pane', 'cli'), assistantMsg('sibling answer')],
+      BASE_MTIME + 100
+    );
+
+    const { body } = await getLastResponse(session.id);
+    expect(body.data.text).toBe('own answer');
   });
 
   // ── Locator: history.jsonl pin ───────────────────────────────────────────

@@ -131,6 +131,20 @@ describe('codex', () => {
   it('resumes with a POSITIONAL subcommand, not a flag', () => {
     expect(cx({ model: 'gpt-5', resumeSessionId: 'roll_42' })).toBe('codex --model gpt-5 resume roll_42');
   });
+
+  // codex 0.157's shared app-server daemon stamps the STARTING pane's originator on every
+  // attached pane's rollout; --no-daemon keeps each pane on its own server. 0.154 rejects
+  // the flag (exit 2), so it is gated and fails closed on an unknown version.
+  it('gates --no-daemon on codex >= 0.157, failing closed when the version is unknown', () => {
+    const at = (v: string | null, codexConfig?: SpawnBridgeOptions['codexConfig']) =>
+      render({ mode: 'codex', sessionId: SID, codexConfig, claudeCliVersion: v });
+    expect(at('0.157.0')).toBe('codex --no-daemon');
+    expect(at('0.160.2', { animations: false, resumeSessionId: 'roll_42' })).toBe(
+      'codex --no-daemon --config tui.animations=false resume roll_42'
+    );
+    expect(at('0.154.0')).toBe('codex');
+    expect(at(null)).toBe('codex');
+  });
 });
 
 describe('gemini', () => {

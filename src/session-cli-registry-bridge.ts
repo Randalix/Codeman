@@ -22,7 +22,7 @@ import { renderLaunch, type EngineValues, type ParamValues } from './config/cli-
 import { matchesPattern } from './config/cli-registry/patterns.js';
 import { buildEffortCliArgs, sanitizeCliSessionName } from './session-cli-builder.js';
 import { compareVersions } from './utils/dependency-checker.js';
-import { getClaudeCliVersion } from './utils/claude-cli-resolver.js';
+import { resolveSessionCliVersion } from './utils/cli-resolver.js';
 import { launcherDefaultTarget } from './utils/cli-launcher.js';
 import { getCli } from './config/cli-registry/registry.js';
 import type {
@@ -212,13 +212,14 @@ export function buildSpawnCommandFromRegistry(entry: CliEntry, options: SpawnBri
     engineValues.effortSettingsJson = JSON.stringify(settingsObj);
   }
 
-  // Preserves buildSpawnCommand's original fallback exactly: an EXPLICIT `undefined` probes
-  // the local claude CLI (getClaudeCliVersion, null under vitest); an explicit `null` means
-  // "known to be unresolvable" and must not probe. The probe only ever runs from
-  // resolveGatesPassed, and only for an entry that actually declares a gate, so this stays
-  // generic without spawning a stray `claude --version` for every other CLI's launch.
+  // An explicit `claudeCliVersion` (tests; `null` = "known to be unresolvable", must not
+  // probe) wins. Otherwise the probe asks for THIS entry's version — it used to ask claude's
+  // for every entry, which would have evaluated codex's `noDaemon` gate against claude
+  // 2.1.x and always passed it. resolveSessionCliVersion keeps claude's own retrying probe
+  // and is null under vitest. The probe only ever runs from resolveGatesPassed, and only for
+  // an entry that actually declares a gate.
   const gatesPassed = resolveGatesPassed(entry, () =>
-    options.claudeCliVersion !== undefined ? options.claudeCliVersion : getClaudeCliVersion()
+    options.claudeCliVersion !== undefined ? options.claudeCliVersion : resolveSessionCliVersion(entry.id)
   );
 
   return renderLaunch(entry.launch, params, engineValues, gatesPassed);
