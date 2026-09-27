@@ -4353,6 +4353,18 @@ export class Session extends EventEmitter {
   }
 
   /**
+   * Since when printable text went in through Codeman's write path without an Enter
+   * after it (0 = none): someone has a half-typed prompt in the composer. The inbox
+   * nudger never types over it — its line and `\r` would submit the draft. Escape
+   * sequences (arrows, ESC) do not count; any submit clears it.
+   */
+  private _draftSince = 0;
+
+  hasDraft(): boolean {
+    return this._draftSince > 0;
+  }
+
+  /**
    * Stamps the pane's last Enter for EVERY write, and feeds the auto-name
    * tracker only for user-originated input on a prompt-taking CLI. Ralph
    * kick-starts, respawn `/clear`s, cron launches, approval answers and the
@@ -4362,6 +4374,10 @@ export class Session extends EventEmitter {
     const submitted = options.fromUser && this._acceptsPrompts ? this._submittedPromptTracker.feed(data) : [];
     if (data.includes('\r') || data.includes('\n')) {
       this._lastSubmitAt = Date.now();
+      this._draftSince = 0;
+      // eslint-disable-next-line no-control-regex -- "anything but a control byte" IS the test
+    } else if (this._draftSince === 0 && !data.startsWith('\u001b') && /[^\u0000-\u001f\u007f]/.test(data)) {
+      this._draftSince = Date.now();
     }
     return submitted;
   }
@@ -4391,6 +4407,7 @@ export class Session extends EventEmitter {
    */
   markPromptSubmitted(): void {
     this._lastSubmitAt = Date.now();
+    this._draftSince = 0;
   }
 
   /**
