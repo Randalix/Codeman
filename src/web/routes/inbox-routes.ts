@@ -1,7 +1,10 @@
 /**
  * @fileoverview Agent inbox routes: the mailbox channel between sessions.
  *
- * - `POST   /api/sessions/:id/inbox`      store a message for the session (never types)
+ * - `POST   /api/sessions/:id/inbox`      store a message for the session; the pane is
+ *                                         typed at only by the nudger, and only when the
+ *                                         receiver would never see the mail on its own
+ *                                         (`web/inbox-nudger.ts`, opt out with `nudge:false`)
  * - `GET    /api/sessions/:id/inbox`      read, non-destructive; `?wait=<ms>` long-polls
  *                                         while the inbox is empty; `?peek=1` marks nothing
  * - `POST   /api/sessions/:id/inbox/ack`  remove messages the reader is done with: an
@@ -25,6 +28,7 @@ import { canAccessOwned, findSessionOrFail, getAuthUser, parseBody } from '../ro
 import { isMultiUserMode } from '../../config/multiuser.js';
 import { agentInbox, MAX_INBOX_WAITERS_PER_SESSION, MAX_MESSAGES_PER_INBOX, MAX_TEXT_LENGTH } from '../agent-inbox.js';
 import type { SessionPort } from '../ports/index.js';
+import type { InboxNudger } from '../inbox-nudger.js';
 
 /** The sender label: an explicit `from`, else the caller's session header, else "api". */
 export function senderLabel(req: FastifyRequest, from: string | undefined): string {
@@ -47,7 +51,11 @@ function abortOnClientHangUp(reply: FastifyReply): AbortController {
   return controller;
 }
 
-export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): void {
+export function registerInboxRoutes(
+  app: FastifyInstance,
+  ctx: SessionPort,
+  options: { nudger?: Pick<InboxNudger, 'schedule'> } = {}
+): void {
   // "Who is waiting for whom": one read-only call the CLI's `ls` folds into its table.
   // A session that waits on its inbox while its peer sits idle with an empty inbox is a
   // stalled pair (each side waiting for the other's post) — the state that cost a
@@ -73,7 +81,10 @@ export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): voi
     const { id } = req.params as { id: string };
     findSessionOrFail(ctx, id, req);
     const body = parseBody(InboxPostSchema, req.body);
-    const result = agentInbox.post(id, senderLabel(req, body.from), body.text);
+    const from = senderLabel(req, body.from);
+    // Read before posting: the post releases any parked long-poll and clears the wait.
+    const receiverWaiting = agentInbox.waiterCount(id) > 0;
+    const result = agentInbox.post(id, from, body.text);
     if (!result.ok) {
       switch (result.reason) {
         case 'full':
@@ -89,6 +100,7 @@ export function registerInboxRoutes(app: FastifyInstance, ctx: SessionPort): voi
           return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Invalid message: ${result.reason}`);
       }
     }
+    options.nudger?.schedule(id, from, { nudge: body.nudge, messageId: result.message.id, receiverWaiting });
     return { message: result.message, pending: result.pending };
   });
 

@@ -68,7 +68,7 @@ import {
 import { imageWatcher } from '../image-watcher.js';
 import { workflowRunWatcher, summarizeRun } from '../workflow-run-watcher.js';
 import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment } from '../attachment-registry.js';
-import { getCli } from '../config/cli-registry/registry.js';
+import { getCli, listClis } from '../config/cli-registry/registry.js';
 import { readCustomModelHosts } from '../custom-model-hosts.js';
 import { applyCustomModelInjection, customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
 import type { CustomModelBookkeeping } from '../types/session.js';
@@ -102,6 +102,8 @@ import { intentStore } from '../intent-store.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { agentInbox } from './agent-inbox.js';
+import { InboxNudger } from './inbox-nudger.js';
+import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -261,6 +263,29 @@ function getOrCreateSelfSignedCert(): { key: string; cert: string } {
 export class WebServer extends EventEmitter {
   private app: FastifyInstance;
   private sessions: Map<string, Session> = new Map();
+  /**
+   * Types one line into a session that has mail it would otherwise never read. Gets a
+   * plain TCP probe for remote hosts and NOT the wake registry: a post must never
+   * wake a sleeping host.
+   */
+  private readonly inboxNudger = new InboxNudger({
+    getSession: (id) => this.sessions.get(id),
+    unseen: (id) => agentInbox.unseen(id),
+    pendingCount: (id) => agentInbox.pendingCount(id),
+    isWaiting: (id) => agentInbox.summary().get(id)?.waiting === true,
+    isShellMode: (mode) => getCli(mode)?.kind === 'shell',
+    agentInForeground: (session) => {
+      const muxName = this.sessions.get(session.id)?.muxName;
+      // Duck-typed like noteRemoteReconnect: the mux port does not expose it.
+      const mux = this.mux as unknown as { paneCurrentCommand?: (name: string) => string | null };
+      const fg = muxName ? mux.paneCurrentCommand?.(muxName) : null;
+      return !!fg && listClis().some((cli) => cli.kind === 'agent' && cli.discovery.binaries.includes(fg));
+    },
+    probeRemote: (remote) => probeRemoteHostReachable(remote),
+    enabled: () => process.env.CODEMAN_INBOX_NUDGE !== '0',
+    now: () => Date.now(),
+    log: (message) => console.log(message),
+  });
   private respawnControllers: Map<string, RespawnController> = new Map();
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
   private runSummaryTrackers: Map<string, RunSummaryTracker> = new Map();
@@ -1072,7 +1097,7 @@ export class WebServer extends EventEmitter {
     registerScheduledRoutes(this.app, ctx);
     registerHookEventRoutes(this.app, ctx);
     registerApprovalRoutes(this.app, ctx);
-    registerInboxRoutes(this.app, ctx);
+    registerInboxRoutes(this.app, ctx, { nudger: this.inboxNudger });
     registerReadMyMindRoutes(this.app, ctx);
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
@@ -1484,6 +1509,7 @@ export class WebServer extends EventEmitter {
     // delete discards the inbox. Waiters are released either way (the pane is gone).
     if (killMux) agentInbox.drop(sessionId);
     else agentInbox.detach(sessionId);
+    this.inboxNudger.drop(sessionId);
 
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
@@ -3445,6 +3471,7 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     agentInbox.stop();
+    this.inboxNudger.stop();
     await this.persistAgentInboxNow();
 
     this.lastRecordedTokens.clear();

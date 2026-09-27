@@ -36,7 +36,6 @@
 
 import { spawn } from 'node:child_process';
 import dgram from 'node:dgram';
-import net from 'node:net';
 
 /** Minimum spacing between two reachability probes for the same session. */
 export const REMOTE_WAKE_PROBE_MIN_INTERVAL_MS = 30_000;
@@ -652,34 +651,10 @@ export class RemoteWakeRegistry {
 
 // ========== Default IO ==========
 
-/**
- * Cheap reachability probe: a bare TCP connect to the SSH port.
- *
- * Deliberately NOT an `ssh … true` probe: that opens a full session (auth,
- * remote log, process) every throttle window for a question a SYN already
- * answers. Any byte count it does move is a few hundred bytes per probe, far
- * below the remote idle detector's traffic threshold, so probing cannot keep a
- * host awake.
- */
-export function probeRemoteHostReachable(
-  remote: WakeableRemote,
-  timeoutMs = REMOTE_WAKE_PROBE_TIMEOUT_MS
-): Promise<boolean> {
-  const port = remote.port ?? DEFAULT_SSH_PORT;
-  return new Promise((resolve) => {
-    let settled = false;
-    const finish = (value: boolean) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(value);
-    };
-    const socket = net.connect({ host: remote.host, port });
-    socket.setTimeout(timeoutMs, () => finish(false));
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
-  });
-}
+// The TCP probe lives in remote-probe.ts so a caller that must never wake a host
+// (the inbox nudger) can use it without importing this module (wiring guard).
+import { probeRemoteHostReachable } from './remote-probe.js';
+export { probeRemoteHostReachable };
 
 /**
  * Run a host's wake command (e.g. a Wake-on-LAN wrapper script). No shell — the

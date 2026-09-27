@@ -2215,6 +2215,25 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   /**
+   * The pane's foreground process name (`#{pane_current_command}`), e.g. `codex` or
+   * `bash`. The inbox nudger asks before typing into a shell-mode pane. Null when
+   * unknown.
+   */
+  paneCurrentCommand(muxName: string): string | null {
+    if (IS_TEST_MODE) return null;
+    if (!isValidMuxName(muxName)) return null;
+    try {
+      const output = execSync(`${this.tmux()} display-message -t "${muxName}" -p '#{pane_current_command}'`, {
+        encoding: 'utf-8',
+        timeout: EXEC_TIMEOUT_MS,
+      }).trim();
+      return output || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Check if a tmux session exists.
    */
   muxSessionExists(muxName: string): boolean {

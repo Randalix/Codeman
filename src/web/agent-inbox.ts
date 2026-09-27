@@ -6,9 +6,11 @@
  * receiver's composer. That is the right primitive for a prompt, and the wrong one
  * for a message: every delivery starts (or interrupts) a billed turn, the receiver
  * cannot defer it, and for the fullscreen TUIs a stray byte is a dead session. The
- * inbox stores instead of typing: nothing reaches the pane, the receiver polls
- * (`codeman agent inbox --wait`) between its own steps, and a message is gone only
- * when the receiver acknowledges it.
+ * inbox stores instead of typing: the message never reaches the pane, the receiver
+ * polls (`codeman agent inbox --wait`) between its own steps, and a message is gone
+ * only when the receiver acknowledges it. The one exception is `inbox-nudger.ts`: a
+ * receiver that would never poll (idle, nobody parked) gets a single short line
+ * saying that mail is waiting — never the message itself.
  *
  * Invariants:
  * - Module-level singleton in the style of `session-wait-registry.ts` /
@@ -222,6 +224,16 @@ export class AgentInbox {
       return null;
     }
     return state.since;
+  }
+
+  /**
+   * Pending messages no non-peek read has handed out yet, oldest first. The inbox
+   * nudger's question: "is there mail this session has not seen?" A parked
+   * `inbox --wait` reads a post the moment it lands, so its mail never shows up here.
+   */
+  unseen(sessionId: string): InboxMessage[] {
+    const seen = this.seen.get(sessionId);
+    return this.list(sessionId).filter((m) => !seen?.has(m.id));
   }
 
   /** Remember the messages a non-peek read handed out, so `ackSeen()` can remove them. */

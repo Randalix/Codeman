@@ -1120,6 +1120,8 @@ export const InboxPostSchema = z
   .object({
     text: z.string().min(1).max(16_384),
     from: z.string().min(1).max(128).optional(),
+    /** false: store only, never type a nudge into the receiver (see web/inbox-nudger). */
+    nudge: z.boolean().optional(),
   })
   .strict();
 
