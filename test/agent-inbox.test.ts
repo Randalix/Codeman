@@ -22,6 +22,19 @@ function make(): { inbox: AgentInbox; tick: (ms: number) => void } {
   return { inbox, tick: (ms) => (t += ms) };
 }
 
+describe('unseen', () => {
+  it('lists pending mail no non-peek read has handed out, and keeps later posts unseen', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'one');
+    await inbox.read(A, undefined, undefined, { peek: true });
+    expect(inbox.unseen(A).map((m) => m.text)).toEqual(['one']); // peek marks nothing
+    await inbox.read(A);
+    inbox.post(A, B, 'two');
+    expect(inbox.unseen(A).map((m) => m.text)).toEqual(['two']);
+    expect(inbox.unseen(B)).toEqual([]);
+  });
+});
+
 describe('post / list / ack', () => {
   it('stores in order, reads are non-destructive, ack removes only the named ids', () => {
     const { inbox } = make();
