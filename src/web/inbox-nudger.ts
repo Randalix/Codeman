@@ -22,6 +22,7 @@
  * - A busy session is nudged on its next `idle` event, not mid-turn. Status is a
  *   heuristic for some modes, so after `NUDGE_MAX_DEFER_MS` it is typed anyway — the
  *   agent CLIs queue input that arrives during a turn.
+ * - Never types over a human's half-written prompt (`hasDraft`): that would submit it.
  * - Shell mode types only when the pane's foreground process is an agent CLI; into a
  *   bare shell the text would run as a command.
  * - NEVER wakes a host. A remote session is nudged only when its host answers a plain
@@ -50,6 +51,8 @@ export interface NudgeTarget {
   readonly status: string;
   readonly remote: { host: string; port?: number } | undefined;
   writeViaMux(data: string): Promise<boolean>;
+  /** Someone has unsubmitted text in the composer (see Session.hasDraft). */
+  hasDraft(): boolean;
   once(event: 'idle', listener: () => void): unknown;
   off(event: 'idle', listener: () => void): unknown;
 }
@@ -175,6 +178,20 @@ export class InboxNudger {
         this.deferUntilIdle(sessionId, session, state, NUDGE_MAX_DEFER_MS - (now - state.deferredSince));
         return 'deferred';
       }
+    }
+
+    if (session.hasDraft()) {
+      // A human is mid-prompt: our line plus Enter would submit their draft. Look
+      // again later; past the max defer give up — the mail stays, the next post retries.
+      if (state.deferredSince === null) state.deferredSince = now;
+      if (now - state.deferredSince < NUDGE_MAX_DEFER_MS) {
+        this.retryIn(sessionId, state, NUDGE_COOLDOWN_MS);
+        return 'deferred';
+      }
+      this.clearTimers(sessionId, state);
+      state.deferredSince = null;
+      this.deps.log(`[InboxNudger] ${sessionId.slice(0, 8)}: unsubmitted draft in the composer, not typing`);
+      return 'skipped';
     }
 
     if (this.deps.isShellMode(session.mode) && !this.deps.agentInForeground(session)) return 'skipped';

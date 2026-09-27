@@ -3568,9 +3568,25 @@ export class Session extends EventEmitter {
     return this._lastSubmitAt;
   }
 
+  /**
+   * Since when printable text went in through Codeman's write path without an Enter
+   * after it (0 = none): someone has a half-typed prompt in the composer. The inbox
+   * nudger never types over it — its line and `\r` would submit the draft. Escape
+   * sequences (arrows, ESC) do not count; any submit clears it.
+   */
+  private _draftSince = 0;
+
+  hasDraft(): boolean {
+    return this._draftSince > 0;
+  }
+
   private _trackSubmit(data: string): void {
     if (data.includes('\r') || data.includes('\n')) {
       this._lastSubmitAt = Date.now();
+      this._draftSince = 0;
+      // eslint-disable-next-line no-control-regex -- "anything but a control byte" IS the test
+    } else if (this._draftSince === 0 && !data.startsWith('\u001b') && /[^\u0000-\u001f\u007f]/.test(data)) {
+      this._draftSince = Date.now();
     }
   }
 
@@ -3582,6 +3598,7 @@ export class Session extends EventEmitter {
    */
   markPromptSubmitted(): void {
     this._lastSubmitAt = Date.now();
+    this._draftSince = 0;
   }
 
   /**

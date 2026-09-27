@@ -21,7 +21,11 @@ const B = 'bbbbbbbb-0000-4000-8000-000000000000';
 
 class FakeSession extends EventEmitter implements NudgeTarget {
   status = 'idle';
+  draft = false;
   written: string[] = [];
+  hasDraft(): boolean {
+    return this.draft;
+  }
   constructor(
     readonly id: string,
     readonly mode = 'claude',
@@ -134,6 +138,28 @@ describe('when a post is announced', () => {
     await settle(NUDGE_COOLDOWN_MS);
     expect(s.written).toHaveLength(2);
     expect(s.written[1]).toMatch(/1 new message from bbbbbbbb \(2 pending\)/);
+  });
+
+  it('waits while a human has a draft in the composer, and never types over it', async () => {
+    const { sessions, post } = setup();
+    const s = new FakeSession(A);
+    s.draft = true;
+    sessions.set(A, s);
+    post(A, B);
+    await settle();
+    expect(s.written).toEqual([]);
+    s.draft = false; // submitted
+    await settle(NUDGE_COOLDOWN_MS);
+    expect(s.written).toHaveLength(1);
+
+    const stuck = setup();
+    const t = new FakeSession(A);
+    t.draft = true;
+    stuck.sessions.set(A, t);
+    stuck.post(A, B);
+    await settle();
+    await settle(NUDGE_MAX_DEFER_MS + NUDGE_COOLDOWN_MS);
+    expect(t.written).toEqual([]); // gave up instead of submitting the draft
   });
 
   it('types into a shell-mode pane only when an agent CLI is in the foreground', async () => {
