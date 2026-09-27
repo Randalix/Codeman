@@ -14,11 +14,15 @@ import { createMockRouteContext } from '../mocks/index.js';
 
 const SESSION_ID = 'inbox-test-session';
 
+const scheduled: Array<[string, string, { nudge?: boolean; messageId?: string; receiverWaiting?: boolean }]> = [];
+
 async function createHarness(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
   await app.register(fastifyCookie);
   const ctx = createMockRouteContext({ sessionId: SESSION_ID });
-  registerInboxRoutes(app, ctx as never);
+  registerInboxRoutes(app, ctx as never, {
+    nudger: { schedule: (id, from, opts) => void scheduled.push([id, from, opts ?? {}]) },
+  });
   app.addHook('preSerialization', (req, reply, payload: unknown, done) => {
     if (!req.url.startsWith('/api')) return done(null, payload);
     if (payload === null || typeof payload !== 'object') return done(null, payload);
@@ -42,12 +46,40 @@ describe('agent inbox routes', () => {
 
   beforeEach(async () => {
     agentInbox.resetForTests();
+    scheduled.length = 0;
     app = await createHarness();
   });
 
   afterEach(async () => {
     await app.close();
     agentInbox.resetForTests();
+  });
+
+  it('a stored post hands the nudger its receiver, sender and opt-out; a refused one does not', async () => {
+    await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox`, payload: { text: 'a', from: 's1' } });
+    await app.inject({
+      method: 'POST',
+      url: `/api/sessions/${SESSION_ID}/inbox`,
+      payload: { text: 'b', from: 's2', nudge: false },
+    });
+    const bad = await app.inject({
+      method: 'POST',
+      url: `/api/sessions/${SESSION_ID}/inbox`,
+      payload: { text: 'x'.repeat(16_385) },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(scheduled).toMatchObject([
+      [SESSION_ID, 's1', { nudge: undefined, receiverWaiting: false, messageId: expect.any(String) }],
+      [SESSION_ID, 's2', { nudge: false, receiverWaiting: false }],
+    ]);
+  });
+
+  it('tells the nudger when a long-poll was parked at post time (the post clears that state)', async () => {
+    const waiting = app.inject({ method: 'GET', url: `/api/sessions/${SESSION_ID}/inbox?wait=5000&peek=1` });
+    while (agentInbox.waiterCount(SESSION_ID) === 0) await new Promise((r) => setTimeout(r, 5));
+    await app.inject({ method: 'POST', url: `/api/sessions/${SESSION_ID}/inbox`, payload: { text: 'a' } });
+    await waiting;
+    expect(scheduled[0][2]).toMatchObject({ receiverWaiting: true });
   });
 
   it('POST stores, GET reads non-destructively, ack removes, DELETE clears', async () => {

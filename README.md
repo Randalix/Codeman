@@ -1004,7 +1004,7 @@ REST over Fastify — **~235 handlers across 26 route modules**, plus an SSE str
 | `POST`   | `/api/sessions/:id/pin`    | Pin/unpin in the Session Manager (`{pinned}`)                                      |
 | `PUT`    | `/api/session-order`       | Sync tab order across devices (`{order: [ids]}`)                                   |
 | `POST`   | `/api/sessions/:id/custom-model` | Restart the session's CLI on a saved custom endpoint (`{endpointId, modelId}`; `{clear: true}` returns to the native backend) |
-| `POST`   | `/api/sessions/:id/inbox`  | Leave a message in the session's agent mailbox (`{text, from?}`); **nothing is typed** |
+| `POST`   | `/api/sessions/:id/inbox`  | Leave a message in the session's agent mailbox (`{text, from?, nudge?}`); the message is never typed — an idle receiver not parked on its inbox gets one short nudge line (`nudge:false` or `CODEMAN_INBOX_NUDGE=0`: never) |
 | `GET`    | `/api/sessions/:id/inbox`  | Read the mailbox, non-destructive (`?wait=<ms>` long-polls while empty, `?peek=1` marks nothing); `POST …/inbox/ack {}` removes what the session read (`{ids}` for a subset), `DELETE …/inbox` clears |
 | `DELETE` | `/api/sessions/:id`        | Delete session                                                                     |
 

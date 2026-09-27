@@ -555,6 +555,15 @@ describe('agent post / inbox (mailbox)', () => {
     expect(deps.out.join('')).toMatch(/posted .*3 pending/);
   });
 
+  it('post sends nudge:false only for --no-nudge (an older strict server would refuse the field)', async () => {
+    const plain = fakeDeps([ok({ pending: 1 })]);
+    await agentPost(plain, { id: OTHER, text: 'x' });
+    expect(plain.calls[0].body).not.toHaveProperty('nudge');
+    const quiet = fakeDeps([ok({ pending: 1 })]);
+    await agentPost(quiet, { id: OTHER, text: 'x', nudge: false });
+    expect(quiet.calls[0].body).toMatchObject({ text: 'x', nudge: false });
+  });
+
   it('post refuses self and empty text before any request', async () => {
     const self = fakeDeps([]);
     expect(await agentPost(self, { id: SELF.slice(0, 8), text: 'note' })).toBe(EXIT.refused);

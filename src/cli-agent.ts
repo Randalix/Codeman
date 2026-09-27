@@ -1176,11 +1176,16 @@ export interface InboxMessage {
 }
 
 /**
- * `agent post` — leave a message in another session's inbox. Nothing is typed into
- * its pane: the receiver reads it with `agent inbox` when it wants to. Multi-line
- * text is fine here (it is stored, not sent as keystrokes).
+ * `agent post` — leave a message in another session's inbox. The message itself is
+ * never typed: the receiver reads it with `agent inbox`. A receiver that would never
+ * look (idle, not parked on `inbox --wait`) gets one short nudge line from the server
+ * (`web/inbox-nudger.ts`); `nudge: false` stores only. Multi-line text is fine here
+ * (it is stored, not sent as keystrokes).
  */
-export async function agentPost(deps: AgentDeps, options: { id: string; text: string }): Promise<number> {
+export async function agentPost(
+  deps: AgentDeps,
+  options: { id: string; text: string; nudge?: boolean }
+): Promise<number> {
   if (isSelfSession(deps.ctx.selfId, options.id)) {
     return fail(deps, `refusing: ${options.id} is me — a note to self goes in a file, not the mailbox`, EXIT.refused);
   }
@@ -1190,7 +1195,9 @@ export async function agentPost(deps: AgentDeps, options: { id: string; text: st
   const res = await deps.request(deps.ctx, {
     method: 'POST',
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
-    body: { text: options.text, from: deps.ctx.selfId },
+    // `nudge` only when opting out: the schema is strict, and an older server would
+    // refuse the unknown field on every ordinary post.
+    body: { text: options.text, from: deps.ctx.selfId, ...(options.nudge === false ? { nudge: false } : {}) },
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as { message?: InboxMessage; pending?: number } | undefined;
@@ -1542,10 +1549,11 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('post <id> [text...]')
     .description(
-      "Leave a message in another session's mailbox (nothing is typed; it reads it with `agent inbox`). Text from stdin when omitted or `-`"
+      "Leave a message in another session's mailbox; it reads it with `agent inbox`. An idle receiver that would never look gets one short nudge typed into its pane (--no-nudge: never). Text from stdin when omitted or `-`"
     )
+    .option('--no-nudge', 'Store only; never type a nudge into the receiver')
     .option('--json', 'Machine-readable output')
-    .action(async (id: string, words: string[], options: { json?: boolean }) => {
+    .action(async (id: string, words: string[], options: { json?: boolean; nudge?: boolean }) => {
       const fromStdin = words.length === 0 || (words.length === 1 && words[0] === '-');
       // An agent's shell tool has a TTY on stdin: waiting for EOF there hangs the tool
       // until its own timeout. Only read stdin when something is actually piped in.
@@ -1559,7 +1567,7 @@ export function registerAgentCommands(program: Command): Command {
         return;
       }
       const text = fromStdin ? await readStdin() : words.join(' ');
-      await run(Boolean(options.json), (deps) => agentPost(deps, { id, text }));
+      await run(Boolean(options.json), (deps) => agentPost(deps, { id, text, nudge: options.nudge }));
     });
 
   agent
