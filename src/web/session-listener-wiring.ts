@@ -29,6 +29,7 @@ import { getLifecycleLog } from '../session-lifecycle-log.js';
 import { fileStreamManager } from '../file-stream-manager.js';
 import { sessionWaits } from './session-wait-registry.js';
 import { approvalInbox } from './approval-inbox.js';
+import { turnWatch } from './agent-watch.js';
 
 /** Stored listener references for session cleanup (prevents memory leaks) */
 export interface SessionListenerRefs {
@@ -41,6 +42,7 @@ export interface SessionListenerRefs {
   exit: (code: number | null) => void;
   working: () => void;
   idle: () => void;
+  turnEnded: () => void;
   taskCreated: (task: BackgroundTask) => void;
   taskUpdated: (task: BackgroundTask) => void;
   taskCompleted: (task: BackgroundTask) => void;
@@ -244,6 +246,9 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
         tracker.recordTokens(session.inputTokens, session.outputTokens);
       }
     },
+
+    /** Wakes parked `GET /api/agent-watch` requests — the session latched a turn end */
+    turnEnded: () => turnWatch.notify(session.id),
 
     /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
     idle: () => {
@@ -465,6 +470,7 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('exit', refs.exit);
   session.on('working', refs.working);
   session.on('idle', refs.idle);
+  session.on('turnEnded', refs.turnEnded);
   session.on('taskCreated', refs.taskCreated);
   session.on('taskUpdated', refs.taskUpdated);
   session.on('taskCompleted', refs.taskCompleted);
@@ -500,6 +506,7 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('exit', refs.exit);
   session.off('working', refs.working);
   session.off('idle', refs.idle);
+  session.off('turnEnded', refs.turnEnded);
   session.off('taskCreated', refs.taskCreated);
   session.off('taskUpdated', refs.taskUpdated);
   session.off('taskCompleted', refs.taskCompleted);

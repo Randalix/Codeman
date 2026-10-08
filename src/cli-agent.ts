@@ -388,6 +388,9 @@ interface SessionRow {
   workingDir?: string;
   pid?: number | null;
   parentSessionId?: string | null;
+  /** Wall-clock ms the last turn ended; null while one runs. Absent on older servers. */
+  turnEndedAt?: number | null;
+  turnEndSource?: string | null;
 }
 
 /** A full session id (the only form the routes accept); `ls` prints the 8-char prefix. */
@@ -504,14 +507,15 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
       inbox ? String(inbox.pending) : '?',
       inbox ? (inbox.waitingSince ? `since ${clockTime(inbox.waitingSince)}` : '-') : '?',
+      s.turnEndedAt ? clockTime(new Date(s.turnEndedAt).toISOString()) : '-',
       s.name || s.workingDir || '',
     ];
   });
-  const header = [' ', 'ID', 'MODE', 'STATUS', ...(options.alive ? ['PANE'] : []), 'INBOX', 'WAIT', 'NAME'];
+  const header = [' ', 'ID', 'MODE', 'STATUS', ...(options.alive ? ['PANE'] : []), 'INBOX', 'WAIT', 'ENDED', 'NAME'];
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(
-      `* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since.`
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs).`
     )
   );
   if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));
@@ -1292,6 +1296,95 @@ export async function agentAck(deps: AgentDeps, options: AckOptions): Promise<nu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Watch — which of my workers is waiting for input?
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface WatchOptions {
+  /** Sessions to watch; empty means this session's children (lineage). */
+  ids: string[];
+  /** The `cursor` of the previous answer; absent reports every finished turn. */
+  since?: number;
+  /** Block up to this long while nothing qualifies. */
+  waitMs: number;
+}
+
+interface WatchAnswer {
+  cursor: number;
+  ended: {
+    id: string;
+    name: string;
+    mode: string;
+    status: string;
+    turnEndedAt: number;
+    turnEndSource: string | null;
+  }[];
+  gone: string[];
+  timedOut: boolean;
+}
+
+/** The ids to watch: the given ones (resolved like every id), else this session's children. */
+async function watchTargets(deps: AgentDeps, ids: string[]): Promise<{ ids: string[] } | { error: string }> {
+  if (ids.length > 0) {
+    const resolved: string[] = [];
+    for (const id of ids) {
+      if (isSelfSession(deps.ctx.selfId, id))
+        return { error: `refusing: ${id} is me — watch your workers, not yourself` };
+      const target = await resolveSessionId(deps, id);
+      if ('error' in target) return target;
+      resolved.push(target.id);
+    }
+    return { ids: resolved };
+  }
+  const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
+  if (!res.json?.success) return { error: describeFailure(res) };
+  const children = ((res.json.data as SessionRow[] | undefined) ?? []).filter(
+    (s) => s.parentSessionId === deps.ctx.selfId
+  );
+  if (children.length === 0) return { error: 'no workers to watch: this session spawned none — pass their ids' };
+  return { ids: children.map((s) => s.id) };
+}
+
+/**
+ * `agent watch` — block until one of the watched sessions has finished its turn (or
+ * died), then print one line per such session and the cursor for the next call.
+ *
+ * Level-triggered: the server keeps "turn over since <t>" per session, so a turn that
+ * ended while nobody was watching is still reported. Feed `--since <cursor>` back to
+ * see only what ended after the previous answer. Exit 0 with hits, 2 on timeout.
+ */
+export async function agentWatch(deps: AgentDeps, options: WatchOptions): Promise<number> {
+  const targets = await watchTargets(deps, options.ids);
+  if ('error' in targets) return fail(deps, targets.error, EXIT.refused);
+  const res = await deps.request(deps.ctx, {
+    method: 'GET',
+    path: '/api/v1/agent-watch',
+    query: { sessions: targets.ids.join(','), since: options.since, wait: options.waitMs },
+    timeoutMs: options.waitMs + 30_000,
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  const data = res.json.data as WatchAnswer;
+  if (deps.json) {
+    emitJson(deps, data);
+  } else {
+    for (const s of data.ended) {
+      const what = s.turnEndSource === 'exit' ? 'EXITED' : 'IDLE';
+      deps.io.out(
+        `${what}  ${s.id.slice(0, 8)}  ${s.mode}  since ${clockTime(new Date(s.turnEndedAt).toISOString())} (${s.turnEndSource ?? '?'})  ${s.name}`
+      );
+    }
+    for (const id of data.gone) deps.io.out(`GONE  ${id.slice(0, 8)}`);
+    if (data.timedOut) deps.io.err(palette.muted(`(no turn ended within ${options.waitMs} ms)`));
+    deps.io.out(`cursor ${data.cursor}`);
+    deps.io.err(
+      palette.muted(
+        `next: codeman agent watch --since ${data.cursor}${options.ids.length ? ` ${options.ids.join(' ')}` : ''}`
+      )
+    );
+  }
+  return data.timedOut ? EXIT.timeout : EXIT.ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Todos (the session's Ralph todo list)
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -1508,7 +1601,7 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description(
-      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, read, interrupt, rm, post, inbox, todo'
+      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, watch, read, interrupt, rm, post, inbox, todo'
     );
 
   agent
@@ -1753,6 +1846,24 @@ export function registerAgentCommands(program: Command): Command {
     .option('--json', 'Machine-readable output')
     .action((ids: string[], options: { json?: boolean }) =>
       run(Boolean(options.json), (deps) => agentAck(deps, { ids }))
+    );
+
+  agent
+    .command('watch [ids...]')
+    .description(
+      'Block until one of your workers (default: the sessions you spawned) has finished its turn or died; prints IDLE/EXITED/GONE lines and a cursor — pass it back as --since to see only newer ones. Exit 2 on timeout'
+    )
+    .option('--since <cursor>', 'The cursor of the previous watch: report only turns that ended after it')
+    .option('-t, --timeout <ms>', 'Wait budget in ms', String(DEFAULT_WAIT_MS))
+    .option('--json', 'Machine-readable output')
+    .action((ids: string[], options: { since?: string; timeout?: string; json?: boolean }) =>
+      run(Boolean(options.json), (deps) =>
+        agentWatch(deps, {
+          ids,
+          since: options.since === undefined ? undefined : parsePositiveInt(options.since, 0, '--since'),
+          waitMs: parsePositiveInt(options.timeout, DEFAULT_WAIT_MS),
+        })
+      )
     );
 
   registerTodoCommands(agent);

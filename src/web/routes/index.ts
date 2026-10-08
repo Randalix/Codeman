@@ -12,6 +12,7 @@ export { registerSystemRoutes } from './system-routes.js';
 export { registerHookEventRoutes } from './hook-event-routes.js';
 export { registerApprovalRoutes } from './approval-routes.js';
 export { registerInboxRoutes } from './inbox-routes.js';
+export { registerAgentWatchRoutes } from './agent-watch-routes.js';
 export { registerReadMyMindRoutes } from './readmymind-routes.js';
 export { registerStatusTelemetryRoutes } from './status-telemetry-routes.js';
 export { registerCaseRoutes } from './case-routes.js';

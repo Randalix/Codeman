@@ -1133,6 +1133,18 @@ export const InboxAckSchema = z
   })
   .strict();
 
+/** GET /api/agent-watch */
+export const AgentWatchQuerySchema = z
+  .object({
+    sessions: z
+      .string()
+      .min(1)
+      .max(64 * 40),
+    since: z.coerce.number().int().nonnegative().optional(),
+    wait: z.coerce.number().int().positive().optional(),
+  })
+  .strict();
+
 export const InboxReadQuerySchema = z
   .object({
     wait: z.coerce.number().int().positive().optional(),

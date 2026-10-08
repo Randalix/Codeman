@@ -95,6 +95,9 @@ export function registerHookEventRoutes(
     if (waitSession && hooksAvailableForMode(waitSession.mode, sessionHookOptions(waitSession))) {
       if (event === 'stop') {
         sessionWaits.notifySignal(sessionId, 'stop');
+        // The edge above reaches only a waiter already parked; the latch is what a
+        // coordinator that connects later reads (`GET /api/agent-watch`).
+        waitSession.markTurnEnded('hook');
       } else if (event === 'permission_prompt' || event === 'elicitation_dialog') {
         sessionWaits.notifySignal(sessionId, 'blocked');
       }

@@ -102,6 +102,7 @@ import { intentStore } from '../intent-store.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { agentInbox } from './agent-inbox.js';
+import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
@@ -176,6 +177,7 @@ import {
   registerHookEventRoutes,
   registerApprovalRoutes,
   registerInboxRoutes,
+  registerAgentWatchRoutes,
   registerReadMyMindRoutes,
   registerStatusTelemetryRoutes,
   registerSystemRoutes,
@@ -1098,6 +1100,7 @@ export class WebServer extends EventEmitter {
     registerHookEventRoutes(this.app, ctx);
     registerApprovalRoutes(this.app, ctx);
     registerInboxRoutes(this.app, ctx, { nudger: this.inboxNudger });
+    registerAgentWatchRoutes(this.app, ctx);
     registerReadMyMindRoutes(this.app, ctx);
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
@@ -3479,6 +3482,7 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     agentInbox.stop();
+    turnWatch.stop();
     this.inboxNudger.stop();
     await this.persistAgentInboxNow();
 
