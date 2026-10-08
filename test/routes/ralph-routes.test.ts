@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 import { registerRalphRoutes } from '../../src/web/routes/ralph-routes.js';
+import { RalphTracker } from '../../src/ralph-tracker.js';
 
 /** Create a mock ralph tracker with all methods used by ralph-routes */
 function createMockRalphTracker() {
@@ -530,6 +531,90 @@ describe('ralph-routes', () => {
       expect(res.statusCode).toBe(400);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(false);
+    });
+  });
+
+  // ========== Agent-set todos: /api/sessions/:id/ralph-todos ==========
+
+  describe('ralph-todos (agent-set, real tracker)', () => {
+    let tracker: RalphTracker;
+    const base = () => `/api/sessions/${harness.ctx._sessionId}/ralph-todos`;
+
+    beforeEach(() => {
+      tracker = new RalphTracker();
+      (harness.ctx._session as Record<string, unknown>).ralphTracker = tracker;
+    });
+
+    afterEach(() => tracker.destroy());
+
+    it('adds, lists, updates and removes; persists after every write', async () => {
+      const added = await harness.app.inject({
+        method: 'POST',
+        url: base(),
+        payload: { content: 'Write the tests', priority: 'P1' },
+      });
+      const todo = JSON.parse(added.body).data;
+      expect(todo).toMatchObject({ content: 'Write the tests', status: 'pending', priority: 'P1', source: 'agent' });
+
+      const listed = JSON.parse((await harness.app.inject({ method: 'GET', url: base() })).body);
+      expect(listed.data.todos).toHaveLength(1);
+      expect(listed.data.stats).toMatchObject({ total: 1, pending: 1 });
+
+      const updated = await harness.app.inject({
+        method: 'POST',
+        url: `${base()}/${todo.id}`,
+        payload: { status: 'completed' },
+      });
+      expect(JSON.parse(updated.body).data.status).toBe('completed');
+
+      const removed = await harness.app.inject({ method: 'DELETE', url: `${base()}/${todo.id}` });
+      expect(JSON.parse(removed.body)).toEqual({ success: true, data: { removed: todo.id } });
+      expect(tracker.todos).toEqual([]);
+      expect(harness.ctx.persistSessionState).toHaveBeenCalledTimes(3);
+    });
+
+    it('works for external-CLI sessions, where ralph-config refuses', async () => {
+      harness.ctx._session.mode = 'opencode';
+      const res = await harness.app.inject({ method: 'POST', url: base(), payload: { content: 'Codex can plan too' } });
+      expect(JSON.parse(res.body).success).toBe(true);
+      expect(tracker.enabled).toBe(false);
+    });
+
+    it('answers NOT_FOUND for an unknown todo id', async () => {
+      const update = await harness.app.inject({
+        method: 'POST',
+        url: `${base()}/todo-missing`,
+        payload: { status: 'completed' },
+      });
+      expect(JSON.parse(update.body)).toMatchObject({ success: false, errorCode: 'NOT_FOUND' });
+      const del = await harness.app.inject({ method: 'DELETE', url: `${base()}/todo-missing` });
+      expect(JSON.parse(del.body)).toMatchObject({ success: false, errorCode: 'NOT_FOUND' });
+      expect(harness.ctx.persistSessionState).not.toHaveBeenCalled();
+    });
+
+    it('answers CONFLICT when the list is full of agent-set todos', async () => {
+      tracker.setMaxTodos(1);
+      await harness.app.inject({ method: 'POST', url: base(), payload: { content: 'First' } });
+      const res = await harness.app.inject({ method: 'POST', url: base(), payload: { content: 'Second' } });
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: 'CONFLICT' });
+    });
+
+    it('rejects blank content, an unknown status and an unknown priority', async () => {
+      for (const payload of [
+        { content: '   ' },
+        { content: 'x', status: 'blocked' },
+        { content: 'x', priority: 'P9' },
+      ]) {
+        const res = await harness.app.inject({ method: 'POST', url: base(), payload });
+        expect(res.statusCode).toBe(400);
+      }
+      const res = await harness.app.inject({ method: 'POST', url: `${base()}/todo-x`, payload: {} });
+      expect(res.statusCode).toBe(400);
+    });
+
+    it('returns an error for an unknown session', async () => {
+      const res = await harness.app.inject({ method: 'GET', url: '/api/sessions/nonexistent/ralph-todos' });
+      expect(JSON.parse(res.body).success).toBe(false);
     });
   });
 });

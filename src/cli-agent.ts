@@ -1292,6 +1292,164 @@ export async function agentAck(deps: AgentDeps, options: AckOptions): Promise<nu
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Todos (the session's Ralph todo list)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ⚠️ Nothing these verbs print may start with a todo glyph (☐ ☒ ◐ ✓ ✔) or a
+// `- [ ]` checkbox: the output lands in the caller's own pane, where an enabled
+// tracker would read `✓ added …` back as a second, parsed todo. Status is a word.
+
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TodoRow {
+  id: string;
+  content: string;
+  status: TodoStatus;
+  priority?: 'P0' | 'P1' | 'P2' | null;
+  source?: 'agent';
+}
+
+const TODO_STATUS_WORD: Record<TodoStatus, string> = {
+  pending: 'pending',
+  in_progress: 'doing',
+  completed: 'done',
+};
+
+/** The session a todo verb works on: `--session` (resolved like every id), else this one. */
+async function todoTarget(deps: AgentDeps, session: string | undefined): Promise<{ id: string } | { error: string }> {
+  return session === undefined ? { id: deps.ctx.selfId } : resolveSessionId(deps, session);
+}
+
+async function fetchTodos(
+  deps: AgentDeps,
+  sessionId: string
+): Promise<{ todos: TodoRow[]; stats?: Record<string, number> } | { error: string }> {
+  const res = await deps.request(deps.ctx, {
+    method: 'GET',
+    path: `/api/v1/sessions/${encodeURIComponent(sessionId)}/ralph-todos`,
+  });
+  if (!res.json?.success) return { error: describeFailure(res) };
+  const data = res.json.data as { todos?: TodoRow[]; stats?: Record<string, number> } | undefined;
+  return { todos: data?.todos ?? [], stats: data?.stats };
+}
+
+/**
+ * Match what was typed against the list: the full id, the id without its `todo-`
+ * prefix, or a unique prefix of either. Ambiguity refuses rather than picking one —
+ * `done` on the wrong item is a lie the orchestrator then acts on.
+ */
+export function matchTodoId(todos: readonly TodoRow[], typed: string): { id: string } | { error: string } {
+  const key = typed.trim();
+  if (!key) return { error: 'refusing: empty todo id' };
+  const exact = todos.find((t) => t.id === key || t.id === `todo-${key}`);
+  if (exact) return { id: exact.id };
+  const hits = todos.filter((t) => t.id.startsWith(key) || t.id.startsWith(`todo-${key}`));
+  if (hits.length === 1) return { id: hits[0].id };
+  if (hits.length === 0) return { error: `no todo matches "${key}" (see \`agent todo ls\`)` };
+  return { error: `"${key}" is ambiguous: ${hits.map((t) => t.id).join(', ')}` };
+}
+
+/** `agent todo ls` — the session's todo list, agent-set and parsed alike. */
+export async function agentTodoLs(deps: AgentDeps, options: { session?: string } = {}): Promise<number> {
+  const target = await todoTarget(deps, options.session);
+  if ('error' in target) return fail(deps, target.error);
+  const list = await fetchTodos(deps, target.id);
+  if ('error' in list) return fail(deps, list.error);
+  if (deps.json) {
+    emitJson(deps, list);
+    return EXIT.ok;
+  }
+  if (list.todos.length === 0) {
+    deps.io.out(palette.muted('(no todos)'));
+    return EXIT.ok;
+  }
+  const rows = list.todos.map((t) => [
+    t.id,
+    TODO_STATUS_WORD[t.status] ?? t.status,
+    t.priority ?? '-',
+    t.source === 'agent' ? 'agent' : 'output',
+    t.content,
+  ]);
+  deps.io.out(table([['ID', 'STATUS', 'PRIO', 'FROM', 'TODO'], ...rows], { gap: 2 }));
+  const done = list.todos.filter((t) => t.status === 'completed').length;
+  deps.io.out(
+    palette.muted(
+      `${done}/${list.todos.length} done. FROM agent = set with \`agent todo\` (never expires); output = read off the terminal (expires after an hour without change).`
+    )
+  );
+  return EXIT.ok;
+}
+
+export interface TodoAddOptions {
+  session?: string;
+  text: string;
+  status?: TodoStatus;
+  priority?: 'P0' | 'P1' | 'P2';
+}
+
+/** `agent todo add` — put an item on the list (re-adding the same text re-marks it). */
+export async function agentTodoAdd(deps: AgentDeps, options: TodoAddOptions): Promise<number> {
+  if (options.text.trim().length === 0) return fail(deps, 'refusing: empty todo', EXIT.refused);
+  const target = await todoTarget(deps, options.session);
+  if ('error' in target) return fail(deps, target.error);
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/ralph-todos`,
+    body: {
+      content: options.text,
+      ...(options.status ? { status: options.status } : {}),
+      ...(options.priority ? { priority: options.priority } : {}),
+    },
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  const todo = res.json.data as TodoRow;
+  if (deps.json) emitJson(deps, todo);
+  else deps.io.out(palette.ok(`added ${todo.id} (${TODO_STATUS_WORD[todo.status] ?? todo.status})`));
+  return EXIT.ok;
+}
+
+/** `agent todo start|done|reopen` — set one item's status. */
+export async function agentTodoSet(
+  deps: AgentDeps,
+  options: { session?: string; todo: string; status: TodoStatus }
+): Promise<number> {
+  const target = await todoTarget(deps, options.session);
+  if ('error' in target) return fail(deps, target.error);
+  const list = await fetchTodos(deps, target.id);
+  if ('error' in list) return fail(deps, list.error);
+  const match = matchTodoId(list.todos, options.todo);
+  if ('error' in match) return fail(deps, match.error, EXIT.refused);
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/ralph-todos/${encodeURIComponent(match.id)}`,
+    body: { status: options.status },
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  const todo = res.json.data as TodoRow;
+  if (deps.json) emitJson(deps, todo);
+  else deps.io.out(palette.ok(`${todo.id} is now ${TODO_STATUS_WORD[todo.status] ?? todo.status}`));
+  return EXIT.ok;
+}
+
+/** `agent todo rm` — take one item off the list. */
+export async function agentTodoRm(deps: AgentDeps, options: { session?: string; todo: string }): Promise<number> {
+  const target = await todoTarget(deps, options.session);
+  if ('error' in target) return fail(deps, target.error);
+  const list = await fetchTodos(deps, target.id);
+  if ('error' in list) return fail(deps, list.error);
+  const match = matchTodoId(list.todos, options.todo);
+  if ('error' in match) return fail(deps, match.error, EXIT.refused);
+  const res = await deps.request(deps.ctx, {
+    method: 'DELETE',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/ralph-todos/${encodeURIComponent(match.id)}`,
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  if (deps.json) emitJson(deps, res.json.data ?? {});
+  else deps.io.out(palette.ok(`removed ${match.id}`));
+  return EXIT.ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Commander wiring
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1350,7 +1508,7 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description(
-      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, read, interrupt, rm, post, inbox'
+      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, read, interrupt, rm, post, inbox, todo'
     );
 
   agent
@@ -1597,5 +1755,77 @@ export function registerAgentCommands(program: Command): Command {
       run(Boolean(options.json), (deps) => agentAck(deps, { ids }))
     );
 
+  registerTodoCommands(agent);
+
   return agent;
+}
+
+const SESSION_FLAG = ['-s, --session <id>', "Another session's list (default: this session's)"] as const;
+
+/** `codeman agent todo …` — the session's Ralph todo list (the panel in the web UI). */
+function registerTodoCommands(agent: Command): void {
+  const todo = agent
+    .command('todo')
+    .description(
+      "This session's todo list, shown in the web UI's Ralph panel: ls, add, start, done, reopen, rm. Items you add never expire; --session works on another session's list"
+    );
+
+  todo
+    .command('ls', { isDefault: true })
+    .alias('list')
+    .description('List the todos (agent-set and those read off the terminal)')
+    .option(...SESSION_FLAG)
+    .option('--json', 'Machine-readable output')
+    .action((options: { session?: string; json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentTodoLs(deps, { session: options.session }))
+    );
+
+  todo
+    .command('add <text...>')
+    .description('Add a todo (pending unless --start); the same text again only re-marks it')
+    .option('--start', 'Add it as in progress')
+    .option('-p, --priority <P0|P1|P2>', 'Priority (default: read from the text, e.g. "critical")')
+    .option(...SESSION_FLAG)
+    .option('--json', 'Machine-readable output')
+    .action((words: string[], options: { start?: boolean; priority?: string; session?: string; json?: boolean }) => {
+      const priority = options.priority?.toUpperCase();
+      if (priority !== undefined && priority !== 'P0' && priority !== 'P1' && priority !== 'P2') {
+        console.error(palette.err(`${GLYPH.fail} --priority must be P0, P1 or P2`));
+        process.exitCode = EXIT.refused;
+        return;
+      }
+      return run(Boolean(options.json), (deps) =>
+        agentTodoAdd(deps, {
+          session: options.session,
+          text: words.join(' '),
+          status: options.start ? 'in_progress' : undefined,
+          priority,
+        })
+      );
+    });
+
+  const setters: [verb: string, status: TodoStatus, description: string][] = [
+    ['start', 'in_progress', 'Mark a todo as in progress'],
+    ['done', 'completed', 'Mark a todo as done'],
+    ['reopen', 'pending', 'Mark a todo as pending again'],
+  ];
+  for (const [verb, status, description] of setters) {
+    todo
+      .command(`${verb} <todo-id>`)
+      .description(`${description} (full id, or a unique prefix as \`ls\` prints it)`)
+      .option(...SESSION_FLAG)
+      .option('--json', 'Machine-readable output')
+      .action((id: string, options: { session?: string; json?: boolean }) =>
+        run(Boolean(options.json), (deps) => agentTodoSet(deps, { session: options.session, todo: id, status }))
+      );
+  }
+
+  todo
+    .command('rm <todo-id>')
+    .description('Remove a todo')
+    .option(...SESSION_FLAG)
+    .option('--json', 'Machine-readable output')
+    .action((id: string, options: { session?: string; json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentTodoRm(deps, { session: options.session, todo: id }))
+    );
 }

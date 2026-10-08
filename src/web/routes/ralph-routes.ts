@@ -11,7 +11,14 @@ import fs from 'node:fs/promises';
 import { ApiErrorCode, createErrorResponse, getErrorMessage, type ApiResponse } from '../../types.js';
 import { Session, isExternalCliMode } from '../../session.js';
 import { RespawnController } from '../../respawn-controller.js';
-import { RalphConfigSchema, FixPlanImportSchema, RalphPromptWriteSchema, RalphLoopStartSchema } from '../schemas.js';
+import {
+  RalphConfigSchema,
+  FixPlanImportSchema,
+  RalphPromptWriteSchema,
+  RalphLoopStartSchema,
+  RalphTodoAddSchema,
+  RalphTodoStatusUpdateSchema,
+} from '../schemas.js';
 import { SseEvent } from '../sse-events.js';
 import {
   autoConfigureRalph,
@@ -147,6 +154,57 @@ export function registerRalphRoutes(
         exitGateMet: session.ralphTracker.exitGateMet,
       },
     };
+  });
+
+  // ═══════════════════════════════════════════════════════════════
+  // Agent-set todos (`codeman agent todo`)
+  // ═══════════════════════════════════════════════════════════════
+  // Every mode, tracker enabled or not: these write the list directly instead of
+  // parsing output, so opencode/codex (which cannot run the tracker) keep one too.
+  // The tracker's todoUpdate event does the SSE broadcast and the inner-store write.
+
+  app.get('/api/sessions/:id/ralph-todos', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    return {
+      success: true,
+      data: { todos: session.ralphTracker.todos, stats: session.ralphTracker.getTodoStats() },
+    };
+  });
+
+  app.post('/api/sessions/:id/ralph-todos', async (req) => {
+    const { id } = req.params as { id: string };
+    const { content, status, priority } = parseBody(RalphTodoAddSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+    const todo = session.ralphTracker.addAgentTodo(content, status, priority);
+    if (!todo) {
+      return createErrorResponse(
+        ApiErrorCode.CONFLICT,
+        `Todo list is full (${session.ralphTracker.maxTodos} agent-set todos); remove one first`
+      );
+    }
+    ctx.persistSessionState(session);
+    return { success: true, data: todo };
+  });
+
+  app.post('/api/sessions/:id/ralph-todos/:todoId', async (req) => {
+    const { id, todoId } = req.params as { id: string; todoId: string };
+    const { status } = parseBody(RalphTodoStatusUpdateSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+    const todo = session.ralphTracker.setTodoStatus(todoId, status);
+    if (!todo) return createErrorResponse(ApiErrorCode.NOT_FOUND, `No todo ${todoId} in this session`);
+    ctx.persistSessionState(session);
+    return { success: true, data: todo };
+  });
+
+  app.delete('/api/sessions/:id/ralph-todos/:todoId', async (req) => {
+    const { id, todoId } = req.params as { id: string; todoId: string };
+    const session = findSessionOrFail(ctx, id, req);
+    if (!session.ralphTracker.removeTodo(todoId)) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, `No todo ${todoId} in this session`);
+    }
+    ctx.persistSessionState(session);
+    return { success: true, data: { removed: todoId } };
   });
 
   // ═══════════════════════════════════════════════════════════════

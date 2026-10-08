@@ -44,6 +44,12 @@ other's post are visible instead of silently stalled (HTTP:
 anything that is a message rather than a prompt — it never starts a billed turn and
 never risks a control byte in a fullscreen TUI.
 
+The session's **todo list** (the Ralph panel in the web UI) is in the CLI too:
+`codeman agent todo add <text>` / `start|done|reopen <todo-id>` / `rm <todo-id>` /
+`ls`, with `--session <id>` for a worker's list. Items set this way never expire and
+work in every mode, tracker enabled or not; ids take a unique prefix as `ls` prints
+them (HTTP: `GET/POST /api/v1/sessions/:id/ralph-todos`, `POST|DELETE …/ralph-todos/:todoId`).
+
 ## 0. Guard and bootstrap
 
 If `CODEMAN_MUX` is not `1`, **stop and say so**. Do not guess an API URL; a server

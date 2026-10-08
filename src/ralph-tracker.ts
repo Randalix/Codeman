@@ -771,6 +771,88 @@ export class RalphTracker extends EventEmitter {
     return newTodos.length;
   }
 
+  // ========== Agent-Set Todos (codeman agent todo) ==========
+
+  /**
+   * Add a todo on purpose (an agent's `codeman agent todo add`), or re-mark an
+   * existing one with the same content as agent-set. Unlike a parsed todo it never
+   * expires and is never evicted for a parsed one; when the list is full of
+   * agent-set todos the add is refused (null) rather than dropping one.
+   *
+   * Works with the tracker disabled: this is data, not output parsing, so the
+   * external-CLI modes that cannot run the tracker can still keep a list.
+   * @fires todoUpdate
+   */
+  addAgentTodo(
+    content: string,
+    status: RalphTodoStatus = 'pending',
+    priority?: Exclude<RalphTodoPriority, null>
+  ): RalphTodoItem | null {
+    const cleanContent = content.replace(ANSI_ESCAPE_PATTERN_SIMPLE, '').replace(/\s+/g, ' ').trim();
+    if (!cleanContent) return null;
+    const id = this.generateTodoId(cleanContent);
+    let todo = this._todos.get(id);
+    if (todo) {
+      todo.source = 'agent';
+      if (priority) todo.priority = priority;
+      this.applyTodoStatus(todo, status);
+    } else {
+      while (this._todos.size >= this._maxTodos) {
+        const oldest = this.findOldestTodo();
+        if (!oldest) return null;
+        this._todos.delete(oldest.id);
+        this._todoStartTimes.delete(oldest.id);
+      }
+      const estimatedComplexity = this.estimateComplexity(cleanContent);
+      todo = {
+        id,
+        content: cleanContent,
+        status: 'pending',
+        detectedAt: Date.now(),
+        priority: priority ?? this.parsePriority(cleanContent),
+        estimatedComplexity,
+        estimatedDurationMs: this.getEstimatedDuration(estimatedComplexity),
+        source: 'agent',
+      };
+      this._todos.set(id, todo);
+      this.applyTodoStatus(todo, status);
+    }
+    this.emit('todoUpdate', this.todos);
+    return { ...todo };
+  }
+
+  /**
+   * Set one todo's status by id (agent-set or parsed). Undefined when no such todo.
+   * @fires todoUpdate
+   */
+  setTodoStatus(id: string, status: RalphTodoStatus): RalphTodoItem | undefined {
+    const todo = this._todos.get(id);
+    if (!todo) return undefined;
+    this.applyTodoStatus(todo, status);
+    this.emit('todoUpdate', this.todos);
+    return { ...todo };
+  }
+
+  /**
+   * Remove one todo by id. False when no such todo.
+   * @fires todoUpdate
+   */
+  removeTodo(id: string): boolean {
+    if (!this._todos.delete(id)) return false;
+    this._todoStartTimes.delete(id);
+    this.emit('todoUpdate', this.todos);
+    return true;
+  }
+
+  /** Status transition shared by the agent verbs: refreshes `detectedAt` and the duration tracking. */
+  private applyTodoStatus(todo: RalphTodoItem, status: RalphTodoStatus): void {
+    const was = todo.status;
+    todo.status = status;
+    todo.detectedAt = Date.now();
+    if (was !== 'completed' && status === 'completed') this.recordTodoCompletion(todo.id);
+    if (was !== 'in_progress' && status === 'in_progress') this.startTrackingTodo(todo.id);
+  }
+
   // ========== Delegated Stall Detector Methods ==========
 
   /**
@@ -1852,13 +1934,9 @@ export class RalphTracker extends EventEmitter {
 
       while (this._todos.size >= this._maxTodos) {
         const oldest = this.findOldestTodo();
-        if (oldest) {
-          this._todos.delete(oldest.id);
-        } else {
-          const firstKey = this._todos.keys().next().value;
-          if (firstKey) this._todos.delete(firstKey);
-          else break;
-        }
+        // Only agent-set todos left: they outrank anything read off the terminal.
+        if (!oldest) return;
+        this._todos.delete(oldest.id);
       }
 
       const estimatedDurationMs = this.getEstimatedDuration(estimatedComplexity);
@@ -2149,11 +2227,13 @@ export class RalphTracker extends EventEmitter {
   }
 
   /**
-   * Find the todo item with the oldest detectedAt timestamp.
+   * Find the evictable todo with the oldest detectedAt timestamp. Agent-set todos
+   * are never evictable, so this is undefined when only those are left.
    */
   private findOldestTodo(): RalphTodoItem | undefined {
     let oldest: RalphTodoItem | undefined;
     for (const todo of this._todos.values()) {
+      if (todo.source === 'agent') continue;
       if (!oldest || todo.detectedAt < oldest.detectedAt) {
         oldest = todo;
       }
@@ -2181,6 +2261,8 @@ export class RalphTracker extends EventEmitter {
     const toDelete: string[] = [];
 
     for (const [id, todo] of this._todos) {
+      // An agent-set todo stays until the agent marks or removes it.
+      if (todo.source === 'agent') continue;
       if (now - todo.detectedAt > this._todoExpiryMs) {
         toDelete.push(id);
       }
@@ -2362,6 +2444,24 @@ export class RalphTracker extends EventEmitter {
         priority: todo.priority ?? null,
       });
     }
+  }
+
+  /**
+   * Bring back the agent-set todos from persisted state, whatever the mode or loop
+   * state (the full `restoreState` only runs for an enabled loop in a non-external
+   * mode). Todos already present are left alone; parsed ones are skipped — they are
+   * the output of a tracker that may not even run. Does not emit: it runs at boot,
+   * before the session's listeners exist, and the store already holds this list.
+   * @returns how many todos were restored
+   */
+  restoreAgentTodos(todos: readonly RalphTodoItem[]): number {
+    let restored = 0;
+    for (const todo of todos) {
+      if (todo.source !== 'agent' || this._todos.has(todo.id)) continue;
+      this._todos.set(todo.id, { ...todo, priority: todo.priority ?? null });
+      restored++;
+    }
+    return restored;
   }
 
   /**
