@@ -489,6 +489,16 @@ const DEFAULT_SHORTCUTS = [
     action: 'decreaseFontSize',
   },
   {
+    // The prompt composer from the desktop: a real textarea that holds the text until
+    // Send. OS-level dictation (macOS fn-fn) types into the focused field, so it needs
+    // one that does not auto-flush; the accessory bar's Compose key is mobile-only.
+    id: 'compose-prompt',
+    group: 'Terminal',
+    label: 'Compose Prompt',
+    bindings: [{ modifiers: ['ctrl', 'shift'], key: 'Enter' }],
+    action: 'openComposePrompt',
+  },
+  {
     id: 'voice-input',
     group: 'Terminal',
     label: 'Voice Input',
@@ -1386,6 +1396,7 @@ class CodemanApp {
       increaseFontSize: () => this.increaseFontSize(),
       decreaseFontSize: () => this.decreaseFontSize(),
       toggleVoiceInput: () => VoiceInput.toggle(),
+      openComposePrompt: () => KeyboardAccessoryBar.composePrompt(),
       moveActiveTabLeft: () => this.moveActiveTabLeft(),
       moveActiveTabRight: () => this.moveActiveTabRight(),
       toggleSessionSidebar: () => this.toggleSessionSidebar(),
