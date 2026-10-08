@@ -3844,6 +3844,14 @@ export class WebServer extends EventEmitter {
               }
             }
 
+            // Agent-set todos (`codeman agent todo`) belong to the session, not to a
+            // loop: they come back in every mode, tracker enabled or not.
+            const storedTodos = this.store.getRalphState(muxSession.sessionId)?.todos;
+            if (storedTodos) {
+              const restored = session.ralphTracker.restoreAgentTodos(storedTodos);
+              if (restored > 0) console.log(`[Server] Restored ${restored} agent todo(s) for session ${session.id}`);
+            }
+
             // Fallback: auto-detect completion phrase from CLAUDE.md (not supported for external CLIs)
             if (
               !isExternalCliMode(session.mode) &&

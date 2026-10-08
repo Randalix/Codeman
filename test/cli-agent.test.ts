@@ -23,7 +23,12 @@ import {
   agentRm,
   agentSend,
   agentSpawn,
+  agentTodoAdd,
+  agentTodoLs,
+  agentTodoRm,
+  agentTodoSet,
   agentWait,
+  matchTodoId,
   buildInterruptBody,
   buildRestoreBody,
   buildSendBody,
@@ -1051,5 +1056,103 @@ describe('httpRequest', () => {
     expect(res.status).toBe(401);
     expect(res.json).toBeUndefined();
     expect(res.text).toBe('Unauthorized');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// todo — the session's Ralph todo list
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('agent todo', () => {
+  const TODOS = [
+    { id: 'todo-abc123', content: 'Write the parser', status: 'in_progress', priority: 'P1', source: 'agent' },
+    { id: 'todo-abd999', content: 'Parsed from output', status: 'pending', priority: null },
+    { id: 'todo--x7', content: 'Negative hash', status: 'completed', priority: null, source: 'agent' },
+  ];
+  const listed = () => ok({ todos: TODOS, stats: { total: 3 } });
+
+  it('matchTodoId: full id, id without todo-, unique prefix; refuses ambiguity and misses', () => {
+    const rows = TODOS as never;
+    expect(matchTodoId(rows, 'todo-abc123')).toEqual({ id: 'todo-abc123' });
+    expect(matchTodoId(rows, 'abc123')).toEqual({ id: 'todo-abc123' });
+    expect(matchTodoId(rows, 'abc')).toEqual({ id: 'todo-abc123' });
+    expect(matchTodoId(rows, 'todo--x')).toEqual({ id: 'todo--x7' });
+    expect(matchTodoId(rows, 'ab')).toMatchObject({ error: expect.stringMatching(/ambiguous/) });
+    expect(matchTodoId(rows, 'zzz')).toMatchObject({ error: expect.stringMatching(/no todo matches/) });
+    expect(matchTodoId(rows, ' ')).toMatchObject({ error: expect.stringMatching(/empty/) });
+  });
+
+  it('ls reads this session by default and prints status as a word, never a todo glyph', async () => {
+    const deps = fakeDeps([listed()]);
+    expect(await agentTodoLs(deps)).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({ method: 'GET', path: `/api/v1/sessions/${SELF}/ralph-todos` });
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/todo-abc123\s+doing\s+P1\s+agent\s+Write the parser/);
+    expect(text).toMatch(/todo-abd999\s+pending\s+-\s+output/);
+    expect(text).toMatch(/1\/3 done/);
+    // The caller's own tracker reads its pane: no line may look like a todo to it.
+    for (const line of deps.out)
+      expect(line.replace(/\x1b\[[0-9;]*m/g, '')).not.toMatch(/^[\s⎿]*(☐|☒|◐|✓|✔)|^[-*]\s*\[/);
+  });
+
+  it('ls --session resolves another session first; --json prints the data as is', async () => {
+    const deps = fakeDeps([ok([{ id: OTHER }]), listed()], true);
+    expect(await agentTodoLs(deps, { session: OTHER.slice(0, 8) })).toBe(EXIT.ok);
+    expect(deps.calls[1].path).toBe(`/api/v1/sessions/${OTHER}/ralph-todos`);
+    expect(JSON.parse(deps.out[0])).toEqual({ todos: TODOS, stats: { total: 3 } });
+  });
+
+  it('add posts content, status and priority only when given', async () => {
+    const deps = fakeDeps([ok({ id: 'todo-new', content: 'Ship', status: 'in_progress', source: 'agent' })]);
+    expect(await agentTodoAdd(deps, { text: 'Ship', status: 'in_progress', priority: 'P0' })).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${SELF}/ralph-todos`,
+      body: { content: 'Ship', status: 'in_progress', priority: 'P0' },
+    });
+    expect(deps.out[0]).toMatch(/added todo-new \(doing\)/);
+
+    const plain = fakeDeps([ok({ id: 'todo-new', content: 'Ship', status: 'pending' })]);
+    await agentTodoAdd(plain, { text: 'Ship' });
+    expect(plain.calls[0].body).toEqual({ content: 'Ship' });
+  });
+
+  it('add refuses empty text without a request', async () => {
+    const deps = fakeDeps([]);
+    expect(await agentTodoAdd(deps, { text: '  ' })).toBe(EXIT.refused);
+    expect(deps.calls).toEqual([]);
+  });
+
+  it('set resolves the prefix against the list, then posts the status to the full id', async () => {
+    const deps = fakeDeps([listed(), ok({ ...TODOS[0], status: 'completed' })]);
+    expect(await agentTodoSet(deps, { todo: 'abc', status: 'completed' })).toBe(EXIT.ok);
+    expect(deps.calls[1]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${SELF}/ralph-todos/todo-abc123`,
+      body: { status: 'completed' },
+    });
+    expect(deps.out[0]).toMatch(/todo-abc123 is now done/);
+  });
+
+  it('set and rm refuse an ambiguous id (exit 4) without writing', async () => {
+    const set = fakeDeps([listed()]);
+    expect(await agentTodoSet(set, { todo: 'ab', status: 'completed' })).toBe(EXIT.refused);
+    expect(set.calls).toHaveLength(1);
+    const rm = fakeDeps([listed()]);
+    expect(await agentTodoRm(rm, { todo: 'ab' })).toBe(EXIT.refused);
+    expect(rm.calls).toHaveLength(1);
+  });
+
+  it('rm deletes the resolved id', async () => {
+    const deps = fakeDeps([listed(), ok({ removed: 'todo--x7' })]);
+    expect(await agentTodoRm(deps, { todo: 'todo--x' })).toBe(EXIT.ok);
+    expect(deps.calls[1]).toMatchObject({ method: 'DELETE', path: `/api/v1/sessions/${SELF}/ralph-todos/todo--x7` });
+    expect(deps.out[0]).toMatch(/removed todo--x7/);
+  });
+
+  it('surfaces a server refusal (full list) as an error', async () => {
+    const deps = fakeDeps([apiError(200, 'CONFLICT', 'Todo list is full')]);
+    expect(await agentTodoAdd(deps, { text: 'one more' })).toBe(EXIT.error);
+    expect(deps.err[0]).toMatch(/CONFLICT: Todo list is full/);
   });
 });
