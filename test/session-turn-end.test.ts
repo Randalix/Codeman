@@ -85,15 +85,11 @@ describe('Session turn-end latch', () => {
     expect(ended).toHaveBeenCalledTimes(2);
   });
 
-  it('a submitted prompt clears it, from the write path and from the hook alike', () => {
+  it('the prompt hook clears it; a bare Enter through the write path does not', () => {
     const s = idleSession();
     s.markTurnEnded('hook');
-    internals(s)._trackSubmit('typing only');
-    expect(s.turnEndedAt).not.toBeNull(); // a draft is not a new turn
-    internals(s)._trackSubmit('go\r');
-    expect(s.turnEndedAt).toBeNull();
-
-    s.markTurnEnded('hook');
+    internals(s)._trackSubmit('\r'); // empty composer: no turn starts, the worker is still idle
+    expect(s.turnEndedAt).not.toBeNull();
     s.markPromptSubmitted();
     expect(s.turnEndedAt).toBeNull();
   });
