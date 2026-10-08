@@ -1435,14 +1435,16 @@ export class Session extends EventEmitter {
    * Latch "this session's turn is over" for a coordinator (`GET /api/agent-watch`).
    *
    * The lifecycle signals are edges: one that fires while nobody waits is gone. This is
-   * the LEVEL behind them, stamped once per turn and kept until the next turn starts
-   * (a submitted prompt, or the heuristic's working transition), so a watcher that
-   * connects late still sees that the turn ended and when.
+   * the LEVEL behind them, stamped once per turn, so a watcher that connects late still
+   * sees that the turn ended and when. It opens again only on evidence a turn started:
+   * the CLI's UserPromptSubmit hook, or the heuristic's working transition (all a
+   * hook-less CLI like codex has; its stamp comes from the heuristic too, which leaves
+   * `_isWorking` false, so that transition does fire).
    *
-   * The first report wins the timestamp (except `exit`, which always re-stamps); a later
-   * `hook` only upgrades the source of a heuristic stamp (the hook is the definitive one, the heuristic often lands first or
-   * last by a few seconds). Deliberately leaves `status` alone: the UI's idle transition
-   * stays the heuristic's, as before.
+   * The first report wins the timestamp (except `exit`, which always re-stamps); a
+   * later `hook` only upgrades the source of a heuristic stamp, the hook being the
+   * definitive one. Deliberately leaves `status` alone: the UI's idle transition stays
+   * the heuristic's, as before.
    * @fires turnEnded on a new stamp
    */
   markTurnEnded(source: TurnEndSource): void {
@@ -4208,7 +4210,9 @@ export class Session extends EventEmitter {
     if (data.includes('\r') || data.includes('\n')) {
       this._lastSubmitAt = Date.now();
       this._draftSince = 0;
-      this._clearTurnEnded();
+      // NOT _clearTurnEnded(): an Enter on an empty composer starts no turn, and the
+      // worker would vanish from `agent watch` until it next worked. A real turn
+      // clears the latch through the working transition or the prompt hook.
       // eslint-disable-next-line no-control-regex -- "anything but a control byte" IS the test
     } else if (this._draftSince === 0 && !data.startsWith('\u001b') && /[^\u0000-\u001f\u007f]/.test(data)) {
       this._draftSince = Date.now();
