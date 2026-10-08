@@ -221,6 +221,9 @@ const NEWLINE_SPLIT_PATTERN = /\r?\n/;
  * An UNREGISTERED mode is treated as external — the conservative answer, since it disables
  * Claude-specific parsing rather than pointing it at output that was never Claude's.
  */
+/** What ended a turn: the CLI's own stop hook, the idle heuristic, or the pane exiting. */
+export type TurnEndSource = 'hook' | 'heuristic' | 'exit';
+
 export function isExternalCliMode(mode: SessionMode): boolean {
   return getCli(mode)?.capabilities.external ?? true;
 }
@@ -553,6 +556,9 @@ export class Session extends EventEmitter {
   private _promptResolved: boolean = false; // Guard against race conditions in runPrompt
   private _isWorking: boolean = false;
   private _lastPromptTime: number = 0;
+  /** When the current wait for input began; null while a turn runs. See {@link markTurnEnded}. */
+  private _turnEndedAt: number | null = null;
+  private _turnEndSource: TurnEndSource | null = null;
   private activityTimeout: NodeJS.Timeout | null = null;
   private _awaitingIdleConfirmation: boolean = false; // Prevents timeout reset during idle detection
   private _activityStreak: ActivityStreak | null = null; // Unbroken run of PTY repaints (working detection)
@@ -1457,6 +1463,48 @@ export class Session extends EventEmitter {
     return this._lastPromptTime;
   }
 
+  /** Wall-clock ms the last turn ended, null while one runs (or none ended yet). */
+  get turnEndedAt(): number | null {
+    return this._turnEndedAt;
+  }
+
+  /** What reported {@link turnEndedAt}: the CLI's stop hook, the idle heuristic, or the pane's exit. */
+  get turnEndSource(): TurnEndSource | null {
+    return this._turnEndSource;
+  }
+
+  /**
+   * Latch "this session's turn is over" for a coordinator (`GET /api/agent-watch`).
+   *
+   * The lifecycle signals are edges: one that fires while nobody waits is gone. This is
+   * the LEVEL behind them, stamped once per turn and kept until the next turn starts
+   * (a submitted prompt, or the heuristic's working transition), so a watcher that
+   * connects late still sees that the turn ended and when.
+   *
+   * The first report wins the timestamp (except `exit`, which always re-stamps); a later
+   * `hook` only upgrades the source of a heuristic stamp (the hook is the definitive one, the heuristic often lands first or
+   * last by a few seconds). Deliberately leaves `status` alone: the UI's idle transition
+   * stays the heuristic's, as before.
+   * @fires turnEnded on a new stamp
+   */
+  markTurnEnded(source: TurnEndSource): void {
+    // An exit re-stamps even an idle session: a watcher that already saw the turn end
+    // must still learn that the worker is now gone.
+    if (this._turnEndedAt !== null && !(source === 'exit' && this._turnEndSource !== 'exit')) {
+      if (source === 'hook' && this._turnEndSource === 'heuristic') this._turnEndSource = source;
+      return;
+    }
+    this._turnEndedAt = Date.now();
+    this._turnEndSource = source;
+    this.emit('turnEnded', source);
+  }
+
+  /** A new turn started: the latch opens again. */
+  private _clearTurnEnded(): void {
+    this._turnEndedAt = null;
+    this._turnEndSource = null;
+  }
+
   get taskTracker(): TaskTracker {
     return this._taskTracker;
   }
@@ -1991,6 +2039,8 @@ export class Session extends EventEmitter {
       isWorking: this._isWorking,
       watching: this._watching,
       lastPromptTime: this._lastPromptTime,
+      turnEndedAt: this._turnEndedAt,
+      turnEndSource: this._turnEndSource,
       // Buffer statistics for monitoring long-running sessions
       bufferStats: {
         terminalBufferSize: this._terminalBuffer.length,
@@ -3035,6 +3085,7 @@ export class Session extends EventEmitter {
         );
         this.emit('respawnBreakerTripped', { count: breakerResult.count });
       }
+      this.markTurnEnded('exit');
       this.emit('exit', exitCode);
     });
   }
@@ -3434,6 +3485,7 @@ export class Session extends EventEmitter {
     if (this._isWorking) return;
     this._isWorking = true;
     this._status = 'busy';
+    this._clearTurnEnded();
     this.emit('working');
     this._autoOps.notifyWorking();
   }
@@ -3487,6 +3539,9 @@ export class Session extends EventEmitter {
     // Only a finished turn proves omp has written its session file; a pane that is
     // merely ready has nothing to resolve yet and could claim a neighbour's file.
     if (turnEnded) this._maybeCaptureOmpSessionId();
+    // The watch latch (`agent watch`): a pane concluded idle is a turn over, also a
+    // pane that just became ready. Idempotent, the first stamp of a turn wins.
+    this.markTurnEnded('heuristic');
     this.emit('idle');
   }
 
@@ -3774,6 +3829,7 @@ export class Session extends EventEmitter {
       if (this._muxSession && this._mux) {
         this._mux.setAttached(this.id, false);
       }
+      this.markTurnEnded('exit');
       this.emit('exit', exitCode);
     });
 
@@ -4375,6 +4431,7 @@ export class Session extends EventEmitter {
     if (data.includes('\r') || data.includes('\n')) {
       this._lastSubmitAt = Date.now();
       this._draftSince = 0;
+      this._clearTurnEnded();
       // eslint-disable-next-line no-control-regex -- "anything but a control byte" IS the test
     } else if (this._draftSince === 0 && !data.startsWith('\u001b') && /[^\u0000-\u001f\u007f]/.test(data)) {
       this._draftSince = Date.now();
@@ -4408,6 +4465,7 @@ export class Session extends EventEmitter {
   markPromptSubmitted(): void {
     this._lastSubmitAt = Date.now();
     this._draftSince = 0;
+    this._clearTurnEnded();
   }
 
   /**

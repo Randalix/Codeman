@@ -31,6 +31,7 @@ import { sessionWaits } from './session-wait-registry.js';
 import { approvalInbox } from './approval-inbox.js';
 import { composeAutoSessionName, deriveAutoSessionName } from '../session-auto-name.js';
 import { MAX_SESSION_NAME_LENGTH } from '../config/terminal-limits.js';
+import { turnWatch } from './agent-watch.js';
 
 /** Stored listener references for session cleanup (prevents memory leaks) */
 export interface SessionListenerRefs {
@@ -45,6 +46,7 @@ export interface SessionListenerRefs {
   idle: () => void;
   watchingChanged: () => void;
   displayModelChanged: () => void;
+  turnEnded: () => void;
   taskCreated: (task: BackgroundTask) => void;
   taskUpdated: (task: BackgroundTask) => void;
   taskCompleted: (task: BackgroundTask) => void;
@@ -252,6 +254,9 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
         tracker.recordTokens(session.inputTokens, session.outputTokens);
       }
     },
+
+    /** Wakes parked `GET /api/agent-watch` requests — the session latched a turn end */
+    turnEnded: () => turnWatch.notify(session.id),
 
     /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
     idle: () => {
@@ -520,6 +525,7 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('idle', refs.idle);
   session.on('watchingChanged', refs.watchingChanged);
   session.on('displayModelChanged', refs.displayModelChanged);
+  session.on('turnEnded', refs.turnEnded);
   session.on('taskCreated', refs.taskCreated);
   session.on('taskUpdated', refs.taskUpdated);
   session.on('taskCompleted', refs.taskCompleted);
@@ -558,6 +564,7 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('idle', refs.idle);
   session.off('watchingChanged', refs.watchingChanged);
   session.off('displayModelChanged', refs.displayModelChanged);
+  session.off('turnEnded', refs.turnEnded);
   session.off('taskCreated', refs.taskCreated);
   session.off('taskUpdated', refs.taskUpdated);
   session.off('taskCompleted', refs.taskCompleted);

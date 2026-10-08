@@ -72,6 +72,23 @@ export class MockSession extends EventEmitter {
   /** Mirrors Session.markPromptSubmitted. */
   markPromptSubmitted(): void {
     this.lastSubmitAt = Date.now();
+    this.turnEndedAt = null;
+    this.turnEndSource = null;
+  }
+
+  /** Mirrors Session.turnEndedAt / turnEndSource (the agent-watch latch). */
+  turnEndedAt: number | null = null;
+  turnEndSource: 'hook' | 'heuristic' | 'exit' | null = null;
+
+  /** Mirrors Session.markTurnEnded, including the hook upgrade and the exit re-stamp. */
+  markTurnEnded(source: 'hook' | 'heuristic' | 'exit'): void {
+    if (this.turnEndedAt !== null && !(source === 'exit' && this.turnEndSource !== 'exit')) {
+      if (source === 'hook' && this.turnEndSource === 'heuristic') this.turnEndSource = source;
+      return;
+    }
+    this.turnEndedAt = Date.now();
+    this.turnEndSource = source;
+    this.emit('turnEnded', source);
   }
 
   /** Mirrors Session.trackUserInput (the send-key route feeds it around the write path). */

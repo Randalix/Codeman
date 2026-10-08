@@ -111,6 +111,7 @@ import { intentStore } from '../intent-store.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
 import { agentInbox } from './agent-inbox.js';
+import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
@@ -186,6 +187,7 @@ import {
   registerApprovalRoutes,
   registerRebootRestoreRoutes,
   registerInboxRoutes,
+  registerAgentWatchRoutes,
   registerReadMyMindRoutes,
   registerGitStatusRoutes,
   registerStatusTelemetryRoutes,
@@ -1168,6 +1170,7 @@ export class WebServer extends EventEmitter {
     registerApprovalRoutes(this.app, ctx);
     registerRebootRestoreRoutes(this.app, ctx);
     registerInboxRoutes(this.app, ctx, { nudger: this.inboxNudger });
+    registerAgentWatchRoutes(this.app, ctx);
     registerReadMyMindRoutes(this.app, ctx);
     registerGitStatusRoutes(this.app, ctx);
     registerStatusTelemetryRoutes(this.app, ctx);
@@ -4126,6 +4129,7 @@ export class WebServer extends EventEmitter {
     // so without this a restart during a wake waits out the readiness poll.
     this.remoteWake?.stop();
     agentInbox.stop();
+    turnWatch.stop();
     this.inboxNudger.stop();
     await this.persistAgentInboxNow();
 

@@ -50,6 +50,15 @@ The session's **todo list** (the Ralph panel in the web UI) is in the CLI too:
 work in every mode, tracker enabled or not; ids take a unique prefix as `ls` prints
 them (HTTP: `GET/POST /api/v1/sessions/:id/ralph-todos`, `POST|DELETE …/ralph-todos/:todoId`).
 
+**Coordinating workers: `codeman agent watch`** blocks until one of the sessions you
+spawned (or the ids you name) has finished its turn or died, prints `IDLE`/`EXITED`/
+`GONE` lines plus `cursor <n>`, and exits (2 on timeout). Run it as a background task
+and pass the cursor back as `--since <n>` next time: the server keeps "turn over since"
+per session, so a worker that finished while you were not watching is still reported,
+and nothing that ended after the cursor is lost. claude reports through its stop hook
+(seconds), codex through the idle heuristic (a few seconds more); `agent ls` shows the
+same stamp as `ENDED` (HTTP: `GET /api/v1/agent-watch?sessions=…&since=…&wait=…`).
+
 ## 0. Guard and bootstrap
 
 If `CODEMAN_MUX` is not `1`, **stop and say so**. Do not guess an API URL; a server
