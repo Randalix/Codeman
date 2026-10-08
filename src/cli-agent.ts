@@ -391,6 +391,12 @@ interface SessionRow {
   /** Wall-clock ms the last turn ended; null while one runs. Absent on older servers. */
   turnEndedAt?: number | null;
   turnEndSource?: string | null;
+  ralphTodoStats?: { total: number; pending: number; inProgress: number; completed: number };
+}
+
+/** `open/total` for the TODO column, `-` without a list. */
+function todoCell(stats: SessionRow['ralphTodoStats']): string {
+  return stats && stats.total > 0 ? `${stats.pending + stats.inProgress}/${stats.total}` : '-';
 }
 
 /** A full session id (the only form the routes accept); `ls` prints the 8-char prefix. */
@@ -508,14 +514,26 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       inbox ? String(inbox.pending) : '?',
       inbox ? (inbox.waitingSince ? `since ${clockTime(inbox.waitingSince)}` : '-') : '?',
       s.turnEndedAt ? clockTime(new Date(s.turnEndedAt).toISOString()) : '-',
+      todoCell(s.ralphTodoStats),
       s.name || s.workingDir || '',
     ];
   });
-  const header = [' ', 'ID', 'MODE', 'STATUS', ...(options.alive ? ['PANE'] : []), 'INBOX', 'WAIT', 'ENDED', 'NAME'];
+  const header = [
+    ' ',
+    'ID',
+    'MODE',
+    'STATUS',
+    ...(options.alive ? ['PANE'] : []),
+    'INBOX',
+    'WAIT',
+    'ENDED',
+    'TODO',
+    'NAME',
+  ];
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(
-      `* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs).`
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list.`
     )
   );
   if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));
@@ -1308,16 +1326,24 @@ export interface WatchOptions {
   waitMs: number;
 }
 
+interface WatchRow {
+  id: string;
+  name: string;
+  mode: string;
+  status: string;
+  turnEndedAt: number;
+  turnEndSource: string | null;
+  /** Why it stands, classified by the server; absent on a server before the reasons. */
+  reason?: string;
+  openTodos?: number;
+  totalTodos?: number;
+  inboxPending?: number;
+  inboxUnseen?: number;
+}
+
 interface WatchAnswer {
   cursor: number;
-  ended: {
-    id: string;
-    name: string;
-    mode: string;
-    status: string;
-    turnEndedAt: number;
-    turnEndSource: string | null;
-  }[];
+  ended: WatchRow[];
   gone: string[];
   timedOut: boolean;
 }
@@ -1367,9 +1393,14 @@ export async function agentWatch(deps: AgentDeps, options: WatchOptions): Promis
     emitJson(deps, data);
   } else {
     for (const s of data.ended) {
-      const what = s.turnEndSource === 'exit' ? 'EXITED' : 'IDLE';
+      const what =
+        s.reason === 'exited' || s.turnEndSource === 'exit' ? 'EXITED' : s.reason === 'blocked' ? 'BLOCKED' : 'IDLE';
+      const facts =
+        s.reason === undefined
+          ? ''
+          : `  ${s.reason}  todos ${s.openTodos ?? 0}/${s.totalTodos ?? 0}  inbox ${s.inboxPending ?? 0}`;
       deps.io.out(
-        `${what}  ${s.id.slice(0, 8)}  ${s.mode}  since ${clockTime(new Date(s.turnEndedAt).toISOString())} (${s.turnEndSource ?? '?'})  ${s.name}`
+        `${what}  ${s.id.slice(0, 8)}  ${s.mode}  since ${clockTime(new Date(s.turnEndedAt).toISOString())} (${s.turnEndSource ?? 'dialog'})${facts}  ${s.name}`
       );
     }
     for (const id of data.gone) deps.io.out(`GONE  ${id.slice(0, 8)}`);
@@ -1851,7 +1882,7 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('watch [ids...]')
     .description(
-      'Block until one of your workers (default: the sessions you spawned) has finished its turn or died; prints IDLE/EXITED/GONE lines and a cursor — pass it back as --since to see only newer ones. Exit 2 on timeout'
+      'Block until one of your workers (default: the sessions you spawned) has finished its turn, is stuck on a dialog, or died; prints IDLE/BLOCKED/EXITED/GONE lines with a reason (blocked, api-error, waiting-inbox, inbox-unread, inbox-unacked, open-todos, done) and a cursor — pass it back as --since to see only newer ones. Exit 2 on timeout'
     )
     .option('--since <cursor>', 'The cursor of the previous watch: report only turns that ended after it')
     .option('-t, --timeout <ms>', 'Wait budget in ms', String(DEFAULT_WAIT_MS))

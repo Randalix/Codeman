@@ -99,4 +99,10 @@ describe('Session turn-end latch', () => {
     s.markTurnEnded('hook');
     expect(s.toLightDetailedState()).toMatchObject({ turnEndedAt: s.turnEndedAt, turnEndSource: 'hook' });
   });
+
+  it('paneText falls back to the buffer tail with cursor jumps as line breaks', () => {
+    const s = new Session({ workingDir: '/tmp', mode: 'claude' });
+    (s as unknown as Internals)._handleTerminalOutput('\x1b[2J\x1b[3;1Hdone\x1b[4;3H\x1b[31m⎿  API Error: x\x1b[0m');
+    expect(s.paneText()).toMatch(/^\s*⎿ {2}API Error: x$/m);
+  });
 });
