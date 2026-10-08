@@ -1702,6 +1702,20 @@ export const FixPlanImportSchema = z.object({
   content: z.string().max(500000),
 });
 
+const RalphTodoStatusSchema = z.enum(['pending', 'in_progress', 'completed']);
+
+/** POST /api/sessions/:id/ralph-todos — an agent-set todo (`codeman agent todo add`) */
+export const RalphTodoAddSchema = z.object({
+  content: z.string().trim().min(1).max(2000),
+  status: RalphTodoStatusSchema.optional(),
+  priority: z.enum(['P0', 'P1', 'P2']).optional(),
+});
+
+/** POST /api/sessions/:id/ralph-todos/:todoId */
+export const RalphTodoStatusUpdateSchema = z.object({
+  status: RalphTodoStatusSchema,
+});
+
 /** POST /api/sessions/:id/ralph-prompt/write */
 export const RalphPromptWriteSchema = z.object({
   content: z.string().max(500000),

@@ -130,6 +130,12 @@ export interface RalphTodoItem {
   estimatedDurationMs?: number;
   /** P1-009: Complexity category for progress estimation */
   estimatedComplexity?: 'trivial' | 'simple' | 'moderate' | 'complex';
+  /**
+   * `'agent'` when a session set this item on purpose (`codeman agent todo`), not
+   * when the tracker read it off the terminal. Such an item never expires, is never
+   * evicted for a parsed one, and comes back on boot whatever the mode or loop state.
+   */
+  source?: 'agent';
 }
 
 /**
