@@ -138,7 +138,7 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
     expect(command).toContain("-o 'StrictHostKeyChecking=accept-new'");
     expect(command).toContain('-t');
     expect(command).toContain('aakht@192.168.55.170');
-    expect(command).toContain('tmux -L codeman-remote new-session -A');
+    expect(command).toContain('tmux -u -L codeman-remote new-session -A');
 
     // Connection options come BEFORE -t / the target / the tmux command.
     const idxProxy = command.indexOf('ProxyCommand=');
@@ -157,7 +157,7 @@ describe('COD-107 buildRemoteLaunchCommand — threads connection args', () => {
     const path = sh('/home/ubuntu/work');
     const paneCommand = `cd ${path} && exec "\${SHELL:-/bin/sh}" -i -l`;
     const tmuxInvocation = [
-      `tmux -L codeman-remote new-session -A -s ${remoteName} -c ${path} ${sh(paneCommand)}`,
+      `tmux -u -L codeman-remote new-session -A -s ${remoteName} -c ${path} ${sh(paneCommand)}`,
       `set -t ${remoteName} status off`,
       `set -t ${remoteName} mouse off`,
       `set -t ${remoteName} prefix C-q`,

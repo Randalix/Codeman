@@ -66,7 +66,7 @@ describe('COD-105 parseRemoteSessionList', () => {
 });
 
 describe('COD-105 buildRemoteAttachCommand', () => {
-  it('emits ssh -t <target> tmux -L codeman attach -t <session>', () => {
+  it('emits ssh -t <target> tmux -u -L codeman attach -t <session>', () => {
     const command = buildRemoteAttachCommand(baseRemote, 'codeman-disco1');
     expect(command).toContain('ssh');
     expect(command).toContain('BatchMode=yes');
@@ -75,7 +75,7 @@ describe('COD-105 buildRemoteAttachCommand', () => {
     // The tmux invocation is nested-quoted (inner session name escaped, whole
     // invocation re-escaped as one ssh arg). Assert the stable prefix here; the
     // exact re-parsed token is verified by the argv-reparse test below.
-    expect(command).toContain('tmux -L codeman attach -t ');
+    expect(command).toContain('tmux -u -L codeman attach -t ');
     expect(command).toContain('codeman-disco1');
   });
 
@@ -103,7 +103,7 @@ describe('COD-105 buildRemoteAttachCommand', () => {
       .map((l) => l.slice(2));
     expect(sshArgs).toContain('ubuntu@10.0.0.42');
     const tmuxArg = sshArgs.find((a) => a.includes('attach'));
-    expect(tmuxArg).toBe("tmux -L codeman attach -t 'codeman-disco1'");
+    expect(tmuxArg).toBe("tmux -u -L codeman attach -t 'codeman-disco1'");
   });
 });
 
