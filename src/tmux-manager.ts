@@ -987,7 +987,7 @@ export function remoteTmuxSessionName(sessionId: string): string {
  *
  * Emits:
  *   ssh -o BatchMode=yes -t [<COD-107 connection opts>] user@host \
- *     'tmux -L codeman-remote new-session -A -s codeman-ssh-<id> -c <path> "cd <path> && exec <cli>" \
+ *     'tmux -u -L codeman-remote new-session -A -s codeman-ssh-<id> -c <path> "cd <path> && exec <cli>" \
  *        \; set -t codeman-ssh-<id> status off \; set -t codeman-ssh-<id> mouse off \
  *        \; set -t codeman-ssh-<id> prefix C-q \; set -s escape-time 0'
  *
@@ -1104,7 +1104,11 @@ export function buildRemoteLaunchCommand(options: {
   // scoped per-session (`set -t <name>` / server `set -s`), NEVER `-g`, so a
   // shared remote tmux server's other sessions keep their own prefix/mouse.
   const tmuxInvocation = [
-    `tmux -L ${REMOTE_TMUX_SOCKET} new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${shellescape(paneCommand)}`,
+    // `-u`: the remote CLIENT must render UTF-8 whatever the remote locale. A
+    // non-interactive `ssh` carries no LANG (measured on Hufflepuff: client_utf8=0),
+    // and a non-UTF-8 client draws `❯` as `_` and box lines as ACS — so idle
+    // detection never sees the prompt glyph and the session reads `busy` forever.
+    `tmux -u -L ${REMOTE_TMUX_SOCKET} new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${shellescape(paneCommand)}`,
     `set -t ${remoteName} status off`,
     `set -t ${remoteName} mouse off`,
     `set -t ${remoteName} prefix C-q`,
@@ -1525,7 +1529,7 @@ export function resolveDockerLaunchOptions(
  *
  * Emits:
  *   ssh -o BatchMode=yes -t [<COD-107 connection opts>] user@host \
- *     'tmux -L codeman attach -t <session>'
+ *     'tmux -u -L codeman attach -t <session>'
  *
  * - `attach` (NOT `new-session -A`) so we only join an existing session; the
  *   remote session keeps running independent of us, which is exactly why the
@@ -1539,7 +1543,8 @@ export function resolveDockerLaunchOptions(
  *   right after `ssh -o BatchMode=yes` (a PTY is required for interactive tmux).
  */
 export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionName: string): string {
-  const tmuxInvocation = `tmux -L codeman attach -t ${shellescape(remoteSessionName)}`;
+  // `-u` for the same reason as the launch: a locale-less ssh client renders no UTF-8.
+  const tmuxInvocation = `tmux -u -L codeman attach -t ${shellescape(remoteSessionName)}`;
   const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
   const sshParts = [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)];
   return sshParts.join(' ');

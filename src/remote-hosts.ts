@@ -605,7 +605,7 @@ export function toSessionRemote(host: RemoteHost, remoteCase: RemoteCase): Sessi
  * COD-105 — build a NON-owned `SessionRemote` for ATTACHING to a `codeman-*`
  * session already running on a remote host (discovered via
  * `listRemoteCodemanSessions`). The resulting session's pane runs
- * `tmux -L codeman attach -t <remoteSessionName>` (see
+ * `tmux -u -L codeman attach -t <remoteSessionName>` (see
  * `buildRemoteAttachCommand`), and because we did NOT create the remote session,
  * `owned: false` means closing the tab DETACHES rather than killing it.
  *
