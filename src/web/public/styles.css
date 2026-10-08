@@ -5867,6 +5867,23 @@ body.touch-device .terminal-container .xterm .xterm-helper-textarea {
   padding: 0.3rem 0.5rem;
 }
 
+/* Compose Button — desktop only: mobile reaches the same composer through the
+   accessory bar's Compose key. */
+.btn-toolbar.btn-compose {
+  padding: 0.3rem 0.5rem;
+}
+
+@media (max-width: 1023px) {
+  .toolbar-center .btn-toolbar.btn-compose {
+    display: none !important;
+  }
+}
+
+.btn-toolbar.btn-compose:hover {
+  color: var(--text);
+  border-color: rgba(59, 130, 246, 0.4);
+}
+
 @media (max-width: 1023px) {
   .toolbar-center .btn-toolbar.btn-voice {
     display: none !important;
