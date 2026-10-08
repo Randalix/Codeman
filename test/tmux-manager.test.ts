@@ -153,7 +153,7 @@ describe('TmuxManager (unit)', () => {
       expect(command).toContain('ubuntu@10.0.0.42');
       expect(command).toContain('/home/ubuntu/work');
       // Dedicated socket + a name that fails a remote Codeman's SAFE_MUX_NAME_PATTERN.
-      expect(command).toContain('tmux -L codeman-remote new-session -A -s codeman-ssh-abc123de');
+      expect(command).toContain('tmux -u -L codeman-remote new-session -A -s codeman-ssh-abc123de');
       expect(command).toContain('exec codx personal');
       // Session options are scoped per-session, never global (-g).
       expect(command).not.toContain('set -g');
