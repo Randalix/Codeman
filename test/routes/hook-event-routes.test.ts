@@ -249,6 +249,24 @@ describe('hook-event-routes', () => {
       expect(mockController.signalStopHook).toHaveBeenCalled();
     });
 
+    it('latches the turn end on stop, and not for a mode without hooks', async () => {
+      const stop = () =>
+        harness.app.inject({
+          method: 'POST',
+          url: '/api/hook-event',
+          payload: { event: 'stop', sessionId: harness.ctx._sessionId, data: null },
+        });
+      await stop();
+      expect(harness.ctx._session.turnEndSource).toBe('hook');
+      expect(harness.ctx._session.turnEndedAt).toEqual(expect.any(Number));
+
+      harness.ctx._session.turnEndedAt = null;
+      harness.ctx._session.turnEndSource = null;
+      harness.ctx._session.mode = 'codex'; // a forged stop for a hook-less mode is dropped
+      await stop();
+      expect(harness.ctx._session.turnEndedAt).toBeNull();
+    });
+
     it('signals respawn controller on elicitation_dialog event', async () => {
       const mockController = {
         signalStopHook: vi.fn(),

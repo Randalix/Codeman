@@ -28,6 +28,7 @@ import {
   agentTodoRm,
   agentTodoSet,
   agentWait,
+  agentWatch,
   matchTodoId,
   buildInterruptBody,
   buildRestoreBody,
@@ -242,8 +243,8 @@ describe('agent ls', () => {
     const deps = fakeDeps(withSummary({}));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+0\s+-\s+w1-Codeman/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+0\s+-\s+\/home\/joe\/wiki/);
+    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+0\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+0\s+-\s+-\s+\/home\/joe\/wiki/);
   });
 
   it('--json is the envelope data plus a self flag and the mailbox state', async () => {
@@ -290,7 +291,7 @@ describe('agent ls', () => {
     const deps = fakeDeps((o) => (o.path === SUMMARY ? { status: 404, text: 'Route not found' } : ok(sessions)));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+\?\s+\?\s+w1-Codeman/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+\?\s+\?\s+-\s+w1-Codeman/);
     expect(text).not.toMatch(/owes a post/);
   });
 
@@ -1154,5 +1155,110 @@ describe('agent todo', () => {
     const deps = fakeDeps([apiError(200, 'CONFLICT', 'Todo list is full')]);
     expect(await agentTodoAdd(deps, { text: 'one more' })).toBe(EXIT.error);
     expect(deps.err[0]).toMatch(/CONFLICT: Todo list is full/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// watch — which of my workers is waiting for input?
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('agent watch', () => {
+  const W1 = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const W2 = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const sessions = () =>
+    ok([
+      { id: SELF, parentSessionId: null },
+      { id: W1, parentSessionId: SELF },
+      { id: W2, parentSessionId: SELF },
+      { id: OTHER, parentSessionId: 'someone-else' },
+    ]);
+  const answer = (over: Record<string, unknown> = {}) =>
+    ok({
+      cursor: 1_700_000_005_000,
+      ended: [
+        {
+          id: W1,
+          name: 'w1-impl',
+          mode: 'claude',
+          status: 'idle',
+          turnEndedAt: 1_700_000_004_000,
+          turnEndSource: 'hook',
+        },
+      ],
+      gone: [],
+      timedOut: false,
+      ...over,
+    });
+
+  it(`defaults to this session's children and passes since/wait through`, async () => {
+    const deps = fakeDeps([sessions(), answer()]);
+    expect(await agentWatch(deps, { ids: [], since: 42, waitMs: 90_000 })).toBe(EXIT.ok);
+    expect(deps.calls[1]).toMatchObject({
+      method: 'GET',
+      path: '/api/v1/agent-watch',
+      query: { sessions: `${W1},${W2}`, since: 42, wait: 90_000 },
+      timeoutMs: 120_000,
+    });
+  });
+
+  it('prints one line per finished worker and the cursor last on stdout', async () => {
+    const deps = fakeDeps([sessions(), answer({ gone: [OTHER] })]);
+    await agentWatch(deps, { ids: [], waitMs: 1_000 });
+    expect(deps.out[0]).toMatch(/^IDLE  aaaaaaaa  claude  since \S+ \(hook\)  w1-impl$/);
+    expect(deps.out[1]).toBe(`GONE  ${OTHER.slice(0, 8)}`);
+    expect(deps.out.at(-1)).toBe('cursor 1700000005000');
+    expect(deps.err.join('\n')).toMatch(/next: codeman agent watch --since 1700000005000/);
+  });
+
+  it('marks a dead worker EXITED and exits 2 on timeout', async () => {
+    const dead = fakeDeps([
+      sessions(),
+      answer({
+        ended: [{ id: W2, name: 'w2', mode: 'codex', status: 'stopped', turnEndedAt: 1, turnEndSource: 'exit' }],
+      }),
+    ]);
+    await agentWatch(dead, { ids: [], waitMs: 1_000 });
+    expect(dead.out[0]).toMatch(/^EXITED  bbbbbbbb  codex/);
+
+    const quiet = fakeDeps([sessions(), answer({ ended: [], timedOut: true })]);
+    expect(await agentWatch(quiet, { ids: [], waitMs: 1_000 })).toBe(EXIT.timeout);
+  });
+
+  it('resolves explicit ids by prefix and refuses to watch itself', async () => {
+    const deps = fakeDeps([ok([{ id: W1 }]), answer()]);
+    expect(await agentWatch(deps, { ids: ['aaaaaaaa'], waitMs: 1_000 })).toBe(EXIT.ok);
+    expect(deps.calls[1].query).toMatchObject({ sessions: W1 });
+
+    const self = fakeDeps([]);
+    expect(await agentWatch(self, { ids: [SELF.slice(0, 8)], waitMs: 1_000 })).toBe(EXIT.refused);
+    expect(self.calls).toEqual([]);
+  });
+
+  it('refuses when there are no children and no ids', async () => {
+    const deps = fakeDeps([ok([{ id: SELF, parentSessionId: null }])]);
+    expect(await agentWatch(deps, { ids: [], waitMs: 1_000 })).toBe(EXIT.refused);
+    expect(deps.err[0]).toMatch(/no workers to watch/);
+  });
+
+  it('--json prints the answer as is', async () => {
+    const deps = fakeDeps([sessions(), answer()], true);
+    await agentWatch(deps, { ids: [], waitMs: 1_000 });
+    expect(JSON.parse(deps.out[0])).toMatchObject({ cursor: 1_700_000_005_000, timedOut: false });
+  });
+
+  it(`ls shows when each session's last turn ended`, async () => {
+    const deps = fakeDeps((o) =>
+      o.path === '/api/v1/sessions'
+        ? ok([
+            { id: W1, mode: 'claude', status: 'idle', name: 'w1', turnEndedAt: Date.UTC(2026, 9, 8, 11, 2, 3) },
+            { id: W2, mode: 'codex', status: 'busy', name: 'w2', turnEndedAt: null },
+          ])
+        : ok({})
+    );
+    await agentLs(deps);
+    const [header, row1, row2] = deps.out[0].split('\n');
+    expect(header).toMatch(/WAIT\s+ENDED\s+NAME/);
+    expect(row1).toMatch(/\d\d:\d\d\s+w1$/);
+    expect(row2).toMatch(/-\s+w2$/);
   });
 });
