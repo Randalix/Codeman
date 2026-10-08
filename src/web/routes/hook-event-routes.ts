@@ -15,6 +15,7 @@ import { persistDockerCaseClaudeSessionId } from '../../docker-hosts.js';
 import { getDataDir } from '../../config/instance.js';
 import { sessionWaits, hooksAvailableForMode, sessionHookOptions } from '../session-wait-registry.js';
 import { approvalInbox, type ApprovalKind } from '../approval-inbox.js';
+import { turnWatch } from '../agent-watch.js';
 import type { SessionPort, EventPort, RespawnPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 /** Hook events that open an Approvals Inbox item. */
@@ -206,6 +207,9 @@ export function registerHookEventRoutes(
           },
         });
         approvalId = item.id;
+        // A worker stuck on a dialog is the first one a coordinator must hear about;
+        // `GET /api/agent-watch` reports it from the approval item, this wakes it.
+        if (approvalKind !== 'idle') turnWatch.notify(sessionId);
       } else if (APPROVAL_RESOLVING_EVENTS.has(event)) {
         approvalInbox.resolveForSession(sessionId, 'resolved_in_terminal');
       }

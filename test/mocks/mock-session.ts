@@ -70,6 +70,11 @@ export class MockSession extends EventEmitter {
     this.turnEndSource = null;
   }
 
+  /** Mirrors Session.paneText (the rendered pane; the mock's buffer stands in for it). */
+  paneText(): string {
+    return this.terminalBuffer;
+  }
+
   /** Mirrors Session.turnEndedAt / turnEndSource (the agent-watch latch). */
   turnEndedAt: number | null = null;
   turnEndSource: 'hook' | 'heuristic' | 'exit' | null = null;

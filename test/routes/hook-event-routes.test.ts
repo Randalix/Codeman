@@ -267,6 +267,18 @@ describe('hook-event-routes', () => {
       expect(harness.ctx._session.turnEndedAt).toBeNull();
     });
 
+    it('wakes parked agent-watch requests when a worker hits a dialog', async () => {
+      const { turnWatch } = await import('../../src/web/agent-watch.js');
+      const notify = vi.spyOn(turnWatch, 'notify');
+      await harness.app.inject({
+        method: 'POST',
+        url: '/api/hook-event',
+        payload: { event: 'permission_prompt', sessionId: harness.ctx._sessionId, data: { tool_name: 'Bash' } },
+      });
+      expect(notify).toHaveBeenCalledWith(harness.ctx._sessionId);
+      notify.mockRestore();
+    });
+
     it('signals respawn controller on elicitation_dialog event', async () => {
       const mockController = {
         signalStopHook: vi.fn(),

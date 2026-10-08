@@ -243,8 +243,8 @@ describe('agent ls', () => {
     const deps = fakeDeps(withSummary({}));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+0\s+-\s+-\s+w1-Codeman/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+0\s+-\s+-\s+\/home\/joe\/wiki/);
+    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+0\s+-\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+0\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
   });
 
   it('--json is the envelope data plus a self flag and the mailbox state', async () => {
@@ -291,7 +291,7 @@ describe('agent ls', () => {
     const deps = fakeDeps((o) => (o.path === SUMMARY ? { status: 404, text: 'Route not found' } : ok(sessions)));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+\?\s+\?\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+\?\s+\?\s+-\s+-\s+w1-Codeman/);
     expect(text).not.toMatch(/owes a post/);
   });
 
@@ -1183,6 +1183,11 @@ describe('agent watch', () => {
           status: 'idle',
           turnEndedAt: 1_700_000_004_000,
           turnEndSource: 'hook',
+          reason: 'open-todos',
+          openTodos: 2,
+          totalTodos: 5,
+          inboxPending: 1,
+          inboxUnseen: 0,
         },
       ],
       gone: [],
@@ -1204,7 +1209,9 @@ describe('agent watch', () => {
   it('prints one line per finished worker and the cursor last on stdout', async () => {
     const deps = fakeDeps([sessions(), answer({ gone: [OTHER] })]);
     await agentWatch(deps, { ids: [], waitMs: 1_000 });
-    expect(deps.out[0]).toMatch(/^IDLE  aaaaaaaa  claude  since \S+ \(hook\)  w1-impl$/);
+    expect(deps.out[0]).toMatch(
+      /^IDLE  aaaaaaaa  claude  since \S+ \(hook\)  open-todos  todos 2\/5  inbox 1  w1-impl$/
+    );
     expect(deps.out[1]).toBe(`GONE  ${OTHER.slice(0, 8)}`);
     expect(deps.out.at(-1)).toBe('cursor 1700000005000');
     expect(deps.err.join('\n')).toMatch(/next: codeman agent watch --since 1700000005000/);
@@ -1218,7 +1225,32 @@ describe('agent watch', () => {
       }),
     ]);
     await agentWatch(dead, { ids: [], waitMs: 1_000 });
-    expect(dead.out[0]).toMatch(/^EXITED  bbbbbbbb  codex/);
+    expect(dead.out[0]).toMatch(/^EXITED  bbbbbbbb  codex  since \S+ \(exit\)  w2$/); // older server: no reason
+
+    const blocked = fakeDeps([
+      sessions(),
+      answer({
+        ended: [
+          {
+            id: W2,
+            name: 'w2',
+            mode: 'claude',
+            status: 'busy',
+            turnEndedAt: 1,
+            turnEndSource: null,
+            reason: 'blocked',
+            openTodos: 0,
+            totalTodos: 0,
+            inboxPending: 0,
+            inboxUnseen: 0,
+          },
+        ],
+      }),
+    ]);
+    await agentWatch(blocked, { ids: [], waitMs: 1_000 });
+    expect(blocked.out[0]).toMatch(
+      /^BLOCKED  bbbbbbbb  claude  since \S+ \(dialog\)  blocked  todos 0\/0  inbox 0  w2$/
+    );
 
     const quiet = fakeDeps([sessions(), answer({ ended: [], timedOut: true })]);
     expect(await agentWatch(quiet, { ids: [], waitMs: 1_000 })).toBe(EXIT.timeout);
@@ -1251,14 +1283,21 @@ describe('agent watch', () => {
       o.path === '/api/v1/sessions'
         ? ok([
             { id: W1, mode: 'claude', status: 'idle', name: 'w1', turnEndedAt: Date.UTC(2026, 9, 8, 11, 2, 3) },
-            { id: W2, mode: 'codex', status: 'busy', name: 'w2', turnEndedAt: null },
+            {
+              id: W2,
+              mode: 'codex',
+              status: 'busy',
+              name: 'w2',
+              turnEndedAt: null,
+              ralphTodoStats: { total: 5, pending: 1, inProgress: 1, completed: 3 },
+            },
           ])
         : ok({})
     );
     await agentLs(deps);
     const [header, row1, row2] = deps.out[0].split('\n');
-    expect(header).toMatch(/WAIT\s+ENDED\s+NAME/);
-    expect(row1).toMatch(/\d\d:\d\d\s+w1$/);
-    expect(row2).toMatch(/-\s+w2$/);
+    expect(header).toMatch(/WAIT\s+ENDED\s+TODO\s+NAME/);
+    expect(row1).toMatch(/\d\d:\d\d\s+-\s+w1$/);
+    expect(row2).toMatch(/-\s+2\/5\s+w2$/);
   });
 });
