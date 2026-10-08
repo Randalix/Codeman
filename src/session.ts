@@ -106,6 +106,7 @@ import {
   getClaudeBinaryPath,
   spawnPtyWithHelperRepair,
   resolveLocalShell,
+  stripAnsi,
 } from './utils/index.js';
 import {
   MAX_TERMINAL_BUFFER_SIZE,
@@ -1126,6 +1127,20 @@ export class Session extends EventEmitter {
 
   get terminalBuffer(): string {
     return this._terminalBuffer.value;
+  }
+
+  /**
+   * What the pane shows as plain text: the rendered tmux frame when there is a mux,
+   * else the raw buffer's last `fallbackChars` with cursor jumps turned into line
+   * breaks (a TUI positions rows with `ESC[r;cH`, not newlines) and ANSI stripped.
+   * Costs one `capture-pane`; callers use it on demand, never on the output path.
+   */
+  paneText(fallbackChars = 4000): string {
+    const frame =
+      this._mux && this._muxSession ? (this._mux.capturePaneText?.(this._muxSession.muxName) ?? null) : null;
+    if (frame !== null) return frame;
+    // eslint-disable-next-line no-control-regex -- matching the escape IS the point
+    return stripAnsi(this._terminalBuffer.tail(fallbackChars).replace(/\x1b\[\d*;?\d*H/g, '\n'));
   }
 
   get terminalBufferLength(): number {

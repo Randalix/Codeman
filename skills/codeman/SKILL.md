@@ -51,8 +51,13 @@ work in every mode, tracker enabled or not; ids take a unique prefix as `ls` pri
 them (HTTP: `GET/POST /api/v1/sessions/:id/ralph-todos`, `POST|DELETE …/ralph-todos/:todoId`).
 
 **Coordinating workers: `codeman agent watch`** blocks until one of the sessions you
-spawned (or the ids you name) has finished its turn or died, prints `IDLE`/`EXITED`/
-`GONE` lines plus `cursor <n>`, and exits (2 on timeout). Run it as a background task
+spawned (or the ids you name) has finished its turn, is stuck on a permission/question
+dialog, or died, prints `IDLE`/`BLOCKED`/`EXITED`/`GONE` lines plus `cursor <n>`, and
+exits (2 on timeout). Each line names a reason, most urgent first: `blocked` (answer
+its dialog), `api-error` (re-prompt it), `waiting-inbox` (parked on `inbox --wait` on
+purpose — leave it), `inbox-unread` / `inbox-unacked` (it has mail it never read or
+never handled), `open-todos` (stopped with its `agent todo` list unfinished — give it
+the next item), `done`. Run it as a background task
 and pass the cursor back as `--since <n>` next time: the server keeps "turn over since"
 per session, so a worker that finished while you were not watching is still reported,
 and nothing that ended after the cursor is lost. claude reports through its stop hook

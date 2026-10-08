@@ -6,7 +6,18 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 import { registerAgentWatchRoutes } from '../../src/web/routes/agent-watch-routes.js';
 import { turnWatch } from '../../src/web/agent-watch.js';
-import { createMockSession } from '../mocks/index.js';
+import { agentInbox } from '../../src/web/agent-inbox.js';
+import { approvalInbox } from '../../src/web/approval-inbox.js';
+import { classifyWatchReason } from '../../src/web/routes/agent-watch-routes.js';
+import { createMockSession, type MockSession } from '../mocks/index.js';
+import { vi } from 'vitest';
+
+/** The slice of the real tracker the route reads. */
+function withTodos(session: MockSession, open = 0, total = open): void {
+  (session as unknown as { ralphTracker: unknown }).ralphTracker = {
+    getTodoStats: () => ({ total, pending: open, inProgress: 0, completed: total - open }),
+  };
+}
 
 describe('GET /api/agent-watch', () => {
   let harness: RouteTestHarness;
@@ -14,13 +25,18 @@ describe('GET /api/agent-watch', () => {
 
   beforeEach(async () => {
     turnWatch.resetForTests();
+    agentInbox.resetForTests();
     harness = await createRouteTestHarness(registerAgentWatchRoutes);
     const second = createMockSession('worker-2');
     harness.ctx.sessions.set('worker-2', second);
+    withTodos(harness.ctx._session);
+    withTodos(second);
   });
 
   afterEach(async () => {
     turnWatch.resetForTests();
+    agentInbox.resetForTests();
+    vi.restoreAllMocks();
     await harness.app.close();
   });
 
@@ -82,5 +98,53 @@ describe('GET /api/agent-watch', () => {
     expect(res.data).toMatchObject({ ended: [], timedOut: false });
     expect((await harness.app.inject({ method: 'GET', url: url('sessions=,') })).json().success).toBe(false);
     expect((await harness.app.inject({ method: 'GET', url: url('sessions=a&bogus=1') })).statusCode).toBe(400);
+  });
+
+  it('carries the reason and the facts behind it', async () => {
+    withTodos(harness.ctx._session, 2, 5);
+    harness.ctx._session.markTurnEnded('hook');
+    const res = await body(`sessions=${harness.ctx._sessionId}`);
+    expect(res.data.ended[0]).toMatchObject({ reason: 'open-todos', openTodos: 2, totalTodos: 5, inboxPending: 0 });
+  });
+
+  it('a pending dialog qualifies a session whose turn has not ended, at the dialog time', async () => {
+    vi.spyOn(approvalInbox, 'getForSession').mockImplementation((id) =>
+      id === 'worker-2' ? ({ kind: 'question', createdAt: 4_242 } as never) : undefined
+    );
+    const res = await body('sessions=worker-2');
+    expect(res.data.ended).toEqual([
+      expect.objectContaining({ id: 'worker-2', reason: 'blocked', turnEndedAt: 4_242 }),
+    ]);
+    // Claude's own idle notice is no block.
+    vi.spyOn(approvalInbox, 'getForSession').mockReturnValue({ kind: 'idle', createdAt: 1 } as never);
+    expect((await body('sessions=worker-2')).data.ended).toEqual([]);
+  });
+});
+
+describe('classifyWatchReason', () => {
+  const none = { blocked: false, inboxWaiting: false, inboxUnseen: 0, inboxPending: 0, openTodos: 0 };
+  const session = (pane = '', source: 'hook' | 'heuristic' | 'exit' | null = 'hook') => ({
+    turnEndSource: source,
+    paneText: () => pane,
+  });
+
+  it('follows the documented precedence', () => {
+    const all = { blocked: true, inboxWaiting: true, inboxUnseen: 1, inboxPending: 1, openTodos: 1 };
+    const errPane = "  ⎿  API Error: Can't reach the API server (ENOTFOUND)\n";
+    expect(classifyWatchReason(session(errPane, 'exit'), all)).toBe('exited');
+    expect(classifyWatchReason(session(errPane), all)).toBe('blocked');
+    expect(classifyWatchReason(session(errPane), { ...all, blocked: false })).toBe('api-error');
+    expect(classifyWatchReason(session(), { ...all, blocked: false })).toBe('waiting-inbox');
+    expect(classifyWatchReason(session(), { ...none, inboxUnseen: 1, inboxPending: 1, openTodos: 1 })).toBe(
+      'inbox-unread'
+    );
+    expect(classifyWatchReason(session(), { ...none, inboxPending: 1, openTodos: 1 })).toBe('inbox-unacked');
+    expect(classifyWatchReason(session(), { ...none, openTodos: 1 })).toBe('open-todos');
+    expect(classifyWatchReason(session(), none)).toBe('done');
+  });
+
+  it('counts an API error only as its own line, not prose that mentions one', () => {
+    expect(classifyWatchReason(session('we discussed the API Error yesterday'), none)).toBe('done');
+    expect(classifyWatchReason(session('done.\nAPI Error: 529 overloaded'), none)).toBe('api-error');
   });
 });
