@@ -19,6 +19,9 @@
  * 3. `rm` fails closed: empty id, a short self id, or a prefix match in EITHER
  *    direction refuses. Ids appear in full and 8-char form, so equality alone
  *    misses a real combination — and the miss deletes the caller.
+ * 4. An id shorter than 8 characters refuses (exit 4) before any request, on every
+ *    verb. `9` would resolve to whichever session is alone with that first
+ *    character, the user's own interactive tab included.
  *
  * Commands live here as functions returning an exit code, not calling
  * `process.exit`, so the whole surface is unit-testable against a fake server.
@@ -32,6 +35,7 @@ import type { Command } from 'commander';
 import { dataPath } from './config/instance.js';
 import { GLYPH, palette, table } from './cli-style.js';
 import { getErrorMessage } from './types.js';
+import { stripAnsi as stripAnsiSequences } from './utils/regex-patterns.js';
 import {
   discoverCliSessionId,
   findDeletedSession,
@@ -198,10 +202,13 @@ export function defaultClientId(selfId: string, suffix = ''): string {
   return `codeman-agent-cli-${selfId.slice(0, 8)}${suffix ? `-${suffix}` : ''}`;
 }
 
-/** Strip ANSI CSI/charset sequences from a terminal buffer (GNU and BSD alike). */
+/**
+ * Strip a terminal buffer for humans: the shared ANSI strip (CSI, OSC such as window
+ * titles, keypad modes) plus the charset designators (`ESC ( B`) it leaves in.
+ */
 export function stripAnsi(text: string): string {
   // eslint-disable-next-line no-control-regex
-  return text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '').replace(/\x1b[()][AB0]/g, '');
+  return stripAnsiSequences(text).replace(/\x1b[()][AB0]/g, '');
 }
 
 /** Parse a positive-integer option (`--timeout` ms, `--tail` bytes); the server rejects anything else. */
@@ -403,20 +410,41 @@ function todoCell(stats: SessionRow['ralphTodoStats']): string {
 const FULL_ID_LENGTH = 36;
 
 /**
+ * Shortest prefix that may name a session: the 8-char form `ls` prints, and the floor
+ * the server's own resolver uses (`PARENT_SESSION_ID_MIN_PREFIX`, route-helpers.ts).
+ */
+export const MIN_ID_PREFIX_LENGTH = 8;
+
+/** Why an id is too short to name a session, or `undefined` when it may. */
+export function shortIdRefusal(id: string): string | undefined {
+  if (!id) return 'refusing: empty session id';
+  if (id.length < MIN_ID_PREFIX_LENGTH) {
+    return `refusing: "${id}" is shorter than ${MIN_ID_PREFIX_LENGTH} characters — use the 8-character id \`agent ls\` prints, or the full id`;
+  }
+  return undefined;
+}
+
+/**
  * Turn the id a human typed into the one the routes accept. `ls` prints 8-char
  * prefixes and the routes answer 404 to those (measured live), so anything shorter
  * than a full id resolves through the session list; an ambiguous prefix refuses
- * rather than picking one.
+ * rather than picking one. Below 8 characters it refuses before the list: "unique"
+ * means nothing for `9` — it names whatever session happens to be alone with that
+ * first character, and `rm`/`send` would act on it.
  */
-export async function resolveSessionId(deps: AgentDeps, id: string): Promise<{ id: string } | { error: string }> {
-  if (!id) return { error: 'refusing: empty session id' };
+export async function resolveSessionId(
+  deps: AgentDeps,
+  id: string
+): Promise<{ id: string } | { error: string; code: number }> {
+  const tooShort = shortIdRefusal(id);
+  if (tooShort) return { error: tooShort, code: EXIT.refused };
   if (id.length >= FULL_ID_LENGTH) return { id };
   const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
-  if (!res.json?.success) return { error: describeFailure(res) };
+  if (!res.json?.success) return { error: describeFailure(res), code: EXIT.error };
   const matches = ((res.json.data as SessionRow[] | undefined) ?? []).filter((s) => s.id.startsWith(id));
   if (matches.length === 1) return { id: matches[0].id };
-  if (matches.length === 0) return { error: `no session starts with "${id}" (see \`agent ls\`)` };
-  return { error: `"${id}" is ambiguous: ${matches.map((s) => s.id.slice(0, 13)).join(', ')}` };
+  if (matches.length === 0) return { error: `no session starts with "${id}" (see \`agent ls\`)`, code: EXIT.error };
+  return { error: `"${id}" is ambiguous: ${matches.map((s) => s.id.slice(0, 13)).join(', ')}`, code: EXIT.error };
 }
 
 /** One session's mailbox state, from `GET /api/agent-inbox/summary`. */
@@ -742,7 +770,7 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
   const refusal = inputRefusal(options.text);
   if (refusal) return fail(deps, refusal, EXIT.refused);
   const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const body = buildSendBody(options.text, {
     enter: options.enter,
     clientId: options.clientId ?? defaultClientId(deps.ctx.selfId),
@@ -757,8 +785,24 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
     timeoutMs: (options.timeoutMs ?? 60_000) + 10_000,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
-  const data = res.json.data as { delivered?: boolean; duplicate?: boolean; wait?: WaitResult } | undefined;
+  const data = res.json.data as
+    | { delivered?: boolean; duplicate?: boolean; buffered?: boolean; dropped?: boolean; wait?: WaitResult }
+    | undefined;
   if (deps.json) emitJson(deps, data ?? {});
+  // Fire-and-forget to a remote session whose host is asleep (wake-on-LAN): the server
+  // holds the chunk and types it once the pane is back (`buffered`), or the chunk was
+  // over the wake buffer's cap and is gone (`dropped`). The seq is spent either way,
+  // so a retry needs a new one (the default, the clock, gives it that).
+  if (data?.dropped) {
+    if (!deps.json) {
+      deps.io.err(
+        palette.err(
+          `${GLYPH.fail} dropped: ${target.id}'s host is waking and its input buffer is full — nothing will be typed; send again once it is back`
+        )
+      );
+    }
+    return EXIT.error;
+  }
   // `delivered:false` without `duplicate` is the route's "the bytes went nowhere":
   // the PTY exited or send-keys hit a dead pane. The field exists so a client does not
   // say "wait longer" when the truth is "restart the worker" — so it is a failure here.
@@ -774,6 +818,12 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
     const noEnter = options.enter ? '' : ' (no Enter)';
     if (data?.duplicate) {
       deps.io.out(palette.warn(`${GLYPH.warn} duplicate (clientId/seq already applied): nothing typed`));
+    } else if (data?.buffered) {
+      deps.io.out(
+        palette.ok(
+          `${GLYPH.ok} buffered for ${target.id}${noEnter}: its host is asleep; Codeman is waking it and types this once the pane is back`
+        )
+      );
     } else if (data?.delivered === true) {
       deps.io.out(palette.ok(`${GLYPH.ok} delivered to ${target.id}${noEnter}`));
     } else {
@@ -819,7 +869,7 @@ export async function agentWait(deps: AgentDeps, options: WaitOptions): Promise<
   if (options.until && options.match)
     return fail(deps, 'use either --until <signals> or --match <marker>, not both', EXIT.refused);
   const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const sid = encodeURIComponent(target.id);
   const res = options.match
     ? await deps.request(deps.ctx, {
@@ -864,7 +914,7 @@ export interface ReadOptions {
 /** `agent read` — the last answer (claude/codex/deepseek transcript) or a terminal tail (every mode). */
 export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<number> {
   const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const sid = encodeURIComponent(target.id);
   if (options.tail !== undefined) {
     const res = await deps.request(deps.ctx, {
@@ -912,7 +962,7 @@ export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<
 export async function agentInterrupt(deps: AgentDeps, options: { id: string }): Promise<number> {
   if (isSelfSession(deps.ctx.selfId, options.id)) return fail(deps, `refusing: ${options.id} is me`, EXIT.refused);
   const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const body = buildInterruptBody(defaultClientId(deps.ctx.selfId, 'interrupt'), (deps.now ?? Date.now)());
   const res = await deps.request(deps.ctx, {
     method: 'POST',
@@ -935,7 +985,7 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
   const refusal = deleteRefusal(deps.ctx.selfId, options.id);
   if (refusal) return fail(deps, refusal, EXIT.refused);
   const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   // The guard again on the RESOLVED id: a prefix that is not me can still resolve
   // to me only if the list is lying, but a delete is the one call worth the paranoia.
   const resolvedRefusal = deleteRefusal(deps.ctx.selfId, target.id);
@@ -1081,6 +1131,8 @@ export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Pr
   let liveId: string | undefined;
   if (options.id) {
     const id = options.id;
+    const tooShort = shortIdRefusal(id);
+    if (tooShort) return fail(deps, tooShort, EXIT.refused);
     const list = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
     if (!list.json?.success) return fail(deps, describeFailure(list));
     const sessions = (list.json.data as SessionRow[] | undefined) ?? [];
@@ -1213,7 +1265,7 @@ export async function agentPost(
   }
   if (options.text.trim().length === 0) return fail(deps, 'refusing: empty message', EXIT.refused);
   const target = await resolveSessionId(deps, options.id);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const res = await deps.request(deps.ctx, {
     method: 'POST',
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
@@ -1440,7 +1492,10 @@ const TODO_STATUS_WORD: Record<TodoStatus, string> = {
 };
 
 /** The session a todo verb works on: `--session` (resolved like every id), else this one. */
-async function todoTarget(deps: AgentDeps, session: string | undefined): Promise<{ id: string } | { error: string }> {
+async function todoTarget(
+  deps: AgentDeps,
+  session: string | undefined
+): Promise<{ id: string } | { error: string; code: number }> {
   return session === undefined ? { id: deps.ctx.selfId } : resolveSessionId(deps, session);
 }
 
@@ -1476,7 +1531,7 @@ export function matchTodoId(todos: readonly TodoRow[], typed: string): { id: str
 /** `agent todo ls` — the session's todo list, agent-set and parsed alike. */
 export async function agentTodoLs(deps: AgentDeps, options: { session?: string } = {}): Promise<number> {
   const target = await todoTarget(deps, options.session);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const list = await fetchTodos(deps, target.id);
   if ('error' in list) return fail(deps, list.error);
   if (deps.json) {
@@ -1515,7 +1570,7 @@ export interface TodoAddOptions {
 export async function agentTodoAdd(deps: AgentDeps, options: TodoAddOptions): Promise<number> {
   if (options.text.trim().length === 0) return fail(deps, 'refusing: empty todo', EXIT.refused);
   const target = await todoTarget(deps, options.session);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const res = await deps.request(deps.ctx, {
     method: 'POST',
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}/ralph-todos`,
@@ -1538,7 +1593,7 @@ export async function agentTodoSet(
   options: { session?: string; todo: string; status: TodoStatus }
 ): Promise<number> {
   const target = await todoTarget(deps, options.session);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const list = await fetchTodos(deps, target.id);
   if ('error' in list) return fail(deps, list.error);
   const match = matchTodoId(list.todos, options.todo);
@@ -1558,7 +1613,7 @@ export async function agentTodoSet(
 /** `agent todo rm` — take one item off the list. */
 export async function agentTodoRm(deps: AgentDeps, options: { session?: string; todo: string }): Promise<number> {
   const target = await todoTarget(deps, options.session);
-  if ('error' in target) return fail(deps, target.error);
+  if ('error' in target) return fail(deps, target.error, target.code);
   const list = await fetchTodos(deps, target.id);
   if ('error' in list) return fail(deps, list.error);
   const match = matchTodoId(list.todos, options.todo);
@@ -1719,7 +1774,9 @@ export function registerAgentCommands(program: Command): Command {
 
   agent
     .command('send <id> <text...>')
-    .description('Type a prompt into another session and press Enter (printable text only)')
+    .description(
+      'Type a prompt into another session and press Enter (printable text only; a prompt that starts with "-" goes after --: send <id> -- "- fix the bug")'
+    )
     .option('-w, --wait', 'Block until end of turn (the default signal set; see --until)')
     .option('-u, --until <signals>', 'Signals to wait for, comma list such as stop,exit (implies --wait)')
     .option('-t, --timeout <ms>', 'Wait budget in ms (with --wait)', String(DEFAULT_WAIT_MS))
@@ -1766,7 +1823,10 @@ export function registerAgentCommands(program: Command): Command {
       '-u, --until <signals>',
       'Comma list: stop,idle,exit,working,blocked (stop/blocked are claude+deepseek only; the server says so with a 400)'
     )
-    .option('-m, --match <marker>', 'Literal substring to wait for in the output (ANSI-stripped, no regex)')
+    .option(
+      '-m, --match <marker>',
+      'Literal substring to wait for in the output (ANSI-stripped, no regex). The echo of your own prompt is output too, so never put the marker verbatim in the prompt: ask for it in halves ("print WORKDONE followed by _4711") and wait on the joined form (WORKDONE_4711)'
+    )
     .option('--from <where>', 'buffer (scan existing output first, the default) or now', 'buffer')
     .option('--nocase', 'Case-insensitive --match')
     .option('--fresh', 'Require an actual transition (--until only)')
@@ -1824,7 +1884,7 @@ export function registerAgentCommands(program: Command): Command {
 
   agent
     .command('rm <id>')
-    .description('Delete a session you created (refuses your own id)')
+    .description('Delete any session except this one (refuses your own id)')
     .option('--json', 'Machine-readable output')
     .action((id: string, options: { json?: boolean }) => run(Boolean(options.json), (deps) => agentRm(deps, { id })));
 

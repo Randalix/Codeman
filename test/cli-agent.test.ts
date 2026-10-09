@@ -8,6 +8,7 @@ import http from 'node:http';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Command } from 'commander';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   AgentGuardError,
@@ -42,8 +43,10 @@ import {
   opencodePermissionEnv,
   parseEnvPairs,
   probeAlive,
+  MIN_ID_PREFIX_LENGTH,
   parsePositiveInt,
   readCodemanEnvFile,
+  registerAgentCommands,
   resolveAgentContext,
   stripAnsi,
   waitExitCode,
@@ -386,6 +389,24 @@ describe('agent send', () => {
     expect(deps.out.join('')).not.toMatch(/delivered to/);
   });
 
+  it('a sleeping remote host: `buffered` gets its own line and exit 0, never "accepted"', async () => {
+    const deps = fakeDeps([ok({ buffered: true })]);
+    expect(await agentSend(deps, { id: OTHER, text: 'go', enter: true })).toBe(EXIT.ok);
+    expect(deps.out.join('')).toMatch(/buffered for .*asleep/);
+    expect(deps.out.join('')).not.toMatch(/accepted for/);
+  });
+
+  it('`dropped` (over the wake buffer cap) is a failure: exit 1, nothing claims success', async () => {
+    const deps = fakeDeps([ok({ buffered: true, dropped: true })]);
+    expect(await agentSend(deps, { id: OTHER, text: 'go', enter: true })).toBe(EXIT.error);
+    expect(deps.err.join('')).toMatch(/dropped: .*nothing will be typed/);
+    expect(deps.out).toEqual([]);
+
+    const json = fakeDeps([ok({ buffered: true, dropped: true })], true);
+    expect(await agentSend(json, { id: OTHER, text: 'go', enter: true })).toBe(EXIT.error);
+    expect(JSON.parse(json.out.join(''))).toEqual({ buffered: true, dropped: true });
+  });
+
   it('reports a tagged duplicate instead of claiming delivery', async () => {
     const deps = fakeDeps([ok({ delivered: false, duplicate: true })]);
     await agentSend(deps, { id: OTHER, text: 'go', enter: true });
@@ -456,7 +477,7 @@ describe('agent read', () => {
   });
 
   it('--tail fetches the terminal and strips ANSI', async () => {
-    const deps = fakeDeps([ok({ terminalBuffer: '\u001b[32m❯\u001b[0m ready \u001b(B' })]);
+    const deps = fakeDeps([ok({ terminalBuffer: '\u001b]0;w1 title\u0007\u001b[32m❯\u001b[0m ready \u001b(B' })]);
     expect(await agentRead(deps, { id: OTHER, tail: 500 })).toBe(EXIT.ok);
     expect(deps.calls[0]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/terminal`, query: { tail: 500 } });
     expect(deps.out).toEqual(['❯ ready ']);
@@ -938,6 +959,34 @@ describe('session id prefixes', () => {
   const THIRD = '94990c6d-ffff-4000-8000-000000000000';
   const list = ok([{ id: SELF }, { id: OTHER }, { id: THIRD }]);
 
+  it('a prefix shorter than 8 characters refuses (exit 4) before any request, on every verb', async () => {
+    expect(MIN_ID_PREFIX_LENGTH).toBe(8);
+    // Ark0N's repro on #557: `rm 9` with one other session starting with 9 deleted it.
+    const rm = fakeDeps([ok([{ id: SELF }, { id: OTHER }]), ok({})]);
+    expect(await agentRm(rm, { id: '9' })).toBe(EXIT.refused);
+    expect(rm.calls).toEqual([]);
+    expect(rm.err.join('')).toMatch(/"9" is shorter than 8 characters.*8-character id `agent ls` prints/);
+
+    const short = OTHER.slice(0, 7);
+    const verbs: Array<[string, (deps: AgentDeps) => Promise<number>]> = [
+      ['send', (d) => agentSend(d, { id: short, text: 'go', enter: true })],
+      ['wait', (d) => agentWait(d, { id: short, until: 'idle', timeoutMs: 1000 })],
+      ['read', (d) => agentRead(d, { id: short })],
+      ['interrupt', (d) => agentInterrupt(d, { id: short })],
+      ['rm', (d) => agentRm(d, { id: short })],
+      ['post', (d) => agentPost(d, { id: short, text: 'hi' })],
+      ['watch', (d) => agentWatch(d, { ids: [short], waitMs: 1000 })],
+      ['todo ls --session', (d) => agentTodoLs(d, { session: short })],
+      ['todo add --session', (d) => agentTodoAdd(d, { session: short, text: 'x' })],
+      ['restore', (d) => agentRestore(d, { id: short, runner: async () => ({ code: 0, output: '' }) })],
+    ];
+    for (const [verb, call] of verbs) {
+      const deps = fakeDeps([ok([{ id: SELF }, { id: OTHER }]), ok({ delivered: true })]);
+      expect(await call(deps), verb).toBe(EXIT.refused);
+      expect(deps.calls, verb).toEqual([]);
+    }
+  });
+
   it('a full id goes straight to the route, no list call', async () => {
     const deps = fakeDeps([ok({ text: 'x' })]);
     await agentRead(deps, { id: OTHER });
@@ -971,6 +1020,25 @@ describe('session id prefixes', () => {
     const resolved = fakeDeps([ok([{ id: SELF }, { id: OTHER }])]);
     expect(await agentRm(resolved, { id: 'deadbeef' })).toBe(EXIT.error); // nothing to delete
     expect(resolved.calls.map((c) => c.method)).toEqual(['GET']);
+  });
+});
+
+describe('help texts carry the traps the skill documents', () => {
+  const agent = registerAgentCommands(new Command());
+  const sub = (name: string) => agent.commands.find((c) => c.name() === name)!;
+
+  it('--match says the prompt must not contain the marker verbatim, and how to split it', () => {
+    const match = sub('wait').options.find((o) => o.long === '--match')!;
+    expect(match.description).toMatch(/never put the marker verbatim in the prompt/);
+    expect(match.description).toMatch(/WORKDONE followed by _4711.*WORKDONE_4711/);
+  });
+
+  it('send names the -- escape for a prompt that starts with "-"', () => {
+    expect(sub('send').description()).toContain('send <id> -- "- fix the bug"');
+  });
+
+  it('rm does not claim a lineage check it does not make', () => {
+    expect(sub('rm').description()).toMatch(/^Delete any session except this one/);
   });
 });
 
