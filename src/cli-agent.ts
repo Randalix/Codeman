@@ -115,17 +115,18 @@ export function resolveAgentContext(
   if (!selfId) {
     throw new AgentGuardError('CODEMAN_SESSION_ID is not set; cannot tell which session is me.');
   }
-  let username = env.CODEMAN_USERNAME;
-  let password = env.CODEMAN_PASSWORD;
-  if (!password) {
-    const file = envFile();
-    username = username || file.CODEMAN_USERNAME;
-    password = file.CODEMAN_PASSWORD;
-  }
+  // Each field from the environment first, then the data dir's `.env` — per FIELD, the
+  // order `codeman attach` and the TUI use. Taking the file only when the password was
+  // missing paired an env password with the default user `admin` instead of the
+  // file's user.
+  const needFile = !env.CODEMAN_USERNAME || !env.CODEMAN_PASSWORD;
+  const file = needFile ? envFile() : {};
+  const username = env.CODEMAN_USERNAME || file.CODEMAN_USERNAME || 'admin';
+  const password = env.CODEMAN_PASSWORD || file.CODEMAN_PASSWORD;
   return {
     apiUrl,
     selfId,
-    auth: password ? { username: username || 'admin', password } : undefined,
+    auth: password ? { username, password } : undefined,
   };
 }
 
@@ -149,6 +150,18 @@ export function deleteRefusal(selfId: string, id: string): string | undefined {
   if (selfId.length < 8) return 'refusing: own session id unset or too short to prove this is not me';
   if (isSelfSession(selfId, id)) return `refusing: ${id} is me`;
   return undefined;
+}
+
+/**
+ * The prompt `send` was given, which must be ONE argument. Joining several with spaces
+ * would turn an unquoted `$(cat notes.txt)`, which the shell splits on every newline,
+ * back into a single line, so the multi-line refusal below would never see it.
+ */
+export function sendPromptFromArgs(words: readonly string[]): { text: string } | { error: string } {
+  if (words.length === 1) return { text: words[0] };
+  return {
+    error: `refusing: the prompt must be ONE argument, got ${words.length} — quote it (\`send <id> "…"\`; a prompt that starts with "-" goes after --: \`send <id> -- "- fix the bug"\`)`,
+  };
 }
 
 /**
@@ -1775,7 +1788,7 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('send <id> <text...>')
     .description(
-      'Type a prompt into another session and press Enter (printable text only; a prompt that starts with "-" goes after --: send <id> -- "- fix the bug")'
+      'Type a prompt into another session and press Enter (ONE quoted argument, printable text only; a prompt that starts with "-" goes after --: send <id> -- "- fix the bug")'
     )
     .option('-w, --wait', 'Block until end of turn (the default signal set; see --until)')
     .option('-u, --until <signals>', 'Signals to wait for, comma list such as stop,exit (implies --wait)')
@@ -1801,17 +1814,19 @@ export function registerAgentCommands(program: Command): Command {
           json?: boolean;
         }
       ) =>
-        run(Boolean(options.json), (deps) =>
-          agentSend(deps, {
+        run(Boolean(options.json), (deps) => {
+          const prompt = sendPromptFromArgs(words);
+          if ('error' in prompt) return Promise.resolve(fail(deps, prompt.error, EXIT.refused));
+          return agentSend(deps, {
             id,
-            text: words.join(' '),
+            text: prompt.text,
             enter: options.enter,
             wait: options.until ?? (options.wait ? true : undefined),
             timeoutMs: parsePositiveInt(options.timeout, DEFAULT_WAIT_MS),
             clientId: options.clientId,
             seq: options.seq === undefined ? undefined : parsePositiveInt(options.seq, 1, '--seq'),
-          })
-        )
+          });
+        })
     );
 
   agent

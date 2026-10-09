@@ -44,6 +44,7 @@ import {
   parseEnvPairs,
   probeAlive,
   MIN_ID_PREFIX_LENGTH,
+  sendPromptFromArgs,
   parsePositiveInt,
   readCodemanEnvFile,
   registerAgentCommands,
@@ -133,6 +134,22 @@ describe('resolveAgentContext (guard)', () => {
       password: 'file',
     });
     expect(resolveAgentContext(inside, () => ({})).auth).toBeUndefined();
+  });
+
+  it('resolves each field on its own: an env password still takes the .env user, not admin', () => {
+    expect(
+      resolveAgentContext({ ...inside, CODEMAN_PASSWORD: 'pw' }, () => ({ CODEMAN_USERNAME: 'joe' })).auth
+    ).toEqual({ username: 'joe', password: 'pw' });
+    expect(
+      resolveAgentContext({ ...inside, CODEMAN_USERNAME: 'env-user' }, () => ({
+        CODEMAN_USERNAME: 'joe',
+        CODEMAN_PASSWORD: 'file',
+      })).auth
+    ).toEqual({ username: 'env-user', password: 'file' });
+    // Both in the environment: the file is never read.
+    let read = false;
+    resolveAgentContext({ ...inside, CODEMAN_USERNAME: 'u', CODEMAN_PASSWORD: 'p' }, () => ((read = true), {}));
+    expect(read).toBe(false);
   });
 
   it('reads a hand-authored .env with quotes and export prefixes', () => {
@@ -1020,6 +1037,16 @@ describe('session id prefixes', () => {
     const resolved = fakeDeps([ok([{ id: SELF }, { id: OTHER }])]);
     expect(await agentRm(resolved, { id: 'deadbeef' })).toBe(EXIT.error); // nothing to delete
     expect(resolved.calls.map((c) => c.method)).toEqual(['GET']);
+  });
+});
+
+describe('send takes the prompt as ONE argument', () => {
+  it('refuses several words, which an unquoted multi-line $(…) becomes after word splitting', () => {
+    expect(sendPromptFromArgs(['review src/, then say DONE'])).toEqual({ text: 'review src/, then say DONE' });
+    expect(sendPromptFromArgs(['line', 'one', 'line', 'two'])).toMatchObject({
+      error: expect.stringMatching(/ONE argument, got 4/),
+    });
+    expect(sendPromptFromArgs(['a', 'b'])).toMatchObject({ error: expect.stringContaining('send <id> -- "- fix') });
   });
 });
 
