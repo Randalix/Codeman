@@ -536,12 +536,31 @@ function sanitizePaneLineStyles(line: string): string {
 
     const end = findEscapeEnd(line, i);
     const sequence = line.slice(i, end + 1);
-    if (isSgrSequence(sequence)) {
+    if (isSgrSequence(sequence) || isHyperlinkSequence(sequence)) {
       result += sequence;
     }
     i = end;
   }
   return result;
+}
+
+/**
+ * An OSC 8 hyperlink open (`ESC ] 8 ; params ; uri ST`) or close (empty uri).
+ * `capture-pane -e` emits these for cells that carry one — Claude Code's
+ * `file://` links on its image/file lines — and the visible-frame repaint must
+ * keep them, or a tab switch (or any shell session) loses the links the live
+ * stream had. Printable bytes only and bounded: the snapshot replays straight
+ * into xterm, so this admits a link and nothing else an OSC could carry.
+ */
+function isHyperlinkSequence(sequence: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return sequence.length <= 4096 && /^\x1b\]8;[^;\x00-\x1f\x7f]*;[^\x00-\x1f\x7f]*(?:\x07|\x1b\\)$/.test(sequence);
+}
+
+/** Whether an OSC 8 sequence opens a link (non-empty uri) rather than closing one. */
+function opensHyperlink(sequence: string): boolean {
+  // eslint-disable-next-line no-control-regex
+  return !/;(?:\x07|\x1b\\)$/.test(sequence);
 }
 
 function isSgrSequence(sequence: string): boolean {
@@ -669,6 +688,7 @@ function truncatePaneLineByVisibleColumns(line: string, maxColumns: number): str
   let result = '';
   let visibleColumns = 0;
   let sawSgr = false;
+  let linkOpen = false;
 
   for (let i = 0; i < line.length; i++) {
     if (line[i] === '\x1b') {
@@ -677,6 +697,9 @@ function truncatePaneLineByVisibleColumns(line: string, maxColumns: number): str
       if (isSgrSequence(sequence)) {
         result += sequence;
         sawSgr = true;
+      } else if (isHyperlinkSequence(sequence)) {
+        result += sequence;
+        linkOpen = opensHyperlink(sequence);
       }
       i = end;
       continue;
@@ -700,6 +723,11 @@ function truncatePaneLineByVisibleColumns(line: string, maxColumns: number): str
 
   if (sawSgr) {
     result += '\x1b[0m';
+  }
+  // A link still open here (truncated mid-link) would otherwise run on into
+  // every row painted after this one: xterm keeps it across cursor moves.
+  if (linkOpen) {
+    result += '\x1b]8;;\x1b\\';
   }
   return result;
 }

@@ -171,3 +171,35 @@ describe('why a capture has to report its height', () => {
     expect(addressed.filter((row) => row > 30)).toHaveLength(20);
   });
 });
+
+describe('visible-frame snapshot keeps OSC 8 hyperlinks', () => {
+  // `capture-pane -e` carries the file:// links Claude Code puts on its image/file lines.
+  // The repaint used to keep SGR only, so a tab switch (or any shell session) dropped the
+  // links on exactly the rows the user was looking at.
+  const geometry = { cols: 40, rows: 2, cursorX: 0, cursorY: 1 };
+  const open = '\x1b]8;id=tmux1;file:///tmp/out/a.png\x1b\\';
+  const close = '\x1b]8;;\x1b\\';
+
+  it('passes a link through on the row it sits on', () => {
+    const snapshot = formatPaneSnapshot([`see ${open}a.png${close} ok`, ''], geometry);
+    expect(snapshot).toContain(`${open}a.png${close}`);
+  });
+
+  it('still strips every other OSC (titles, clipboard)', () => {
+    const snapshot = formatPaneSnapshot(['\x1b]0;title\x07\x1b]52;c;aGk=\x07text', ''], geometry);
+    expect(snapshot).not.toContain('\x1b]0;');
+    expect(snapshot).not.toContain('\x1b]52;');
+    expect(snapshot).toContain('text');
+  });
+
+  it('closes a link the column limit cut off, so it cannot run into the next row', () => {
+    const snapshot = formatPaneSnapshot([`${open}${'x'.repeat(60)}${close}`, 'next'], geometry);
+    const firstRow = snapshot.slice(0, snapshot.indexOf('\x1b[2;1H'));
+    expect(firstRow.endsWith(close)).toBe(true);
+  });
+
+  it('drops a link whose uri carries control bytes', () => {
+    const snapshot = formatPaneSnapshot(['\x1b]8;;file:///tmp/a\x01b.png\x1b\\a.png', ''], geometry);
+    expect(snapshot).not.toContain('\x1b]8;');
+  });
+});
