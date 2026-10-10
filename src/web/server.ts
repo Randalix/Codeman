@@ -3030,6 +3030,15 @@ export class WebServer extends EventEmitter {
     if (!this.testMode) {
       const pruned = agentInbox.pruneExcept(this.sessions.keys());
       if (pruned > 0) console.log(`[Inbox] dropped ${pruned} inbox(es) of sessions that did not come back`);
+      // The nudger's state did not survive the restart and only a post schedules it:
+      // without this, restored mail stays unannounced until the next post.
+      let rearmed = 0;
+      for (const [sessionId, inbox] of agentInbox.summary()) {
+        if (inbox.pending === 0) continue;
+        this.inboxNudger.rearm(sessionId);
+        rearmed++;
+      }
+      if (rearmed > 0) console.log(`[Inbox] will announce restored mail in ${rearmed} session(s)`);
     }
 
     // Sweep agent preamble caches whose sessions are gone (see

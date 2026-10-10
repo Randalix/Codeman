@@ -30,6 +30,10 @@
  * - NEVER wakes a host. A remote session is nudged only when its host answers a plain
  *   TCP probe; a sleeping host keeps the mail until something legitimate wakes it.
  *   This module has no access to the wake registry (wiring guard in the tests).
+ * - Survives a server restart: the store is persisted but this state is not, so boot
+ *   calls `rearm()` for every restored inbox with mail (after `NUDGE_RESTART_DELAY_MS`,
+ *   once the adopted sessions report real status). Read-but-unacked mail counts as
+ *   unseen then — `seen` is not persisted — and gets one reminder.
  * - Opt-out per post (`nudge: false`, CLI `--no-nudge`) and globally
  *   (`CODEMAN_INBOX_NUDGE=0`).
  *
@@ -45,6 +49,8 @@ export const NUDGE_DEBOUNCE_MS = 2_000;
 export const NUDGE_COOLDOWN_MS = 30_000;
 /** How long a busy session is left alone before the nudge is typed anyway. */
 export const NUDGE_MAX_DEFER_MS = 5 * 60_000;
+/** After a server restart: let adopted sessions settle before announcing restored mail. */
+export const NUDGE_RESTART_DELAY_MS = 30_000;
 
 /** The slice of a Session the nudger reads. */
 export interface NudgeTarget {
@@ -137,6 +143,15 @@ export class InboxNudger {
       state.timer = null;
       void this.check(sessionId);
     }, NUDGE_DEBOUNCE_MS);
+  }
+
+  /**
+   * Announce mail that is already there without a post: restored at boot. Runs the
+   * normal `check()` after `delayMs`, so every rule above still applies.
+   */
+  rearm(sessionId: string, delayMs = NUDGE_RESTART_DELAY_MS): void {
+    if (this.stopped || !this.deps.enabled()) return;
+    this.retryIn(sessionId, this.state(sessionId), delayMs);
   }
 
   /** Forget a session (deleted). */

@@ -12,6 +12,7 @@ import {
   NUDGE_COOLDOWN_MS,
   NUDGE_DEBOUNCE_MS,
   NUDGE_MAX_DEFER_MS,
+  NUDGE_RESTART_DELAY_MS,
   nudgeText,
   type NudgeTarget,
 } from '../src/web/inbox-nudger.js';
@@ -324,7 +325,66 @@ describe('when it is deliberately not announced', () => {
   });
 });
 
+describe('after a server restart', () => {
+  it('rearm announces mail that is already there, after the settle delay', async () => {
+    const { inbox, sessions, nudger } = setup();
+    const s = new FakeSession(A);
+    sessions.set(A, s);
+    inbox.post(A, B, 'restored'); // in the store, no schedule(): what boot sees
+    nudger.rearm(A);
+    await settle(NUDGE_RESTART_DELAY_MS - 1);
+    expect(s.written).toEqual([]);
+    await settle(1);
+    expect(s.written).toHaveLength(1);
+    expect(s.written[0]).toMatch(/1 new message from bbbbbbbb/);
+  });
+
+  it('rearm keeps every rule: no mail, disabled, busy and draft all hold', async () => {
+    const empty = setup();
+    const e = new FakeSession(A);
+    empty.sessions.set(A, e);
+    empty.nudger.rearm(A);
+    await settle(NUDGE_RESTART_DELAY_MS);
+    expect(e.written).toEqual([]);
+
+    const off = setup({ enabled: false });
+    const o = new FakeSession(A);
+    off.sessions.set(A, o);
+    off.inbox.post(A, B, 'x');
+    off.nudger.rearm(A);
+    await settle(NUDGE_RESTART_DELAY_MS);
+    expect(o.written).toEqual([]);
+
+    const busy = setup();
+    const b = new FakeSession(A);
+    b.status = 'busy';
+    b.draft = true;
+    busy.sessions.set(A, b);
+    busy.inbox.post(A, B, 'x');
+    busy.nudger.rearm(A);
+    await settle(NUDGE_RESTART_DELAY_MS);
+    expect(b.written).toEqual([]);
+    b.status = 'idle';
+    b.emit('idle');
+    await settle();
+    expect(b.written).toEqual([]); // still a draft
+    b.draft = false;
+    await settle(NUDGE_COOLDOWN_MS);
+    expect(b.written).toHaveLength(1);
+  });
+});
+
 describe('wiring guard', () => {
+  it('boot rearms the nudger for restored mail, after the restore and its prune', () => {
+    const server = readFileSync(new URL('../src/web/server.ts', import.meta.url), 'utf-8');
+    const restore = server.indexOf('await this.restoreMuxSessions()');
+    const prune = server.indexOf('agentInbox.pruneExcept(', restore);
+    const rearm = server.indexOf('this.inboxNudger.rearm(', prune);
+    expect(restore).toBeGreaterThan(0);
+    expect(prune).toBeGreaterThan(restore);
+    expect(rearm).toBeGreaterThan(prune);
+  });
+
   it('the nudger cannot reach the wake registry (a post must never wake a host)', () => {
     const src = readFileSync(new URL('../src/web/inbox-nudger.ts', import.meta.url), 'utf-8');
     expect(src).not.toMatch(/^import .*remote-wake/m);
