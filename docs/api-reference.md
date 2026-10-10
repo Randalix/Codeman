@@ -468,7 +468,7 @@ geometry was read. The capture runs synchronous tmux calls on the server; the
 
 ## The `codeman agent` CLI (client over these endpoints)
 
-`codeman agent ls|spawn|send|wait|read|interrupt|rm` (`src/cli-agent.ts`) is the command-line client for the endpoints above, for agents in modes that never receive the claude-only skill preamble. It adds no route: `spawn` is `POST /api/v1/quick-start` (+ `wait-output` on the composer mark for claude/deepseek), `send` is `POST …/input` with `clientId`+`seq` (and `wait`/`waitTimeout` for `--wait` / `--until <signals>`; `delivered:false` without `duplicate` and `wait.ended` both exit 3 — the CLI never reports a dead worker as done), `wait` is `GET …/wait` (`--until`) or `GET …/wait-output` (`--match`, `from=buffer` by default), `read` is `GET …/last-response` or `GET …/terminal?tail=`, `interrupt` is `POST …/input` with a bare `\u001b`, `rm` is `DELETE …/sessions/:id`; `spawn --env` fills quick-start's `envOverrides` (allowlisted prefixes only), `--permission allow|ask` sets `OPENCODE_PERMISSION` (granular bash+edit), `--resume <id>` fills the mode's config resume field (`openCodeConfig.continueSession`, `codexConfig.resumeSessionId`, …; claude refused — quick-start has no resume field for it); `ls --alive` and `restore` probe with `GET …/wait?until=exit&timeout=1000` (an immediate `exit` is the only truthful death check), and `restore` then delegates to the host-local `codeman-restore-session` tool — a live worker is refused. Every call carries `X-Codeman-Parent-Session` and `X-Codeman-Agent-Origin: codeman-agent-cli`, and Basic auth from `CODEMAN_PASSWORD` or the data dir's `.env`. Server-side error codes are shown verbatim (`INVALID_INPUT: until=stop …` on a hook-less mode is not hidden); exit codes are `0` ok, `1` error, `2` timeout, `3` the session exited, `4` refused by a client-side guard. See the README section "`codeman agent`" for the guards and `test/cli-agent.test.ts` for the pinned behaviour.
+`codeman agent ls|spawn|send|wait|read|interrupt|rm` (`src/cli-agent.ts`) is the command-line client for the endpoints above, for agents in modes that never receive the claude-only skill preamble. It adds no route: `spawn` is `POST /api/v1/quick-start` (+ `wait-output` on the mode's `capabilities.composerReadyMark` from the CLI registry, where it declares one), `send` is `POST …/input` with `clientId`+`seq` (and `wait`/`waitTimeout` for `--wait` / `--until <signals>`; `delivered:false` without `duplicate` and `wait.ended` both exit 3 — the CLI never reports a dead worker as done), `wait` is `GET …/wait` (`--until`) or `GET …/wait-output` (`--match`, `from=buffer` by default), `read` is `GET …/last-response` or `GET …/terminal?tail=`, `interrupt` is `POST …/input` with a bare `\u001b`, `rm` is `DELETE …/sessions/:id`. `spawn --env` fills quick-start's `envOverrides` (allowlisted prefixes only), `--permission allow|ask` sets `OPENCODE_PERMISSION` (granular bash+edit), `--resume <id>` fills the mode's config resume field (`openCodeConfig.continueSession`, `codexConfig.resumeSessionId`, …; claude refused — quick-start has no resume field for it); `ls --alive` and `restore` probe with `GET …/wait?until=exit&timeout=1000` (an immediate `exit` is the only truthful death check), and `restore` then delegates to the host-local `codeman-restore-session` tool — a live worker is refused. A fire-and-forget `send` to a sleeping wake-on-LAN host reads the route's `buffered` (own line, exit 0) and `dropped` (exit 1: the chunk is gone). An id may be the 8-character form `ls` prints, resolved through `GET /api/v1/sessions`; anything shorter refuses before any request, the same floor as `PARENT_SESSION_ID_MIN_PREFIX`. Every call carries `X-Codeman-Parent-Session`; only `spawn`'s quick-start carries `X-Codeman-Agent-Origin: codeman-agent-cli` (the agent-scratch label must never reach a request that cannot create the case directory). Basic auth comes from `CODEMAN_PASSWORD` or the data dir's `.env`. Server-side error codes are shown verbatim (`INVALID_INPUT: until=stop …` on a hook-less mode is not hidden); exit codes are `0` ok, `1` error, `2` timeout, `3` the session exited, `4` refused by a client-side guard. See the README section "`codeman agent`" for the guards and `test/cli-agent.test.ts` for the pinned behaviour.
 
 ## Agent inbox (`/api/sessions/:id/inbox`)
 
@@ -485,6 +485,23 @@ A per-session mailbox for agent-to-agent messages that must NOT be typed into th
 Reading and acknowledging are deliberately separate: `GET` is non-destructive and only marks its result as seen, `POST …/ack` removes. A receiver that reads an order but never acts on it leaves it `pending` — visible in `summary`/`ls` and re-delivered on the next read — instead of the message vanishing with the read. A message posted after a read was never marked seen and survives an ack-all. (The seen set is in-memory, like the wait state: a server restart empties it and an ack-all becomes a no-op, which keeps unsent mail rather than dropping it.)
 
 Ownership is the session rule (`findSessionOrFail`): a session the caller cannot see is a `404`. Every post broadcasts `inbox:message` `{sessionId, from, messageId, pending}` on SSE (routed per owner in multi-user mode). The store is persisted whole to `<data dir>/agent-inbox.json` (debounced, atomic rename) and restored at boot, a session's inbox is dropped on delete (kept on a detach, so a re-adopted session finds its mail), and inboxes of sessions that did not come back after a restart are pruned once at boot. The inbox never writes to the pane: delivery is the receiver polling.
+
+## Prompt uploads (`POST /api/v1/sessions/:id/paste-image`)
+
+A `multipart/form-data` body with one `image` part. The file is written into the
+session's workspace as `<workingDir>/.codeman-uploads/paste-<ms>-<hex>.<ext>`, and
+`data` carries `path` and `filename` for the client to type the path into the
+prompt. The folder is Codeman's own: hidden, created on first use with a
+`.gitignore` containing `*` (written once, never over a file already there), and
+cleaned up the way pasted images always were: `paste-*` files older than 7 days
+go in an hourly sweep, and the folder goes when the last session of that
+workspace is killed. Uploads made before this release sit in `.claude-images/`;
+that folder receives nothing new, and is swept and removed the same way for one
+release. A remote (SSH) session answers 400, since the file would land on the
+Codeman host under a path the remote agent cannot read. A Docker session of an
+owned case is fine, its workspace is bind-mounted at the same absolute path; an
+adopted container (`owned: false`) mounts nothing, so its agent can open the file
+only if the container itself exposes that host path.
 
 ## Session lineage (`parentSessionId`)
 
@@ -832,10 +849,10 @@ Copies MCP servers between the agent CLIs' own user-level config files (`docs/cl
 Result (`data`):
 
 - `applied` — `false` for the dry run.
-- `targets[]` — one per enabled CLI that declares an MCP config: `id`, `label`, `file`, `status`, `error?`, `servers` (names it already has), `added` (names added, or that would be), `skipped` (names its dialect cannot express, e.g. SSE for Codex and Antigravity).
+- `targets[]` — one per enabled CLI that declares an MCP config, plus GitHub Copilot CLI (`id: "copilot"`, a sync-only target that is not a run mode): `id`, `label`, `file`, `status`, `error?`, `servers` (names it already has), `added` (names added, or that would be), `skipped` (names its dialect cannot express, e.g. SSE for Codex and Antigravity).
   - `status`: `ok`; `absent` (not installed and no config file, so not read or created); `skipped` (the CLI's relocation env var, e.g. `CODEX_HOME`, is set to a relative path in the server's environment, so its file cannot be located safely and is neither read nor written); `unreadable` (the file exists but cannot be parsed safely, so it is not written); `failed` (a read or write error, the file may be unchanged).
   - `error` says why a target is not `ok`. A parse failure is reported by position only (`not valid TOML (line 3, column 21)`, `not valid JSON`), never with text from the file.
-  - `file` honours each CLI's own relocation env var as the server process sees it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`, `GEMINI_CLI_HOME`); see `docs/cli-registry.md`.
+  - `file` honours each CLI's own relocation env var as the server process sees it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`, `GEMINI_CLI_HOME`, and `COPILOT_HOME` for the sync-only Copilot CLI); see `docs/cli-registry.md`.
 - `conflicts[]` — names defined differently by different CLIs. Existing definitions are kept; the first CLI's is copied where the name is missing.
 - `disabled[]` — names left out because every definition is switched off in its own CLI (codex `enabled = false`, opencode `enabled: false`, antigravity `disabled: true`).
 - `unsupported[]` — labels of enabled agent CLIs with no known MCP config file (nothing is guessed).

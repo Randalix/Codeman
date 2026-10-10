@@ -15,10 +15,11 @@ import { existsSync, readFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { homedir } from 'node:os';
 import { dataPath } from './config/instance.js';
+import { readCodemanCredentials } from './codeman-credentials.js';
 import { casePath } from './config/cases-dir.js';
 import { assertValidBasePath } from './config/base-path.js';
 import { installAgentSkillInto, removeAgentSkillFrom, type AgentSkillApplyResult } from './hooks-config.js';
-import { readCodemanEnvFile, registerAgentCommands, agentRestore, httpRequest } from './cli-agent.js';
+import { registerAgentCommands, agentRestore, httpRequest } from './cli-agent.js';
 import type { AgentContext, AgentDeps } from './cli-agent.js';
 import { getSessionManager } from './session-manager.js';
 import { getTaskQueue } from './task-queue.js';
@@ -44,13 +45,8 @@ function makeAttachmentMagicLink(filePath: string): string {
   return `codeman://attach?path=${encodeURIComponent(filePath)}`;
 }
 
-/** `.env` in the data dir — the same reader `codeman agent` uses. */
-const readCodemanEnv = (): Record<string, string> => readCodemanEnvFile();
-
 async function postAttachment(apiUrl: string, sessionId: string, filePath: string): Promise<boolean> {
-  const envFile = readCodemanEnv();
-  const username = process.env.CODEMAN_USERNAME || envFile.CODEMAN_USERNAME || 'admin';
-  const password = process.env.CODEMAN_PASSWORD || envFile.CODEMAN_PASSWORD;
+  const { username, password } = readCodemanCredentials();
   const url = new URL(`/api/sessions/${encodeURIComponent(sessionId)}/attachments`, apiUrl);
   const body = JSON.stringify({ path: filePath });
   const transport = url.protocol === 'https:' ? https : http;
@@ -367,21 +363,19 @@ sessionCmd
 /**
  * An `AgentContext` for the root CLI, which runs OUTSIDE a Codeman session (no
  * `CODEMAN_MUX`): the URL comes from `--url`, then `CODEMAN_API_URL`, then the local
- * port, and there is no self id. Credentials follow the same `.env` fallback the agent
- * path uses.
+ * port, and there is no self id. Credentials come from the shared reader every API
+ * client uses (`readCodemanCredentials`).
  */
 function rootAgentContext(options: { url?: string }): AgentContext {
   const apiUrl =
     options.url?.trim() ||
     process.env.CODEMAN_API_URL?.trim() ||
     `http://127.0.0.1:${process.env.CODEMAN_PORT || '3000'}`;
-  const envFile = readCodemanEnvFile();
-  const password = process.env.CODEMAN_PASSWORD || envFile.CODEMAN_PASSWORD;
-  const username = process.env.CODEMAN_USERNAME || envFile.CODEMAN_USERNAME || 'admin';
+  const credentials = readCodemanCredentials();
   return {
     apiUrl,
     selfId: process.env.CODEMAN_SESSION_ID?.trim() || '',
-    auth: password ? { username, password } : undefined,
+    auth: credentials.password ? credentials : undefined,
   };
 }
 
@@ -678,9 +672,7 @@ function probeWebServerAt(base: string): Promise<WebServerProbe | null> {
   } catch {
     return Promise.resolve(null);
   }
-  const envFile = readCodemanEnv();
-  const username = process.env.CODEMAN_USERNAME || envFile.CODEMAN_USERNAME || 'admin';
-  const password = process.env.CODEMAN_PASSWORD || envFile.CODEMAN_PASSWORD;
+  const { username, password } = readCodemanCredentials();
   const transport = url.protocol === 'https:' ? https : http;
   const headers: Record<string, string> = { Accept: 'application/json' };
   if (password) {

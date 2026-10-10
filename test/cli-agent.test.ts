@@ -31,6 +31,8 @@ import {
   agentWait,
   agentWatch,
   matchTodoId,
+  baseHeaders,
+  composerReadyMark,
   buildInterruptBody,
   buildRestoreBody,
   buildSendBody,
@@ -46,7 +48,6 @@ import {
   MIN_ID_PREFIX_LENGTH,
   sendPromptFromArgs,
   parsePositiveInt,
-  readCodemanEnvFile,
   registerAgentCommands,
   resolveAgentContext,
   stripAnsi,
@@ -56,6 +57,7 @@ import {
   type ApiResponse,
   type RequestOptions,
 } from '../src/cli-agent.js';
+import { readCodemanEnvFile } from '../src/codeman-credentials.js';
 
 const SELF = '058ee7b5-b2aa-4c33-8cc1-e900eb0b28af';
 const OTHER = '94990c6d-e461-4a29-aa83-89275327732c';
@@ -136,20 +138,11 @@ describe('resolveAgentContext (guard)', () => {
     expect(resolveAgentContext(inside, () => ({})).auth).toBeUndefined();
   });
 
-  it('resolves each field on its own: an env password still takes the .env user, not admin', () => {
+  it('resolves each field the way attach and the TUI do (one shared order)', () => {
+    // Password from the environment, username from the file: joe, not admin.
     expect(
       resolveAgentContext({ ...inside, CODEMAN_PASSWORD: 'pw' }, () => ({ CODEMAN_USERNAME: 'joe' })).auth
     ).toEqual({ username: 'joe', password: 'pw' });
-    expect(
-      resolveAgentContext({ ...inside, CODEMAN_USERNAME: 'env-user' }, () => ({
-        CODEMAN_USERNAME: 'joe',
-        CODEMAN_PASSWORD: 'file',
-      })).auth
-    ).toEqual({ username: 'env-user', password: 'file' });
-    // Both in the environment: the file is never read.
-    let read = false;
-    resolveAgentContext({ ...inside, CODEMAN_USERNAME: 'u', CODEMAN_PASSWORD: 'p' }, () => ((read = true), {}));
-    expect(read).toBe(false);
   });
 
   it('reads a hand-authored .env with quotes and export prefixes', () => {
@@ -490,7 +483,7 @@ describe('agent read', () => {
   it('says why an empty transcript is empty instead of printing nothing', async () => {
     const deps = fakeDeps([ok({ text: '' })]);
     await agentRead(deps, { id: OTHER });
-    expect(deps.err.join('')).toMatch(/opencode\/pi\/gemini/);
+    expect(deps.err.join('')).toMatch(/nothing answered yet.*--tail 3000/);
   });
 
   it('--tail fetches the terminal and strips ANSI', async () => {
@@ -532,6 +525,36 @@ describe('agent interrupt', () => {
   });
 });
 
+describe('send takes the prompt as ONE argument', () => {
+  it('refuses several words, which an unquoted multi-line $(…) becomes after word splitting', () => {
+    expect(sendPromptFromArgs(['review src/, then say DONE'])).toEqual({ text: 'review src/, then say DONE' });
+    expect(sendPromptFromArgs(['line', 'one', 'line', 'two'])).toMatchObject({
+      error: expect.stringMatching(/ONE argument, got 4/),
+    });
+    // A leading "-" is commander's option syntax, so the hint names the escape.
+    expect(sendPromptFromArgs(['a', 'b'])).toMatchObject({ error: expect.stringContaining('send <id> -- "- fix') });
+  });
+});
+
+describe('agent spawn: a worker that dies during the readiness wait', () => {
+  it('is exit 3 with its own line, not the composer-timeout hint', async () => {
+    const deps = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' }), ok({ wait: { ended: true, matched: false } })]);
+    expect(await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.dead);
+    expect(deps.err.join('')).toMatch(/exited during the readiness wait/);
+    expect(deps.err.join('')).not.toMatch(/composer not seen/);
+  });
+});
+
+describe('agent wait: a timeout is an answer, not a failure', () => {
+  it('prints a neutral line and exits 2', async () => {
+    const deps = fakeDeps([ok({ wait: { timedOut: true, timeoutMs: 1000 } })]);
+    expect(await agentWait(deps, { id: OTHER, until: 'stop', from: 'buffer', timeoutMs: 1000 })).toBe(EXIT.timeout);
+    const line = deps.out.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+    expect(line).toBe('timed out after 1000 ms (exit 2)');
+    expect(deps.err).toEqual([]);
+  });
+});
+
 describe('agent spawn', () => {
   it('quick-starts with lineage and waits for the claude composer', async () => {
     const deps = fakeDeps([
@@ -554,11 +577,40 @@ describe('agent spawn', () => {
     expect(deps.err.join('')).toMatch(/spawned .*composer up/s);
   });
 
+  it('labels the case as agent scratch on the spawn request, and on no other request', async () => {
+    // The label drives a recursive-delete affordance in the Add Case UI: it may only ride
+    // the request that can CREATE a case directory (quick-start), never anything else.
+    const spawn = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' }), ok({ wait: { matched: true } })]);
+    await agentSpawn(spawn, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 });
+    expect(spawn.calls[0].headers).toEqual({ 'X-Codeman-Agent-Origin': 'codeman-agent-cli' });
+    expect(spawn.calls[1].headers?.['X-Codeman-Agent-Origin']).toBeUndefined(); // the readiness wait
+
+    const everyOther = fakeDeps((o) =>
+      o.path === '/api/v1/sessions' ? ok([]) : ok({ wait: { signal: 'stop' }, text: '' })
+    );
+    await agentLs(everyOther);
+    await agentSend(everyOther, { id: OTHER, text: 'hi', enter: true });
+    await agentWait(everyOther, { id: OTHER, until: 'stop', from: 'buffer', timeoutMs: 1000 });
+    await agentRead(everyOther, { id: OTHER });
+    await agentInterrupt(everyOther, { id: OTHER });
+    await agentRm(everyOther, { id: OTHER });
+    expect(everyOther.calls.length).toBeGreaterThan(5);
+    for (const call of everyOther.calls) expect(call.headers?.['X-Codeman-Agent-Origin'], call.path).toBeUndefined();
+    expect(baseHeaders(ctx())).not.toHaveProperty('X-Codeman-Agent-Origin');
+  });
+
+  it('takes the readiness mark from the CLI registry, not from a mode list', () => {
+    expect(composerReadyMark('claude')).toBe('shift+tab');
+    expect(composerReadyMark('deepseek')).toBe('❯');
+    expect(composerReadyMark('pi')).toBeUndefined();
+    expect(composerReadyMark('no-such-cli')).toBeUndefined();
+  });
+
   it('a composer that never shows up is exit 2 and the session is left for inspection, not deleted', async () => {
     const deps = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' }), ok({ wait: { matched: false, timedOut: true } })]);
     expect(await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.timeout);
     expect(deps.calls.map((c) => c.method)).toEqual(['POST', 'GET']);
-    expect(deps.err.join('')).toMatch(/trust dialog/);
+    expect(deps.err.join('')).toMatch(/startup dialog/);
   });
 
   it('a mode without a readiness mark returns after the create, and --no-ready skips the wait everywhere', async () => {
@@ -1030,6 +1082,29 @@ describe('session id prefixes', () => {
     expect(deps.calls.map((c) => c.method)).toEqual(['GET']);
   });
 
+  it('a prefix shorter than 8 characters refuses (exit 4) before any request, on every verb', async () => {
+    expect(MIN_ID_PREFIX_LENGTH).toBe(8);
+    // The maintainer's repro: `rm 9` with one other session starting with 9 deleted it.
+    const rm = fakeDeps([ok([{ id: SELF }, { id: OTHER }]), ok({})]);
+    expect(await agentRm(rm, { id: '9' })).toBe(EXIT.refused);
+    expect(rm.calls).toEqual([]);
+    expect(rm.err.join('')).toMatch(/"9" is shorter than 8 characters.*8-character id `agent ls` prints/);
+
+    const short = OTHER.slice(0, 7);
+    const verbs: Array<[string, (deps: AgentDeps) => Promise<number>]> = [
+      ['send', (d) => agentSend(d, { id: short, text: 'go', enter: true })],
+      ['wait', (d) => agentWait(d, { id: short, until: 'idle', timeoutMs: 1000 })],
+      ['read', (d) => agentRead(d, { id: short })],
+      ['interrupt', (d) => agentInterrupt(d, { id: short })],
+      ['rm', (d) => agentRm(d, { id: short })],
+    ];
+    for (const [verb, call] of verbs) {
+      const deps = fakeDeps([ok([{ id: SELF }, { id: OTHER }]), ok({ delivered: true })]);
+      expect(await call(deps), verb).toBe(EXIT.refused);
+      expect(deps.calls, verb).toEqual([]);
+    }
+  });
+
   it('rm runs the self guard before the list and again on the resolved id', async () => {
     const first = fakeDeps([ok([{ id: SELF }])]);
     expect(await agentRm(first, { id: SELF.slice(0, 8) })).toBe(EXIT.refused);
@@ -1130,7 +1205,7 @@ describe('httpRequest', () => {
     const last = seen.at(-1)!;
     expect(last.url).toBe('/api/v1/sessions/x/wait-output?match=shift%2Btab&from=buffer&timeout=1000');
     expect(last.headers['x-codeman-parent-session']).toBe(SELF);
-    expect(last.headers['x-codeman-agent-origin']).toBe('codeman-agent-cli');
+    expect(last.headers['x-codeman-agent-origin']).toBeUndefined(); // only spawn's quick-start carries it
     expect(last.headers.authorization).toBe(`Basic ${Buffer.from('joe:pw').toString('base64')}`);
   });
 

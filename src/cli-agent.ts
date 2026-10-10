@@ -30,9 +30,15 @@
  */
 import http from 'node:http';
 import https from 'node:https';
-import { readFileSync, statSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import type { Command } from 'commander';
-import { dataPath } from './config/instance.js';
+import {
+  basicAuthHeader,
+  credentialsFrom,
+  readCodemanEnvFile,
+  type CodemanCredentials,
+} from './codeman-credentials.js';
+import { getCli } from './config/cli-registry/registry.js';
 import { GLYPH, palette, table } from './cli-style.js';
 import { getErrorMessage } from './types.js';
 import { stripAnsi as stripAnsiSequences } from './utils/regex-patterns.js';
@@ -53,7 +59,7 @@ export interface AgentContext {
   /** This session's id, from `CODEMAN_SESSION_ID`. */
   selfId: string;
   /** Basic-auth credentials, when the server has a password. */
-  auth?: { username: string; password: string };
+  auth?: CodemanCredentials;
 }
 
 /** Thrown when the process is not inside a Codeman-managed session. */
@@ -69,36 +75,12 @@ export const EXIT = {
 } as const;
 
 /**
- * Parse the data dir's `.env` (hand-authored; the same fallback `codeman attach`
- * and the agent skill use). Tolerant: unreadable or absent means `{}`.
- */
-export function readCodemanEnvFile(path: string = dataPath('.env')): Record<string, string> {
-  try {
-    const text = readFileSync(path, 'utf-8');
-    const result: Record<string, string> = {};
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const match = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
-      if (!match) continue;
-      let value = match[2].trim();
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-      result[match[1]] = value;
-    }
-    return result;
-  } catch {
-    return {};
-  }
-}
-
-/**
  * Resolve the context from the environment, or throw `AgentGuardError`.
  *
- * Credentials, cheapest first: `CODEMAN_PASSWORD` in the environment (a session
- * inherits the server's), then the data dir's `.env`. Nothing found means the
- * server is open (single-user, no password) — or it is not, and the 401 says so.
+ * Credentials in the order every client of the API uses (`credentialsFrom`, shared
+ * with `codeman attach` and the TUI): each field from the environment (a session
+ * inherits the server's), then the data dir's `.env`. No password means the server
+ * is open (single-user) — or it is not, and the 401 says so.
  */
 export function resolveAgentContext(
   env: NodeJS.ProcessEnv = process.env,
@@ -115,19 +97,8 @@ export function resolveAgentContext(
   if (!selfId) {
     throw new AgentGuardError('CODEMAN_SESSION_ID is not set; cannot tell which session is me.');
   }
-  // Each field from the environment first, then the data dir's `.env` — per FIELD, the
-  // order `codeman attach` and the TUI use. Taking the file only when the password was
-  // missing paired an env password with the default user `admin` instead of the
-  // file's user.
-  const needFile = !env.CODEMAN_USERNAME || !env.CODEMAN_PASSWORD;
-  const file = needFile ? envFile() : {};
-  const username = env.CODEMAN_USERNAME || file.CODEMAN_USERNAME || 'admin';
-  const password = env.CODEMAN_PASSWORD || file.CODEMAN_PASSWORD;
-  return {
-    apiUrl,
-    selfId,
-    auth: password ? { username, password } : undefined,
-  };
+  const credentials = credentialsFrom(env, envFile());
+  return { apiUrl, selfId, auth: credentials.password ? credentials : undefined };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -297,16 +268,15 @@ export type ApiRequest = (ctx: AgentContext, options: RequestOptions) => Promise
 export function baseHeaders(ctx: AgentContext): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
-    // Tags sessions this caller spawns as its children (lineage in the web UI) and
-    // labels case directories a spawn creates as agent scratch. Cosmetic, never
-    // fails a call, so there is no case for leaving them off. Omitted when the
-    // caller has no session of its own (the root `codeman session restore`).
-    'X-Codeman-Agent-Origin': 'codeman-agent-cli',
+    // Tags sessions this caller spawns as its children (lineage in the web UI).
+    // Cosmetic, never fails a call. NOT X-Codeman-Agent-Origin: that one marks a case
+    // directory as deletable agent scratch, so it rides only the spawn request that
+    // may create one (see agentSpawn), never anything else. The parent header is
+    // omitted when the caller has no session of its own (the root `codeman session restore`).
   };
   if (ctx.selfId) headers['X-Codeman-Parent-Session'] = ctx.selfId;
-  if (ctx.auth) {
-    headers.Authorization = `Basic ${Buffer.from(`${ctx.auth.username}:${ctx.auth.password}`).toString('base64')}`;
-  }
+  const authorization = ctx.auth ? basicAuthHeader(ctx.auth) : undefined;
+  if (authorization) headers.Authorization = authorization;
   return headers;
 }
 
@@ -585,7 +555,7 @@ export interface SpawnOptions {
   caseName: string;
   mode: string;
   name?: string;
-  /** Wait for the composer before returning (claude/deepseek only; other modes return at once). */
+  /** Wait for the composer before returning, where the registry gives the mode a ready mark. */
   ready: boolean;
   timeoutMs: number;
   /** `KEY=VALUE` pairs → quick-start `envOverrides` (the server allowlists the prefixes). */
@@ -669,17 +639,20 @@ export function buildSpawnExtras(options: SpawnOptions): Record<string, unknown>
 }
 
 /**
- * The token each TUI draws once it can take a prompt; modes without one return
- * immediately. Deliberately NOT the registry's `workDetect.promptGlyph`: claude's `❯`
- * also marks the selected row of its trust dialog, which is exactly the screen a
- * readiness wait must not mistake for a composer. `shift+tab` is the composer's own
- * hint text (the skill's choice, measured).
+ * Agent-scratch label for a case directory a spawn CREATES (the server applies it only
+ * when quick-start makes the directory). The Add Case UI offers a recursive delete for
+ * such directories, so this header must never ride any other request: mislabelling a
+ * real repo there is the one failure in this area that costs actual work.
  */
-export const READY_MARK: Record<string, string> = {
-  claude: 'shift+tab',
-  deepseek: '❯',
-};
+export const AGENT_ORIGIN_HEADER = { 'X-Codeman-Agent-Origin': 'codeman-agent-cli' } as const;
 
+/**
+ * What the mode's TUI draws once its composer can take a prompt, from the CLI registry
+ * (`capabilities.composerReadyMark`); undefined means the mode has no readiness wait.
+ */
+export function composerReadyMark(mode: string): string | undefined {
+  return getCli(mode)?.capabilities.composerReadyMark;
+}
 /**
  * Extra quick-start fields per mode, as data rather than a branch. deepseek: the same
  * permission posture the skill's `spawn_worker` and the Run button send — the harness's
@@ -715,14 +688,20 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
         ? { ...(existing as Record<string, unknown>), ...(value as Record<string, unknown>) }
         : value;
   }
-  const res = await deps.request(deps.ctx, { method: 'POST', path: '/api/v1/quick-start', body });
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: '/api/v1/quick-start',
+    body,
+    headers: { ...AGENT_ORIGIN_HEADER },
+  });
   const data = res.json?.data as { sessionId?: string; caseName?: string; casePath?: string } | undefined;
   if (!res.json?.success || !data?.sessionId) return fail(deps, describeFailure(res));
   const sid = data.sessionId;
 
   let ready: boolean | undefined;
   let readinessError: string | undefined;
-  const mark = READY_MARK[options.mode];
+  let dead = false;
+  const mark = composerReadyMark(options.mode);
   if (options.ready && mark) {
     const wait = await deps.request(deps.ctx, {
       method: 'GET',
@@ -733,7 +712,13 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
     // A failed readiness call (waiter cap, 400, network) is its own error, not "the
     // composer never showed up": report the real reason instead of the trust-dialog hint.
     if (!wait.json?.success) readinessError = describeFailure(wait);
-    else ready = Boolean((wait.json.data as { wait?: WaitResult } | undefined)?.wait?.matched);
+    else {
+      const result = (wait.json.data as { wait?: WaitResult } | undefined)?.wait;
+      // A worker that died while we waited is exit 3 like every other wait, not a
+      // "composer not seen" timeout that sends the caller looking for a dialog.
+      dead = waitExitCode(result) === EXIT.dead;
+      ready = !dead && Boolean(result?.matched);
+    }
   }
 
   if (deps.json) {
@@ -743,10 +728,11 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
     const say = (line: string) => deps.io.err(line);
     say(palette.ok(`${GLYPH.ok} spawned ${sid} (${options.mode}, case ${data.caseName ?? options.caseName})`));
     if (ready === true) say(palette.muted('  composer up: the worker can take a prompt'));
-    if (ready === false) {
+    if (dead) say(palette.err(`${GLYPH.fail} the worker exited during the readiness wait`));
+    if (ready === false && !dead) {
       say(
         palette.warn(
-          `${GLYPH.warn} composer not seen within ${options.timeoutMs} ms — read \`agent read ${sid.slice(0, 8)} --tail 2000\` before sending (trust dialog?)`
+          `${GLYPH.warn} composer not seen within ${options.timeoutMs} ms — read \`agent read ${sid.slice(0, 8)} --tail 2000\` before sending (a startup dialog?)`
         )
       );
     }
@@ -761,6 +747,7 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
     deps.io.out(sid);
   }
   if (readinessError) return EXIT.error;
+  if (dead) return EXIT.dead;
   return ready === false ? EXIT.timeout : EXIT.ok;
 }
 
@@ -856,11 +843,13 @@ function describeWait(wait: WaitResult): string {
       `${GLYPH.fail} the wait ended without an answer: the session went away (dead worker, deleted, or nothing was written)`
     );
   }
-  if (wait.timedOut) return palette.warn(`${GLYPH.warn} timed out after ${wait.timeoutMs ?? '?'} ms`);
+  // A timeout is a 200 with `timedOut`, an answer rather than a failure: exit 2 says it,
+  // so the line stays neutral instead of looking like an error to whoever reads the log.
+  if (wait.timedOut) return palette.muted(`timed out after ${wait.timeoutMs ?? '?'} ms (exit 2)`);
   if (wait.matched !== undefined) {
     return wait.matched
       ? palette.ok(`${GLYPH.ok} matched "${wait.match}"${wait.snippet ? `: ${wait.snippet}` : ''}`)
-      : palette.warn(`${GLYPH.warn} not matched`);
+      : palette.muted('not matched (exit 2)');
   }
   return palette.ok(
     `${GLYPH.ok} signal: ${wait.signal}${wait.immediate ? ' (immediate: current state, not a transition)' : ''}`
@@ -924,7 +913,7 @@ export interface ReadOptions {
   full?: boolean;
 }
 
-/** `agent read` — the last answer (claude/codex/deepseek transcript) or a terminal tail (every mode). */
+/** `agent read` — the last answer (the route picks the transcript reader or the pane segmenter) or a terminal tail. */
 export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<number> {
   const target = await resolveSessionId(deps, options.id);
   if ('error' in target) return fail(deps, target.error, target.code);
@@ -961,9 +950,7 @@ export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<
   const text = data?.text ?? '';
   if (!text) {
     deps.io.err(
-      palette.muted(
-        '(empty: no transcript yet, or a mode without one — opencode/pi/gemini/shell have none; try --tail 3000)'
-      )
+      palette.muted('(empty: nothing answered yet, or nothing the server could segment as an answer; try --tail 3000)')
     );
     return EXIT.ok;
   }
@@ -1721,7 +1708,7 @@ export function registerAgentCommands(program: Command): Command {
     .description(
       'Start a worker session in a case (created if missing) and wait for its composer where the mode draws one'
     )
-    .option('-m, --mode <mode>', 'claude|opencode|codex|gemini|pi|deepseek|shell|…', 'claude')
+    .option('-m, --mode <mode>', 'Run mode id, as the Run menu names it', 'claude')
     .option('-n, --name <name>', 'Session name shown in the UI')
     .option('--no-ready', 'Return as soon as the session exists, without the readiness wait')
     .option('-t, --timeout <ms>', 'Readiness budget in ms', String(DEFAULT_WAIT_MS))
@@ -1836,7 +1823,7 @@ export function registerAgentCommands(program: Command): Command {
     )
     .option(
       '-u, --until <signals>',
-      'Comma list: stop,idle,exit,working,blocked (stop/blocked are claude+deepseek only; the server says so with a 400)'
+      'Comma list: stop,idle,exit,working,blocked (stop/blocked need hook signals for the session; where there are none the server answers 400, passed through)'
     )
     .option(
       '-m, --match <marker>',
@@ -1875,7 +1862,7 @@ export function registerAgentCommands(program: Command): Command {
 
   agent
     .command('read <id>')
-    .description("Print a session's last answer (claude/codex/deepseek transcript) or, with --tail, its terminal")
+    .description("Print a session's last answer (as the server reads it for that mode) or, with --tail, its terminal")
     .option('--tail <bytes>', 'Raw terminal tail in bytes, ANSI stripped (works in every mode)')
     .option('--full', 'The whole conversation instead of the last assistant message')
     .option('--json', 'Machine-readable output')
