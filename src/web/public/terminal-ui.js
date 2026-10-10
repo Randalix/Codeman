@@ -2240,6 +2240,11 @@ Object.assign(CodemanApp.prototype, {
    *
    * The caret's line is walked out through soft wraps, since a long prompt spans
    * rows.
+   *
+   * Rows are compared as BUFFER rows: cursorY is baseY-relative (xterm API), so
+   * with the viewport scrolled up the caret is not on screen row cursorY. Mixing
+   * the two made whatever scrollback line sat on that screen row count as the
+   * composer — its links never opened from a tap.
    */
   _tapIsOnCaretLine(clientX, clientY) {
     const buffer = this.terminal?.buffer?.active;
@@ -2247,13 +2252,15 @@ Object.assign(CodemanApp.prototype, {
     const pos = this._clientPointToCell(clientX, clientY);
     if (!pos) return false;
     const rows = Math.max(1, this.terminal.rows || 1);
-    const cursorRow = Math.max(0, Math.min(rows - 1, buffer.cursorY || 0));
-    const tappedRow = pos.row - 1;
+    const baseY = buffer.baseY || 0;
+    const cursorRow = baseY + Math.max(0, Math.min(rows - 1, buffer.cursorY || 0));
+    const tappedRow = (buffer.viewportY || 0) + pos.row - 1;
     if (tappedRow === cursorRow) return true;
+    const lastRow = baseY + rows - 1;
     let start = cursorRow;
-    while (start > 0 && buffer.getLine(buffer.viewportY + start)?.isWrapped) start--;
+    while (start > 0 && buffer.getLine(start)?.isWrapped) start--;
     let end = cursorRow;
-    while (end + 1 < rows && buffer.getLine(buffer.viewportY + end + 1)?.isWrapped) end++;
+    while (end < lastRow && buffer.getLine(end + 1)?.isWrapped) end++;
     return tappedRow >= start && tappedRow <= end;
   },
 

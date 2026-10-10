@@ -1089,6 +1089,46 @@ describe('terminal link tap', () => {
     expect(app._terminalLinkAtPoint(4, 8)).toBeNull();
     expect(app._activateTerminalLinkAtPoint(4, 8)).toBe(false);
   });
+
+  // cursorY is baseY-relative, not a screen row. Scrolled up, the scrollback line that
+  // happens to sit on screen row cursorY used to count as the composer, so its links were
+  // dead on a phone (found 2026-10: a wrapped path near the bottom of the screen).
+  /** Buffer of `lines`, `rows` tall, scrolled to `viewportY`; caret on the last line. */
+  function scrolledHarness(lines: string[], rows: number, viewportY: number, wrapped = new Set<number>()) {
+    const h = linkHarness(lines);
+    const grid = createTerminalGrid(lines, 0, wrapped);
+    const baseY = lines.length - rows;
+    Object.assign(grid, { rows });
+    Object.assign(grid.buffer.active, { baseY, viewportY, cursorY: rows - 1 });
+    Object.assign(h.app.terminal, { rows, buffer: grid.buffer });
+    return h;
+  }
+
+  it('opens a scrollback link that sits on the screen row the caret has at the bottom', () => {
+    const line = 'wrote /tmp/out/chart.png';
+    // 6 buffer rows, 3 on screen; scrolled to the top, screen row 2 (= cursorY) shows `line`.
+    const { app } = scrolledHarness(['a', 'b', line, 'c', 'd', '❯ '], 3, 0);
+
+    expect(app._tapIsOnCaretLine(at(line.indexOf('/tmp'), 2).clientX, at(0, 2).clientY)).toBe(false);
+    expect(app._handleMobileTerminalTap(at(line.indexOf('/tmp'), 2), false, 'history')).toBe('link');
+    expect(app.openFilePreview).toHaveBeenCalledWith('/tmp/out/chart.png', 'sess-1');
+  });
+
+  it('still treats the real composer as the caret line once scrolled back down', () => {
+    const composer = '❯ open /tmp/out/chart.png';
+    const { app } = scrolledHarness(['a', 'b', 'wrote /tmp/x.png', 'c', 'd', composer], 3, 3);
+
+    expect(app._handleMobileTerminalTap(at(composer.indexOf('/tmp'), 2), true, 'input')).toBe('input');
+    expect(app.openFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('walks a wrapped composer in buffer rows, not screen rows', () => {
+    // Composer wraps over buffer rows 4–5; scrolled down, both are the caret's line.
+    const { app } = scrolledHarness(['a', 'b', 'c', 'd', '❯ long prompt /tmp/out/', 'chart.png'], 3, 3, new Set([5]));
+
+    expect(app._tapIsOnCaretLine(at(2, 1).clientX, at(2, 1).clientY)).toBe(true);
+    expect(app._tapIsOnCaretLine(at(2, 0).clientX, at(2, 0).clientY)).toBe(false);
+  });
 });
 
 describe('terminal touch selection', () => {
