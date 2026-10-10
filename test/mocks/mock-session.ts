@@ -74,6 +74,7 @@ export class MockSession extends EventEmitter {
     this.lastSubmitAt = Date.now();
     this.turnEndedAt = null;
     this.turnEndSource = null;
+    this.turnEndReady = false;
   }
 
   /** Mirrors Session.paneText (the rendered pane; the mock's buffer stands in for it). */
@@ -84,15 +85,21 @@ export class MockSession extends EventEmitter {
   /** Mirrors Session.turnEndedAt / turnEndSource (the agent-watch latch). */
   turnEndedAt: number | null = null;
   turnEndSource: 'hook' | 'heuristic' | 'exit' | null = null;
+  turnEndReady = false;
 
-  /** Mirrors Session.markTurnEnded, including the hook upgrade and the exit re-stamp. */
-  markTurnEnded(source: 'hook' | 'heuristic' | 'exit'): void {
-    if (this.turnEndedAt !== null && !(source === 'exit' && this.turnEndSource !== 'exit')) {
+  /** Mirrors Session.markTurnEnded, including the hook upgrade, the exit and the ready re-stamp. */
+  markTurnEnded(source: 'hook' | 'heuristic' | 'exit', opts: { ready?: boolean } = {}): void {
+    if (
+      this.turnEndedAt !== null &&
+      !(source === 'exit' && this.turnEndSource !== 'exit') &&
+      !(source === 'hook' && this.turnEndReady)
+    ) {
       if (source === 'hook' && this.turnEndSource === 'heuristic') this.turnEndSource = source;
       return;
     }
     this.turnEndedAt = Date.now();
     this.turnEndSource = source;
+    this.turnEndReady = opts.ready === true;
     this.emit('turnEnded', source);
   }
 

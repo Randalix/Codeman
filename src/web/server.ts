@@ -114,6 +114,8 @@ import { approvalInbox } from './approval-inbox.js';
 import { agentInbox } from './agent-inbox.js';
 import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
+import { CoordinatorReports } from './coordinator-reports.js';
+import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
@@ -330,6 +332,28 @@ export class WebServer extends EventEmitter {
     now: () => Date.now(),
     log: (message) => console.log(message),
   });
+  /**
+   * Posts a worker's turn end / dialog / exit into its parent session's mailbox (the
+   * push side of `agent watch`). Same nudge path as a post; no wake registry.
+   */
+  private readonly coordinatorReports = new CoordinatorReports({
+    getSession: (id) => this.sessions.get(id),
+    row: (id) => {
+      const session = this.sessions.get(id);
+      return session ? buildWatchRow(session) : null;
+    },
+    post: (to, from, text) => {
+      // What the post route does: read the wait before the post releases it.
+      const receiverWaiting = agentInbox.waiterCount(to) > 0;
+      const result = agentInbox.post(to, from, text);
+      if (!result.ok) return false;
+      this.inboxNudger.schedule(to, from, { messageId: result.message.id, receiverWaiting });
+      return true;
+    },
+    enabled: () => process.env.CODEMAN_COORDINATOR_REPORTS !== '0',
+    log: (message) => console.log(message),
+  });
+  private unsubscribeCoordinatorReports: (() => void) | null = null;
   private respawnControllers: Map<string, RespawnController> = new Map();
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
   private runSummaryTrackers: Map<string, RunSummaryTracker> = new Map();
@@ -1650,6 +1674,7 @@ export class WebServer extends EventEmitter {
     if (killMux) agentInbox.drop(sessionId);
     else agentInbox.detach(sessionId);
     this.inboxNudger.drop(sessionId);
+    this.coordinatorReports.drop(sessionId);
 
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
@@ -3041,6 +3066,8 @@ export class WebServer extends EventEmitter {
         rearmed++;
       }
       if (rearmed > 0) console.log(`[Inbox] will announce restored mail in ${rearmed} session(s)`);
+      // From here on every worker's turn end reaches its coordinator's mailbox.
+      this.unsubscribeCoordinatorReports = turnWatch.subscribe((id) => this.coordinatorReports.notify(id));
     }
 
     // Sweep agent preamble caches whose sessions are gone (see
@@ -4147,6 +4174,8 @@ export class WebServer extends EventEmitter {
     this.remoteWake?.stop();
     agentInbox.stop();
     turnWatch.stop();
+    this.unsubscribeCoordinatorReports?.();
+    this.coordinatorReports.stop();
     this.inboxNudger.stop();
     await this.persistAgentInboxNow();
 

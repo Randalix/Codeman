@@ -92,6 +92,48 @@ function pendingDialogAt(sessionId: string): number | null {
   return item && item.kind !== 'idle' ? item.createdAt : null;
 }
 
+/**
+ * The watch row for one session, or null when nothing qualifies (turn running, no
+ * dialog, or both older than `since`). Shared by the route and the coordinator reports.
+ */
+export function buildWatchRow(
+  session: Pick<
+    Session,
+    'id' | 'name' | 'mode' | 'status' | 'turnEndedAt' | 'turnEndSource' | 'paneText' | 'ralphTracker'
+  >,
+  since?: number
+): WatchRow | null {
+  const id = session.id;
+  const dialogAt = pendingDialogAt(id);
+  const stamps = [session.turnEndedAt, dialogAt].filter(
+    (t): t is number => t !== null && (since === undefined || t >= since)
+  );
+  if (stamps.length === 0) return null;
+  const todos = session.ralphTracker.getTodoStats();
+  const openTodos = todos.pending + todos.inProgress;
+  const inboxPending = agentInbox.pendingCount(id);
+  const inboxUnseen = agentInbox.unseen(id).length;
+  return {
+    id,
+    name: session.name,
+    mode: session.mode,
+    status: session.status,
+    turnEndedAt: Math.max(...stamps),
+    turnEndSource: session.turnEndSource,
+    reason: classifyWatchReason(session, {
+      blocked: dialogAt !== null,
+      inboxWaiting: agentInbox.waiterCount(id) > 0,
+      inboxUnseen,
+      inboxPending,
+      openTodos,
+    }),
+    openTodos,
+    totalTodos: todos.total,
+    inboxPending,
+    inboxUnseen,
+  };
+}
+
 /** Same shape as inbox-routes' helper: abort only when the socket dies before the answer. */
 function abortOnClientHangUp(reply: FastifyReply): AbortController {
   const controller = new AbortController();
@@ -128,34 +170,8 @@ export function registerAgentWatchRoutes(app: FastifyInstance, ctx: SessionPort)
           gone.push(id);
           continue;
         }
-        const dialogAt = pendingDialogAt(id);
-        const stamps = [session.turnEndedAt, dialogAt].filter(
-          (t): t is number => t !== null && (since === undefined || t >= since)
-        );
-        if (stamps.length === 0) continue;
-        const todos = session.ralphTracker.getTodoStats();
-        const openTodos = todos.pending + todos.inProgress;
-        const inboxPending = agentInbox.pendingCount(id);
-        const inboxUnseen = agentInbox.unseen(id).length;
-        ended.push({
-          id,
-          name: session.name,
-          mode: session.mode,
-          status: session.status,
-          turnEndedAt: Math.max(...stamps),
-          turnEndSource: session.turnEndSource,
-          reason: classifyWatchReason(session, {
-            blocked: dialogAt !== null,
-            inboxWaiting: agentInbox.waiterCount(id) > 0,
-            inboxUnseen,
-            inboxPending,
-            openTodos,
-          }),
-          openTodos,
-          totalTodos: todos.total,
-          inboxPending,
-          inboxUnseen,
-        });
+        const row = buildWatchRow(session, since);
+        if (row) ended.push(row);
       }
       return { cursor, ended, gone };
     };

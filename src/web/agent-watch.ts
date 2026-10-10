@@ -32,6 +32,7 @@ interface Waiter {
 
 export class TurnWatch {
   private readonly waiters = new Set<Waiter>();
+  private readonly listeners = new Set<(sessionId: string) => void>();
   private stopped = false;
 
   /** Parked requests right now. */
@@ -62,11 +63,21 @@ export class TurnWatch {
     });
   }
 
-  /** A turn ended in `sessionId`: wake every request watching it. */
+  /** A turn ended in `sessionId`: wake every request watching it, then tell the subscribers. */
   notify(sessionId: string): void {
     for (const waiter of [...this.waiters]) {
       if (waiter.ids.has(sessionId)) waiter.settle('woken');
     }
+    for (const listener of [...this.listeners]) listener(sessionId);
+  }
+
+  /**
+   * Hear every notify — the push side of the same signal (coordinator reports).
+   * Returns the unsubscribe.
+   */
+  subscribe(listener: (sessionId: string) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   /** Shutdown: release everything and refuse new waits. */

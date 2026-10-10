@@ -564,6 +564,8 @@ export class Session extends EventEmitter {
   /** When the current wait for input began; null while a turn runs. See {@link markTurnEnded}. */
   private _turnEndedAt: number | null = null;
   private _turnEndSource: TurnEndSource | null = null;
+  /** The latch was stamped by a pane becoming ready, not by a finished turn. */
+  private _turnEndReady = false;
   private activityTimeout: NodeJS.Timeout | null = null;
   private _awaitingIdleConfirmation: boolean = false; // Prevents timeout reset during idle detection
   private _activityStreak: ActivityStreak | null = null; // Unbroken run of PTY repaints (working detection)
@@ -1487,6 +1489,14 @@ export class Session extends EventEmitter {
     return this._turnEndedAt;
   }
 
+  /**
+   * The stamp came from a pane that merely became ready (launch, adoption after a
+   * restart), not from a finished turn. Coordinator reports skip it.
+   */
+  get turnEndReady(): boolean {
+    return this._turnEndReady;
+  }
+
   /** What reported {@link turnEndedAt}: the CLI's stop hook, the idle heuristic, or the pane's exit. */
   get turnEndSource(): TurnEndSource | null {
     return this._turnEndSource;
@@ -1506,17 +1516,24 @@ export class Session extends EventEmitter {
    * later `hook` only upgrades the source of a heuristic stamp, the hook being the
    * definitive one. Deliberately leaves `status` alone: the UI's idle transition stays
    * the heuristic's, as before.
+   * A hook landing on a `ready` stamp re-stamps: the pane only looked idle (a quiet
+   * tool call after adoption), the hook is the turn's real end.
    * @fires turnEnded on a new stamp
    */
-  markTurnEnded(source: TurnEndSource): void {
+  markTurnEnded(source: TurnEndSource, opts: { ready?: boolean } = {}): void {
     // An exit re-stamps even an idle session: a watcher that already saw the turn end
     // must still learn that the worker is now gone.
-    if (this._turnEndedAt !== null && !(source === 'exit' && this._turnEndSource !== 'exit')) {
+    if (
+      this._turnEndedAt !== null &&
+      !(source === 'exit' && this._turnEndSource !== 'exit') &&
+      !(source === 'hook' && this._turnEndReady)
+    ) {
       if (source === 'hook' && this._turnEndSource === 'heuristic') this._turnEndSource = source;
       return;
     }
     this._turnEndedAt = Date.now();
     this._turnEndSource = source;
+    this._turnEndReady = opts.ready === true;
     this.emit('turnEnded', source);
   }
 
@@ -1524,6 +1541,7 @@ export class Session extends EventEmitter {
   private _clearTurnEnded(): void {
     this._turnEndedAt = null;
     this._turnEndSource = null;
+    this._turnEndReady = false;
   }
 
   get taskTracker(): TaskTracker {
@@ -3564,7 +3582,7 @@ export class Session extends EventEmitter {
     if (turnEnded) this._maybeCaptureOmpSessionId();
     // The watch latch (`agent watch`): a pane concluded idle is a turn over, also a
     // pane that just became ready. Idempotent, the first stamp of a turn wins.
-    this.markTurnEnded('heuristic');
+    this.markTurnEnded('heuristic', { ready: !turnEnded });
     this.emit('idle');
   }
 

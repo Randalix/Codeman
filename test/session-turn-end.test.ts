@@ -85,6 +85,38 @@ describe('Session turn-end latch', () => {
     expect(ended).toHaveBeenCalledTimes(2);
   });
 
+  it('a pane that only became ready is marked as such; a hook then counts as a real turn end', () => {
+    // An adopted pane mid-way through a quiet tool call is concluded "ready" by the
+    // heuristic; the CLI's stop hook minutes later is the turn's real end and must
+    // reach a coordinator (re-stamp + event), not just upgrade the source.
+    vi.useFakeTimers({ now: 1_000 });
+    const s = idleSession();
+    const ended = vi.fn();
+    s.on('turnEnded', ended);
+    s.markTurnEnded('heuristic', { ready: true });
+    expect(s.turnEndReady).toBe(true);
+    vi.advanceTimersByTime(60_000);
+    s.markTurnEnded('hook');
+    expect(s.turnEndedAt).toBe(61_000);
+    expect(s.turnEndSource).toBe('hook');
+    expect(s.turnEndReady).toBe(false);
+    expect(ended).toHaveBeenCalledTimes(2);
+  });
+
+  it('a pane settling at startup stamps a ready latch, a finished turn does not', () => {
+    vi.useFakeTimers();
+    const s = idleSession();
+    internals(s)._markWorking();
+    internals(s)._handleTerminalOutput(COMPOSER);
+    internals(s)._detectInteractiveActivity(COMPOSER);
+    vi.advanceTimersByTime(IDLE_SILENCE_MS + 3000);
+    expect(s.turnEndReady).toBe(false);
+    internals(s)._markWorking();
+    expect(s.turnEndReady).toBe(false);
+    (s as unknown as { _concludeIdle(turnEnded: boolean): void })._concludeIdle(false);
+    expect(s.turnEndReady).toBe(true);
+  });
+
   it('the prompt hook clears it; a bare Enter through the write path does not', () => {
     const s = idleSession();
     s.markTurnEnded('hook');
