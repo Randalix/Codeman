@@ -1930,6 +1930,92 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
+   * Open a file path linked in a terminal — by the path provider below or by an
+   * OSC 8 `file://` hyperlink (_activateOscLink).
+   *
+   * Tailing a PNG in the log viewer shows binary noise; the file preview
+   * already renders images, PDFs, documents and media inline — and it
+   * now reaches files outside the workspace too, which is where an
+   * agent's screenshots and scratchpad captures actually land.
+   *
+   * Text goes to the log viewer, which follows a file that is still
+   * being written — but ONLY where it can actually read: it spawns
+   * `tail -f` and allows the workspace, /var/log and ~/logs, so an
+   * out-of-workspace path there answered "Path must be within
+   * working directory or allowed log directories" while the SAME
+   * path clicked in the response viewer previewed fine. The preview
+   * reads those through the guarded attachment routes, so external
+   * paths route there and the two surfaces agree.
+   *
+   * A relative path is resolved against the session's working
+   * directory first, and a `~/` path always previews (only the
+   * server knows that host's home, and the log viewer cannot ask).
+   * A folder path opens the folder grid (which falls back to the
+   * preview if the server finds a file there after all).
+   */
+  _openTerminalPathLink(text, sessionId, folder = false) {
+    const target = this._resolveLinkedFilePath(text, sessionId);
+    if (folder) {
+      this.openFolderGrid(target, sessionId);
+      return;
+    }
+    if (previewsInFileViewer(target) || this._isExternalPreviewPath(target, sessionId)) {
+      this.openFilePreview(target, sessionId);
+      return;
+    }
+    this.openLogViewerWindow(target, sessionId);
+  },
+
+  /**
+   * Activate an OSC 8 hyperlink — xterm's built-in provider calls this through
+   * the terminal's `linkHandler` (registerFilePathLinkProvider). Returns true
+   * when the URI was handled.
+   *
+   * Claude Code wraps the paths of its image/file lines in `file://` OSC 8
+   * links, and lays those lines out in columns: on a narrow terminal (a phone)
+   * the path breaks INSIDE its column, the size column sits after the first
+   * half and a `[image]` tag before the second, so the path provider sees
+   * `…/menu/_ga` and `age_jeepeye.png` as unrelated text. The hyperlink carries
+   * the whole path on every cell of both halves. xterm drops non-http OSC 8
+   * links unless `allowNonHttpProtocols` is set, so these were inert.
+   *
+   * http(s): a link whose visible text IS its target opens like that URL as
+   * plain text (Claude Code hyperlinks the URLs it prints, and those opened
+   * directly while tmux still stripped OSC 8); one that shows something else
+   * asks first, xterm's own OSC 8 default. Other schemes do nothing.
+   */
+  _activateOscLink(uri, sessionId, visibleText = '') {
+    let url;
+    try {
+      url = new URL(uri);
+    } catch {
+      return false;
+    }
+    if (url.protocol === 'file:') {
+      let path;
+      try {
+        path = decodeURIComponent(url.pathname);
+      } catch {
+        return false;
+      }
+      if (!path.startsWith('/')) return false;
+      const name = path.replace(/\/+$/, '').split('/').pop() || '';
+      this._openTerminalPathLink(path, sessionId, path.endsWith('/') || !/\.[^./]+$/.test(name));
+      return true;
+    }
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      if (visibleText.trim() === uri) {
+        if (this.openLinkThroughWebTabIfLoopback?.(uri)) return true;
+        window.open(uri, '_blank', 'noopener,noreferrer');
+      } else if (window.confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) {
+        window.open(uri, '_blank', 'noopener,noreferrer');
+      }
+      return true;
+    }
+    return false;
+  },
+
+  /**
    * Register a custom link provider for xterm.js that detects file paths
    * in terminal output and makes them clickable.
    * When clicked, opens a floating log viewer window with live streaming.
@@ -1951,6 +2037,29 @@ Object.assign(CodemanApp.prototype, {
         this._linkHovered = hovered;
       });
     const isPrimary = terminal === this.terminal;
+
+    // OSC 8 hyperlinks (`file://` from Claude Code's image/file lines) open like
+    // a linked path, against this terminal's session — see _activateOscLink.
+    if (terminal.options) {
+      terminal.options.linkHandler = {
+        allowNonHttpProtocols: true,
+        activate: (_event, uri, range) => {
+          // xterm's OSC provider hands out one-row ranges, 1-based, end inclusive.
+          let visible = '';
+          try {
+            const line = terminal.buffer.active.getLine(range.start.y - 1);
+            visible = line?.translateToString(true, range.start.x - 1, range.end.x) || '';
+          } catch {
+            /* no range (a tap) or no buffer: treat as not matching */
+          }
+          this._activateOscLink(uri, getSessionId(), visible);
+        },
+        // Same as the path provider's links: a desktop click on a hovered link
+        // must not ALSO reach the CLI as a mouse click (_handleDesktopTerminalClick).
+        hover: () => setHovered(true),
+        leave: () => setHovered(false),
+      };
+    }
 
     // Debug: Track if provider is being invoked
     let lastInvokedLine = -1;
@@ -2097,37 +2206,8 @@ Object.assign(CodemanApp.prototype, {
               pointerCursor: true,
               underline: true,
             },
-            activate(event, text) {
-              // Tailing a PNG in the log viewer shows binary noise; the file preview
-              // already renders images, PDFs, documents and media inline — and it
-              // now reaches files outside the workspace too, which is where an
-              // agent's screenshots and scratchpad captures actually land.
-              //
-              // Text goes to the log viewer, which follows a file that is still
-              // being written — but ONLY where it can actually read: it spawns
-              // `tail -f` and allows the workspace, /var/log and ~/logs, so an
-              // out-of-workspace path there answered "Path must be within
-              // working directory or allowed log directories" while the SAME
-              // path clicked in the response viewer previewed fine. The preview
-              // reads those through the guarded attachment routes, so external
-              // paths route there and the two surfaces agree.
-              //
-              // A relative path is resolved against the session's working
-              // directory first, and a `~/` path always previews (only the
-              // server knows that host's home, and the log viewer cannot ask).
-              const sessionId = getSessionId();
-              const target = self._resolveLinkedFilePath(text, sessionId);
-              // A folder path opens the folder grid (which falls back to the
-              // preview if the server finds a file there after all).
-              if (folder) {
-                self.openFolderGrid(target, sessionId);
-                return;
-              }
-              if (previewsInFileViewer(target) || self._isExternalPreviewPath(target, sessionId)) {
-                self.openFilePreview(target, sessionId);
-                return;
-              }
-              self.openLogViewerWindow(target, sessionId);
+            activate(_event, text) {
+              self._openTerminalPathLink(text, getSessionId(), folder);
             },
             hover() {
               setHovered(true);
@@ -2206,26 +2286,39 @@ Object.assign(CodemanApp.prototype, {
     // Link ranges are 1-based ABSOLUTE buffer lines (xterm adds ydisp to the
     // viewport row before asking), which is what the provider's coordAt() emits.
     const y = (buffer.viewportY || 0) + pos.row;
-    let links = null;
-    try {
-      provider.provideLinks(y, (result) => {
-        links = result || [];
-      });
-    } catch {
-      return null;
-    }
-    if (!links || links.length === 0) return null;
     const cols = Math.max(1, this.terminal.cols || 1);
     const current = y * cols + pos.col;
-    return (
-      links.find((link) => {
-        const start = link?.range?.start;
-        const end = link?.range?.end;
-        if (!start || !end) return false;
-        return start.y * cols + start.x <= current && current <= end.y * cols + end.x;
-      }) || null
-    );
+    const linkAt = (source, accept = () => true) => {
+      let links = null;
+      try {
+        source.provideLinks(y, (result) => {
+          links = result || [];
+        });
+      } catch {
+        return null;
+      }
+      return (
+        (links || []).find((link) => {
+          const start = link?.range?.start;
+          const end = link?.range?.end;
+          if (!start || !end || !accept(link)) return false;
+          return start.y * cols + start.x <= current && current <= end.y * cols + end.x;
+        }) || null
+      );
+    };
+    // An OSC 8 `file://` link wins, as on desktop where xterm asks its own OSC
+    // provider first: it carries the whole path even where the visible text is
+    // half of one (_activateOscLink). Only `file:` — an http(s) OSC link would
+    // ask before opening, where the same URL as plain text opens directly.
+    const xtermProviders = this.terminal._core?._linkProviderService?.linkProviders || [];
+    for (const source of xtermProviders) {
+      if (source === provider) continue;
+      const link = linkAt(source, (l) => /^file:/i.test(l?.text || ''));
+      if (link) return link;
+    }
+    return linkAt(provider);
   },
+
 
   /**
    * Is this point on the caret's logical line — the editable composer?

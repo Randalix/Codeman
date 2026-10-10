@@ -1785,6 +1785,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private remoteAliveInFlight: Set<string> = new Set();
 
   private trueColorConfigured = false;
+  /** enableClientHyperlinks() ran (once per process). */
+  private clientHyperlinksConfigured = false;
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
   private liveHistoryResizeSupported: boolean | null = null;
 
@@ -4125,6 +4127,38 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     } catch (err) {
       console.error('[TmuxManager] Failed to set manual window size:', err);
       return false;
+    }
+  }
+
+  /**
+   * Let attach clients receive OSC 8 hyperlinks. tmux keeps them in the pane but
+   * only re-emits them to a client whose terminal declares the `hyperlinks`
+   * feature, and the built-in `xterm*` entry does not — so the `file://` links
+   * Claude Code puts on its image/file lines never reached xterm.js, which needs
+   * them where a narrow terminal breaks such a path inside its column.
+   *
+   * Server-wide and read at ATTACH, so it must be set before the attach client
+   * starts (Session calls this right before spawning it, re-adopted sessions
+   * included). Once per process, appended only when missing so restarts do not
+   * grow the list. tmux < 3.2 has no `terminal-features`: the error is ignored
+   * and links stay plain text, as before.
+   */
+  enableClientHyperlinks(): void {
+    if (this.clientHyperlinksConfigured) return;
+    this.clientHyperlinksConfigured = true;
+    try {
+      const current = execSync(`${this.tmux()} show-options -sv terminal-features`, {
+        encoding: 'utf-8',
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      if (/^\*:hyperlinks$/m.test(String(current))) return;
+      execSync(`${this.tmux()} set-option -sa terminal-features ",*:hyperlinks"`, {
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+    } catch {
+      /* Non-critical — OSC 8 links stay plain text (old tmux, no server yet) */
     }
   }
 

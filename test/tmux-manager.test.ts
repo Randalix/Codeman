@@ -291,6 +291,36 @@ describe('TmuxManager (unit)', () => {
     });
   });
 
+  describe('client hyperlinks', () => {
+    // tmux re-emits OSC 8 only to clients that declare `hyperlinks`; without it the
+    // file:// links Claude Code prints never reach xterm.js.
+    const SET = `tmux -L 'codeman' set-option -sa terminal-features ",*:hyperlinks"`;
+
+    it('appends the hyperlinks feature once per process', () => {
+      manager.enableClientHyperlinks();
+      manager.enableClientHyperlinks();
+
+      expect(mockedExecSync.mock.calls.filter(([cmd]) => cmd === SET)).toHaveLength(1);
+    });
+
+    it('does not append it again when the server already has it', () => {
+      mockedExecSync.mockImplementation((cmd: string) =>
+        String(cmd).includes('show-options') ? 'xterm*:clipboard:title\n*:hyperlinks\n' : ''
+      );
+      manager.enableClientHyperlinks();
+
+      expect(mockedExecSync.mock.calls.some(([cmd]) => cmd === SET)).toBe(false);
+    });
+
+    it('swallows a tmux without terminal-features', () => {
+      mockedExecSync.mockImplementation(() => {
+        throw new Error('invalid option: terminal-features');
+      });
+
+      expect(() => manager.enableClientHyperlinks()).not.toThrow();
+    });
+  });
+
   describe('window sizing', () => {
     it('pins a tmux window to manual sizing before browser attach', () => {
       expect(manager.setManualWindowSize('codeman-abc12345')).toBe(true);

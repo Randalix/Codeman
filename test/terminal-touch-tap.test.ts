@@ -27,10 +27,11 @@ function loadTerminalUiHarness() {
     requestAnimationFrame: (_fn: () => void) => 1,
     setTimeout: (_fn: () => void) => 1,
     Blob: function Blob() {},
-    URL: {
+    // The real constructor (OSC 8 links are parsed with it) plus stubbed blob URLs.
+    URL: Object.assign(class extends URL {}, {
       createObjectURL: () => 'blob:yield',
       revokeObjectURL: () => {},
-    },
+    }),
     Worker: function Worker(this: any) {
       this.postMessage = () => {};
     },
@@ -1128,6 +1129,114 @@ describe('terminal link tap', () => {
 
     expect(app._tapIsOnCaretLine(at(2, 1).clientX, at(2, 1).clientY)).toBe(true);
     expect(app._tapIsOnCaretLine(at(2, 0).clientX, at(2, 0).clientY)).toBe(false);
+  });
+
+  // OSC 8: Claude Code wraps the path of an image/file line in a `file://` hyperlink and
+  // lays the line out in columns, so on a phone the path breaks INSIDE its column — the
+  // size after the first half, an `[image]` tag before the second. Only the hyperlink
+  // knows the whole path (found 2026-10, `…/menu/_ga` + `age_jeepeye.png`).
+  /** linkHarness plus xterm's own OSC provider, registered first as xterm does. */
+  function oscHarness(lines: string[], osc: Array<{ row: number; from: number; to: number; uri: string }>) {
+    const harness = loadTerminalUiHarness();
+    const { app, windowRef } = harness;
+    app.activeSessionId = 'sess-1';
+    app.sessions = new Map([['sess-1', { mode: 'claude', cliMouseTracking: true }]]);
+    app._sendInputAsync = vi.fn();
+    app.terminal = { ...createTerminalGrid(lines, lines.length - 1), options: {} as any };
+    app.terminal.registerLinkProvider = vi.fn();
+    app.openFilePreview = vi.fn();
+    app.openFolderGrid = vi.fn();
+    app.openLogViewerWindow = vi.fn();
+    app._isExternalPreviewPath = () => false;
+    windowRef.open = vi.fn();
+    windowRef.confirm = vi.fn(() => false);
+    const oscProvider = {
+      provideLinks(y: number, callback: (links: any[]) => void) {
+        callback(
+          osc
+            .filter((l) => l.row + 1 === y)
+            .map((l) => {
+              const range = { start: { x: l.from + 1, y }, end: { x: l.to, y } };
+              return {
+                text: l.uri,
+                range,
+                activate: (e: any, uri: string) => app.terminal.options.linkHandler.activate(e, uri, range),
+              };
+            })
+        );
+      },
+    };
+    const ours = app.registerFilePathLinkProvider();
+    app.terminal._core = { ...app.terminal._core, _linkProviderService: { linkProviders: [oscProvider, ours] } };
+    return { app, windowRef };
+  }
+
+  it('routes OSC 8 links through the terminal linkHandler', () => {
+    const { app, windowRef } = oscHarness(['x', '❯ '], []);
+    const handler = app.terminal.options.linkHandler;
+    expect(handler.allowNonHttpProtocols).toBe(true);
+    handler.hover();
+    expect(app._linkHovered).toBe(true);
+    handler.leave();
+    expect(app._linkHovered).toBe(false);
+
+    handler.activate(null, 'file:///tmp/out/a%20b.png');
+    expect(app.openFilePreview).toHaveBeenCalledWith('/tmp/out/a b.png', 'sess-1');
+    handler.activate(null, 'file:///tmp/out/renders');
+    expect(app.openFolderGrid).toHaveBeenCalledWith('/tmp/out/renders', 'sess-1');
+
+    // http(s) keeps xterm's OSC 8 default: the visible text need not be the target.
+    handler.activate(null, 'https://example.com/x');
+    expect(windowRef.confirm).toHaveBeenCalledOnce();
+    expect(windowRef.open).not.toHaveBeenCalled();
+    windowRef.confirm = vi.fn(() => true);
+    handler.activate(null, 'https://example.com/x');
+    expect(windowRef.open).toHaveBeenCalledWith('https://example.com/x', '_blank', 'noopener,noreferrer');
+
+    // A link that shows its own target opens directly, like the same URL as plain text.
+    windowRef.confirm = vi.fn(() => false);
+    windowRef.open = vi.fn();
+    expect(app._activateOscLink('https://example.com/y', 'sess-1', 'https://example.com/y')).toBe(true);
+    expect(windowRef.confirm).not.toHaveBeenCalled();
+    expect(windowRef.open).toHaveBeenCalledWith('https://example.com/y', '_blank', 'noopener,noreferrer');
+
+    expect(app._activateOscLink('ssh://host/x', 'sess-1')).toBe(false);
+    expect(app._activateOscLink('not a uri', 'sess-1')).toBe(false);
+  });
+
+  it('opens the whole path from either half of a column-broken OSC 8 file link', () => {
+    const row0 = '  ›     /tmp/out/menu/_ga (1008.6K';
+    const row1 = '  [image]rage_jeep.png        B)';
+    const uri = 'file:///tmp/out/menu/_garage_jeep.png';
+    const { app } = oscHarness(
+      [row0, row1, '', '❯ '],
+      [
+        { row: 0, from: row0.indexOf('/tmp'), to: row0.indexOf(' (1008'), uri },
+        { row: 1, from: row1.indexOf('rage'), to: row1.indexOf('.png') + 4, uri },
+      ]
+    );
+
+    expect(app._handleMobileTerminalTap(at(row1.indexOf('rage') + 2, 1), false, 'content')).toBe('link');
+    expect(app.openFilePreview).toHaveBeenLastCalledWith('/tmp/out/menu/_garage_jeep.png', 'sess-1');
+
+    // The first half's visible text is a folder-looking `…/_ga`; the hyperlink wins.
+    expect(app._handleMobileTerminalTap(at(row0.indexOf('/tmp') + 2, 0), false, 'content')).toBe('link');
+    expect(app.openFilePreview).toHaveBeenCalledTimes(2);
+    expect(app.openFolderGrid).not.toHaveBeenCalled();
+  });
+
+  it('leaves a plain-text URL to the path provider even under an http OSC 8 link', () => {
+    // An http(s) OSC link would ask before opening; tapping a URL that is plain text too
+    // keeps opening it directly, as before.
+    const line = 'see https://example.com/x now';
+    const { app, windowRef } = oscHarness(
+      [line, '', '❯ '],
+      [{ row: 0, from: line.indexOf('https'), to: line.indexOf(' now'), uri: 'https://example.com/x' }]
+    );
+
+    expect(app._handleMobileTerminalTap(at(line.indexOf('https') + 3), false, 'content')).toBe('link');
+    expect(windowRef.confirm).not.toHaveBeenCalled();
+    expect(windowRef.open).toHaveBeenCalledWith('https://example.com/x', '_blank', 'noopener,noreferrer');
   });
 });
 

@@ -2212,6 +2212,8 @@ export class Session extends EventEmitter {
       // Prevent tmux from letting the newest browser attach dictate global window
       // size; accepted Codeman resize events update it explicitly below.
       mux.setManualWindowSize?.(this._muxSession!.muxName);
+      // Before the attach client starts: tmux reads client features at attach.
+      mux.enableClientHyperlinks?.();
     }
     // Query existing tmux window size so re-attach matches (avoids flicker from 120x40 default).
     // MUST go through the dedicated socket (mux.muxSocket); a bare `tmux display` hits the

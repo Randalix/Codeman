@@ -317,6 +317,9 @@ export interface TerminalMultiplexer extends EventEmitter {
   /** Pin a mux window so client attaches do not automatically dictate its size. */
   setManualWindowSize?(muxName: string): boolean;
 
+  /** Let attach clients receive OSC 8 hyperlinks; call before spawning one. */
+  enableClientHyperlinks?(): void;
+
   /** Explicitly resize a mux window after Codeman accepts a terminal resize. */
   resizeWindow?(muxName: string, cols: number, rows: number): boolean;
 
