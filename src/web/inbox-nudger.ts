@@ -33,7 +33,8 @@
  * - Survives a server restart: the store is persisted but this state is not, so boot
  *   calls `rearm()` for every restored inbox with mail (after `NUDGE_RESTART_DELAY_MS`,
  *   once the adopted sessions report real status). Read-but-unacked mail counts as
- *   unseen then — `seen` is not persisted — and gets one reminder.
+ *   unseen then — `seen` is not persisted — and gets one reminder. A busy receiver's
+ *   `NUDGE_MAX_DEFER_MS` counts from the oldest such post, not from the boot.
  * - Opt-out per post (`nudge: false`, CLI `--no-nudge`) and globally
  *   (`CODEMAN_INBOX_NUDGE=0`).
  *
@@ -151,7 +152,12 @@ export class InboxNudger {
    */
   rearm(sessionId: string, delayMs = NUDGE_RESTART_DELAY_MS): void {
     if (this.stopped || !this.deps.enabled()) return;
-    this.retryIn(sessionId, this.state(sessionId), delayMs);
+    const state = this.state(sessionId);
+    // A busy receiver's wait counts from the oldest post, not from this boot: starting
+    // it over held a post 8 minutes instead of 5 across one deploy (2026-10-10).
+    const oldest = Math.min(...this.deps.unseen(sessionId).map((m) => m.createdAt));
+    if (Number.isFinite(oldest)) state.deferredSince = Math.min(state.deferredSince ?? oldest, oldest);
+    this.retryIn(sessionId, state, delayMs);
   }
 
   /** Forget a session (deleted). */

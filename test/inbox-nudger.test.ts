@@ -374,6 +374,36 @@ describe('after a server restart', () => {
   });
 });
 
+describe('a restart does not restart the busy wait', () => {
+  // 2026-10-10: post 23:53:55 to a busy receiver, deploy 23:56:22, nudge only 00:01:55 —
+  // the restart began the 5-minute wait again instead of counting from the post.
+  it('counts the max defer from the post, not from the restart', async () => {
+    const { inbox, sessions, nudger } = setup();
+    const s = new FakeSession(A);
+    s.status = 'busy';
+    sessions.set(A, s);
+    inbox.post(A, B, 'restored'); // landed before the restart, still busy since
+    await settle(4 * 60_000);
+    nudger.rearm(A); // the new process
+    await settle(NUDGE_RESTART_DELAY_MS);
+    expect(s.written).toEqual([]); // 4.5 min since the post: still within the defer
+    await settle(NUDGE_MAX_DEFER_MS - 4 * 60_000 - NUDGE_RESTART_DELAY_MS);
+    expect(s.written).toHaveLength(1);
+  });
+
+  it('types right after the settle delay when the post is older than the max defer', async () => {
+    const { inbox, sessions, nudger } = setup();
+    const s = new FakeSession(A);
+    s.status = 'busy';
+    sessions.set(A, s);
+    inbox.post(A, B, 'restored');
+    await settle(NUDGE_MAX_DEFER_MS * 2);
+    nudger.rearm(A);
+    await settle(NUDGE_RESTART_DELAY_MS);
+    expect(s.written).toHaveLength(1);
+  });
+});
+
 describe('wiring guard', () => {
   it('boot rearms the nudger for restored mail, after the restore and its prune', () => {
     const server = readFileSync(new URL('../src/web/server.ts', import.meta.url), 'utf-8');
