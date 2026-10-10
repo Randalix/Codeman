@@ -43,6 +43,7 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
   const inbox = new AgentInbox();
   const sessions = new Map<string, FakeSession>();
   const probes: string[] = [];
+  const logs: string[] = [];
   const nudger = new InboxNudger({
     getSession: (id) => sessions.get(id),
     unseen: (id) => inbox.unseen(id),
@@ -56,7 +57,7 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
     },
     enabled: () => opts.enabled ?? true,
     now: () => Date.now(),
-    log: () => {},
+    log: (line) => logs.push(line),
   });
   const post = (to: string, from: string, text = 'hi', nudge?: boolean) => {
     const receiverWaiting = inbox.waiterCount(to) > 0; // what the route does
@@ -65,7 +66,7 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
     nudger.schedule(to, from, { nudge, messageId: r.message.id, receiverWaiting });
     return r.message;
   };
-  return { inbox, sessions, nudger, post, probes };
+  return { inbox, sessions, nudger, post, probes, logs };
 }
 
 /** Let the debounce fire and the async check (probe + write) settle. */
@@ -159,7 +160,40 @@ describe('when a post is announced', () => {
     stuck.post(A, B);
     await settle();
     await settle(NUDGE_MAX_DEFER_MS + NUDGE_COOLDOWN_MS);
-    expect(t.written).toEqual([]); // gave up instead of submitting the draft
+    expect(t.written).toEqual([]); // never submits the draft, however long it sits
+  });
+
+  it('does not give up on a long draft: the nudge follows once it is gone', async () => {
+    const { sessions, post, logs } = setup();
+    const s = new FakeSession(A);
+    s.draft = true;
+    sessions.set(A, s);
+    post(A, B);
+    await settle();
+    for (let i = 0; i < 4; i++) await settle(NUDGE_MAX_DEFER_MS);
+    expect(s.written).toEqual([]);
+    expect(logs.filter((l) => l.includes('draft'))).toHaveLength(1); // once per draft, not per retry
+    s.draft = false; // sent or cleared, 20 min later
+    await settle(NUDGE_COOLDOWN_MS);
+    expect(s.written).toHaveLength(1);
+  });
+
+  it('a submitted draft gets the full idle wait: no typing into the turn it started', async () => {
+    const { sessions, post } = setup();
+    const s = new FakeSession(A);
+    s.draft = true;
+    sessions.set(A, s);
+    post(A, B);
+    await settle();
+    await settle(NUDGE_MAX_DEFER_MS + NUDGE_COOLDOWN_MS); // draft outlived the busy max defer
+    s.draft = false;
+    s.status = 'busy'; // the submitted draft runs a turn
+    await settle(NUDGE_COOLDOWN_MS);
+    expect(s.written).toEqual([]);
+    s.status = 'idle';
+    s.emit('idle');
+    await settle();
+    expect(s.written).toHaveLength(1);
   });
 
   it('types into a shell-mode pane only when an agent CLI is in the foreground', async () => {

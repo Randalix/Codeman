@@ -23,6 +23,8 @@
  *   heuristic for some modes, so after `NUDGE_MAX_DEFER_MS` it is typed anyway — the
  *   agent CLIs queue input that arrives during a turn.
  * - Never types over a human's half-written prompt (`hasDraft`): that would submit it.
+ *   Never gives up on it either: while the mail is unread it looks again every
+ *   `NUDGE_COOLDOWN_MS`, and once the draft is sent or cleared the normal path runs.
  * - Shell mode types only when the pane's foreground process is an agent CLI; into a
  *   bare shell the text would run as a command.
  * - NEVER wakes a host. A remote session is nudged only when its host answers a plain
@@ -88,6 +90,8 @@ interface NudgeState {
   /** Set while waiting for a busy session's `idle`. */
   deferredSince: number | null;
   idleListener: (() => void) | null;
+  /** A draft blocked the nudge and was logged; cleared once the draft is gone. */
+  draftLogged: boolean;
 }
 
 /** The line typed into the receiver's composer. Printable only, plus the caller's `\r`. */
@@ -181,18 +185,21 @@ export class InboxNudger {
     }
 
     if (session.hasDraft()) {
-      // A human is mid-prompt: our line plus Enter would submit their draft. Look
-      // again later; past the max defer give up — the mail stays, the next post retries.
-      if (state.deferredSince === null) state.deferredSince = now;
-      if (now - state.deferredSince < NUDGE_MAX_DEFER_MS) {
-        this.retryIn(sessionId, state, NUDGE_COOLDOWN_MS);
-        return 'deferred';
-      }
-      this.clearTimers(sessionId, state);
+      // A human is mid-prompt: our line plus Enter would submit their draft. Look again
+      // until it is sent or cleared — giving up left the mail unannounced for hours
+      // (2026-10-09/10). Waiting for the human is not a busy defer: reset it, so a
+      // submitted draft's turn gets the full idle wait before we type.
       state.deferredSince = null;
-      this.deps.log(`[InboxNudger] ${sessionId.slice(0, 8)}: unsubmitted draft in the composer, not typing`);
-      return 'skipped';
+      if (!state.draftLogged) {
+        state.draftLogged = true;
+        this.deps.log(
+          `[InboxNudger] ${sessionId.slice(0, 8)}: unsubmitted draft in the composer, retrying until it is gone`
+        );
+      }
+      this.retryIn(sessionId, state, NUDGE_COOLDOWN_MS);
+      return 'deferred';
     }
+    state.draftLogged = false;
 
     if (this.deps.isShellMode(session.mode) && !this.deps.agentInForeground(session)) return 'skipped';
     if (session.remote && !(await this.deps.probeRemote(session.remote))) {
@@ -220,7 +227,14 @@ export class InboxNudger {
   private state(sessionId: string): NudgeState {
     let state = this.states.get(sessionId);
     if (!state) {
-      state = { timer: null, nudged: new Set(), lastNudgeAt: 0, deferredSince: null, idleListener: null };
+      state = {
+        timer: null,
+        nudged: new Set(),
+        lastNudgeAt: 0,
+        deferredSince: null,
+        idleListener: null,
+        draftLogged: false,
+      };
       this.states.set(sessionId, state);
     }
     return state;
