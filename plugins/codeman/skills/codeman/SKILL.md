@@ -57,7 +57,8 @@ and the directories that already have a remote case; `codeman agent spawn --host
 --cwd <absolute path on that host>` reuses the case for that directory or creates one,
 wakes a sleeping host (wake-on-LAN), and refuses a directory that does not exist there.
 Everything after the spawn (mailbox, `send`, `wait`, `read`, `watch`, `rm`) is the same;
-`agent ls` shows each session's `HOST`. Files the worker writes stay on its host:
+`agent ls` shows each session's `HOST` and `MODEL` (as reported, else the `--model` it
+was started with; `-` = unknown). Files the worker writes stay on its host:
 `codeman agent pull <id> <path> [dest]` copies one out of its working directory (path
 relative to it; an existing local file is overwritten only with `--force`).
 

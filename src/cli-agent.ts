@@ -389,6 +389,20 @@ interface SessionRow {
   turnEndedAt?: number | null;
   turnEndSource?: string | null;
   ralphTodoStats?: { total: number; pending: number; inProgress: number; completed: number };
+  /** What the server knows of the running model (`src/session-display-model.ts`); absent when nothing is known. */
+  displayModel?: { model?: string; source?: string };
+  /** The model the session was started with (`--model`); absent without one. */
+  model?: string;
+}
+
+/**
+ * The MODEL column: what the CLI reports (claude's statusline follows `/model`),
+ * else what it was started with, else `-`. A remote claude reports nothing back,
+ * so a remote worker started without `--model` reads `-` rather than a guess.
+ */
+export function modelCell(s: Pick<SessionRow, 'displayModel' | 'model'>): string {
+  const name = s.displayModel?.model?.trim() || s.model?.trim();
+  return name ? name.replace(/\s*\(1M context\)$/i, ' 1M') : '-';
 }
 
 /** Where a session runs: `local`, its remote host id, or `docker`. */
@@ -534,6 +548,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       isSelfSession(deps.ctx.selfId, s.id) ? '*' : ' ',
       s.id.slice(0, 8),
       s.mode ?? '?',
+      modelCell(s),
       hostCell(s),
       s.status ?? '?',
       ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
@@ -548,6 +563,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
     ' ',
     'ID',
     'MODE',
+    'MODEL',
     'HOST',
     'STATUS',
     ...(options.alive ? ['PANE'] : []),
@@ -560,7 +576,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(
-      `* = this session (${deps.ctx.selfId.slice(0, 8)}). HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list.`
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). MODEL = what the CLI reports, else what it was started with (- = unknown, e.g. a remote worker started without --model). HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list.`
     )
   );
   if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));

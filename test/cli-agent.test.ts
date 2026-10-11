@@ -21,6 +21,7 @@ import {
   agentPost,
   agentRead,
   agentPull,
+  modelCell,
   agentRestore,
   agentRm,
   agentSend,
@@ -263,8 +264,8 @@ describe('agent ls', () => {
     const deps = fakeDeps(withSummary({}));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+local\s+busy\s+0\s+-\s+-\s+-\s+w1-Codeman/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+local\s+idle\s+0\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
+    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+-\s+local\s+busy\s+0\s+-\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+-\s+local\s+idle\s+0\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
   });
 
   it('--json is the envelope data plus a self flag and the mailbox state', async () => {
@@ -288,8 +289,8 @@ describe('agent ls', () => {
     await agentLs(deps);
     const text = deps.out.join('\n');
     expect(text).toMatch(/INBOX\s+WAIT/);
-    expect(text).toMatch(/058ee7b5\s+claude\s+local\s+busy\s+0\s+since 08:43/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+local\s+idle\s+3\s+-/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+-\s+local\s+busy\s+0\s+since 08:43/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+-\s+local\s+idle\s+3\s+-/);
   });
 
   it('names a stalled pair: the waiter and its idle, mail-less child', async () => {
@@ -311,8 +312,60 @@ describe('agent ls', () => {
     const deps = fakeDeps((o) => (o.path === SUMMARY ? { status: 404, text: 'Route not found' } : ok(sessions)));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+claude\s+local\s+busy\s+\?\s+\?\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+-\s+local\s+busy\s+\?\s+\?\s+-\s+-\s+w1-Codeman/);
     expect(text).not.toMatch(/owes a post/);
+  });
+
+  it("shows each session's model: reported, else started with, else -", async () => {
+    const list = [
+      {
+        id: SELF,
+        mode: 'claude',
+        status: 'busy',
+        name: 'w1',
+        displayModel: { model: 'Opus 5.5 (1M context)', source: 'statusline' },
+      },
+      {
+        id: OTHER,
+        mode: 'claude',
+        status: 'idle',
+        name: 'huff',
+        model: 'opus',
+        displayModel: { model: 'opus', source: 'launch' },
+        remote: { hostId: 'hufflepuff' },
+      },
+      {
+        id: '5c0ffee0-0000-4000-8000-000000000000',
+        mode: 'claude',
+        status: 'idle',
+        name: 'huff-default',
+        remote: { hostId: 'hufflepuff' },
+      },
+    ];
+    const deps = fakeDeps(withSummary({}, list));
+    await agentLs(deps);
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/ID\s+MODE\s+MODEL\s+HOST/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+Opus 5\.5 1M\s+local/);
+    expect(text).toMatch(/94990c6d\s+claude\s+opus\s+hufflepuff/);
+    expect(text).toMatch(/5c0ffee0\s+claude\s+-\s+hufflepuff/);
+    expect(text).toMatch(/MODEL = what the CLI reports, else what it was started with/);
+  });
+
+  describe('modelCell', () => {
+    it('prefers the report, falls back to the launch model, else -', () => {
+      expect(modelCell({ displayModel: { model: 'Sonnet 5.5', source: 'statusline' }, model: 'opus' })).toBe(
+        'Sonnet 5.5'
+      );
+      expect(modelCell({ model: 'haiku' })).toBe('haiku');
+      expect(modelCell({ displayModel: { model: '  ' }, model: 'opus[1m]' })).toBe('opus[1m]');
+      expect(modelCell({})).toBe('-');
+    });
+
+    it('shortens the 1M context suffix only at the end', () => {
+      expect(modelCell({ displayModel: { model: 'Opus 5.5 (1M context)' } })).toBe('Opus 5.5 1M');
+      expect(modelCell({ displayModel: { model: 'Custom (1M context) v2' } })).toBe('Custom (1M context) v2');
+    });
   });
 
   describe('stalledPairLines', () => {
@@ -1059,8 +1112,8 @@ describe('agent restore / ls --alive', () => {
     };
     expect(await agentLs(deps, { alive: true })).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+\?\s+local\s+\?\s+alive/);
-    expect(text).toMatch(/94990c6d\s+\?\s+local\s+\?\s+unknown/);
+    expect(text).toMatch(/058ee7b5\s+\?\s+-\s+local\s+\?\s+alive/);
+    expect(text).toMatch(/94990c6d\s+\?\s+-\s+local\s+\?\s+unknown/);
   });
 
   it('restore hands a dead session (and the --resume id) to the runner and reports its result', async () => {
@@ -1235,8 +1288,8 @@ describe('agent restore / ls --alive', () => {
     expect(await agentLs(deps, { alive: true })).toBe(EXIT.ok);
     const text = deps.out.join('\n');
     expect(text).toMatch(/PANE/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+local\s+\?\s+DEAD/);
-    expect(text).toMatch(/058ee7b5\s+claude\s+local\s+\?\s+alive/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+-\s+local\s+\?\s+DEAD/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+-\s+local\s+\?\s+alive/);
   });
 });
 
@@ -1943,8 +1996,8 @@ describe('agent ls: HOST column', () => {
     );
     await agentLs(deps);
     const lines = stripAnsi(deps.out.join('\n')).split('\n');
-    expect(lines[0]).toMatch(/ID\s+MODE\s+HOST\s+STATUS/);
-    expect(lines.find((l) => l.includes(OTHER.slice(0, 8)))).toMatch(/claude\s+hufflepuff\s+idle/);
-    expect(lines.find((l) => l.includes(SELF.slice(0, 8)))).toMatch(/claude\s+local\s+busy/);
+    expect(lines[0]).toMatch(/ID\s+MODE\s+MODEL\s+HOST\s+STATUS/);
+    expect(lines.find((l) => l.includes(OTHER.slice(0, 8)))).toMatch(/claude\s+-\s+hufflepuff\s+idle/);
+    expect(lines.find((l) => l.includes(SELF.slice(0, 8)))).toMatch(/claude\s+-\s+local\s+busy/);
   });
 });
