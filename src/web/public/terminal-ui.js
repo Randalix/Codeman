@@ -3772,6 +3772,24 @@ Object.assign(CodemanApp.prototype, {
     // Keyboard activation still works through the button's ordinary click event.
     button.addEventListener('pointerdown', (ev) => ev.preventDefault());
     button.addEventListener('mousedown', (ev) => ev.preventDefault());
+    // Android can still run the compatibility click/focus path after a tap even
+    // when pointerdown was canceled. Own touch activation explicitly: cancel the
+    // browser's synthesized mouse/click sequence, then perform the same action on
+    // touchend. This keeps tapping the floating control from focusing xterm and
+    // opening the on-screen keyboard.
+    let touchActive = false;
+    button.addEventListener('touchstart', (ev) => {
+      if (ev.touches.length !== 1) return;
+      ev.preventDefault();
+      touchActive = true;
+    }, { passive: false });
+    button.addEventListener('touchend', (ev) => {
+      if (!touchActive) return;
+      ev.preventDefault();
+      touchActive = false;
+      this.scrollTerminalToBottom();
+    }, { passive: false });
+    button.addEventListener('touchcancel', () => { touchActive = false; });
     button.addEventListener('click', () => this.scrollTerminalToBottom());
     this.terminal.onScroll(() => this._updateTerminalScrollBottomButton());
     this.terminal.onRender(() => this._updateTerminalScrollBottomButton());
