@@ -42,6 +42,7 @@ class FakeSession extends EventEmitter implements NudgeTarget {
 
 function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?: boolean } = {}) {
   const inbox = new AgentInbox();
+  const dialogs = new Set<string>();
   const sessions = new Map<string, FakeSession>();
   const probes: string[] = [];
   const logs: string[] = [];
@@ -50,6 +51,7 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
     unseen: (id) => inbox.unseen(id),
     pendingCount: (id) => inbox.pendingCount(id),
     isWaiting: (id) => inbox.summary().get(id)?.waiting === true,
+    dialogOpen: (id) => dialogs.has(id),
     isShellMode: (mode) => mode === 'shell',
     agentInForeground: () => ['codex', 'claude'].includes(opts.foreground ?? ''),
     probeRemote: async (remote) => {
@@ -67,7 +69,7 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
     nudger.schedule(to, from, { nudge, messageId: r.message.id, receiverWaiting });
     return r.message;
   };
-  return { inbox, sessions, nudger, post, probes, logs };
+  return { inbox, sessions, nudger, post, probes, logs, dialogs };
 }
 
 /** Let the debounce fire and the async check (probe + write) settle. */
@@ -177,6 +179,33 @@ describe('when a post is announced', () => {
     s.draft = false; // sent or cleared, 20 min later
     await settle(NUDGE_COOLDOWN_MS);
     expect(s.written).toHaveLength(1);
+  });
+
+  it('never types into an open dialog: the nudge would pick option 1 and confirm it', async () => {
+    const { sessions, post, logs, dialogs } = setup();
+    const s = new FakeSession(A);
+    sessions.set(A, s);
+    dialogs.add(A); // AskUserQuestion open, session reads idle
+    post(A, B);
+    await settle();
+    for (let i = 0; i < 4; i++) await settle(NUDGE_MAX_DEFER_MS);
+    expect(s.written).toEqual([]);
+    expect(logs.filter((l) => l.includes('dialog open'))).toHaveLength(1);
+    dialogs.delete(A); // the human answered
+    await settle(NUDGE_COOLDOWN_MS);
+    expect(s.written).toHaveLength(1);
+  });
+
+  it('a dialog in a busy session outlasts the busy max defer', async () => {
+    const { sessions, post, dialogs } = setup();
+    const s = new FakeSession(A);
+    s.status = 'busy'; // permission prompt mid-turn
+    sessions.set(A, s);
+    dialogs.add(A);
+    post(A, B);
+    await settle();
+    await settle(NUDGE_MAX_DEFER_MS + NUDGE_COOLDOWN_MS);
+    expect(s.written).toEqual([]);
   });
 
   it('a submitted draft gets the full idle wait: no typing into the turn it started', async () => {
@@ -426,5 +455,14 @@ describe('wiring guard', () => {
     );
     expect(block).toContain('probeRemoteHostReachable');
     expect(block).not.toMatch(/remoteWake|ensureAwake|wake\(/);
+  });
+
+  it('the server feeds open question/permission dialogs from the Approvals Inbox', () => {
+    const server = readFileSync(new URL('../src/web/server.ts', import.meta.url), 'utf-8');
+    const start = server.indexOf('new InboxNudger(');
+    const block = server.slice(start, server.indexOf('log: (message)', start));
+    expect(block).toMatch(/dialogOpen: \(id\) => \{[^}]*approvalInbox\.getForSession\(id\)/);
+    expect(block).toMatch(/'question'/);
+    expect(block).toMatch(/'permission'/);
   });
 });

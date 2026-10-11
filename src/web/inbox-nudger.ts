@@ -25,6 +25,11 @@
  * - Never types over a human's half-written prompt (`hasDraft`): that would submit it.
  *   Never gives up on it either: while the mail is unread it looks again every
  *   `NUDGE_COOLDOWN_MS`, and once the draft is sent or cleared the normal path runs.
+ * - Never types into an open dialog (`dialogOpen`: a question or permission prompt).
+ *   The `1` in the nudge text picks option 1 and the `\r` confirms it: a coordinator's
+ *   AskUserQuestion was answered three seconds after it opened (2026-10-11). Same
+ *   retry as a draft: look again every `NUDGE_COOLDOWN_MS`, never give up, and the
+ *   busy `NUDGE_MAX_DEFER_MS` fallback does not override it.
  * - Shell mode types only when the pane's foreground process is an agent CLI; into a
  *   bare shell the text would run as a command.
  * - NEVER wakes a host. A remote session is nudged only when its host answers a plain
@@ -75,6 +80,11 @@ export interface InboxNudgerDeps {
    * monitor loop, whose reads mark nothing seen but which does react to the post.
    */
   isWaiting(id: string): boolean;
+  /**
+   * A question or permission dialog is open in the pane (Approvals Inbox, fed by the
+   * claude hooks). Typing there answers it.
+   */
+  dialogOpen(id: string): boolean;
   /** The session's CLI is a plain shell (registry `kind: 'shell'`), not an agent. */
   isShellMode(mode: string): boolean;
   /**
@@ -99,6 +109,8 @@ interface NudgeState {
   idleListener: (() => void) | null;
   /** A draft blocked the nudge and was logged; cleared once the draft is gone. */
   draftLogged: boolean;
+  /** An open dialog blocked the nudge and was logged; cleared once it is gone. */
+  dialogLogged: boolean;
 }
 
 /** The line typed into the receiver's composer. Printable only, plus the caller's `\r`. */
@@ -222,6 +234,18 @@ export class InboxNudger {
     }
     state.draftLogged = false;
 
+    if (this.deps.dialogOpen(sessionId)) {
+      // The nudge's `1` + Enter would pick option 1 for the human. Wait like for a draft.
+      state.deferredSince = null;
+      if (!state.dialogLogged) {
+        state.dialogLogged = true;
+        this.deps.log(`[InboxNudger] ${sessionId.slice(0, 8)}: dialog open in the pane, retrying until it is answered`);
+      }
+      this.retryIn(sessionId, state, NUDGE_COOLDOWN_MS);
+      return 'deferred';
+    }
+    state.dialogLogged = false;
+
     if (this.deps.isShellMode(session.mode) && !this.deps.agentInForeground(session)) return 'skipped';
     if (session.remote && !(await this.deps.probeRemote(session.remote))) {
       this.deps.log(`[InboxNudger] ${sessionId.slice(0, 8)}: remote host unreachable, mail stays unannounced`);
@@ -255,6 +279,7 @@ export class InboxNudger {
         deferredSince: null,
         idleListener: null,
         draftLogged: false,
+        dialogLogged: false,
       };
       this.states.set(sessionId, state);
     }

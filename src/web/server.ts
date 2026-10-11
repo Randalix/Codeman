@@ -322,6 +322,10 @@ export class WebServer extends EventEmitter {
     unseen: (id) => agentInbox.unseen(id).filter((m) => !m.quiet),
     pendingCount: (id) => agentInbox.pendingCount(id),
     isWaiting: (id) => agentInbox.summary().get(id)?.waiting === true,
+    dialogOpen: (id) => {
+      const kind = approvalInbox.getForSession(id)?.kind;
+      return kind === 'question' || kind === 'permission';
+    },
     isShellMode: (mode) => getCli(mode)?.kind === 'shell',
     agentInForeground: (session) => {
       const muxName = this.sessions.get(session.id)?.muxName;
