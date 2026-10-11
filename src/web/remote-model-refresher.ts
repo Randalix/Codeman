@@ -19,6 +19,7 @@
 
 import type { SessionRemote } from '../types/session.js';
 import { friendlyClaudeModel, lastAssistantModel } from '../claude-transcript-model.js';
+import { getCli } from '../config/cli-registry/registry.js';
 
 /** Enough tail for the newest assistant record even behind a long tool result. */
 export const REMOTE_MODEL_TAIL_BYTES = 256 * 1024;
@@ -48,11 +49,12 @@ export class RemoteModelRefresher {
 
   /**
    * Read the model off a remote claude session's transcript. A no-op for a local
-   * session or another CLI. Resolves once done; never rejects.
+   * session or a CLI that writes no claude JSONL transcript. Resolves once done; never rejects.
    */
   async refresh(session: RemoteModelSession): Promise<void> {
     const remote = session.remote;
-    if (!remote || session.mode !== 'claude' || this.inFlight.has(session.id)) return;
+    if (!remote || this.inFlight.has(session.id)) return;
+    if (getCli(session.mode)?.capabilities.transcript !== 'claude-jsonl') return;
     this.inFlight.add(session.id);
     try {
       const ids = [session.claudeSessionId || session.id, session.id];
