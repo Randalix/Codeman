@@ -434,6 +434,11 @@ textarea:focus-visible {
   outline: none;
 }
 
+.xterm.terminal-tab-replay {
+  /* Keep its focused textarea and layout alive while the replay is invisible. */
+  opacity: 0;
+}
+
 /* xterm.js hidden textarea — must never show focus ring or caret.
  * On mobile (touch devices), override xterm.css defaults that position the
  * textarea at left:-9999em with width/height:0. iOS Safari ignores keyboard

@@ -6346,6 +6346,12 @@ class CodemanApp {
 
   _setTerminalLoadState(sessionId, selectGen, phase) {
     this.terminalLoadStates.set(sessionId, { generation: selectGen, phase });
+    // A replay visits intermediate scroll positions before its final view. Hide
+    // those intermediate frames; the owning selection reveals the final view.
+    if (selectGen === this._selectGeneration) {
+      this._terminalReplayVisibilityOwner = { sessionId, selectGen };
+      this.terminal?.element?.classList.add('terminal-tab-replay');
+    }
     this._updateTerminalLoadTab(sessionId);
   }
 
@@ -6353,6 +6359,11 @@ class CodemanApp {
     const state = this.terminalLoadStates.get(sessionId);
     if (state && state.generation !== selectGen) return;
     this.terminalLoadStates.delete(sessionId);
+    const owner = this._terminalReplayVisibilityOwner;
+    if (owner?.sessionId === sessionId && owner.selectGen === selectGen) {
+      this.terminal?.element?.classList.remove('terminal-tab-replay');
+      this._terminalReplayVisibilityOwner = null;
+    }
     this._updateTerminalLoadTab(sessionId);
   }
 
@@ -9212,7 +9223,7 @@ class CodemanApp {
     }
 
     // Load terminal buffer for this session
-    // Show cached content instantly while fetching fresh data in background.
+    // Stage cached content while fetching fresh data; reveal only the final view.
     // Use tail mode for faster initial load (128KB is enough for recent visible content).
     //
     // Protect flushed state during buffer load: terminal.write() can trigger
@@ -9261,13 +9272,13 @@ class CodemanApp {
       }
 
       // xterm snapshot restore: if we have a serialized xterm state from a
-      // previous visit to this session, restore the user's exact prior view
-      // (viewport + scrollback + colors) for an instant first paint. For codex
+      // previous visit to this session, stage its viewport, scrollback and colors
+      // while the canonical capture loads. For codex
       // this is also a correctness fix — its byte-stream replay shows only the
       // latest TUI frame (the idle welcome banner) because codex doesn't include
       // earlier conversation in its current redraw. For claude/opencode/gemini/antigravity
-      // the replay is already complete, so the snapshot is purely a faster,
-      // scroll-preserving first paint before the canonical fetch reconciles.
+      // the replay is already complete; the snapshot seeds the hidden replay
+      // before the canonical fetch reconciles. Only the final view is revealed.
       //
       // Try in-memory first (fast); fall back to localStorage so snapshots
       // survive tab discards / browser reloads.
@@ -9305,7 +9316,7 @@ class CodemanApp {
         }
         this.scrollToLastNonEmptyLine();
         _crashDiag.log('SNAPSHOT_RESTORE_DONE');
-        // Snapshot restore is only first paint. Inactive tabs intentionally
+      // Snapshot restore is only staging. Inactive tabs intentionally
         // unsubscribe from high-volume terminal output, so they can miss bytes
         // emitted while away. Keep going and replace the snapshot with the
         // canonical live tmux pane frame from /terminal.
@@ -9313,6 +9324,7 @@ class CodemanApp {
       }
 
       // Instant cache restore for IDLE sessions only.
+      // Its intermediate viewport stays hidden until the fresh frame is ready.
       // For busy sessions, the cache is always stale — writing it first causes a
       // jarring double-render: stale content appears, then the terminal flashes
       // blank and rewrites with fresh data. Skip the cache and write the fresh
@@ -9716,7 +9728,7 @@ class CodemanApp {
       // of the happy path, so bailing here left the session mute until the user
       // switched away and back.
       this._connectWs(sessionId);
-      // Only when the pane was blanked for a replay that never came. A pane
+      // Only when the pane was cleared for a replay that never came. A pane
       // still holding its previous content is stale, not empty, and stacking a
       // notice on top of readable output is worse than the staleness.
       if (clearedBeforeFresh && this.terminal) {
@@ -9732,10 +9744,8 @@ class CodemanApp {
           '\r\n\x1b[2m  History did not load.\r\n  Live output continues.\r\n  Reload to try again.\x1b[0m\r\n'
         );
       }
-      // ⚠️ CLEAR, not 'failed'. `_setTerminalLoadState` only marks the TAB, and
-      // nothing ever cleared it on this path — so the tab kept its spinner and
-      // `aria-busy="true"` forever, telling every reader and every screen reader
-      // that a load was still running when it had already given up.
+      // Clear both the tab's loading indicator and the hidden replay state,
+      // including on failure so live output remains visible and usable.
       this._clearTerminalLoadState(sessionId, selectGen);
     }
   }
