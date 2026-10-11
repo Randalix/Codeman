@@ -418,7 +418,8 @@ const TRANSCRIPT_NOT_FOUND_EXIT = 3;
  * `~/.claude/projects/*\/<id>.jsonl`, trying each id in order.
  *
  * Output: a lone NUL (rc-file chatter before it is discarded), the id that matched,
- * a NUL, then the last `maxBytes` bytes of the file. Exit 3 = no transcript under
+ * a NUL, then the last `maxBytes` bytes of the file (the newest one when the id
+ * exists under several project dirs). Exit 3 = no transcript under
  * any id. The tail may start mid-line; the JSONL parser skips that one row.
  *
  * `$HOME` is deliberately expanded by the REMOTE shell — the transcript lives in the
@@ -428,17 +429,26 @@ const TRANSCRIPT_NOT_FOUND_EXIT = 3;
 export function buildRemoteClaudeTranscriptTailCommand(ids: readonly string[], maxBytes: number): string {
   const safeIds = [...new Set(ids)].filter((id) => CLAUDE_TRANSCRIPT_ID_PATTERN.test(id));
   if (safeIds.length === 0) return `exit ${TRANSCRIPT_NOT_FOUND_EXIT}`;
-  return [
+  const script = [
     "printf '\\0'",
-    'f=',
+    'best=',
+    'bestid=',
     `for id in ${safeIds.map((id) => shellescape(id)).join(' ')}; do`,
-    '  f=$(ls -t "$HOME"/.claude/projects/*/"$id".jsonl 2>/dev/null | head -n 1)',
-    '  [ -n "$f" ] && break',
+    '  for f in "$HOME"/.claude/projects/*/"$id".jsonl; do',
+    '    [ -f "$f" ] || continue',
+    '    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best=$f; bestid=$id; fi',
+    '  done',
+    '  [ -n "$best" ] && break',
     'done',
-    `[ -n "$f" ] || exit ${TRANSCRIPT_NOT_FOUND_EXIT}`,
-    'printf \'%s\\0\' "$id"',
-    `tail -c ${Math.max(1, Math.floor(maxBytes))} "$f"`,
+    `[ -n "$best" ] || exit ${TRANSCRIPT_NOT_FOUND_EXIT}`,
+    'printf \'%s\\0\' "$bestid"',
+    `tail -c ${Math.max(1, Math.floor(maxBytes))} "$best"`,
   ].join('\n');
+  // ⚠️ sshd runs the command in the remote user's LOGIN shell. On Hufflepuff that is
+  // zsh, where `ls` is an alias for `eza -l` (whose `-t` takes an argument) and an
+  // unmatched glob aborts the whole script ("no matches found"). So: an explicit
+  // `sh`, which reads no rc file, and no `ls` at all — the newest file wins via `-nt`.
+  return `sh -c ${shellescape(script)}`;
 }
 
 /** Split the transcript script's output; `null` = the protocol was not followed. */

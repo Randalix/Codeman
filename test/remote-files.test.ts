@@ -16,7 +16,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, statSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, statSync, chmodSync, utimesSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import {
@@ -441,6 +441,34 @@ describe('the remote claude transcript script on a real shell', () => {
     expect(parseRemoteClaudeTranscriptTail(run(['conv-1'], 9).stdout)?.content).toBe('line two\n');
   });
 
+  it('does not depend on the remote ls (Hufflepuff: zsh aliases ls to eza, whose -t takes an argument)', () => {
+    const bin = mkdtempSync(join(tmpdir(), 'codeman-fake-ls-'));
+    try {
+      writeFileSync(join(bin, 'ls'), '#!/bin/sh\necho broken ls >&2\nexit 2\n');
+      chmodSync(join(bin, 'ls'), 0o755);
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+      const stdout = execFileSync('sh', ['-c', buildRemoteClaudeTranscriptTailCommand(['conv-1'], 1024)], { env });
+      expect(parseRemoteClaudeTranscriptTail(stdout.toString())?.sessionId).toBe('conv-1');
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
+  });
+
+  it('runs under an explicit sh, never the login shell (zsh aborts the script on an unmatched glob)', () => {
+    expect(buildRemoteClaudeTranscriptTailCommand(['conv-1'], 10)).toMatch(/^sh -c '/);
+  });
+
+  it('picks the newest file when the id exists in two project dirs', () => {
+    const older = join(home, '.claude', 'projects', '-other', 'conv-1.jsonl');
+    writeFileSync(older, 'stale\n');
+    utimesSync(older, new Date('2020-01-01'), new Date('2020-01-01'));
+    try {
+      expect(parseRemoteClaudeTranscriptTail(run(['conv-1']).stdout)?.content).toBe('line one\nline two\n');
+    } finally {
+      rmSync(older);
+    }
+  });
+
   it('exits 3 when no id has a transcript', () => {
     expect(run(['nope']).code).toBe(3);
   });
@@ -448,6 +476,7 @@ describe('the remote claude transcript script on a real shell', () => {
   it('never interpolates an id that is not a plain token', () => {
     const command = buildRemoteClaudeTranscriptTailCommand(['$(touch pwned)', "a'b", '../../x'], 1024);
     expect(command).toBe('exit 3');
+    expect(command).not.toMatch(/pwned|a'b|\.\.\//);
   });
 
   it('refuses to open a connection under test', async () => {
