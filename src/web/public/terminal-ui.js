@@ -616,6 +616,7 @@ Object.assign(CodemanApp.prototype, {
     this.terminal.open(container);
     this._initMobileImePreview();
     this._initTerminalScrollBottomButton();
+    this._initScrollJumpDiag();
     this._installMobileTapMouseGuard();
     this._installShiftDragSelection();
     this._installTouchSelectionFocusGuard();
@@ -3848,6 +3849,76 @@ Object.assign(CodemanApp.prototype, {
    */
   _syncStickyScrollBaseline() {
     this._wasAtBottomBeforeWrite = this.isTerminalAtBottom();
+  },
+
+  /**
+   * Diagnose the reported "text jumps away for a moment and back" in claude tabs
+   * (phone and laptop, at or near the bottom), which a replay of a recorded
+   * stream did not reproduce. Logs `SCROLL JUMP` to the crash-diag channel when
+   * three renders within SCROLL_JUMP_WINDOW_MS go A → B → A — by row or by
+   * distance from the bottom, B at least two rows off — with no user scroll in
+   * between, together with the last scroll calls and their callers, so the next
+   * occurrence names the code path. Positions only, never terminal text; at most
+   * one entry a second. Replays and catch-ups hide their frames and are skipped.
+   */
+  _initScrollJumpDiag() {
+    const term = this.terminal;
+    if (typeof term?.onRender !== 'function' || this._scrollJumpDiagInstalled) return;
+    this._scrollJumpDiagInstalled = true;
+    const calls = [];
+    for (const method of ['scrollToLine', 'scrollToBottom', 'scrollLines', 'scrollToTop']) {
+      const original = term[method]?.bind(term);
+      if (!original) continue;
+      term[method] = (...args) => {
+        try {
+          // "at CodemanApp._restoreTerminalViewport (…)" → "_restoreTerminalViewport"
+          const frame = new Error().stack?.split('\n')[2] || '';
+          const from = /at (?:\S+\.)?([\w$]+) /.exec(frame)?.[1] || '?';
+          calls.push({ method, from, at: performance.now(), before: term.buffer.active.viewportY });
+          if (calls.length > 6) calls.shift();
+        } catch {}
+        return original(...args);
+      };
+    }
+    const samples = [];
+    term.onRender(() => {
+      try {
+        const buf = term.buffer.active;
+        const el = term.element;
+        if (buf.type !== 'normal' || this._isLoadingBuffer || el?.classList.contains('terminal-tab-replay')) {
+          samples.length = 0;
+          return;
+        }
+        const now = performance.now();
+        samples.push({
+          y: buf.viewportY,
+          off: buf.baseY - buf.viewportY,
+          gen: this._terminalUserScrollGeneration || 0,
+          sid: this.activeSessionId,
+          at: now,
+        });
+        if (samples.length > 3) samples.shift();
+        if (samples.length < 3) return;
+        const [a, b, c] = samples;
+        if (c.at - a.at > SCROLL_JUMP_WINDOW_MS || a.gen !== c.gen || a.sid !== c.sid) return;
+        const byRow = a.y === c.y && Math.abs(b.y - a.y) >= 2;
+        const byOffset = a.off === c.off && Math.abs(b.off - a.off) >= 2;
+        if (!byRow && !byOffset) return;
+        if (this._lastScrollJumpLogAt != null && now - this._lastScrollJumpLogAt < 1000) return;
+        this._lastScrollJumpLogAt = now;
+        const recent = calls
+          .filter((call) => now - call.at < SCROLL_JUMP_WINDOW_MS * 2)
+          .map((call) => `${call.method}@${call.from}(${call.before},-${Math.round(now - call.at)}ms)`)
+          .join(' ');
+        if (typeof _crashDiag !== 'undefined') {
+          _crashDiag.log(
+            `SCROLL JUMP: ${c.sid} row=${a.y}>${b.y}>${c.y} off=${a.off}>${b.off}>${c.off} ` +
+              `${Math.round(c.at - a.at)}ms ${term.cols}x${term.rows} base=${buf.baseY} ` +
+              `inflight=${this._terminalWriteInFlight ? 1 : 0} calls=[${recent}]`
+          );
+        }
+      } catch {} // Diagnostics must never interrupt rendering.
+    });
   },
 
   // Record a refused local scroll without changing xterm internals. Android's

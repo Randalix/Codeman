@@ -122,6 +122,8 @@ const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 const TERMINAL_CATCH_UP_MAX_MS = 4000;
 // A resume backlog at most one write frame long lands in one paint: nothing to hide.
 const TERMINAL_CATCH_UP_MIN_BYTES = 32 * 1024;
+// Renders A → B → A within this window count as a visible jump (SCROLL JUMP diag).
+const SCROLL_JUMP_WINDOW_MS = 600;
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
 
