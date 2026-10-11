@@ -81,7 +81,12 @@ same stamp as `ENDED` (HTTP: `GET /api/v1/agent-watch?sessions=…&since=…&wai
 
 **The same lines arrive on their own** in your mailbox: every worker you spawned posts
 `[codeman watch] IDLE|BLOCKED|EXITED|GONE …` to its parent when a turn ends (read and
-`ack` them like any post). A worker babysitting a long build ends a short turn every
+`ack` them like any post). **IDLE lines are quiet**: they never end your `inbox --wait`
+and draw no nudge; they arrive with your next real post, or when the wait runs out,
+printed last as `watch digest (N):`, one current line per worker (a newer report
+replaces the unread older one). A worker parked on its own `inbox --wait` is not
+reported at all (`agent ls` shows it under WAIT). BLOCKED, EXITED and GONE still wake
+you at once. A worker babysitting a long build ends a short turn every
 minute; **`codeman agent mute [ids…] --for 30m`** holds its IDLE reports (`90s`, `2h`,
 bare number = minutes, max 24h; no ids = all your workers). BLOCKED and EXITED still
 come, and when the mute ends — or on `codeman agent unmute [ids…]` — its state is

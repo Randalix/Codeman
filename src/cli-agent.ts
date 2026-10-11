@@ -1548,6 +1548,8 @@ export interface InboxMessage {
   from: string;
   text: string;
   createdAt: number;
+  /** A status line (a worker's IDLE report): printed in the digest block, one line each. */
+  quiet?: boolean;
 }
 
 /**
@@ -1616,11 +1618,18 @@ export async function agentInbox(deps: AgentDeps, options: InboxOptions): Promis
       palette.muted(data?.timedOut ? `(nothing arrived within ${data.waitedMs ?? options.waitMs} ms)` : '(inbox empty)')
     );
   } else {
-    for (const m of messages) {
+    for (const m of messages.filter((item) => !item.quiet)) {
       deps.io.out(
         `${palette.emph(`from ${m.from.slice(0, 8)}`)} ${palette.muted(new Date(m.createdAt).toISOString())} ${palette.muted(`#${m.id.slice(0, 8)}`)}`
       );
       deps.io.out(m.text);
+      deps.io.out('');
+    }
+    // Status lines last and compact: one current line per worker, no action owed by itself.
+    const digest = messages.filter((item) => item.quiet);
+    if (digest.length > 0) {
+      deps.io.out(palette.emph(`watch digest (${digest.length}):`));
+      for (const m of digest) deps.io.out(m.text);
       deps.io.out('');
     }
   }

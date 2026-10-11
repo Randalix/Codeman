@@ -316,7 +316,8 @@ export class WebServer extends EventEmitter {
    */
   private readonly inboxNudger = new InboxNudger({
     getSession: (id) => this.sessions.get(id),
-    unseen: (id) => agentInbox.unseen(id),
+    // Quiet mail (IDLE reports) is never worth a nudge on its own.
+    unseen: (id) => agentInbox.unseen(id).filter((m) => !m.quiet),
     pendingCount: (id) => agentInbox.pendingCount(id),
     isWaiting: (id) => agentInbox.summary().get(id)?.waiting === true,
     isShellMode: (mode) => getCli(mode)?.kind === 'shell',
@@ -342,13 +343,17 @@ export class WebServer extends EventEmitter {
       const session = this.sessions.get(id);
       return session ? buildWatchRow(session) : null;
     },
-    post: (to, from, text) => {
+    post: (to, from, text, { quiet }) => {
       // What the post route does: read the wait before the post releases it.
       const receiverWaiting = agentInbox.waiterCount(to) > 0;
-      const result = agentInbox.post(to, from, text);
+      const result = agentInbox.post(to, from, text, { quiet, replaceQuiet: true });
       if (!result.ok) return false;
-      this.inboxNudger.schedule(to, from, { messageId: result.message.id, receiverWaiting });
+      // A quiet report (IDLE) waits for the next loud mail or the end of the wait slice.
+      if (!quiet) this.inboxNudger.schedule(to, from, { messageId: result.message.id, receiverWaiting });
       return true;
+    },
+    withdraw: (to, from) => {
+      agentInbox.withdrawQuiet(to, from);
     },
     enabled: () => process.env.CODEMAN_COORDINATOR_REPORTS !== '0',
     log: (message) => console.log(message),

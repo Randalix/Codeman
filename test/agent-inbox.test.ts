@@ -262,6 +262,73 @@ describe('read with wait', () => {
   });
 });
 
+describe('quiet mail (IDLE digest, w3c 2026-10-11)', () => {
+  const C = 'cccccccc-0000-4000-8000-000000000000';
+
+  it('a quiet post does not release a wait; the next loud post brings both', async () => {
+    const { inbox } = make();
+    const pending = inbox.read(A, 5_000);
+    inbox.post(A, B, '[codeman watch] IDLE b', { quiet: true });
+    expect(inbox.waiterCount(A)).toBe(1);
+    inbox.post(A, C, 'result');
+    const result = await pending;
+    expect(result.messages.map((m) => [m.text, m.quiet === true])).toEqual([
+      ['[codeman watch] IDLE b', true],
+      ['result', false],
+    ]);
+  });
+
+  it('a wait that finds only quiet mail keeps waiting, and hands it out when it runs out', async () => {
+    vi.useFakeTimers();
+    try {
+      const { inbox, tick } = make();
+      inbox.post(A, B, '[codeman watch] IDLE b', { quiet: true });
+      const pending = inbox.read(A, MIN_WAIT_MS);
+      expect(inbox.waiterCount(A)).toBe(1);
+      tick(MIN_WAIT_MS);
+      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
+      const result = await pending;
+      expect(result.timedOut).toBe(true);
+      expect(result.messages.map((m) => m.text)).toEqual(['[codeman watch] IDLE b']);
+      // Handed out, so ack takes it like any other message.
+      expect(inbox.ackSeen(A)).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a plain read (no wait) returns quiet mail at once', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'status', { quiet: true });
+    expect((await inbox.read(A)).messages.map((m) => m.text)).toEqual(['status']);
+  });
+
+  it('replaceQuiet keeps one current line per sender, never touching seen, loud or other senders', async () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'b old (seen)', { quiet: true });
+    await inbox.read(A); // hands out 'b old (seen)'
+    inbox.post(A, B, 'b loud');
+    inbox.post(A, C, 'c status', { quiet: true });
+    inbox.post(A, B, 'b status 1', { quiet: true, replaceQuiet: true });
+    inbox.post(A, B, 'b status 2', { quiet: true, replaceQuiet: true });
+    expect(inbox.list(A).map((m) => m.text)).toEqual(['b old (seen)', 'b loud', 'c status', 'b status 2']);
+    expect(inbox.withdrawQuiet(A, B)).toBe(1);
+    expect(inbox.list(A).map((m) => m.text)).toEqual(['b old (seen)', 'b loud', 'c status']);
+  });
+
+  it('the quiet flag survives a restart', () => {
+    const { inbox } = make();
+    inbox.post(A, B, 'status', { quiet: true });
+    inbox.post(A, B, 'loud');
+    const restored = new AgentInbox();
+    expect(restored.restore(JSON.parse(JSON.stringify(inbox.snapshot())))).toBe(2);
+    expect(restored.list(A).map((m) => m.quiet)).toEqual([true, undefined]);
+    // A malformed flag is refused like any malformed entry.
+    const bad = { version: 1, inboxes: { [A]: [{ id: 'x', from: B, text: 't', createdAt: 1, quiet: 'yes' }] } };
+    expect(new AgentInbox().restore(bad)).toBe(0);
+  });
+});
+
 describe('summary — who is waiting for whom', () => {
   // The state that cost a planner/builder pair 26 minutes: one side parked on its
   // inbox, the other idle with nothing to read. The store records since WHEN a

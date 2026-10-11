@@ -782,6 +782,18 @@ describe('agent post / inbox (mailbox)', () => {
     expect(deps.err.join('\n')).toMatch(/codeman agent ack/);
   });
 
+  it('prints status lines (quiet IDLE reports) last, as one compact digest block', async () => {
+    const msgs = [
+      { id: 'q1', from: OTHER, text: '[codeman watch] IDLE  94990c6d  claude  …', createdAt: 0, quiet: true },
+      { id: 'm1', from: OTHER, text: 'the result', createdAt: 0 },
+    ];
+    const deps = fakeDeps([ok({ messages: msgs, pending: 2, timedOut: false, waitedMs: 0 })]);
+    expect(await agentInbox(deps, { peek: false })).toBe(EXIT.ok);
+    const out = deps.out.join('\n');
+    expect(out).toMatch(/from 94990c6d[^\n]*\nthe result\n[\s\S]*watch digest \(1\):\n\[codeman watch\] IDLE/);
+    expect(out.match(/from 94990c6d/g)).toHaveLength(1); // no header line per status
+  });
+
   it('--peek asks the server to mark nothing; an empty --wait is exit 2', async () => {
     const peek = fakeDeps([ok({ messages: [{ id: 'm1', from: OTHER, text: 'x', createdAt: 0 }], pending: 1 })]);
     expect(await agentInbox(peek, { peek: true })).toBe(EXIT.ok);

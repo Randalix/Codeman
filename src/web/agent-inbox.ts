@@ -27,6 +27,12 @@
  *   resolve on the first post, on `drop()`, on `stop()`, or on timeout — never hang.
  * - Persistence is a whole-store snapshot the server writes on `onChange`; a message
  *   survives a server restart (deploys use KillMode=process, sessions survive too).
+ * - A QUIET message (`post(…, { quiet: true })`, a worker's IDLE report) is stored,
+ *   read, acknowledged and persisted like any other, but it never ends a wait: it does
+ *   not release waiters, and a `read` with `wait` that finds only quiet mail keeps
+ *   waiting. It is handed out with the next loud post or when the wait runs out — a
+ *   digest at most one wait slice old. A status line used to cost the coordinator a
+ *   whole turn each, ~20 an hour (w3c, 2026-10-11).
  *
  * @consumedby web/routes/inbox-routes, web/server (callbacks, persistence, drop on cleanup)
  * @module web/agent-inbox
@@ -54,6 +60,8 @@ export interface InboxMessage {
   from: string;
   text: string;
   createdAt: number;
+  /** Never ends a wait or draws a nudge; read together with the next loud mail. */
+  quiet?: true;
 }
 
 export interface InboxSnapshot {
@@ -75,6 +83,17 @@ export interface InboxReadResult {
 export interface InboxReadOptions {
   /** Mark nothing as seen (the monitor's `--peek`: reading must not consume the mail). */
   peek?: boolean;
+}
+
+export interface PostOptions {
+  /** See `InboxMessage.quiet`. */
+  quiet?: boolean;
+  /**
+   * First withdraw this sender's quiet messages no read has handed out yet, so the
+   * inbox holds one current status line per sender instead of a backlog of stale ones.
+   * Seen-but-unacked ones stay: `ackSeen()` must find what the read handed out.
+   */
+  replaceQuiet?: boolean;
 }
 
 export type PostResult =
@@ -136,20 +155,44 @@ export class AgentInbox {
   constructor(private readonly now: () => number = Date.now) {}
 
   /** Store a message for `sessionId`. Never touches the session's pane. */
-  post(sessionId: string, from: string, text: string): PostResult {
+  post(sessionId: string, from: string, text: string, options: PostOptions = {}): PostResult {
     if (this.stopped) return { ok: false, reason: 'stopped' };
     if (text.length === 0) return { ok: false, reason: 'text-empty' };
     if (text.length > MAX_TEXT_LENGTH) return { ok: false, reason: 'text-too-long' };
     if (from.length > MAX_FROM_LENGTH) return { ok: false, reason: 'from-too-long' };
+    if (options.replaceQuiet) this.removeUnseenQuiet(sessionId, from);
     const queue = this.inboxes.get(sessionId) ?? [];
     if (queue.length >= MAX_MESSAGES_PER_INBOX) return { ok: false, reason: 'full' };
     const message: InboxMessage = { id: randomUUID(), from, text, createdAt: this.now() };
+    if (options.quiet) message.quiet = true;
     queue.push(message);
     this.inboxes.set(sessionId, queue);
     this.onChange?.();
     this.onMessage?.(sessionId, message, queue.length);
-    this.releaseWaiters(sessionId);
+    if (!message.quiet) this.releaseWaiters(sessionId);
     return { ok: true, message, pending: queue.length };
+  }
+
+  /**
+   * Remove `from`'s quiet messages in `sessionId`'s inbox that no read has handed out
+   * yet: its status changed and the old line no longer holds. Returns how many.
+   */
+  withdrawQuiet(sessionId: string, from: string): number {
+    const removed = this.removeUnseenQuiet(sessionId, from);
+    if (removed > 0) this.onChange?.();
+    return removed;
+  }
+
+  private removeUnseenQuiet(sessionId: string, from: string): number {
+    const queue = this.inboxes.get(sessionId);
+    if (!queue) return 0;
+    const seen = this.seen.get(sessionId);
+    const kept = queue.filter((m) => !(m.quiet && m.from === from && !seen?.has(m.id)));
+    const removed = queue.length - kept.length;
+    if (removed === 0) return 0;
+    if (kept.length === 0) this.inboxes.delete(sessionId);
+    else this.inboxes.set(sessionId, kept);
+    return removed;
   }
 
   /** Every pending message, oldest first. Non-destructive. */
@@ -163,7 +206,8 @@ export class AgentInbox {
 
   /**
    * Read, blocking up to `waitMs` (clamped to the agent-wait bounds) while the inbox
-   * is empty. Resolves at once with what is there when it is not empty; a wait that
+   * holds no loud mail (empty, or quiet messages only — those ride along with the
+   * next loud post or the timeout). Resolves at once when loud mail is there; a wait that
    * ends by timeout, `drop()` or `stop()` answers with an empty list and `timedOut`
    * set only for the timeout case. Non-destructive: the messages stay and are only
    * marked as seen (unless `peek`) so `ackSeen()` can remove exactly them later.
@@ -176,7 +220,7 @@ export class AgentInbox {
   ): Promise<InboxReadResult> {
     const peek = options?.peek === true;
     const existing = this.list(sessionId);
-    if (existing.length > 0 || waitMs === undefined || this.stopped || abortSignal?.aborted) {
+    if (existing.some((m) => !m.quiet) || waitMs === undefined || this.stopped || abortSignal?.aborted) {
       if (!peek) this.markSeen(sessionId, existing);
       return { messages: existing, pending: existing.length, timedOut: false, waitedMs: 0 };
     }
@@ -451,7 +495,8 @@ function isInboxMessage(value: unknown): value is InboxMessage {
     typeof m.from === 'string' &&
     typeof m.text === 'string' &&
     m.text.length <= MAX_TEXT_LENGTH &&
-    typeof m.createdAt === 'number'
+    typeof m.createdAt === 'number' &&
+    (m.quiet === undefined || m.quiet === true)
   );
 }
 

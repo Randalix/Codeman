@@ -45,17 +45,19 @@ function row(over: Partial<WatchRow> = {}): WatchRow {
 
 function setup(opts: { enabled?: boolean; postOk?: boolean } = {}) {
   const sessions = new Map<string, Fake>();
-  const posts: { to: string; from: string; text: string }[] = [];
+  const posts: { to: string; from: string; text: string; quiet: boolean }[] = [];
+  const withdrawn: { to: string; from: string }[] = [];
   const logs: string[] = [];
   const saved: MuteSnapshot[] = [];
   const reports = new CoordinatorReports({
     getSession: (id) => sessions.get(id),
     row: (id) => sessions.get(id)?.row ?? null,
-    post: (to, from, text) => {
+    post: (to, from, text, { quiet }) => {
       if (opts.postOk === false) return false;
-      posts.push({ to, from, text });
+      posts.push({ to, from, text, quiet });
       return true;
     },
+    withdraw: (to, from) => withdrawn.push({ to, from }),
     enabled: () => opts.enabled ?? true,
     log: (line) => logs.push(line),
     saveMutes: (snapshot) => saved.push(snapshot),
@@ -66,7 +68,7 @@ function setup(opts: { enabled?: boolean; postOk?: boolean } = {}) {
     return s;
   };
   add(COORD);
-  return { sessions, posts, logs, saved, reports, add };
+  return { sessions, posts, withdrawn, logs, saved, reports, add };
 }
 
 beforeEach(() => vi.useFakeTimers());
@@ -289,6 +291,50 @@ describe('mute', () => {
   });
 });
 
+describe('digest (w3c, 2026-10-11: one IDLE post per turn cost the coordinator a turn each)', () => {
+  it('IDLE goes out quiet; BLOCKED, EXITED and GONE stay loud', async () => {
+    const { sessions, posts, reports, add } = setup();
+    const w = add(WORKER, { parentSessionId: COORD, row: row({ reason: 'done' }) });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    w.row = row({ reason: 'blocked', turnEndSource: null, turnEndedAt: 2_000 });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    w.row = row({ reason: 'exited', turnEndSource: 'exit', turnEndedAt: 3_000 });
+    reports.notify(WORKER);
+    sessions.delete(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts.map((p) => [p.text.split('  ')[0], p.quiet])).toEqual([
+      ['[codeman watch] IDLE', true],
+      ['[codeman watch] BLOCKED', false],
+      ['[codeman watch] GONE', false],
+    ]);
+  });
+
+  it('a worker parked on its own inbox (waiting-inbox) is not reported; its old line is withdrawn', async () => {
+    const { posts, withdrawn, reports, add } = setup();
+    const w = add(WORKER, { parentSessionId: COORD, row: row({ reason: 'done' }) });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    w.row = row({ reason: 'waiting-inbox', turnEndedAt: 2_000 });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    reports.notify(WORKER); // same stamp again: no second withdraw
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts).toHaveLength(1);
+    expect(withdrawn).toEqual([{ to: COORD, from: WORKER }]);
+  });
+
+  it('a pane exit is reported as EXITED even when the row still says waiting-inbox', async () => {
+    const { posts, withdrawn, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row({ reason: 'waiting-inbox', turnEndSource: 'exit' }) });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts.map((p) => [p.text.split('  ')[0], p.quiet])).toEqual([['[codeman watch] EXITED', false]]);
+    expect(withdrawn).toEqual([]);
+  });
+});
+
 describe('turnWatch subscription', () => {
   it('every notify reaches the subscribers, until they unsubscribe', () => {
     const watch = new TurnWatch();
@@ -332,5 +378,16 @@ describe('wiring guard', () => {
     );
     expect(block).toContain('this.inboxNudger.schedule(');
     expect(block).not.toMatch(/remoteWake|RemoteWake|ensureAwake/);
+  });
+
+  it('a quiet report replaces the old line and draws no nudge; quiet mail is never a nudge reason', () => {
+    const block = server.slice(
+      server.indexOf('new CoordinatorReports('),
+      server.indexOf('private unsubscribeCoordinatorReports')
+    );
+    expect(block).toContain('agentInbox.post(to, from, text, { quiet, replaceQuiet: true })');
+    expect(block).toContain('if (!quiet) this.inboxNudger.schedule(');
+    expect(block).toContain('agentInbox.withdrawQuiet(to, from)');
+    expect(server).toContain('unseen: (id) => agentInbox.unseen(id).filter((m) => !m.quiet),');
   });
 });

@@ -23,6 +23,18 @@
  * - NEVER wakes a host: posting is local; the nudger keeps its own remote rule.
  * - Off globally with `CODEMAN_COORDINATOR_REPORTS=0`.
  *
+ * Digest (w3c, 2026-10-11: ~20 IDLE posts an hour, each one ended the coordinator's
+ * `inbox --wait` and cost it a turn with nothing to do; the real result comes as the
+ * worker's own post anyway):
+ * - IDLE reports are QUIET mailbox messages (`agent-inbox.ts`): they never end a wait
+ *   and draw no nudge, and are read together with the next loud mail or when the
+ *   coordinator's wait slice runs out. BLOCKED, EXITED and GONE stay loud.
+ * - Every report from a worker replaces that worker's unseen quiet line, so the
+ *   mailbox holds one current status per worker, not a backlog.
+ * - `waiting-inbox` is not reported at all: the worker is correctly parked on its own
+ *   mailbox (`agent ls` shows it under WAIT). Its older unseen line is withdrawn,
+ *   since it no longer holds.
+ *
  * Mute (`agent mute <worker> --for 30m`): a worker that babysits a long process ends a
  * short turn every minute, and each one was an IDLE in the coordinator's mailbox (w3c,
  * ~45 in 34 minutes, 2026-10-11). A muted worker's IDLE reports are dropped; BLOCKED,
@@ -58,8 +70,14 @@ export interface CoordinatorReportDeps {
   getSession(id: string): ReportSource | undefined;
   /** The row `GET /api/agent-watch` would report for this session now, or null. */
   row(id: string): WatchRow | null;
-  /** Post into `to`'s mailbox as `from` (and schedule its nudge). False when refused. */
-  post(to: string, from: string, text: string): boolean;
+  /**
+   * Post into `to`'s mailbox as `from`, replacing `from`'s unseen quiet line there. A
+   * loud post also schedules the nudge; a quiet one neither wakes a wait nor nudges.
+   * False when refused.
+   */
+  post(to: string, from: string, text: string, options: { quiet: boolean }): boolean;
+  /** Withdraw `from`'s unseen quiet lines from `to`'s mailbox. */
+  withdraw(to: string, from: string): void;
   enabled(): boolean;
   log(message: string): void;
   /** Persist the current mutes (called on every change). */
@@ -198,6 +216,7 @@ export class CoordinatorReports {
     if (this.stopped || !this.deps.getSession(parent)) return 'skipped';
     const session = this.deps.getSession(sessionId);
     let text: string;
+    let quiet = false;
     if (!session) {
       // Closed between the exit and the report: the coordinator must still learn it.
       text = `[codeman watch] GONE  ${sessionId.slice(0, 8)}  ${name}`;
@@ -209,9 +228,15 @@ export class CoordinatorReports {
       // Muted: drop an IDLE without marking it reported, so the end of the mute catches up.
       if (this.mutes.has(sessionId) && reportKind(row) === 'IDLE') return 'skipped';
       this.reported.set(sessionId, row.turnEndedAt);
+      // Only an IDLE line is suppressed: a pane exit still says EXITED.
+      if (row.reason === 'waiting-inbox' && reportKind(row) === 'IDLE') {
+        this.deps.withdraw(parent, sessionId);
+        return 'skipped';
+      }
       text = reportText(row);
+      quiet = reportKind(row) === 'IDLE';
     }
-    if (!this.deps.post(parent, sessionId, text)) {
+    if (!this.deps.post(parent, sessionId, text, { quiet })) {
       this.deps.log(`[CoordinatorReports] ${sessionId.slice(0, 8)} → ${parent.slice(0, 8)}: report not posted`);
       return 'skipped';
     }
