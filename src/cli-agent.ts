@@ -1238,7 +1238,7 @@ export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as
-    | { text?: string; timestamp?: string; messages?: Array<{ role: string; text: string }> }
+    | { text?: string; timestamp?: string; messages?: Array<{ role: string; text: string }>; unavailable?: string }
     | undefined;
   if (deps.json) {
     emitJson(deps, data ?? {});
@@ -1249,6 +1249,10 @@ export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<
     return EXIT.ok;
   }
   const text = data?.text ?? '';
+  if (!text && data?.unavailable) {
+    deps.io.err(palette.muted(`(transcript unavailable: ${data.unavailable}; try --tail 3000)`));
+    return EXIT.ok;
+  }
   if (!text) {
     deps.io.err(
       palette.muted('(empty: nothing answered yet, or nothing the server could segment as an answer; try --tail 3000)')

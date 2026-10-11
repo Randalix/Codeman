@@ -24,6 +24,9 @@ import {
   buildRemoteFileCommand,
   buildRemoteProbeCommand,
   buildRemoteReadCommand,
+  buildRemoteClaudeTranscriptTailCommand,
+  parseRemoteClaudeTranscriptTail,
+  remoteReadClaudeTranscriptTail,
   parseRemoteProbeRecord,
   parseRemoteProbeOutput,
   remoteProbePaths,
@@ -398,5 +401,69 @@ describe('buildRemoteReadCommand', () => {
 
   it('covers the first byte of the file (tail -c +1, not +0)', () => {
     expect(buildRemoteReadCommand('/f', { start: 0, end: 0 })).toBe("tail -c +1 '/f' | head -c 1");
+  });
+});
+
+describe('the remote claude transcript script on a real shell', () => {
+  let home: string;
+  beforeAll(() => {
+    home = mkdtempSync(join(tmpdir(), 'codeman-remote-transcript-'));
+    mkdirSync(join(home, '.claude', 'projects', '-other'), { recursive: true });
+    mkdirSync(join(home, '.claude', 'projects', '-mnt-work dir'), { recursive: true });
+    writeFileSync(join(home, '.claude', 'projects', '-other', 'abc.jsonl'), 'unrelated\n');
+    writeFileSync(join(home, '.claude', 'projects', '-mnt-work dir', 'conv-1.jsonl'), 'line one\nline two\n');
+  });
+  afterAll(() => rmSync(home, { recursive: true, force: true }));
+
+  const run = (ids: string[], maxBytes = 1024) => {
+    const env = { ...process.env, HOME: home };
+    try {
+      return {
+        code: 0,
+        stdout: execFileSync('sh', ['-c', buildRemoteClaudeTranscriptTailCommand(ids, maxBytes)], { env }).toString(),
+      };
+    } catch (err) {
+      const e = err as { status: number; stdout: Buffer };
+      return { code: e.status, stdout: e.stdout.toString() };
+    }
+  };
+
+  it('finds the transcript in any project dir (spaces included) and reports the matched id', () => {
+    const { code, stdout } = run(['missing-id', 'conv-1']);
+    expect(code).toBe(0);
+    expect(parseRemoteClaudeTranscriptTail('banner from .bashrc\n' + stdout)).toEqual({
+      sessionId: 'conv-1',
+      content: 'line one\nline two\n',
+    });
+  });
+
+  it('returns only the last maxBytes bytes', () => {
+    expect(parseRemoteClaudeTranscriptTail(run(['conv-1'], 9).stdout)?.content).toBe('line two\n');
+  });
+
+  it('exits 3 when no id has a transcript', () => {
+    expect(run(['nope']).code).toBe(3);
+  });
+
+  it('never interpolates an id that is not a plain token', () => {
+    const command = buildRemoteClaudeTranscriptTailCommand(['$(touch pwned)', "a'b", '../../x'], 1024);
+    expect(command).toBe('exit 3');
+  });
+
+  it('refuses to open a connection under test', async () => {
+    await expect(
+      remoteReadClaudeTranscriptTail(
+        { hostId: 'h', label: 'h', host: '192.0.2.1', username: 'j', remotePath: '/' },
+        ['a'],
+        10
+      )
+    ).rejects.toBeInstanceOf(RemoteFileAccessError);
+  });
+});
+
+describe('parseRemoteClaudeTranscriptTail', () => {
+  it('is null when the protocol markers are missing', () => {
+    expect(parseRemoteClaudeTranscriptTail('Welcome to host')).toBeNull();
+    expect(parseRemoteClaudeTranscriptTail('\0id-without-terminator')).toBeNull();
   });
 });

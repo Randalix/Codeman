@@ -186,12 +186,20 @@ import {
   selectLastAnsweredTurn,
 } from '../response-viewer-transcript.js';
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
+import { RemoteFileAccessError, remoteReadClaudeTranscriptTail } from '../../remote-files.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
 
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
 const LINKED_CASES_FILE = dataPath('linked-cases.json');
 const CODEMAN_CONFIG_DIR = getDataDir();
+
+/**
+ * How much of a REMOTE claude transcript `last-response` pulls over ssh: the end of
+ * the file only. Enough for the last answer and a long recent history; a very long
+ * conversation's `context=full` view starts at the cut instead of at turn 1.
+ */
+const REMOTE_CLAUDE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 
 // Pre-compiled regex for terminal buffer cleaning (avoids per-request compilation)
 // eslint-disable-next-line no-control-regex
@@ -2672,6 +2680,40 @@ export function registerSessionRoutes(
         hasContext: blocks.length > 0,
         messages: externalQuery.context === 'full' ? blocks : undefined,
       };
+    }
+
+    // A remote-SSH case's claude writes its transcript into the REMOTE user's
+    // ~/.claude/projects, so the local scan below can never find it and returned
+    // "nothing answered yet" for a worker that had answered. Read the end of the
+    // remote file over ssh instead. Only the response viewer and `agent read` call
+    // this route (nothing polls it), so one ssh round trip per call is fine; a
+    // sleeping host is a connect timeout, never a wake.
+    if (session.remote) {
+      const remoteQuery = req.query as { context?: string };
+      const wantsRemoteMessages = remoteQuery.context === 'full' || remoteQuery.context === 'turn';
+      const empty = wantsRemoteMessages ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
+      let remoteTranscript: { sessionId: string; content: string } | null;
+      try {
+        remoteTranscript = await remoteReadClaudeTranscriptTail(
+          session.remote,
+          [session.claudeSessionId || session.id, session.id],
+          REMOTE_CLAUDE_TRANSCRIPT_TAIL_BYTES
+        );
+      } catch (err) {
+        // Say WHY instead of an empty answer an agent reads as "not answered yet".
+        if (err instanceof RemoteFileAccessError) return { ...empty, unavailable: err.message };
+        throw err;
+      }
+      if (!remoteTranscript) return empty;
+      const parsed = parseClaudeResponseTranscript(remoteTranscript.content, wantsRemoteMessages);
+      if (remoteQuery.context === 'turn') {
+        return {
+          text: parsed.text,
+          timestamp: parsed.timestamp,
+          messages: selectLastAnsweredTurn(parsed.messages ?? []),
+        };
+      }
+      return parsed;
     }
 
     // Scan ~/.claude/projects/*/ for the transcript file

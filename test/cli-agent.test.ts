@@ -492,6 +492,17 @@ describe('agent read', () => {
     expect(deps.err.join('')).toMatch(/nothing answered yet.*--tail 3000/);
   });
 
+  it('passes on the reason when the server could not read the transcript (remote host)', async () => {
+    const deps = fakeDeps([
+      ok({ text: '', timestamp: '', unavailable: 'remote host Hufflepuff unreachable: timed out' }),
+    ]);
+    expect(await agentRead(deps, { id: OTHER })).toBe(EXIT.ok);
+    expect(deps.err.join('')).toMatch(
+      /transcript unavailable: remote host Hufflepuff unreachable: timed out.*--tail 3000/
+    );
+    expect(deps.err.join('')).not.toMatch(/nothing answered yet/);
+  });
+
   it('--tail fetches the terminal and strips ANSI', async () => {
     const deps = fakeDeps([ok({ terminalBuffer: '\u001b]0;w1 title\u0007\u001b[32m❯\u001b[0m ready \u001b(B' })]);
     expect(await agentRead(deps, { id: OTHER, tail: 500 })).toBe(EXIT.ok);

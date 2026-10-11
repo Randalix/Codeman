@@ -407,6 +407,85 @@ export async function remoteReadFile(remote: SessionRemote, remotePath: string, 
   }
 }
 
+/** Conversation ids are uuids; anything else never reaches the remote shell. */
+const CLAUDE_TRANSCRIPT_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/** Exit status the transcript script uses for "no such transcript on that host". */
+const TRANSCRIPT_NOT_FOUND_EXIT = 3;
+
+/**
+ * Script that prints the END of a claude transcript in the remote user's
+ * `~/.claude/projects/*\/<id>.jsonl`, trying each id in order.
+ *
+ * Output: a lone NUL (rc-file chatter before it is discarded), the id that matched,
+ * a NUL, then the last `maxBytes` bytes of the file. Exit 3 = no transcript under
+ * any id. The tail may start mid-line; the JSONL parser skips that one row.
+ *
+ * `$HOME` is deliberately expanded by the REMOTE shell — the transcript lives in the
+ * remote user's home, which the server cannot know. Ids are validated and each one
+ * is a single shellescaped token.
+ */
+export function buildRemoteClaudeTranscriptTailCommand(ids: readonly string[], maxBytes: number): string {
+  const safeIds = [...new Set(ids)].filter((id) => CLAUDE_TRANSCRIPT_ID_PATTERN.test(id));
+  if (safeIds.length === 0) return `exit ${TRANSCRIPT_NOT_FOUND_EXIT}`;
+  return [
+    "printf '\\0'",
+    'f=',
+    `for id in ${safeIds.map((id) => shellescape(id)).join(' ')}; do`,
+    '  f=$(ls -t "$HOME"/.claude/projects/*/"$id".jsonl 2>/dev/null | head -n 1)',
+    '  [ -n "$f" ] && break',
+    'done',
+    `[ -n "$f" ] || exit ${TRANSCRIPT_NOT_FOUND_EXIT}`,
+    'printf \'%s\\0\' "$id"',
+    `tail -c ${Math.max(1, Math.floor(maxBytes))} "$f"`,
+  ].join('\n');
+}
+
+/** Split the transcript script's output; `null` = the protocol was not followed. */
+export function parseRemoteClaudeTranscriptTail(stdout: string): { sessionId: string; content: string } | null {
+  const start = stdout.indexOf('\0');
+  if (start === -1) return null;
+  const idEnd = stdout.indexOf('\0', start + 1);
+  if (idEnd === -1) return null;
+  return { sessionId: stdout.slice(start + 1, idEnd), content: stdout.slice(idEnd + 1) };
+}
+
+/**
+ * Read the end of a remote claude session's transcript in ONE ssh round trip.
+ *
+ * A remote case's claude writes its transcript into the remote user's
+ * ~/.claude/projects, so `last-response` cannot find it locally. Returns `null` when
+ * no transcript exists yet under any id; an unreachable host or an ssh failure is a
+ * `RemoteFileAccessError`. Never wakes a host: a sleeping one is a connect timeout.
+ */
+export async function remoteReadClaudeTranscriptTail(
+  remote: SessionRemote,
+  ids: readonly string[],
+  maxBytes: number
+): Promise<{ sessionId: string; content: string } | null> {
+  assertNotUnderTest();
+  const command = buildRemoteFileCommand(remote, buildRemoteClaudeTranscriptTailCommand(ids, maxBytes));
+  let stdout: Buffer;
+  try {
+    const result = await runWithRemoteSshLimit(() =>
+      execAsync(command, {
+        timeout: REMOTE_READ_TIMEOUT_MS,
+        maxBuffer: maxBytes + READ_BUFFER_SLACK_BYTES,
+        encoding: 'buffer',
+      })
+    );
+    stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout);
+  } catch (err) {
+    if ((err as { code?: unknown }).code === TRANSCRIPT_NOT_FOUND_EXIT) return null;
+    throw new RemoteFileAccessError(
+      `remote host ${remote.label || remote.host} unreachable: ${describeExecError(err)}`
+    );
+  }
+  const parsed = parseRemoteClaudeTranscriptTail(stdout.toString('utf8'));
+  if (!parsed) throw new RemoteFileAccessError('unexpected output from the remote transcript read');
+  return parsed;
+}
+
 /**
  * Command that writes a remote file's bytes to stdout.
  *

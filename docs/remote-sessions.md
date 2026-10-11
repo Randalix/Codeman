@@ -280,6 +280,7 @@ and it follows the same rule as the launch path: every ssh command line comes fr
 | `POST /api/sessions/:id/attachments` | Registers an absolute path that lives on the **remote** host (a clicked link pointing outside the case directory) by probing it there |
 | `GET /api/sessions/:id/attachments/:attachmentId/raw` | Streams the registered remote file over ssh, same 200/206/416 contract; `preview` (office) and `thumbnail` answer `400` |
 | `GET /api/sessions/:id/attachments/:attachmentId`, `GET …/attachments` (history) | Size/mtime/existence resolved over ssh, so a remote entry is not reported `missing`; the history list resolves EVERY entry in one batched probe, never one connection per entry |
+| `GET /api/sessions/:id/last-response` (claude) | The transcript lives in the **remote** user's `~/.claude/projects`, so the end of it (4 MB) is read over ssh in one round trip (`remoteReadClaudeTranscriptTail`). No transcript yet → empty answer; host unreachable → empty answer plus `unavailable: <reason>`, which `codeman agent read` prints instead of "nothing answered yet". Only the response viewer and `agent read` call it — nothing polls, and a sleeping host is a connect timeout, never a wake |
 
 ⚠️ The attachment route is the one a clicked path takes when it is **outside** the case
 directory (a remote `/tmp` scratchpad capture, a screenshot elsewhere in the home dir):
