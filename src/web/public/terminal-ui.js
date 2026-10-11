@@ -997,8 +997,8 @@ Object.assign(CodemanApp.prototype, {
     //
     // So: capture runs ancestors-first; this handler sees every wheel first
     // and stops propagation, keeping xterm's scroller out of it entirely.
-    // Local scrolling goes through terminal.scrollLines() — buffer-level, so
-    // it keeps working after resets — with our own deltaMode normalization
+    // Local scrolling goes through xterm's public scrollLines() API, with
+    // our own deltaMode normalization
     // (_wheelScrollLines) covering Firefox's line-unit wheels. Two cases still
     // belong to xterm and are passed through untouched:
     //  - mouseTrackingMode active: xterm's own encoder forwards the wheel to
@@ -1071,7 +1071,7 @@ Object.assign(CodemanApp.prototype, {
               this._forwardScrollToApp(touchLastX, touchLastY, lines);
             } else if (!this._maybePageCliTranscript({ shiftKey: false }, lines)) {
               this._noteTerminalUserScroll(lines);
-              this.terminal.scrollLines(lines);
+              this._scrollTerminalLines(lines);
               this._maybeLoadMoreHistoryOnScroll(lines);
             }
           }
@@ -1250,7 +1250,7 @@ Object.assign(CodemanApp.prototype, {
               } else if (!this._maybePageCliTranscript({ shiftKey: false }, lines)) {
                 this._logScrollRouting('local-scrollback');
                 this._noteTerminalUserScroll(lines);
-                this.terminal.scrollLines(lines);
+                this._scrollTerminalLines(lines);
                 this._maybeLoadMoreHistoryOnScroll(lines);
               }
               pixelAccum -= lines * ch;
@@ -3785,6 +3785,80 @@ Object.assign(CodemanApp.prototype, {
     this._wasAtBottomBeforeWrite = this.isTerminalAtBottom();
   },
 
+  // Record a refused local scroll without changing xterm internals. Android's
+  // keyboard toggle can recover the reported stuck state; these dimensions
+  // distinguish stale viewport geometry from a gesture routed to the CLI.
+  _scrollTerminalLines(lines) {
+    const before = this.terminal.buffer.active;
+    const target = Math.max(0, Math.min(before.baseY, before.viewportY + lines));
+    this.terminal.scrollLines(lines);
+    if (this.terminal.buffer.active.viewportY === target) return;
+    try {
+      const now = performance.now();
+      if (this._lastScrollStallLogAt != null && now - this._lastScrollStallLogAt < 1000) return;
+      this._lastScrollStallLogAt = now;
+      const viewport = this.terminal._core?._viewport;
+      const model = viewport?._scrollableElement;
+      const pos = model?.getScrollPosition?.();
+      const dims = model?.getScrollDimensions?.();
+      const cellHeight = this.terminal._core?._renderService?.dimensions?.css?.cell?.height;
+      if (typeof _crashDiag !== 'undefined') {
+        _crashDiag.log(`SCROLL STALL: ${this.activeSessionId} target=${target} row=${this.terminal.buffer.active.viewportY} ` +
+          `base=${before.baseY} top=${pos?.scrollTop} height=${dims?.height}/${dims?.scrollHeight} cell=${cellHeight}`);
+      }
+    } catch {} // Diagnostics must never interrupt a drag.
+  },
+
+  // A replay destroys xterm markers. Keep a short, transient text context so
+  // appended output is not mistaken for older history prepended by the fetch.
+  _captureTerminalReadingPosition() {
+    const buffer = this.terminal?.buffer?.active;
+    if (!buffer) return null;
+    const row = buffer.viewportY;
+    const context = [];
+    for (let offset = -2; offset <= 2; offset++) {
+      const text = buffer.getLine(row + offset)?.translateToString(true);
+      if (text?.trim()) context.push({ offset, text });
+    }
+    return {
+      sessionId: this.activeSessionId,
+      selectGeneration: this._selectGeneration || 0,
+      generation: this._terminalUserScrollGeneration || 0,
+      context,
+    };
+  },
+
+  _restoreTerminalReadingPosition(anchor, fallbackLine) {
+    if (!anchor) return false;
+    // The user may scroll while the replacement frame is parsing. That newer
+    // position belongs to the new buffer and must not be overwritten.
+    if (anchor.sessionId !== this.activeSessionId ||
+        anchor.selectGeneration !== (this._selectGeneration || 0) ||
+        anchor.generation !== (this._terminalUserScrollGeneration || 0)) return true;
+    if (fallbackLine === null) {
+      this.terminal.scrollToBottom();
+      return true;
+    }
+    const buffer = this.terminal?.buffer?.active;
+    if (!buffer || !anchor.context.length) return false;
+    const first = anchor.context[0];
+    let nearest = null;
+    let distance = Infinity;
+    for (let row = 0; row <= buffer.baseY; row++) {
+      if (buffer.getLine(row + first.offset)?.translateToString(true) !== first.text) continue;
+      if (!anchor.context.every(({ offset, text }) =>
+        buffer.getLine(row + offset)?.translateToString(true) === text)) continue;
+      const candidateDistance = Math.abs(row - fallbackLine);
+      if (candidateDistance < distance) {
+        nearest = row;
+        distance = candidateDistance;
+      }
+    }
+    if (nearest === null) return false; // Reflow/eviction: retain the caller's bounded fallback.
+    this.terminal.scrollToLine(nearest);
+    return true;
+  },
+
   // Record manual scroll gestures so sticky-scroll can give an upward scroll a
   // short grace window (see _hasRecentUserScrollUp). A downward scroll that
   // lands back at the bottom clears the suppression immediately.
@@ -3896,7 +3970,7 @@ Object.assign(CodemanApp.prototype, {
       const move = pending > 0 ? Math.max(1, Math.floor(eased)) : Math.min(-1, Math.ceil(eased));
       this._smoothScrollPending = pending - move;
       this._noteTerminalUserScroll(move);
-      this.terminal.scrollLines(move);
+      this._scrollTerminalLines(move);
       this._maybeLoadMoreHistoryOnScroll(move);
       if (Math.abs(this._smoothScrollPending) >= 1) this._smoothScrollFrame = requestAnimationFrame(step);
     };
@@ -5970,6 +6044,9 @@ Object.assign(CodemanApp.prototype, {
     if (!this._scrollRoutingLogged) this._scrollRoutingLogged = new Map();
     if (this._scrollRoutingLogged.get(sessionId) === signature) return;
     this._scrollRoutingLogged.set(sessionId, signature);
+    if (typeof _crashDiag !== 'undefined') {
+      _crashDiag.log(`SCROLL ROUTE: ${sessionId} ${decision} base=${baseY} tracking=${tracking}/${cliTracking}`);
+    }
     console.log(
       `[scroll] ${sessionId} → ${decision} (mode=${session?.mode || '?'}, cliVersion=${session?.cliVersion || 'unknown'}, ` +
         `localScrollbackOptOut=${optOut}, mouseTracking=${tracking}, cliMouseTracking=${cliTracking}, ` +

@@ -237,6 +237,10 @@ const KeyboardHandler = {
   // the top visible line to return to.
   _settleFollowing: true,
   _settleAnchorY: null,
+  _settleAnchorMarker: null,
+  _settleSessionId: null,
+  _settleSelectGeneration: 0,
+  _settleScrollGeneration: 0,
 
   /** Initialize keyboard handling */
   init() {
@@ -312,6 +316,11 @@ const KeyboardHandler = {
     this._settlePending = false;
     this._settleFollowing = true;
     this._settleAnchorY = null;
+    this._settleAnchorMarker?.dispose();
+    this._settleAnchorMarker = null;
+    this._settleSessionId = null;
+    this._settleSelectGeneration = 0;
+    this._settleScrollGeneration = 0;
   },
 
   /**
@@ -564,11 +573,23 @@ const KeyboardHandler = {
    * terminal we cannot read keeps the historical scroll-to-bottom behavior.
    */
   _captureTerminalScrollIntent() {
+    this._settleAnchorMarker?.dispose();
+    this._settleAnchorMarker = null;
     this._settleFollowing = true;
     this._settleAnchorY = null;
     if (typeof app === 'undefined' || !app.terminal?.buffer?.active) return;
+    this._settleSessionId = app.activeSessionId;
+    this._settleSelectGeneration = app._selectGeneration || 0;
+    this._settleScrollGeneration = app._terminalUserScrollGeneration || 0;
     this._settleFollowing = app.isTerminalAtBottom();
-    if (!this._settleFollowing) this._settleAnchorY = app.terminal.buffer.active.viewportY;
+    if (!this._settleFollowing) {
+      const buffer = app.terminal.buffer.active;
+      this._settleAnchorY = buffer.viewportY;
+      // Output may trim scrollback before the timer fires. A marker follows
+      // the text; the numeric anchor remains the fallback for terminals without it.
+      this._settleAnchorMarker =
+        app.terminal.registerMarker?.(buffer.viewportY - buffer.baseY - buffer.cursorY) || null;
+    }
   },
 
   /**
@@ -578,7 +599,8 @@ const KeyboardHandler = {
    */
   _restoreTerminalScrollIntent() {
     const term = typeof app !== 'undefined' ? app.terminal : null;
-    const anchor = this._settleAnchorY;
+    const marker = this._settleAnchorMarker;
+    const anchor = marker ? (marker.isDisposed ? 0 : marker.line) : this._settleAnchorY;
     if (typeof anchor !== 'number' || typeof term?.scrollToLine !== 'function' || !term.buffer?.active) {
       term?.scrollToBottom?.();
       return;
@@ -597,10 +619,19 @@ const KeyboardHandler = {
     this._viewportSettleTimer = setTimeout(() => {
       this._viewportSettleTimer = null;
       this._settlePending = false;
-      const shouldRestoreScroll = this._settleRestoreScroll;
+      const sameSession =
+        typeof app !== 'undefined' &&
+        this._settleSessionId === app.activeSessionId &&
+        this._settleSelectGeneration === (app._selectGeneration || 0);
+      const shouldRestoreScroll = this._settleRestoreScroll && sameSession;
       this._settleRestoreScroll = false;
 
       if (typeof app !== 'undefined' && app.terminal) {
+        // A swipe during the OS animation supersedes the intent captured when
+        // it began. Sample the new view BEFORE the final geometry reflow.
+        if (sameSession && this._settleScrollGeneration !== (app._terminalUserScrollGeneration || 0)) {
+          this._captureTerminalScrollIntent();
+        }
         // Floored fit, not a bare fitAddon.fit(): _shrinkPaddingToFit measures
         // the leftover gap under the LAST row, so it has to run against the
         // geometry xterm will actually keep (issue #464).
@@ -611,11 +642,14 @@ const KeyboardHandler = {
         if (shouldRestoreScroll) {
           if (this._settleFollowing === false) this._restoreTerminalScrollIntent();
           else app.terminal.scrollToBottom();
+          app._syncStickyScrollBaseline?.();
         }
         app._syncMobileHelperTextareaToCursor?.();
         app._localEchoOverlay?.rerender?.();
         this._sendTerminalResize();
       }
+      this._settleAnchorMarker?.dispose();
+      this._settleAnchorMarker = null;
       window.scrollTo(0, 0);
     }, this.VIEWPORT_SETTLE_MS);
   },

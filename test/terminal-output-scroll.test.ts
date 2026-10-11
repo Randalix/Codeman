@@ -127,3 +127,74 @@ describe('new output preserves the text being read', () => {
     expect(terminal.markers).toHaveLength(0);
   });
 });
+
+describe('capture replays preserve the text being read', () => {
+  const history = (start: number, end: number) =>
+    Array.from({ length: end - start }, (_, i) => `history ${start + i}\r\n`).join('');
+
+  async function readingReplay() {
+    const state = await harness();
+    state.terminal.options.scrollback = 1000;
+    const replay = async (text: string) => {
+      state.terminal.write('\x1bc');
+      await new Promise<void>((resolve) => state.terminal.write(text, resolve));
+    };
+    await replay(history(0, 200));
+    state.terminal.scrollToLine(30);
+    return { ...state, replay };
+  }
+
+  it.each([
+    { start: 0, end: 210, fallback: 40 },
+    { start: -10, end: 200, fallback: 40 },
+    { start: -10, end: 210, fallback: 50 },
+  ])('holds the same text with a replacement spanning $start..$end', async ({ start, end, fallback }) => {
+    const { app, terminal, top, replay } = await readingReplay();
+    const before = top();
+    const anchor = app._captureTerminalReadingPosition();
+    await replay(history(start, end));
+    expect(app._restoreTerminalReadingPosition(anchor, fallback)).toBe(true);
+    expect(top()).toBe(before);
+    expect(terminal.markers).toHaveLength(0);
+  });
+
+  it('uses neighboring rows to distinguish repeated headings', async () => {
+    const { app, terminal, top, replay } = await readingReplay();
+    const text = history(0, 30) + 'Repeated heading\r\n' + history(31, 200);
+    await replay(text);
+    terminal.scrollToLine(30);
+    const anchor = app._captureTerminalReadingPosition();
+    await replay('Repeated heading\r\n'.repeat(40) + text + history(200, 210));
+    expect(app._restoreTerminalReadingPosition(anchor, 80)).toBe(true);
+    expect(terminal.buffer.active.viewportY).toBe(70);
+    expect(top()).toBe('Repeated heading');
+  });
+
+  it('continues following output when already at the bottom', async () => {
+    const { app, terminal, replay } = await readingReplay();
+    terminal.scrollToBottom();
+    const anchor = app._captureTerminalReadingPosition();
+    await replay(history(0, 210));
+    app._restoreTerminalReadingPosition(anchor, null);
+    expect(terminal.buffer.active.viewportY).toBe(terminal.buffer.active.baseY);
+  });
+
+  it.each(['gesture', 'session', 'selection'])('does not restore a position superseded by a newer %s', async (kind) => {
+    const { app, terminal, replay } = await readingReplay();
+    const anchor = app._captureTerminalReadingPosition();
+    await replay(history(0, 210));
+    terminal.scrollToLine(15);
+    if (kind === 'gesture') app._noteTerminalUserScroll(-1);
+    else if (kind === 'session') app.activeSessionId = 'new';
+    else app._selectGeneration = 1;
+    expect(app._restoreTerminalReadingPosition(anchor, 40)).toBe(true);
+    expect(terminal.buffer.active.viewportY).toBe(15);
+  });
+
+  it('allows a bounded fallback when the text has been evicted', async () => {
+    const { app, replay } = await readingReplay();
+    const anchor = app._captureTerminalReadingPosition();
+    await replay(history(50, 210));
+    expect(app._restoreTerminalReadingPosition(anchor, 0)).toBe(false);
+  });
+});

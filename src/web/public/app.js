@@ -3244,10 +3244,11 @@ class CodemanApp {
       if (data.terminalBuffer) {
         // This refresh is SERVER-triggered, so a user quietly reading scrollback
         // did not ask for it and must not be dragged to the bottom by it (#259).
-        // The rewrite replaces the buffer, so an absolute viewportY is
-        // meaningless across it — distance from the bottom is what survives.
+        // Match the visible text across the rewrite. Distance from the bottom
+        // is only a fallback if reflow or eviction removed that context.
         const before = this.terminal.buffer?.active;
         const linesFromBottom = before ? Math.max(0, (before.baseY || 0) - (before.viewportY || 0)) : 0;
+        const readingAnchor = this._captureTerminalReadingPosition?.();
         // One queued clear, not clear()+reset(): both of those are synchronous
         // and skip xterm's write queue, so live bytes still parsing would land
         // after them and fuse into the buffer written below. See
@@ -3266,8 +3267,10 @@ class CodemanApp {
           linesFromBottom,
           baseY: this.terminal.buffer?.active?.baseY ?? 0,
         });
-        if (target === null || typeof this.terminal.scrollToLine !== 'function') this.terminal.scrollToBottom();
-        else this.terminal.scrollToLine(target);
+        if (!this._restoreTerminalReadingPosition?.(readingAnchor, target)) {
+          if (target === null || typeof this.terminal.scrollToLine !== 'function') this.terminal.scrollToBottom();
+          else this.terminal.scrollToLine(target);
+        }
         // The load's own replay sampled the sticky-scroll baseline while the
         // terminal sat at the bottom of a just-rewritten buffer, so the next
         // flush would scroll back down and undo the restore above.
@@ -8872,6 +8875,7 @@ class CodemanApp {
       );
       this._fullHistoryRepullUseless?.delete(sessionId);
       const rowsBefore = this.terminal.buffer.active.length;
+      const readingAnchor = this._captureTerminalReadingPosition?.();
       const replayStartedAt = performance.now();
       this._resetTerminalForReplay();
       const {
@@ -8894,13 +8898,15 @@ class CodemanApp {
       } else {
         this.terminalBufferCache.delete(sessionId);
       }
-      // Hold the user's place. The replay is a superset that grew the buffer
-      // UPWARD, so what used to be row 0 (what they were looking at) is now `delta`
-      // rows down; scrolling there reveals the recovered history above it instead
-      // of teleporting them to the bottom the way a normal buffer load does.
+      // Match the text being read: the capture may add both older history and
+      // new output. Treating every added row as older history moves the reader
+      // down by the number of newly appended rows. Keep the old bounded delta
+      // fallback only when the text cannot be found after reflow or eviction.
       const delta = parsedBufferLength - rowsBefore;
-      if (delta > 0) this.terminal.scrollToLine(delta);
-      else this.terminal.scrollToTop();
+      if (!this._restoreTerminalReadingPosition?.(readingAnchor, Math.max(0, delta))) {
+        if (delta > 0) this.terminal.scrollToLine(delta);
+        else this.terminal.scrollToTop();
+      }
       // The load's own replay sampled the sticky-scroll baseline while the
       // terminal sat at the bottom of a just-rewritten buffer, so the next
       // flush would scroll back down and undo the restore above. This path is

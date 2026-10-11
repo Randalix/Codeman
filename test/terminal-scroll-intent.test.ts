@@ -75,6 +75,7 @@ function loadKeyboardHandler(opts: { viewportY: number; baseY: number }) {
   kh._sendTerminalResize = () => {};
   return {
     kh,
+    app,
     terminal,
     calls,
     /** Run the coalesced settle timer the way the OS animation eventually would. */
@@ -87,6 +88,60 @@ function loadKeyboardHandler(opts: { viewportY: number; baseY: number }) {
 }
 
 describe('keyboard settle preserves scroll intent (issue #259)', () => {
+  it.each(['settle', 'cleanup'])('releases the marker after %s', (finish) => {
+    const { kh, terminal, calls, settle } = loadKeyboardHandler({ viewportY: 120, baseY: 500 });
+    const marker = {
+      line: 110,
+      isDisposed: false,
+      dispose: () => {
+        marker.isDisposed = true;
+      },
+    };
+    Object.assign(terminal, { registerMarker: () => marker });
+    kh._scheduleViewportSettle({ restoreScroll: true });
+    if (finish === 'settle') {
+      settle();
+      expect(calls).toContain('scrollToLine:110');
+    } else kh.cleanup();
+    expect(marker.isDisposed).toBe(true);
+    expect(kh._settleAnchorMarker).toBeNull();
+  });
+
+  it('shows the oldest surviving row when the marked text is evicted', () => {
+    const { kh, terminal, calls, settle } = loadKeyboardHandler({ viewportY: 120, baseY: 500 });
+    const marker = { line: -1, isDisposed: true, dispose: () => {} };
+    Object.assign(terminal, { registerMarker: () => marker });
+    kh._scheduleViewportSettle({ restoreScroll: true });
+    settle();
+    expect(calls).toContain('scrollToLine:0');
+  });
+  it.each([120, 500])('keeps a newer user scroll after settling began at %i', (viewportY) => {
+    const { kh, app, terminal, calls, settle } = loadKeyboardHandler({ viewportY, baseY: 500 });
+    kh._scheduleViewportSettle({ restoreScroll: true });
+    terminal.buffer.active.viewportY = 100;
+    app._terminalUserScrollGeneration = 1;
+    settle();
+    expect(calls).toContain('scrollToLine:100');
+    expect(calls).not.toContain('scrollToBottom');
+  });
+
+  it('does not restore the previous tab after a session switch', () => {
+    const { kh, app, calls, settle } = loadKeyboardHandler({ viewportY: 120, baseY: 500 });
+    app.activeSessionId = 'old';
+    kh._scheduleViewportSettle({ restoreScroll: true });
+    app.activeSessionId = 'new';
+    settle();
+    expect(calls).toContain('syncTerminalGeometry');
+    expect(calls.some((c) => c.startsWith('scrollTo'))).toBe(false);
+  });
+  it('does not restore a previous selection of the same session', () => {
+    const { kh, app, calls, settle } = loadKeyboardHandler({ viewportY: 120, baseY: 500 });
+    app.activeSessionId = 'same';
+    kh._scheduleViewportSettle({ restoreScroll: true });
+    app._selectGeneration = 1;
+    settle();
+    expect(calls.some((c) => c.startsWith('scrollTo'))).toBe(false);
+  });
   it('scrolls to bottom when the user is following live output', () => {
     const { kh, calls, settle } = loadKeyboardHandler({ viewportY: 500, baseY: 500 });
 
