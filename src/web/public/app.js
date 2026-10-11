@@ -9316,7 +9316,7 @@ class CodemanApp {
         }
         this.scrollToLastNonEmptyLine();
         _crashDiag.log('SNAPSHOT_RESTORE_DONE');
-      // Snapshot restore is only staging. Inactive tabs intentionally
+        // Snapshot restore is only staging. Inactive tabs intentionally
         // unsubscribe from high-volume terminal output, so they can miss bytes
         // emitted while away. Keep going and replace the snapshot with the
         // canonical live tmux pane frame from /terminal.
