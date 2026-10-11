@@ -137,6 +137,9 @@ const PROC_SNAPSHOT_TTL_MS = 2000;
 const PROC_SNAPSHOT_WAIT_MS = 1500;
 import { DEFAULT_TMUX_HISTORY_LIMIT, DEFAULT_TERMINAL_BUFFER_MAX_BYTES } from './config/terminal-history.js';
 
+/** Ceiling for a plain-text capture with scrollback (`capturePaneText` with `historyLines`). */
+const SCREEN_CAPTURE_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+
 /**
  * Extra stdout headroom for the full-history `capture-pane` child process on
  * top of the consumer's byte cap: raw scrollback carries per-line SGR/ANSI
@@ -3965,15 +3968,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * cursor query, no repaint reconstruction: this feeds a regex, not a
    * terminal. Returns null in tests (no tmux) so callers fall back to their
    * stream heuristics rather than reading an empty screen as "not working".
+   *
+   * `historyLines` adds that much scrollback above the frame (`-S -N`) and
+   * re-joins rows tmux hard-wrapped at the pane width (`-J`): the rendered
+   * text `agent read --tail` prints, one line per row, where the raw byte
+   * buffer holds cursor moves instead of newlines.
    */
-  capturePaneText(muxName: string, paneTarget?: string): string | null {
+  capturePaneText(muxName: string, paneTarget?: string, opts?: { historyLines?: number }): string | null {
     if (IS_TEST_MODE) return null;
     const target = resolveTmuxPaneTarget(muxName, paneTarget);
     if (!target) return null;
+    const history = opts?.historyLines;
+    const historyFlags =
+      typeof history === 'number' && Number.isFinite(history) && history > 0 ? ` -J -S -${Math.trunc(history)}` : '';
     try {
-      return execSync(`${this.tmux()} capture-pane -p -t ${shellescape(target)}`, {
+      return execSync(`${this.tmux()} capture-pane -p${historyFlags} -t ${shellescape(target)}`, {
         encoding: 'utf-8',
         timeout: EXEC_TIMEOUT_MS,
+        // Scrollback of wide panes can pass execSync's 1 MB default; past it the
+        // read would silently degrade to null (the caller's fallback).
+        ...(historyFlags ? { maxBuffer: SCREEN_CAPTURE_MAX_BUFFER_BYTES } : {}),
       });
     } catch {
       // A dead/renamed pane is an ordinary outcome here, not an error worth logging

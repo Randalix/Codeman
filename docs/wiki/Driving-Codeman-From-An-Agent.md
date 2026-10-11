@@ -74,7 +74,8 @@ codeman agent ls                                          # sessions; * marks th
 SID=$(codeman agent spawn scratch-1 --mode claude)        # quick-start + wait for the composer where the mode has a ready mark
 codeman agent send "$SID" 'review src/, then say DONE' --until stop,exit --timeout 300000
 codeman agent read "$SID"                                 # last answer (as the server reads it for that mode)
-codeman agent read "$SID" --tail 3000                     # terminal tail, ANSI stripped (every mode)
+codeman agent read "$SID" --tail 3000                     # screen as rendered, one line per row (every mode; --raw = byte buffer)
+codeman agent pull "$SID" out/report.md ./report.md       # copy a file out of its working dir (remote workers too)
 codeman agent send "$SID" 'run the tests, then print WORKDONE followed by _4711'   # hook-less modes: the marker in halves …
 codeman agent wait "$SID" --match WORKDONE_4711           # … and the wait on the joined form
 codeman agent interrupt "$SID"                            # a bare ESC, conversation intact

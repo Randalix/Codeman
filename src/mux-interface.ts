@@ -381,7 +381,8 @@ export interface TerminalMultiplexer extends EventEmitter {
    * reconstruction. Deliberately cheaper than `capturePaneBuffer` because idle
    * detection calls it on a timer: it only needs to read what the CLI is
    * currently rendering, never to replay it into an xterm. Returns null when the
-   * pane cannot be read.
+   * pane cannot be read. `historyLines` adds that much scrollback above the
+   * frame, with hard-wrapped rows re-joined.
    */
-  capturePaneText?(muxName: string, paneTarget?: string): string | null;
+  capturePaneText?(muxName: string, paneTarget?: string, opts?: { historyLines?: number }): string | null;
 }

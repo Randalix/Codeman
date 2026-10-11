@@ -5,11 +5,11 @@
  */
 
 import http from 'node:http';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import {
   AgentGuardError,
   EXIT,
@@ -20,6 +20,7 @@ import {
   stalledPairLines,
   agentPost,
   agentRead,
+  agentPull,
   agentRestore,
   agentRm,
   agentSend,
@@ -503,9 +504,44 @@ describe('agent read', () => {
     expect(deps.err.join('')).not.toMatch(/nothing answered yet/);
   });
 
-  it('--tail fetches the terminal and strips ANSI', async () => {
-    const deps = fakeDeps([ok({ terminalBuffer: '\u001b]0;w1 title\u0007\u001b[32m❯\u001b[0m ready \u001b(B' })]);
+  it('--tail prints the rendered screen, one line per row', async () => {
+    const deps = fakeDeps([ok({ available: true, text: '● done\n❯ ', truncated: false, scope: 'history' })]);
     expect(await agentRead(deps, { id: OTHER, tail: 500 })).toBe(EXIT.ok);
+    expect(deps.calls).toHaveLength(1);
+    expect(deps.calls[0]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/screen`, query: { tail: 500 } });
+    expect(deps.out).toEqual(['● done\n❯ ']);
+    expect(deps.err).toEqual([]);
+  });
+
+  it('--tail on a remote session says the screen has no scrollback', async () => {
+    const deps = fakeDeps([ok({ available: true, text: '❯ ', truncated: false, scope: 'frame' })]);
+    await agentRead(deps, { id: OTHER, tail: 500 });
+    expect(deps.err.join('')).toMatch(/visible screen only, no scrollback/);
+  });
+
+  it('--tail falls back to the byte buffer when the pane cannot be captured', async () => {
+    const deps = fakeDeps([
+      ok({ available: false }),
+      ok({ terminalBuffer: '\u001b]0;w1 title\u0007\u001b[32m❯\u001b[0m ready \u001b(B' }),
+    ]);
+    expect(await agentRead(deps, { id: OTHER, tail: 500 })).toBe(EXIT.ok);
+    expect(deps.calls[1]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/terminal`, query: { tail: 500 } });
+    expect(deps.out).toEqual(['❯ ready ']);
+  });
+
+  it('--tail falls back to the byte buffer on a server without the screen route', async () => {
+    const deps = fakeDeps([
+      apiError(404, 'NOT_FOUND', 'Route GET:/api/sessions/x/screen not found'),
+      ok({ terminalBuffer: 'x' }),
+    ]);
+    expect(await agentRead(deps, { id: OTHER, tail: 500 })).toBe(EXIT.ok);
+    expect(deps.out).toEqual(['x']);
+  });
+
+  it('--tail --raw fetches the terminal byte buffer and strips ANSI', async () => {
+    const deps = fakeDeps([ok({ terminalBuffer: '\u001b]0;w1 title\u0007\u001b[32m❯\u001b[0m ready \u001b(B' })]);
+    expect(await agentRead(deps, { id: OTHER, tail: 500, raw: true })).toBe(EXIT.ok);
+    expect(deps.calls).toHaveLength(1);
     expect(deps.calls[0]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/terminal`, query: { tail: 500 } });
     expect(deps.out).toEqual(['❯ ready ']);
   });
@@ -523,6 +559,64 @@ describe('agent read', () => {
     await agentRead(deps, { id: OTHER, full: true });
     expect(deps.calls[0].query).toMatchObject({ context: 'full' });
     expect(deps.out.map(stripAnsi)).toEqual(['user: a', 'assistant: b']);
+  });
+});
+
+describe('agent pull', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'agent-pull-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const fileBody = (bytes: Buffer): ApiResponse => ({ status: 200, text: bytes.toString('utf-8'), body: bytes });
+
+  it('asks file-raw for the download and writes the bytes into a destination directory', async () => {
+    const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0xff]);
+    const deps = fakeDeps([fileBody(bytes)]);
+    expect(await agentPull(deps, { id: OTHER, path: 'builds/captures/shot.png', dest: dir })).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({
+      method: 'GET',
+      path: `/api/v1/sessions/${OTHER}/file-raw`,
+      query: { path: 'builds/captures/shot.png', download: 'true' },
+      headers: { Accept: '*/*' },
+    });
+    // Binary-exact: the raw body, not its UTF-8 decoding.
+    expect(readFileSync(join(dir, 'shot.png'))).toEqual(bytes);
+    expect(deps.out.join('')).toMatch(/pulled builds\/captures\/shot\.png from 94990c6d → .*shot\.png \(6 bytes\)/);
+  });
+
+  it('writes to a named destination file', async () => {
+    const deps = fakeDeps([fileBody(Buffer.from('log'))]);
+    await agentPull(deps, { id: OTHER, path: 'run.log', dest: join(dir, 'huff-run.log') });
+    expect(readFileSync(join(dir, 'huff-run.log'), 'utf-8')).toBe('log');
+  });
+
+  it('never overwrites an existing file without --force', async () => {
+    writeFileSync(join(dir, 'run.log'), 'mine');
+    const refused = fakeDeps([fileBody(Buffer.from('theirs'))]);
+    expect(await agentPull(refused, { id: OTHER, path: 'run.log', dest: dir })).toBe(EXIT.error);
+    expect(refused.err.join('')).toMatch(/exists; pass --force/);
+    expect(readFileSync(join(dir, 'run.log'), 'utf-8')).toBe('mine');
+
+    const forced = fakeDeps([fileBody(Buffer.from('theirs'))]);
+    expect(await agentPull(forced, { id: OTHER, path: 'run.log', dest: dir, force: true })).toBe(EXIT.ok);
+    expect(readFileSync(join(dir, 'run.log'), 'utf-8')).toBe('theirs');
+  });
+
+  it('writes nothing when the server refuses (outside the working dir, missing, too large)', async () => {
+    const deps = fakeDeps([apiError(404, 'NOT_FOUND', 'File not found')]);
+    expect(await agentPull(deps, { id: OTHER, path: 'nope.txt', dest: dir })).toBe(EXIT.error);
+    expect(deps.err.join('')).toMatch(/NOT_FOUND: File not found \(HTTP 404\)/);
+    expect(existsSync(join(dir, 'nope.txt'))).toBe(false);
+  });
+
+  it('refuses a path that names no file before asking the server', async () => {
+    const deps = fakeDeps([]);
+    expect(await agentPull(deps, { id: OTHER, path: 'builds/..', dest: dir })).toBe(EXIT.error);
+    expect(deps.calls).toHaveLength(0);
   });
 });
 

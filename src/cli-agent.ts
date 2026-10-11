@@ -30,8 +30,8 @@
  */
 import http from 'node:http';
 import https from 'node:https';
-import { statSync } from 'node:fs';
-import { posix as posixPath, resolve as resolvePath } from 'node:path';
+import { statSync, writeFileSync } from 'node:fs';
+import { join as joinPath, posix as posixPath, resolve as resolvePath } from 'node:path';
 import type { Command } from 'commander';
 import {
   basicAuthHeader,
@@ -237,6 +237,8 @@ export interface ApiResponse<T = unknown> {
   /** Parsed envelope, or `undefined` when the body was not JSON (auth guards answer in plain text). */
   json?: ApiEnvelope<T>;
   text: string;
+  /** The raw response bytes, for binary bodies (`agent pull`); `text` is their UTF-8 decoding. */
+  body?: Buffer;
 }
 
 export interface WaitResult {
@@ -310,14 +312,15 @@ export const httpRequest: ApiRequest = (ctx, options) => {
         const chunks: Buffer[] = [];
         res.on('data', (chunk: Buffer) => chunks.push(chunk));
         res.on('end', () => {
-          const text = Buffer.concat(chunks).toString('utf-8');
+          const body = Buffer.concat(chunks);
+          const text = body.toString('utf-8');
           let json: ApiEnvelope | undefined;
           try {
             json = JSON.parse(text) as ApiEnvelope;
           } catch {
             json = undefined;
           }
-          resolve({ status: res.statusCode ?? 0, json, text });
+          resolve({ status: res.statusCode ?? 0, json, text, body });
         });
       }
     );
@@ -1208,8 +1211,10 @@ export async function agentWait(deps: AgentDeps, options: WaitOptions): Promise<
 
 export interface ReadOptions {
   id: string;
-  /** Bytes of raw terminal to fetch; ANSI is stripped for humans. */
+  /** Bytes of terminal to print: the rendered screen, or the raw byte buffer with `raw`. */
   tail?: number;
+  /** With `tail`: the raw byte buffer (ANSI stripped) instead of the rendered screen. */
+  raw?: boolean;
   /** Whole conversation (`context=full`) instead of the last assistant message. */
   full?: boolean;
 }
@@ -1220,6 +1225,29 @@ export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<
   if ('error' in target) return fail(deps, target.error, target.code);
   const sid = encodeURIComponent(target.id);
   if (options.tail !== undefined) {
+    // The rendered screen first: the raw buffer is a byte stream whose rows a TUI
+    // places with cursor moves, so stripped of escapes it prints as one long
+    // line. Fall back to it when the server cannot capture the pane (no mux, a
+    // dead pane) or predates the screen route.
+    if (!options.raw) {
+      const screen = await deps.request(deps.ctx, {
+        method: 'GET',
+        path: `/api/v1/sessions/${sid}/screen`,
+        query: { tail: options.tail },
+      });
+      const data = screen.json?.success
+        ? (screen.json.data as { available?: boolean; text?: string; scope?: string } | undefined)
+        : undefined;
+      if (data?.available) {
+        if (deps.json) emitJson(deps, data);
+        else {
+          deps.io.out(data.text ?? '');
+          if (data.scope === 'frame')
+            deps.io.err(palette.muted('(remote session: visible screen only, no scrollback)'));
+        }
+        return EXIT.ok;
+      }
+    }
     const res = await deps.request(deps.ctx, {
       method: 'GET',
       path: `/api/v1/sessions/${sid}/terminal`,
@@ -1261,6 +1289,66 @@ export async function agentRead(deps: AgentDeps, options: ReadOptions): Promise<
   }
   deps.io.out(text);
   return EXIT.ok;
+}
+
+export interface PullOptions {
+  id: string;
+  /** A file in the session's working directory: relative to it, or absolute inside it. */
+  path: string;
+  /** Local destination file or existing directory; default the file's name in the current directory. */
+  dest?: string;
+  /** Overwrite an existing destination. */
+  force?: boolean;
+}
+
+/**
+ * `agent pull` — copy a file out of a session's working directory. Made for
+ * remote workers, whose output stays on their host: the server reads it over
+ * ssh through the same `file-raw` route the file viewer uses (bounded to the
+ * working directory, the download size limit, never a wake), so the CLI only
+ * writes the bytes. Works for a local session too, as a plain copy.
+ */
+export async function agentPull(deps: AgentDeps, options: PullOptions): Promise<number> {
+  const target = await resolveSessionId(deps, options.id);
+  if ('error' in target) return fail(deps, target.error, target.code);
+  const name = posixPath.basename(options.path);
+  if (!name || name === '.' || name === '..') return fail(deps, `not a file path: ${options.path}`);
+  const dest = resolvePullDestination(options.dest, name);
+  const res = await deps.request(deps.ctx, {
+    method: 'GET',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/file-raw`,
+    query: { path: options.path, download: 'true' },
+    headers: { Accept: '*/*' },
+    timeoutMs: PULL_TIMEOUT_MS,
+  });
+  if (res.status !== 200) return fail(deps, describeFailure(res));
+  const bytes = res.body ?? Buffer.from(res.text, 'utf-8');
+  try {
+    // `wx` refuses an existing file atomically: no stat-then-write window.
+    writeFileSync(dest, bytes, { flag: options.force ? 'w' : 'wx' });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST') return fail(deps, `${dest} exists; pass --force to overwrite`);
+    return fail(deps, `could not write ${dest}: ${getErrorMessage(err)}`);
+  }
+  if (deps.json) emitJson(deps, { session: target.id, path: options.path, dest, bytes: bytes.length });
+  else
+    deps.io.out(`${GLYPH.ok} pulled ${options.path} from ${target.id.slice(0, 8)} → ${dest} (${bytes.length} bytes)`);
+  return EXIT.ok;
+}
+
+/** Up to the server's own remote read bounds plus transfer time for a large file. */
+const PULL_TIMEOUT_MS = 120_000;
+
+/** `dest` as given, inside it when it is a directory, or the bare name in the current directory. */
+function resolvePullDestination(dest: string | undefined, name: string): string {
+  if (dest === undefined) return resolvePath(name);
+  try {
+    if (statSync(dest).isDirectory()) return resolvePath(joinPath(dest, name));
+  } catch {
+    // Not there yet: it names the file to create.
+  }
+  return resolvePath(dest);
 }
 
 /** `agent interrupt` — a bare ESC keypress, no Enter, conversation intact. */
@@ -2253,17 +2341,30 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('read <id>')
     .description("Print a session's last answer (as the server reads it for that mode) or, with --tail, its terminal")
-    .option('--tail <bytes>', 'Raw terminal tail in bytes, ANSI stripped (works in every mode)')
+    .option('--tail <bytes>', 'Last bytes of the screen as rendered, one line per row (works in every mode)')
+    .option('--raw', 'With --tail: the raw terminal byte buffer, ANSI stripped, instead of the rendered screen')
     .option('--full', 'The whole conversation instead of the last assistant message')
     .option('--json', 'Machine-readable output')
-    .action((id: string, options: { tail?: string; full?: boolean; json?: boolean }) =>
+    .action((id: string, options: { tail?: string; raw?: boolean; full?: boolean; json?: boolean }) =>
       run(Boolean(options.json), (deps) =>
         agentRead(deps, {
           id,
           tail: options.tail === undefined ? undefined : parsePositiveInt(options.tail, 3000, '--tail'),
+          raw: options.raw,
           full: options.full,
         })
       )
+    );
+
+  agent
+    .command('pull <id> <path> [dest]')
+    .description(
+      "Copy a file out of a session's working directory (a remote worker's output stays on its host); path relative to that directory"
+    )
+    .option('--force', 'Overwrite an existing destination file')
+    .option('--json', 'Machine-readable output')
+    .action((id: string, path: string, dest: string | undefined, options: { force?: boolean; json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentPull(deps, { id, path, dest, force: options.force }))
     );
 
   agent

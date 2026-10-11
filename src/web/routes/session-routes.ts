@@ -188,6 +188,7 @@ import {
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
 import { RemoteFileAccessError, remoteReadClaudeTranscriptTail } from '../../remote-files.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
+import { DEFAULT_SCREEN_TAIL_BYTES, MAX_SCREEN_HISTORY_LINES, screenTail } from '../../utils/screen-text.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
 
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
@@ -3101,6 +3102,36 @@ export function registerSessionRoutes(
       ? { text: lastText, timestamp: lastTimestamp, messages: thread }
       : { text: lastText, timestamp: lastTimestamp };
   }
+
+  // ========== Get Rendered Screen Text ==========
+
+  // `agent read --tail`: the pane as tmux drew it, plain text, one line per row,
+  // trimmed to the last `tail` bytes at a line start. The terminal route below
+  // serves the browser xterm a byte stream to replay; stripped of its escapes
+  // that stream is one long line (TUIs place rows with cursor moves), so a
+  // reader gets the rendered capture instead. A remote session's local pane is
+  // the ssh client showing the remote tmux: its frame is the remote screen, but
+  // it has no scrollback of its own, so `scope` says how far back it reaches.
+  // `available: false` (no mux, dead pane, test mode) tells the caller to fall
+  // back to the byte buffer.
+  app.get('/api/sessions/:id/screen', async (req) => {
+    const { id } = req.params as { id: string };
+    const query = req.query as { tail?: string };
+    const session = findSessionOrFail(ctx, id, req);
+    const requested = query.tail ? parseInt(query.tail, 10) : NaN;
+    const tailBytes = Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_SCREEN_TAIL_BYTES;
+    const { tmuxHistoryLimit } = await ctx.getTerminalHistoryConfig();
+    const historyLines = Math.min(
+      tmuxHistoryLimit > 0 ? tmuxHistoryLimit : MAX_SCREEN_HISTORY_LINES,
+      MAX_SCREEN_HISTORY_LINES
+    );
+    const captured = session.muxName
+      ? (ctx.mux.capturePaneText?.(session.muxName, undefined, { historyLines }) ?? null)
+      : null;
+    if (captured === null) return { available: false };
+    const { text, truncated } = screenTail(captured, tailBytes);
+    return { available: true, text, truncated, scope: session.remote ? 'frame' : 'history' };
+  });
 
   // ========== Get Terminal Buffer ==========
 

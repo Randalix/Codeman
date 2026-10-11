@@ -824,6 +824,43 @@ describe('session-routes', () => {
 
   // ========== GET /api/sessions/:id/terminal ==========
 
+  describe('GET /api/sessions/:id/screen', () => {
+    const screen = async (query = '') => {
+      const res = await harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${harness.ctx._sessionId}/screen${query}`,
+      });
+      expect(res.statusCode).toBe(200);
+      return JSON.parse(res.body).data;
+    };
+
+    it('returns the captured pane as rendered text, trimmed to the tail budget', async () => {
+      const capture = vi.fn(() => 'old row\n● done     \n❯         \n\n\n');
+      (harness.ctx.mux as { capturePaneText?: unknown }).capturePaneText = capture;
+      expect(await screen('?tail=14')).toEqual({
+        available: true,
+        text: '● done\n❯',
+        truncated: true,
+        scope: 'history',
+      });
+      // Scrollback is asked for, bounded by the history limit and the screen cap.
+      expect(capture).toHaveBeenCalledWith(harness.ctx._session.muxName, undefined, {
+        historyLines: Math.min((await harness.ctx.getTerminalHistoryConfig()).tmuxHistoryLimit, 2000),
+      });
+    });
+
+    it('marks a remote session as frame-only (its local pane has no scrollback)', async () => {
+      (harness.ctx.mux as { capturePaneText?: unknown }).capturePaneText = vi.fn(() => '❯ \n');
+      (harness.ctx._session as unknown as { remote: unknown }).remote = { hostId: 'gpu-box' };
+      expect(await screen()).toMatchObject({ available: true, text: '❯', scope: 'frame' });
+    });
+
+    it('says unavailable when the pane cannot be captured, so the caller falls back', async () => {
+      (harness.ctx.mux as { capturePaneText?: unknown }).capturePaneText = vi.fn(() => null);
+      expect(await screen('?tail=500')).toEqual({ available: false });
+    });
+  });
+
   describe('GET /api/sessions/:id/terminal', () => {
     it('returns terminal buffer', async () => {
       harness.ctx._session.terminalBuffer = 'hello world';
