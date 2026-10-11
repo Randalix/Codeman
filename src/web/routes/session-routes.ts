@@ -28,7 +28,6 @@ import {
   type GrokConfig,
   type DeepSeekConfig,
   type OmpConfig,
-  type RemoteHost,
 } from '../../types.js';
 import {
   Session,
@@ -87,7 +86,7 @@ import {
   REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS,
   createDefaultRemoteWakeDeps,
   isProbeable,
-  type WakeableRemote,
+  wakeableHost,
 } from '../../remote-wake.js';
 import { clampWaitMs, MAX_BUFFER_SCAN_BYTES } from '../../config/agent-wait.js';
 import {
@@ -866,26 +865,6 @@ function captureHistoryLines(raw: string | undefined, historyLimit: number): num
   if (typeof raw !== 'string' || !/^\d{1,9}$/.test(raw)) return historyLimit;
   const lines = Number(raw);
   return lines >= 1 ? Math.min(lines, historyLimit) : historyLimit;
-}
-
-/**
- * `RemoteHost` → the wake registry's host shape. They differ in one field name only
- * (`id` in host config vs `hostId` on a session's `remote`), but the rename is load-
- * bearing: the registry keys its per-host wake state on `hostId`. The proxy fields
- * travel too: they are what tells the registry its probe cannot reach this host.
- */
-function wakeableHost(host: RemoteHost): WakeableRemote {
-  return {
-    hostId: host.id,
-    label: host.label,
-    host: host.host,
-    port: host.port,
-    wakeMac: host.wakeMac,
-    wakeCommand: host.wakeCommand,
-    jumpHost: host.jumpHost,
-    socksProxy: host.socksProxy,
-    extraSshOptions: host.extraSshOptions,
-  };
 }
 
 export function registerSessionRoutes(

@@ -1201,10 +1201,11 @@ export class WebServer extends EventEmitter {
     registerGitStatusRoutes(this.app, ctx);
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
-    registerCaseRoutes(this.app, ctx);
     // The registry's lifetime is the server's: it drops per-session wake state on every
-    // cleanup path and resolves in-flight wakes on shutdown.
+    // cleanup path and resolves in-flight wakes on shutdown. Registered before the case
+    // routes, whose remote-link (a user request) wakes a sleeping host through it.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
+    registerCaseRoutes(this.app, ctx, { remoteWake: this.remoteWake });
     registerRespawnRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);

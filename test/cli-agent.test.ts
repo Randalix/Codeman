@@ -24,6 +24,9 @@ import {
   agentRm,
   agentSend,
   agentSpawn,
+  agentHosts,
+  normalizeRemotePath,
+  remoteCaseName,
   modelFields,
   agentTodoAdd,
   agentTodoLs,
@@ -259,8 +262,8 @@ describe('agent ls', () => {
     const deps = fakeDeps(withSummary({}));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+busy\s+0\s+-\s+-\s+-\s+w1-Codeman/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+0\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
+    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+local\s+busy\s+0\s+-\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+local\s+idle\s+0\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
   });
 
   it('--json is the envelope data plus a self flag and the mailbox state', async () => {
@@ -284,8 +287,8 @@ describe('agent ls', () => {
     await agentLs(deps);
     const text = deps.out.join('\n');
     expect(text).toMatch(/INBOX\s+WAIT/);
-    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+0\s+since 08:43/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+idle\s+3\s+-/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+local\s+busy\s+0\s+since 08:43/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+local\s+idle\s+3\s+-/);
   });
 
   it('names a stalled pair: the waiter and its idle, mail-less child', async () => {
@@ -307,7 +310,7 @@ describe('agent ls', () => {
     const deps = fakeDeps((o) => (o.path === SUMMARY ? { status: 404, text: 'Route not found' } : ok(sessions)));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+claude\s+busy\s+\?\s+\?\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+local\s+busy\s+\?\s+\?\s+-\s+-\s+w1-Codeman/);
     expect(text).not.toMatch(/owes a post/);
   });
 
@@ -939,8 +942,8 @@ describe('agent restore / ls --alive', () => {
     };
     expect(await agentLs(deps, { alive: true })).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+\?\s+\?\s+alive/);
-    expect(text).toMatch(/94990c6d\s+\?\s+\?\s+unknown/);
+    expect(text).toMatch(/058ee7b5\s+\?\s+local\s+\?\s+alive/);
+    expect(text).toMatch(/94990c6d\s+\?\s+local\s+\?\s+unknown/);
   });
 
   it('restore hands a dead session (and the --resume id) to the runner and reports its result', async () => {
@@ -1115,8 +1118,8 @@ describe('agent restore / ls --alive', () => {
     expect(await agentLs(deps, { alive: true })).toBe(EXIT.ok);
     const text = deps.out.join('\n');
     expect(text).toMatch(/PANE/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+\?\s+DEAD/);
-    expect(text).toMatch(/058ee7b5\s+claude\s+\?\s+alive/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+local\s+\?\s+DEAD/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+local\s+\?\s+alive/);
   });
 });
 
@@ -1619,5 +1622,212 @@ describe('agent mute', () => {
     const off = fakeDeps([ok([{ id: W1 }]), apiError(200, 'OPERATION_FAILED', 'Coordinator reports are off')]);
     expect(await agentMute(off, { ids: ['aaaaaaaa'], forMs: 1 })).toBe(EXIT.error);
     expect(off.err[0]).toMatch(/aaaaaaaa: .*Coordinator reports are off/);
+  });
+});
+
+describe('agent spawn --host: a worker on another machine', () => {
+  const HOSTS = [
+    { id: 'hufflepuff', label: 'Hufflepuff', host: '192.168.50.137', username: 'j', wakeCommand: '/bin/whuff' },
+    { id: 'gpu', label: 'GPU', host: '10.0.0.2', username: 'u' },
+  ];
+  const CASES = [
+    { name: 'Codeman', location: 'linked-local' },
+    {
+      name: 'nightburn-heval',
+      location: 'remote',
+      remote: { hostId: 'hufflepuff', path: '/mnt/caches/huffwork/heval' },
+    },
+    { name: 'hufflepuff-hbottle', location: 'local' },
+  ];
+
+  /** Answers hosts/cases/remote-link/quick-start/readiness by path. */
+  function remoteDeps(overrides: Partial<Record<string, ApiResponse>> = {}) {
+    return fakeDeps((o) => {
+      if (overrides[o.path]) return overrides[o.path] as ApiResponse;
+      if (o.path === '/api/v1/remote-hosts') return ok(HOSTS);
+      if (o.path === '/api/v1/cases') return ok(CASES);
+      if (o.path === '/api/v1/cases/remote-link') return ok({ case: o.body });
+      if (o.path === '/api/v1/quick-start')
+        return ok({ sessionId: OTHER, caseName: (o.body as { caseName: string }).caseName });
+      return ok({ wait: { matched: true } });
+    });
+  }
+  const quickStart = (deps: ReturnType<typeof remoteDeps>) => deps.calls.find((c) => c.path === '/api/v1/quick-start');
+
+  it('reuses the case that already points at that directory (trailing slash and all)', async () => {
+    const deps = remoteDeps();
+    const code = await agentSpawn(deps, {
+      host: 'hufflepuff',
+      cwd: '/mnt/caches/huffwork/heval/',
+      model: 'opus',
+      mode: 'claude',
+      ready: true,
+      timeoutMs: 1000,
+    });
+    expect(code).toBe(EXIT.ok);
+    expect(deps.calls.some((c) => c.path === '/api/v1/cases/remote-link')).toBe(false);
+    expect(quickStart(deps)).toMatchObject({
+      method: 'POST',
+      body: { caseName: 'nightburn-heval', mode: 'claude', model: 'opus', parentSessionId: SELF },
+      headers: { 'X-Codeman-Agent-Origin': 'codeman-agent-cli' },
+    });
+    expect(deps.out).toEqual([OTHER]);
+    expect(deps.err.join('')).toMatch(/hufflepuff:\/mnt\/caches\/huffwork\/heval, case nightburn-heval/);
+  });
+
+  it('creates a remote case for a new directory, avoiding taken names, then spawns into it', async () => {
+    const deps = remoteDeps();
+    const code = await agentSpawn(deps, {
+      host: 'hufflepuff',
+      cwd: '/mnt/caches/huffwork/hbottle',
+      mode: 'claude',
+      ready: false,
+      timeoutMs: 1000,
+    });
+    expect(code).toBe(EXIT.ok);
+    const link = deps.calls.find((c) => c.path === '/api/v1/cases/remote-link');
+    expect(link).toMatchObject({
+      method: 'POST',
+      body: { name: 'hufflepuff-hbottle-2', hostId: 'hufflepuff', remotePath: '/mnt/caches/huffwork/hbottle' },
+    });
+    expect(link?.timeoutMs).toBeGreaterThanOrEqual(60_000); // a wake + two ssh probes
+    expect(deps.calls.indexOf(link as RequestOptions)).toBeLessThan(
+      deps.calls.indexOf(quickStart(deps) as RequestOptions)
+    );
+    expect(quickStart(deps)?.body).toMatchObject({ caseName: 'hufflepuff-hbottle-2' });
+    expect(deps.err.join('')).toMatch(/new case hufflepuff-hbottle-2/);
+  });
+
+  it('--json reports host, path and whether the case was created', async () => {
+    const deps = remoteDeps();
+    deps.json = true;
+    await agentSpawn(deps, { host: 'hufflepuff', cwd: '/srv/x', mode: 'claude', ready: false, timeoutMs: 1000 });
+    expect(JSON.parse(deps.out.join(''))).toMatchObject({
+      sessionId: OTHER,
+      hostId: 'hufflepuff',
+      remotePath: '/srv/x',
+      caseCreated: true,
+      caseName: 'hufflepuff-x',
+    });
+  });
+
+  it('a failed link (asleep for good, missing directory) starts nothing and names the reason', async () => {
+    const deps = remoteDeps({
+      '/api/v1/cases/remote-link': apiError(400, 'INVALID_INPUT', '/srv/nope is not a directory on 192.168.50.137'),
+    });
+    expect(
+      await agentSpawn(deps, { host: 'hufflepuff', cwd: '/srv/nope', mode: 'claude', ready: true, timeoutMs: 1000 })
+    ).toBe(EXIT.error);
+    expect(quickStart(deps)).toBeUndefined();
+    expect(deps.err.join('')).toMatch(/could not create a case for hufflepuff:\/srv\/nope: .*not a directory/);
+  });
+
+  it('a parallel spawn that linked the same directory first: its case is used, not an error', async () => {
+    let caseCalls = 0;
+    const raced = { name: 'hufflepuff-new', location: 'remote', remote: { hostId: 'hufflepuff', path: '/srv/new' } };
+    const deps = fakeDeps((o) => {
+      if (o.path === '/api/v1/remote-hosts') return ok(HOSTS);
+      if (o.path === '/api/v1/cases') return ok(caseCalls++ === 0 ? CASES : [...CASES, raced]);
+      if (o.path === '/api/v1/cases/remote-link') return apiError(409, 'ALREADY_EXISTS', 'Case already exists');
+      if (o.path === '/api/v1/quick-start') return ok({ sessionId: OTHER, caseName: 'hufflepuff-new' });
+      return ok({ wait: { matched: true } });
+    });
+    expect(
+      await agentSpawn(deps, { host: 'hufflepuff', cwd: '/srv/new', mode: 'claude', ready: false, timeoutMs: 1000 })
+    ).toBe(EXIT.ok);
+    expect(deps.calls.find((c) => c.path === '/api/v1/quick-start')?.body).toMatchObject({
+      caseName: 'hufflepuff-new',
+    });
+  });
+
+  it('refuses before any request: no --cwd, a relative or ~ path, a case argument', async () => {
+    for (const [options, message] of [
+      [{ host: 'hufflepuff' }, /--host needs --cwd/],
+      [{ host: 'hufflepuff', cwd: 'work/x' }, /absolute path on hufflepuff/],
+      [{ host: 'hufflepuff', cwd: '~/x' }, /absolute path on hufflepuff/],
+      [{ host: 'hufflepuff', caseName: 'c' }, /pass the directory, not a case/],
+    ] as const) {
+      const deps = remoteDeps();
+      expect(await agentSpawn(deps, { ...options, mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.refused);
+      expect(deps.calls).toEqual([]);
+      expect(deps.err.join('')).toMatch(message);
+    }
+  });
+
+  it('an unknown host is refused with the known ones', async () => {
+    const deps = remoteDeps();
+    expect(await agentSpawn(deps, { host: 'huff', cwd: '/x', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(
+      EXIT.refused
+    );
+    expect(deps.err.join('')).toMatch(/no remote host "huff" \(known: hufflepuff, gpu\)/);
+    expect(quickStart(deps)).toBeUndefined();
+  });
+
+  it('names: host + last segment, case-name characters only, numbered on collision', () => {
+    expect(normalizeRemotePath('/a//b/./c/')).toBe('/a/b/c');
+    expect(normalizeRemotePath('/')).toBe('/');
+    expect(remoteCaseName('hufflepuff', '/home/j/wiki/Coding Projects/Neon Getaway', new Set())).toBe(
+      'hufflepuff-Neon-Getaway'
+    );
+    expect(remoteCaseName('h', '/', new Set())).toBe('h-root');
+    expect(remoteCaseName('h', '/x', new Set(['h-x', 'h-x-2']))).toBe('h-x-3');
+    expect(remoteCaseName('h', '/x', new Set())).toMatch(/^[a-zA-Z0-9_-]+$/);
+    expect(remoteCaseName('h', `/${'a'.repeat(57)}-b`, new Set())).not.toMatch(/-$/); // cut lands on a dash
+  });
+});
+
+describe('agent hosts', () => {
+  const HOSTS = [
+    { id: 'hufflepuff', label: 'Hufflepuff', host: '192.168.50.137', username: 'j', wakeCommand: '/bin/whuff' },
+  ];
+  const CASES = [
+    { name: 'local-one', location: 'local' },
+    {
+      name: 'nightburn-heval',
+      location: 'remote',
+      remote: { hostId: 'hufflepuff', path: '/mnt/caches/huffwork/heval' },
+    },
+  ];
+  const answer = (o: RequestOptions) => (o.path === '/api/v1/remote-hosts' ? ok(HOSTS) : ok(CASES));
+
+  it('lists each host with its remote cases and how to spawn there', async () => {
+    const deps = fakeDeps(answer);
+    expect(await agentHosts(deps)).toBe(EXIT.ok);
+    const text = stripAnsi(deps.out.join('\n'));
+    expect(text).toMatch(/hufflepuff\s+Hufflepuff\s+j@192\.168\.50\.137\s+wakes on spawn/);
+    expect(text).toMatch(/nightburn-heval\s+\/mnt\/caches\/huffwork\/heval/);
+    expect(text).not.toMatch(/local-one/);
+    expect(text).toMatch(/spawn --host <id> --cwd/);
+  });
+
+  it('--json has the same facts', async () => {
+    const deps = fakeDeps(answer, true);
+    await agentHosts(deps);
+    expect(JSON.parse(deps.out.join(''))).toEqual([
+      {
+        id: 'hufflepuff',
+        label: 'Hufflepuff',
+        ssh: 'j@192.168.50.137',
+        wake: true,
+        cases: [{ name: 'nightburn-heval', path: '/mnt/caches/huffwork/heval' }],
+      },
+    ]);
+  });
+});
+
+describe('agent ls: HOST column', () => {
+  it('names the remote host, else local / docker', async () => {
+    const sessions = [
+      { id: SELF, mode: 'claude', status: 'busy', name: 'me' },
+      { id: OTHER, mode: 'claude', status: 'idle', name: 'huff', remote: { hostId: 'hufflepuff' } },
+    ];
+    const deps = fakeDeps((o) =>
+      o.path === '/api/v1/sessions' ? ok(sessions) : { status: 404, text: 'Route not found' }
+    );
+    await agentLs(deps);
+    const lines = stripAnsi(deps.out.join('\n')).split('\n');
+    expect(lines[0]).toMatch(/ID\s+MODE\s+HOST\s+STATUS/);
+    expect(lines.find((l) => l.includes(OTHER.slice(0, 8)))).toMatch(/claude\s+hufflepuff\s+idle/);
+    expect(lines.find((l) => l.includes(SELF.slice(0, 8)))).toMatch(/claude\s+local\s+busy/);
   });
 });

@@ -31,7 +31,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { statSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { posix as posixPath, resolve as resolvePath } from 'node:path';
 import type { Command } from 'commander';
 import {
   basicAuthHeader,
@@ -388,6 +388,13 @@ interface SessionRow {
   ralphTodoStats?: { total: number; pending: number; inProgress: number; completed: number };
 }
 
+/** Where a session runs: `local`, its remote host id, or `docker`. */
+function hostCell(s: SessionRow): string {
+  const hostId = (s.remote as { hostId?: unknown } | undefined)?.hostId;
+  if (typeof hostId === 'string' && hostId) return hostId;
+  return s.remote ? 'remote' : s.docker ? 'docker' : 'local';
+}
+
 /** `open/total` for the TODO column, `-` without a list. */
 function todoCell(stats: SessionRow['ralphTodoStats']): string {
   return stats && stats.total > 0 ? `${stats.pending + stats.inProgress}/${stats.total}` : '-';
@@ -524,6 +531,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       isSelfSession(deps.ctx.selfId, s.id) ? '*' : ' ',
       s.id.slice(0, 8),
       s.mode ?? '?',
+      hostCell(s),
       s.status ?? '?',
       ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
       inbox ? String(inbox.pending) : '?',
@@ -537,6 +545,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
     ' ',
     'ID',
     'MODE',
+    'HOST',
     'STATUS',
     ...(options.alive ? ['PANE'] : []),
     'INBOX',
@@ -548,7 +557,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(
-      `* = this session (${deps.ctx.selfId.slice(0, 8)}). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list.`
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list.`
     )
   );
   if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));
@@ -560,6 +569,8 @@ export interface SpawnOptions {
   caseName?: string;
   /** Working directory for the worker (resolved against this process's cwd); excludes `caseName`. */
   cwd?: string;
+  /** A remote host id (`agent hosts`): `cwd` is then an absolute path ON that host, reached through a remote case. */
+  host?: string;
   /** Model for this worker only; absent = the standard model (app default, else the CLI's own). */
   model?: string;
   mode: string;
@@ -771,7 +782,16 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
   let sid: string;
   let data: Record<string, unknown>;
   let where: string;
-  if (options.caseName === undefined) {
+  if (options.host !== undefined) {
+    const remote = await resolveRemoteCase(deps, options);
+    if ('refused' in remote) return fail(deps, remote.refused, EXIT.refused);
+    if ('error' in remote) return fail(deps, remote.error);
+    const quick = await spawnInCase(deps, { ...options, caseName: remote.caseName }, extras);
+    if ('error' in quick) return fail(deps, quick.error);
+    sid = quick.sessionId;
+    data = { ...quick.data, hostId: options.host, remotePath: remote.remotePath, caseCreated: remote.created };
+    where = `${options.host}:${remote.remotePath}, ${remote.created ? 'new ' : ''}case ${remote.caseName}`;
+  } else if (options.caseName === undefined) {
     const dir = options.cwd !== undefined ? { dir: resolvePath(options.cwd) } : await parentWorkingDir(deps);
     if ('error' in dir) return fail(deps, dir.error, EXIT.refused);
     const spawned = await spawnInDirectory(deps, options, dir.dir, extras);
@@ -787,6 +807,161 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
     where = `case ${(quick.data.caseName as string | undefined) ?? options.caseName}`;
   }
   return finishSpawn(deps, options, sid, data, where);
+}
+
+/** A remote host as `GET /api/remote-hosts` lists it (only the fields the CLI shows). */
+interface RemoteHostRow {
+  id: string;
+  label?: string;
+  host?: string;
+  username?: string;
+  port?: number;
+  wakeMac?: string | string[];
+  wakeCommand?: string;
+}
+
+/** A case as `GET /api/cases` lists it; `remote` only on a remote case. */
+interface CaseRow {
+  name: string;
+  location?: string;
+  remote?: { hostId: string; path: string };
+}
+
+/** `/a/b/` → `/a/b`, `/a//b/./c` → `/a/b/c`: the form a remote case is matched and stored in. */
+export function normalizeRemotePath(path: string): string {
+  const normalized = posixPath.normalize(path);
+  return normalized.length > 1 ? normalized.replace(/\/+$/, '') : normalized;
+}
+
+/**
+ * Name for a remote case `spawn --host` creates: `<host>-<last path segment>`, reduced to
+ * the characters a case name allows, `-2`, `-3`, … while the name is taken by ANY case
+ * (local, linked, remote, docker share one namespace in the UI).
+ */
+export function remoteCaseName(hostId: string, remotePath: string, taken: ReadonlySet<string>): string {
+  const segment = posixPath.basename(remotePath) || 'root';
+  const base = `${hostId}-${segment}`
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .slice(0, 60)
+    .replace(/-$/, '');
+  if (!taken.has(base)) return base;
+  for (let n = 2; ; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+}
+
+async function fetchRemoteHosts(deps: AgentDeps): Promise<RemoteHostRow[] | { error: string }> {
+  const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/remote-hosts' });
+  if (!res.json?.success) return { error: describeFailure(res) };
+  return (res.json.data as RemoteHostRow[] | undefined) ?? [];
+}
+
+async function fetchCases(deps: AgentDeps): Promise<CaseRow[] | { error: string }> {
+  const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/cases' });
+  if (!res.json?.success) return { error: describeFailure(res) };
+  return (res.json.data as CaseRow[] | undefined) ?? [];
+}
+
+/**
+ * `spawn --host <id> --cwd <path>` → the remote case that runs there: an existing one with
+ * the same host and directory, else a new one via `remote-link` (which wakes a sleeping host
+ * and checks the directory exists). Remote sessions only start through a case, so this is
+ * the whole of "start a worker on another machine".
+ */
+async function resolveRemoteCase(
+  deps: AgentDeps,
+  options: SpawnOptions
+): Promise<{ caseName: string; remotePath: string; created: boolean } | { refused: string } | { error: string }> {
+  const hostId = options.host as string;
+  if (options.caseName !== undefined) {
+    return { refused: 'refusing: --host places the worker by --cwd — pass the directory, not a case' };
+  }
+  if (options.cwd === undefined) {
+    return {
+      refused: `refusing: --host needs --cwd <absolute path on ${hostId}> (\`agent hosts\` lists known directories)`,
+    };
+  }
+  if (!options.cwd.startsWith('/')) {
+    return {
+      refused: `refusing: --cwd must be an absolute path on ${hostId} (got ${options.cwd}; ~ and relative paths would resolve on THIS machine)`,
+    };
+  }
+  const remotePath = normalizeRemotePath(options.cwd);
+
+  const [hosts, cases] = await Promise.all([fetchRemoteHosts(deps), fetchCases(deps)]);
+  if ('error' in hosts) return hosts;
+  if ('error' in cases) return cases;
+  if (!hosts.some((h) => h.id === hostId)) {
+    const known = hosts.map((h) => h.id).join(', ');
+    return { refused: `refusing: no remote host "${hostId}" (known: ${known || 'none — add one in the web UI'})` };
+  }
+  const caseFor = (list: CaseRow[]) =>
+    list.find((c) => c.remote?.hostId === hostId && normalizeRemotePath(c.remote.path) === remotePath);
+  const existing = caseFor(cases);
+  if (existing) return { caseName: existing.name, remotePath, created: false };
+
+  const name = remoteCaseName(hostId, remotePath, new Set(cases.map((c) => c.name)));
+  const linked = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: '/api/v1/cases/remote-link',
+    body: { name, hostId, remotePath },
+    // ssh probes (tmux, directory) after a possible wake: give it the wake budget.
+    timeoutMs: REMOTE_LINK_TIMEOUT_MS,
+  });
+  if (linked.json?.success) return { caseName: name, remotePath, created: true };
+  // A parallel spawn into the same new directory (a batch of workers) linked it first:
+  // its case is the one to use, not an error.
+  if (linked.json?.errorCode === 'ALREADY_EXISTS') {
+    const again = await fetchCases(deps);
+    const raced = 'error' in again ? undefined : caseFor(again);
+    if (raced) return { caseName: raced.name, remotePath, created: false };
+  }
+  return { error: `could not create a case for ${hostId}:${remotePath}: ${describeFailure(linked)}` };
+}
+
+/** Wake (40 s) + tmux and directory probes (15 s each) + slack. */
+const REMOTE_LINK_TIMEOUT_MS = 90_000;
+
+/** `agent hosts` — the remote hosts a worker can be spawned on, and the directories that already have a case. */
+export async function agentHosts(deps: AgentDeps): Promise<number> {
+  const [hosts, cases] = await Promise.all([fetchRemoteHosts(deps), fetchCases(deps)]);
+  if ('error' in hosts) return fail(deps, hosts.error);
+  if ('error' in cases) return fail(deps, cases.error);
+  const casesOf = (hostId: string) =>
+    cases.filter((c) => c.remote?.hostId === hostId).map((c) => ({ name: c.name, path: c.remote?.path ?? '' }));
+  const wakes = (h: RemoteHostRow) =>
+    Boolean(h.wakeCommand || (Array.isArray(h.wakeMac) ? h.wakeMac.length : h.wakeMac));
+  if (deps.json) {
+    emitJson(
+      deps,
+      hosts.map((h) => ({
+        id: h.id,
+        label: h.label,
+        ssh: `${h.username}@${h.host}${h.port ? `:${h.port}` : ''}`,
+        wake: wakes(h),
+        cases: casesOf(h.id),
+      }))
+    );
+    return EXIT.ok;
+  }
+  if (hosts.length === 0) {
+    deps.io.out(palette.muted('(no remote hosts — add one in the web UI: New case → Remote)'));
+    return EXIT.ok;
+  }
+  for (const h of hosts) {
+    const ssh = `${h.username}@${h.host}${h.port ? `:${h.port}` : ''}`;
+    deps.io.out(
+      `${palette.ok(h.id)}  ${h.label ?? ''}  ${palette.muted(ssh)}  ${wakes(h) ? 'wakes on spawn' : palette.muted('no wake configured')}`
+    );
+    const rows = casesOf(h.id);
+    if (rows.length === 0) deps.io.out(palette.muted('  (no cases yet)'));
+    else deps.io.out(table([['  CASE', 'PATH'], ...rows.map((c) => [`  ${c.name}`, c.path])], { gap: 2 }));
+  }
+  deps.io.out(
+    palette.muted(
+      'spawn there: codeman agent spawn --host <id> --cwd <absolute path on that host> [-n name] [--model …] — a case with that path is reused, else created; a sleeping host is woken. Or spawn <case> for a case listed here.'
+    )
+  );
+  return EXIT.ok;
 }
 
 /** quick-start in a case: the original spawn path. */
@@ -1868,7 +2043,7 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description(
-      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, watch, mute, read, interrupt, rm, post, inbox, todo'
+      'Talk to other sessions from inside one (any CLI mode): list, spawn (also on another host), hosts, send, wait, watch, mute, read, interrupt, rm, post, inbox, todo'
     );
 
   agent
@@ -1887,7 +2062,7 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('spawn [case]')
     .description(
-      'Start a worker and wait for its composer where the mode draws one. Where: a case (created if missing), else --cwd, else YOUR working directory'
+      'Start a worker and wait for its composer where the mode draws one. Where: a case (created if missing), else --cwd, else YOUR working directory; on another machine: --host <id> --cwd <path there>'
     )
     .option('-m, --mode <mode>', 'Run mode id, as the Run menu names it', 'claude')
     .option(
@@ -1895,6 +2070,10 @@ export function registerAgentCommands(program: Command): Command {
       'Model for this worker only (claude: --model, e.g. opus, sonnet, claude-opus-5-5; codex/opencode/…: their model id). Default: the standard model'
     )
     .option('--cwd <dir>', 'Working directory for the worker (instead of inheriting yours); not with a case')
+    .option(
+      '--host <id>',
+      'Run the worker on that remote host (`agent hosts`); --cwd is then an absolute path THERE. Reuses the case for that directory or creates one; wakes a sleeping host'
+    )
     .option('-n, --name <name>', 'Session name shown in the UI')
     .option('--no-ready', 'Return as soon as the session exists, without the readiness wait')
     .option('-t, --timeout <ms>', 'Readiness budget in ms', String(DEFAULT_WAIT_MS))
@@ -1920,6 +2099,7 @@ export function registerAgentCommands(program: Command): Command {
           mode: string;
           model?: string;
           cwd?: string;
+          host?: string;
           name?: string;
           ready: boolean;
           timeout?: string;
@@ -1933,6 +2113,7 @@ export function registerAgentCommands(program: Command): Command {
           return agentSpawn(deps, {
             caseName,
             cwd: options.cwd,
+            host: options.host,
             model: options.model,
             mode: options.mode,
             name: options.name,
@@ -1944,6 +2125,12 @@ export function registerAgentCommands(program: Command): Command {
           });
         })
     );
+
+  agent
+    .command('hosts')
+    .description('Remote hosts a worker can run on (spawn --host), each with the directories that already have a case')
+    .option('--json', 'Machine-readable output')
+    .action((options: { json?: boolean }) => run(Boolean(options.json), (deps) => agentHosts(deps)));
 
   agent
     .command('restore [id]')

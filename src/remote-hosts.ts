@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getCli } from './config/cli-registry/registry.js';
+import { getErrorMessage } from './types.js';
 import type {
   RemoteCase,
   RemoteHost,
@@ -280,6 +281,48 @@ export async function checkRemoteTmuxAvailable(
     return {
       ok: false,
       error: `remote host ${host.host} needs tmux installed for durable remote sessions`,
+    };
+  }
+}
+
+/**
+ * The SSH command that asks whether `remotePath` is a directory on the host. Same
+ * connection options as the launch; the path is escaped twice (once for the remote
+ * shell, once for the local one that runs ssh).
+ */
+export function buildRemoteDirCheckCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  remotePath: string
+): string {
+  return [
+    ...buildSshConnectionArgs(host),
+    remoteSshTarget(host),
+    shellescape(`test -d ${shellescape(remotePath)}`),
+  ].join(' ');
+}
+
+/**
+ * Linking a remote case checks its directory up front: the launch is `cd <path> && <cli>`,
+ * so a missing directory would otherwise surface as a pane that dies on first start.
+ * `test -d` exits 1 for a missing directory; ssh itself fails with 255 and stderr. Never
+ * throws; no-op under VITEST (mirrors checkRemoteTmuxAvailable).
+ */
+export async function checkRemoteDirExists(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  remotePath: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (process.env.VITEST) return { ok: true };
+  try {
+    await execAsync(buildRemoteDirCheckCommand(host, remotePath), { timeout: 15_000 });
+    return { ok: true };
+  } catch (err) {
+    const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined;
+    if (code === 1) return { ok: false, error: `${remotePath} is not a directory on ${host.host}` };
+    const stderr =
+      err && typeof err === 'object' && 'stderr' in err ? String((err as { stderr?: unknown }).stderr ?? '') : '';
+    return {
+      ok: false,
+      error: `could not check ${remotePath} on ${host.host}: ${stderr.trim() || getErrorMessage(err)}`,
     };
   }
 }

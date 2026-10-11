@@ -960,7 +960,12 @@ describe('wake wiring guard', () => {
     // the registry for its LIFETIME only (`drop()` on session cleanup, `stop()` on
     // shutdown) — the test below pins that it never calls a waking method, which is the
     // property this import list is an approximation of.
-    const allowed = new Set([join('web', 'routes', 'session-routes.ts'), join('web', 'server.ts')]);
+    // `case-routes.ts`: linking a remote case is a user request too (see the create-path test below).
+    const allowed = new Set([
+      join('web', 'routes', 'session-routes.ts'),
+      join('web', 'routes', 'case-routes.ts'),
+      join('web', 'server.ts'),
+    ]);
     const importers = walkTs(SRC)
       .filter((full) => /from\s+['"][^'"]*remote-wake(\.js)?['"]/.test(readFileSync(full, 'utf-8')))
       .map((full) => relative(SRC, full));
@@ -997,7 +1002,13 @@ describe('wake wiring guard', () => {
     // source tree, so a future caller has to come through this test.
     // `remote-wake.ts` names itself: that is the definition, not a caller, and the
     // import guard above already pins the file to the route.
-    const allowed = new Set([join('web', 'routes', 'session-routes.ts'), 'remote-wake.ts']);
+    // `case-routes.ts` is the remote-link route (`codeman agent spawn --host`, the UI's
+    // "Link remote case"): the user asked for that case now, like pressing Run.
+    const allowed = new Set([
+      join('web', 'routes', 'session-routes.ts'),
+      join('web', 'routes', 'case-routes.ts'),
+      'remote-wake.ts',
+    ]);
     const callers = walkTs(SRC)
       .filter((full) => /ensureHostAwake\s*\(/.test(readFileSync(full, 'utf-8')))
       .map((full) => relative(SRC, full));

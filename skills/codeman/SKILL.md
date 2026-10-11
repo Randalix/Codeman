@@ -52,6 +52,13 @@ directory, e.g. a git worktree), and a case name keeps the old quick-start behav
 disk; codex/opencode/…: their model id); without it the worker runs the standard model.
 `-m <mode>` picks the CLI, `-n <name>` the tab name; stdout is the new session id alone.
 
+**A worker on another machine:** `codeman agent hosts` lists the configured remote hosts
+and the directories that already have a remote case; `codeman agent spawn --host <id>
+--cwd <absolute path on that host>` reuses the case for that directory or creates one,
+wakes a sleeping host (wake-on-LAN), and refuses a directory that does not exist there.
+Everything after the spawn (mailbox, `send`, `wait`, `read`, `watch`, `rm`) is the same;
+`agent ls` shows each session's `HOST`.
+
 The session's **todo list** (the Ralph panel in the web UI) is in the CLI too:
 `codeman agent todo add <text>` / `start|done|reopen <todo-id>` / `rm <todo-id>` /
 `ls`, with `--session <id>` for a worker's list. Items set this way never expire and

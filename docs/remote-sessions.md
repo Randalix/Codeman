@@ -532,6 +532,25 @@ turns into "configure WoL"), `test/sse-routing-remote.test.ts` (multi-user routi
 `remote:` family) and `test/host-wake-banner.test.ts` (banner visibility and when the poller
 may connect).
 
+## Spawning a worker on a remote host (`codeman agent spawn --host`)
+
+An agent starts a worker on another machine with
+`codeman agent spawn --host <id> --cwd <absolute path on that host>`. Remote sessions
+only start through a remote case, so the CLI (`resolveRemoteCase` in `src/cli-agent.ts`)
+reads `GET /api/remote-hosts` + `GET /api/cases`, reuses the remote case whose host and
+normalized path match, and otherwise links a new one (`<host>-<last segment>`, numbered
+on a name collision) through `POST /api/cases/remote-link`, then quick-starts into it as
+`spawn <case>` does (`--model` etc. as there). A relative or `~` path is refused before
+any request: it would resolve on the caller's machine. `codeman agent hosts` lists the
+hosts with their cases; `codeman agent ls` has a `HOST` column.
+
+`remote-link` therefore wakes a sleeping host first (`ensureHostAwake`, the same budget
+and the same reasoning as quick-start: linking is the user's own request, wired in the
+HTTP route, never in a service) and, after the tmux probe, checks the directory with
+`test -d` over the same ssh options (`checkRemoteDirExists`): the launch is
+`cd <path> && <cli>`, so a missing directory would otherwise be a pane that dies on
+first start. Both apply to the web UI's "Link remote case" too.
+
 ## `codeman agent` on the remote host
 
 A local session's agent finds `codeman` on PATH and inherits `CODEMAN_MUX`,
@@ -592,7 +611,7 @@ Routes are registered in `src/web/routes/case-routes.ts`:
 | `PUT` | `/api/remote-hosts/:id` | Update a host |
 | `DELETE` | `/api/remote-hosts/:id` | Delete a host |
 | `GET` | `/api/remote-hosts/:hostId/sessions` | Discover `codeman-*` sessions on the host (COD-105; `listRemoteCodemanSessions`, never errors) |
-| `POST` | `/api/cases/remote-link` | Link a case to a remote host (creates the `RemoteCase`) |
+| `POST` | `/api/cases/remote-link` | Link a case to a remote host (creates the `RemoteCase`; wakes a sleeping host, refuses a missing directory) |
 
 `RemoteHost` accepts the optional `wakeMac` (magic packet, sent by Codeman) and `wakeCommand`
 (single executable path, run without a shell, takes precedence) — see **Wake-on-LAN from user

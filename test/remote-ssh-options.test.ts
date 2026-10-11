@@ -18,11 +18,15 @@
  * Pure command-string construction; no real tmux, no ssh. Port: N/A.
  */
 
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { describe, it, expect } from 'vitest';
 import {
   buildSshConnectionArgs,
   buildRemoteTmuxCheckCommand,
+  buildRemoteDirCheckCommand,
   buildRemoteCliVersionProbeCommand,
   remoteSshTarget,
 } from '../src/remote-hosts.js';
@@ -201,6 +205,32 @@ describe('COD-107 buildRemoteTmuxCheckCommand — same connection options as the
       "ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 'command -v tmux'"
     );
     expect(buildRemoteTmuxCheckCommand({ username: 'ubuntu', host: '10.0.0.42', port: 2222 })).toContain('-p 2222');
+  });
+});
+
+describe('buildRemoteDirCheckCommand — remote-link checks the case directory', () => {
+  const PREFIX = 'ssh -o BatchMode=yes -o ConnectTimeout=10 ubuntu@10.0.0.42 ';
+
+  it('uses the shared connection args', () => {
+    const cmd = buildRemoteDirCheckCommand(aaDesktop, '/srv/work');
+    expect(cmd).toContain('-p 2222');
+    expect(cmd).toContain("-o 'ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p'");
+    expect(cmd).toContain('aakht@192.168.55.170');
+  });
+
+  it('survives both shells with a space in the path: what the remote shell runs is `test -d <path>`', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codeman dir check '));
+    try {
+      const cmd = buildRemoteDirCheckCommand({ username: 'ubuntu', host: '10.0.0.42' }, dir);
+      expect(cmd.startsWith(PREFIX)).toBe(true);
+      // ssh hands its last argument to the remote shell; `sh -c` plays that shell here.
+      const asRemote = `sh -c ${cmd.slice(PREFIX.length)}`;
+      expect(spawnSync('sh', ['-c', asRemote]).status).toBe(0);
+      const missing = buildRemoteDirCheckCommand({ username: 'ubuntu', host: '10.0.0.42' }, join(dir, 'nope'));
+      expect(spawnSync('sh', ['-c', `sh -c ${missing.slice(PREFIX.length)}`]).status).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

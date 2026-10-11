@@ -38,6 +38,7 @@ import { spawn } from 'node:child_process';
 import dgram from 'node:dgram';
 import { MAX_WAKE_MACS } from './config/remote-wake-limits.js';
 import { probeRemoteHostReachable } from './remote-probe.js';
+import type { RemoteHost } from './types.js';
 
 /** Minimum spacing between two reachability probes for the same session. */
 export const REMOTE_WAKE_PROBE_MIN_INTERVAL_MS = 30_000;
@@ -1003,5 +1004,25 @@ export function createDefaultRemoteWakeDeps(overrides: Partial<RemoteWakeDeps> =
     waitUntilReady: (remote, opts) => waitUntilRemoteReady(remote, { ...opts, probe }),
     delay,
     ...overrides,
+  };
+}
+
+/**
+ * `RemoteHost` → the wake registry's host shape. They differ in one field name only
+ * (`id` in host config vs `hostId` on a session's `remote`), but the rename is load-
+ * bearing: the registry keys its per-host wake state on `hostId`. The proxy fields
+ * travel too: they are what tells the registry its probe cannot reach this host.
+ */
+export function wakeableHost(host: RemoteHost): WakeableRemote {
+  return {
+    hostId: host.id,
+    label: host.label,
+    host: host.host,
+    port: host.port,
+    wakeMac: host.wakeMac,
+    wakeCommand: host.wakeCommand,
+    jumpHost: host.jumpHost,
+    socksProxy: host.socksProxy,
+    extraSshOptions: host.extraSshOptions,
   };
 }

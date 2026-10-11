@@ -72,13 +72,15 @@ vi.mock('../../src/remote-hosts.js', async (importOriginal) => {
   return {
     ...actual,
     checkRemoteTmuxAvailable: vi.fn(async () => ({ ok: true, tmuxPath: '/usr/bin/tmux' })),
+    checkRemoteDirExists: vi.fn(async () => ({ ok: true })),
   };
 });
 
 // Import mocked modules for test control
 import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import fs from 'node:fs/promises';
-import { checkRemoteTmuxAvailable } from '../../src/remote-hosts.js';
+import { checkRemoteDirExists, checkRemoteTmuxAvailable } from '../../src/remote-hosts.js';
+import type { RemoteWakeRegistry } from '../../src/remote-wake.js';
 
 const mockedExistsSync = vi.mocked(existsSync);
 const mockedMkdirSync = vi.mocked(mkdirSync);
@@ -88,6 +90,7 @@ const mockedReadFile = vi.mocked(fs.readFile);
 const mockedWriteFile = vi.mocked(fs.writeFile);
 const mockedStat = vi.mocked(fs.stat);
 const mockedCheckRemoteTmux = vi.mocked(checkRemoteTmuxAvailable);
+const mockedCheckRemoteDir = vi.mocked(checkRemoteDirExists);
 
 interface CaseRouteHarness {
   app: FastifyInstance;
@@ -100,7 +103,7 @@ interface CaseRouteHarness {
  * from src/web/server.ts) so bare handler returns become { success:true, data }
  * and returned error envelopes get mapped to a conventional HTTP status.
  */
-async function createEnvelopeHarness(): Promise<CaseRouteHarness> {
+async function createEnvelopeHarness(options: { remoteWake?: RemoteWakeRegistry } = {}): Promise<CaseRouteHarness> {
   const app = Fastify({ logger: false });
   await app.register(fastifyCookie);
 
@@ -123,7 +126,7 @@ async function createEnvelopeHarness(): Promise<CaseRouteHarness> {
   });
 
   const ctx = createMockRouteContext();
-  registerCaseRoutes(app, ctx as never);
+  registerCaseRoutes(app, ctx as never, options);
   installRouteErrorHandler(app);
   await app.ready();
 
@@ -407,6 +410,71 @@ describe('case-routes', () => {
           remote: expect.objectContaining({ hostId: 'gpu-box', path: '/home/ubuntu/work' }),
         })
       );
+    });
+
+    describe('remote-link wakes the host and checks the directory', () => {
+      const HOST = { id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', wakeCommand: '/bin/wake' };
+      const LINK = { name: 'gpu-work', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' };
+
+      async function withWake(result: 'awake' | 'woke' | 'failed') {
+        const ensureHostAwake = vi.fn(async () => result);
+        const wakeHarness = await createEnvelopeHarness({
+          remoteWake: { ensureHostAwake } as unknown as RemoteWakeRegistry,
+        });
+        setupRemoteConfigStore();
+        mockedReaddir.mockRejectedValue(new Error('ENOENT'));
+        await wakeHarness.app.inject({ method: 'POST', url: '/api/remote-hosts', payload: HOST });
+        return { app: wakeHarness.app, ensureHostAwake };
+      }
+
+      async function remoteCaseNames(app: FastifyInstance): Promise<string[]> {
+        const cases = await app.inject({ method: 'GET', url: '/api/cases' });
+        return (JSON.parse(cases.body).data as Array<{ name: string; location: string }>)
+          .filter((c) => c.location === 'remote')
+          .map((c) => c.name);
+      }
+
+      it('wakes the host before the ssh checks, then links', async () => {
+        const { app, ensureHostAwake } = await withWake('woke');
+        const link = await app.inject({ method: 'POST', url: '/api/cases/remote-link', payload: LINK });
+        expect(link.statusCode).toBe(200);
+        expect(ensureHostAwake).toHaveBeenCalledTimes(1);
+        expect(ensureHostAwake).toHaveBeenCalledWith(
+          expect.objectContaining({ hostId: 'gpu-box', wakeCommand: '/bin/wake' }),
+          expect.objectContaining({ timeoutMs: expect.any(Number) })
+        );
+        expect(ensureHostAwake.mock.invocationCallOrder[0]).toBeLessThan(
+          mockedCheckRemoteTmux.mock.invocationCallOrder[0]
+        );
+        expect(mockedCheckRemoteDir).toHaveBeenCalledWith(
+          expect.objectContaining({ id: 'gpu-box' }),
+          '/home/ubuntu/work'
+        );
+        expect(await remoteCaseNames(app)).toEqual(['gpu-work']);
+      });
+
+      it('a failed wake links nothing and says so', async () => {
+        const { app } = await withWake('failed');
+        const link = await app.inject({ method: 'POST', url: '/api/cases/remote-link', payload: LINK });
+        expect(JSON.parse(link.body)).toMatchObject({
+          success: false,
+          error: expect.stringMatching(/GPU Box did not come back/),
+        });
+        expect(mockedCheckRemoteTmux).not.toHaveBeenCalled();
+        expect(await remoteCaseNames(app)).toEqual([]);
+      });
+
+      it('a missing directory is refused instead of linked', async () => {
+        const { app } = await withWake('awake');
+        mockedCheckRemoteDir.mockResolvedValueOnce({
+          ok: false,
+          error: '/home/ubuntu/work is not a directory on 10.0.0.42',
+        });
+        const link = await app.inject({ method: 'POST', url: '/api/cases/remote-link', payload: LINK });
+        expect(link.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+        expect(JSON.parse(link.body).error).toMatch(/not a directory/);
+        expect(await remoteCaseNames(app)).toEqual([]);
+      });
     });
 
     it('prefers remote case metadata over a same-name local managed case', async () => {

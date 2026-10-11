@@ -95,6 +95,7 @@ import {
 import type { AdoptedContainerProbe, DockerBrowseResult, DockerContainerInfo } from '../../docker-hosts.js';
 import { buildDockerRemoveCommand } from '../../tmux-manager.js';
 import {
+  checkRemoteDirExists,
   checkRemoteTmuxAvailable,
   listRemoteCodemanSessions,
   readRemoteCases,
@@ -103,6 +104,8 @@ import {
   writeRemoteCases,
   writeRemoteHosts,
 } from '../../remote-hosts.js';
+
+import { REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS, wakeableHost, type RemoteWakeRegistry } from '../../remote-wake.js';
 
 const LINKED_CASES_FILE = dataPath('linked-cases.json');
 const CODEMAN_CONFIG_DIR = getDataDir();
@@ -245,7 +248,12 @@ async function ensureCaseImage(
   return { ok: true, imageBuilding: true };
 }
 
-export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & ConfigPort & SessionPort): void {
+export function registerCaseRoutes(
+  app: FastifyInstance,
+  ctx: EventPort & ConfigPort & SessionPort,
+  /** The server's wake registry (from registerSessionRoutes): linking a case on a sleeping host wakes it. */
+  options: { remoteWake?: RemoteWakeRegistry } = {}
+): void {
   // ═══════════════════════════════════════════════════════════════
   // Case CRUD (list, create, link, detail, fix-plan)
   // ═══════════════════════════════════════════════════════════════
@@ -852,12 +860,33 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
       return createErrorResponse(ApiErrorCode.ALREADY_EXISTS, 'Case already exists');
     }
 
+    // Linking is the user's own request, like pressing Run on a remote case: a sleeping
+    // host is woken here (HTTP route only, never the shared service), or the checks
+    // below would blame tmux / the path for a machine that is merely suspended.
+    if (options.remoteWake) {
+      const hostWake = await options.remoteWake.ensureHostAwake(wakeableHost(host), {
+        timeoutMs: REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS,
+        requestedBy: ownerFor(req),
+      });
+      if (hostWake === 'failed') {
+        return createErrorResponse(
+          ApiErrorCode.OPERATION_FAILED,
+          `${host.label} did not come back after a wake-on-LAN request — the case was not linked`
+        );
+      }
+    }
+
     // Courtesy validation: tmux is a hard prerequisite for durable remote sessions.
     // Verify it up-front so linking surfaces a clear error now instead of a dead pane
     // at first launch (also confirms the SSH connection actually works).
     const tmuxCheck = await checkRemoteTmuxAvailable(host);
     if (!tmuxCheck.ok) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, tmuxCheck.error || 'remote host is missing tmux');
+    }
+    // The launch is `cd <path> && <cli>`: a missing directory is a pane that dies on start.
+    const dirCheck = await checkRemoteDirExists(host, remoteCase.remotePath);
+    if (!dirCheck.ok) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, dirCheck.error || 'remote path is not a directory');
     }
 
     await writeRemoteCases(CODEMAN_CONFIG_DIR, [...remoteCases, remoteCase]);
