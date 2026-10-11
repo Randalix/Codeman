@@ -24,6 +24,7 @@ import {
   agentRm,
   agentSend,
   agentSpawn,
+  modelFields,
   agentTodoAdd,
   agentTodoLs,
   agentTodoRm,
@@ -637,6 +638,99 @@ describe('agent spawn', () => {
     expect(await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.error);
     expect(deps.calls).toHaveLength(1);
     expect(deps.err.join('')).toMatch(/SESSION_BUSY/);
+  });
+});
+
+describe('agent spawn: where it starts and which model it runs', () => {
+  const PARENT_DIR = '/home/joe/work/parent';
+  const listed = () =>
+    ok([
+      { id: SELF, workingDir: PARENT_DIR },
+      { id: OTHER, workingDir: '/elsewhere' },
+    ]);
+  const created = () => ok({ session: { id: OTHER } });
+  const base = { mode: 'claude', ready: false, timeoutMs: 1000 } as const;
+
+  it('without a case inherits the parent directory: create + start, no scratch label', async () => {
+    const deps = fakeDeps([listed(), created(), ok({})]);
+    expect(await agentSpawn(deps, { ...base, name: 'w1' })).toBe(EXIT.ok);
+    expect(deps.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'GET /api/v1/sessions',
+      'POST /api/v1/sessions',
+      `POST /api/v1/sessions/${OTHER}/interactive`,
+    ]);
+    expect(deps.calls[1].body).toEqual({ workingDir: PARENT_DIR, mode: 'claude', parentSessionId: SELF, name: 'w1' });
+    for (const call of deps.calls) expect(call.headers?.['X-Codeman-Agent-Origin']).toBeUndefined();
+    expect(deps.out).toEqual([OTHER]);
+    expect(deps.err.join('')).toContain(`dir ${PARENT_DIR}`);
+  });
+
+  it('--cwd sets the directory (relative to this process), without asking for the parent', async () => {
+    const deps = fakeDeps([created(), ok({})]);
+    expect(await agentSpawn(deps, { ...base, cwd: 'sub/dir' })).toBe(EXIT.ok);
+    expect(deps.calls[0].body).toMatchObject({ workingDir: join(process.cwd(), 'sub/dir') });
+    const abs = fakeDeps([created(), ok({})]);
+    await agentSpawn(abs, { ...base, cwd: '/srv/repo' });
+    expect(abs.calls[0].body).toMatchObject({ workingDir: '/srv/repo' });
+  });
+
+  it('a case still quick-starts; a case together with --cwd is refused before any call', async () => {
+    const quick = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' })]);
+    expect(await agentSpawn(quick, { ...base, caseName: 'c', model: 'opus' })).toBe(EXIT.ok);
+    expect(quick.calls[0]).toMatchObject({ path: '/api/v1/quick-start', body: { caseName: 'c', model: 'opus' } });
+    expect(quick.calls[0].body).not.toHaveProperty('modelOverride'); // would rewrite the case's settings file
+    const both = fakeDeps([]);
+    expect(await agentSpawn(both, { ...base, caseName: 'c', cwd: '/x' })).toBe(EXIT.refused);
+    expect(both.calls).toEqual([]);
+  });
+
+  it('--model lands where the mode takes it; without it nothing is sent (the standard model)', async () => {
+    expect(modelFields('claude', 'opus')).toEqual({ model: 'opus' });
+    expect(modelFields('codex', 'gpt-5.5')).toEqual({ codexConfig: { model: 'gpt-5.5' } });
+    expect(modelFields('opencode', 'anthropic/x')).toEqual({ openCodeConfig: { model: 'anthropic/x' } });
+    for (const mode of ['shell', 'deepseek']) expect(() => modelFields(mode, 'x')).toThrow(/no model to set/);
+
+    const codex = fakeDeps([listed(), created(), ok({})]);
+    await agentSpawn(codex, { ...base, mode: 'codex', model: 'gpt-5.5', resume: 'r-1' });
+    expect(codex.calls[1].body).toMatchObject({ codexConfig: { model: 'gpt-5.5', resumeSessionId: 'r-1' } });
+
+    const plain = fakeDeps([listed(), created(), ok({})]);
+    await agentSpawn(plain, base);
+    expect(plain.calls[1].body).not.toHaveProperty('model');
+
+    const shell = fakeDeps([]);
+    expect(await agentSpawn(shell, { ...base, mode: 'shell', model: 'x' })).toBe(EXIT.refused);
+    expect(shell.calls).toEqual([]);
+  });
+
+  it('deepseek keeps its permission posture next to a placed directory', async () => {
+    const deps = fakeDeps([created(), ok({})]);
+    await agentSpawn(deps, { ...base, mode: 'deepseek', cwd: '/srv' });
+    expect(deps.calls[0].body).toMatchObject({ deepSeekConfig: { permissionMode: 'danger-full-access' } });
+  });
+
+  it('a start that fails removes the created session again; a parent it cannot find is refused', async () => {
+    const deps = fakeDeps([listed(), created(), apiError(409, 'SESSION_BUSY', 'Session is busy'), ok({})]);
+    expect(await agentSpawn(deps, base)).toBe(EXIT.error);
+    expect(deps.calls.at(-1)).toMatchObject({ method: 'DELETE', path: `/api/v1/sessions/${OTHER}` });
+    expect(deps.err.join('')).toMatch(/could not start .*removed again.*SESSION_BUSY/);
+    expect(deps.out).toEqual([]);
+
+    const orphan = fakeDeps([ok([{ id: OTHER, workingDir: '/x' }])]);
+    expect(await agentSpawn(orphan, base)).toBe(EXIT.refused);
+    expect(orphan.err.join('')).toMatch(/--cwd or a case/);
+
+    // a remote parent's directory is a path on another host: never start a local worker there
+    const remote = fakeDeps([ok([{ id: SELF, workingDir: '/home/joe/x', remote: { hostId: 'huff' } }])]);
+    expect(await agentSpawn(remote, base)).toBe(EXIT.refused);
+    expect(remote.calls).toHaveLength(1);
+    expect(remote.err.join('')).toMatch(/cannot inherit a remote directory/);
+  });
+
+  it('the readiness wait runs for an inherited-directory worker too', async () => {
+    const deps = fakeDeps([listed(), created(), ok({}), ok({ wait: { matched: true } })]);
+    expect(await agentSpawn(deps, { ...base, ready: true })).toBe(EXIT.ok);
+    expect(deps.calls[3]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/wait-output` });
   });
 });
 

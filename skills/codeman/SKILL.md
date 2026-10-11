@@ -44,6 +44,14 @@ other's post are visible instead of silently stalled (HTTP:
 anything that is a message rather than a prompt — it never starts a billed turn and
 never risks a control byte in a fullscreen TUI.
 
+**`codeman agent spawn [case]`** starts a worker where you work: without a case it
+inherits **your** working directory, `--cwd <dir>` puts it elsewhere (an existing
+directory, e.g. a git worktree), and a case name keeps the old quick-start behaviour
+(`~/codeman-cases/<case>`, created if missing). `--model <id>` picks this worker's model
+(claude: `opus`, `sonnet`, `claude-opus-5-5`, … as `claude --model`, nothing written to
+disk; codex/opencode/…: their model id); without it the worker runs the standard model.
+`-m <mode>` picks the CLI, `-n <name>` the tab name; stdout is the new session id alone.
+
 The session's **todo list** (the Ralph panel in the web UI) is in the CLI too:
 `codeman agent todo add <text>` / `start|done|reopen <todo-id>` / `rm <todo-id>` /
 `ls`, with `--session <id>` for a worker's list. Items set this way never expire and

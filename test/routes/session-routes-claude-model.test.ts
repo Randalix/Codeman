@@ -160,3 +160,46 @@ describe('POST /api/sessions model', () => {
     expect(session.advisorModel).toBe('opus');
   });
 });
+
+describe('POST /api/quick-start model', () => {
+  let harness: Harness;
+
+  beforeEach(async () => {
+    harness = await createHarness();
+  });
+
+  afterEach(async () => {
+    await harness.app.close();
+  });
+
+  async function quickStart(payload: Record<string, unknown>) {
+    const res = await harness.app.inject({ method: 'POST', url: '/api/quick-start', payload });
+    return { res, body: JSON.parse(res.body) as { success?: boolean; errorCode?: string; casePath?: string } };
+  }
+
+  it('launches the worker on the model it names and writes nothing into the case', async () => {
+    harness.ctx.getModelConfig.mockResolvedValue({ defaultModel: 'sonnet' });
+    const { res, body } = await quickStart({ caseName: 'qs-model-1', mode: 'claude', model: 'opus' });
+    expect(res.statusCode).toBe(200);
+    const calls = harness.ctx.mux.createSession.mock.calls;
+    expect((calls[calls.length - 1][0] as { model?: string }).model).toBe('opus');
+    // The case's settings file (hooks live there too) must not carry the model: that is modelOverride's job.
+    const settings = await readFile(join(body.casePath!, '.claude', 'settings.local.json'), 'utf8').catch(() => '{}');
+    expect(JSON.parse(settings)).not.toHaveProperty('model');
+  });
+
+  it('keeps the app-wide default without a model', async () => {
+    harness.ctx.getModelConfig.mockResolvedValue({ defaultModel: 'sonnet' });
+    await quickStart({ caseName: 'qs-model-2', mode: 'claude' });
+    const calls = harness.ctx.mux.createSession.mock.calls;
+    expect((calls[calls.length - 1][0] as { model?: string }).model).toBe('sonnet');
+  });
+
+  it('refuses a model for a CLI that takes it in its own config, and a flag-shaped one', async () => {
+    const codex = await quickStart({ caseName: 'qs-model-3', mode: 'codex', model: 'gpt-5' });
+    expect(codex.body.success).toBe(false);
+    expect(codex.body.errorCode).toBe('INVALID_INPUT');
+    expect((await quickStart({ caseName: 'qs-model-4', mode: 'claude', model: '-p' })).res.statusCode).toBe(400);
+    expect(harness.ctx.mux.createSession).not.toHaveBeenCalled();
+  });
+});

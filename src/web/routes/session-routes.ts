@@ -3523,6 +3523,7 @@ export function registerSessionRoutes(
       sessionName,
       mode = 'claude',
       modelOverride,
+      model,
       openCodeConfig,
       codexConfig,
       geminiConfig,
@@ -3538,6 +3539,14 @@ export function registerSessionRoutes(
       agentOrigin,
       customModel,
     } = parseBody(QuickStartSchema, req.body);
+    // Same rule as the create path: only claude takes a session `model`; any other CLI
+    // would drop it without a word (its model lives in its own config object).
+    if (model && !cliTakesSessionModel(mode)) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'model applies to claude sessions only; other CLIs take their model in their own config object, such as codexConfig.model'
+      );
+    }
 
     // Resolved ONCE here: the same value labels a case directory this request creates
     // (agent-case-marker.ts) and draws the tab lineage line on the session below.
@@ -3583,6 +3592,7 @@ export function registerSessionRoutes(
         effort ||
         advisorModel ||
         modelOverride !== undefined ||
+        model ||
         codexConfig ||
         geminiConfig ||
         antigravityConfig ||
@@ -3595,7 +3605,7 @@ export function registerSessionRoutes(
       ) {
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          'envOverrides, effort, advisorModel, modelOverride, per-CLI config, and custom model endpoints are not supported for remote cases (they do not cross ssh). Configure the remote command via the host command override instead.'
+          'envOverrides, effort, advisorModel, modelOverride, model, per-CLI config, and custom model endpoints are not supported for remote cases (they do not cross ssh). Configure the remote command via the host command override instead.'
         );
       }
 
@@ -3653,6 +3663,7 @@ export function registerSessionRoutes(
         (envOverrides && Object.keys(envOverrides).length > 0) ||
         effort ||
         advisorModel ||
+        model ||
         codexConfig ||
         geminiConfig ||
         antigravityConfig ||
@@ -3665,7 +3676,7 @@ export function registerSessionRoutes(
       ) {
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          'envOverrides, effort, advisorModel, per-CLI config, and custom model endpoints are not supported for docker cases (they do not cross into the container). Configure the container via the docker host command override instead.'
+          'envOverrides, effort, advisorModel, model, per-CLI config, and custom model endpoints are not supported for docker cases (they do not cross into the container). Configure the container via the docker host command override instead.'
         );
       }
 
@@ -3954,7 +3965,7 @@ export function registerSessionRoutes(
             qsModelSource.param ?? 'model'
           ] as string | undefined)
         : qsModelSource?.source === 'claude-settings-file'
-          ? qsModelConfig?.defaultModel || undefined
+          ? model || qsModelConfig?.defaultModel || undefined
           : undefined;
     const qsClaudeModeConfig = await ctx.getClaudeModeConfig();
     const qsEffectiveClaudeMode = await resolveClaudeModeForUsername(qsClaudeModeConfig.claudeMode, owner);

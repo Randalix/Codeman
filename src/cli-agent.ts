@@ -31,6 +31,7 @@
 import http from 'node:http';
 import https from 'node:https';
 import { statSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 import type { Command } from 'commander';
 import {
   basicAuthHeader,
@@ -376,6 +377,9 @@ interface SessionRow {
   mode?: string;
   status?: string;
   workingDir?: string;
+  /** Present only for a session that runs on another host / in a container. */
+  remote?: unknown;
+  docker?: unknown;
   pid?: number | null;
   parentSessionId?: string | null;
   /** Wall-clock ms the last turn ended; null while one runs. Absent on older servers. */
@@ -552,7 +556,12 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
 }
 
 export interface SpawnOptions {
-  caseName: string;
+  /** A case (quick-start, created if missing). Absent: a directory — `cwd`, else the parent's. */
+  caseName?: string;
+  /** Working directory for the worker (resolved against this process's cwd); excludes `caseName`. */
+  cwd?: string;
+  /** Model for this worker only; absent = the standard model (app default, else the CLI's own). */
+  model?: string;
   mode: string;
   name?: string;
   /** Wait for the composer before returning, where the registry gives the mode a ready mark. */
@@ -607,9 +616,29 @@ export const PERMISSION_ENV_BY_MODE: Record<string, { name: string; value: (mode
   opencode: { name: 'OPENCODE_PERMISSION', value: opencodePermissionEnv },
 };
 
+/**
+ * Where `--model` goes for this mode, from the registry's `capabilities.model`: claude takes
+ * the per-session top-level `model` (`claude --model`, nothing written to disk — never
+ * `modelOverride`, which rewrites the directory's settings file and so the model of every
+ * session there, the parent's included); a `flag` CLI takes it in its own config object;
+ * `none` (shell, deepseek) has no model to set.
+ */
+export function modelFields(mode: string, model: string): Record<string, unknown> {
+  const entry = getCli(mode);
+  const source = entry?.capabilities.model;
+  if (source?.source === 'claude-settings-file') return { model };
+  const configField = entry?.launch.legacyConfigField;
+  if (source?.source === 'flag' && configField) {
+    const param = source.param ?? 'model';
+    return { [configField]: { [entry.launch.legacyConfigAliases?.[param] ?? param]: model } };
+  }
+  throw new Error(`--model is not available for mode "${mode}" (it has no model to set)`);
+}
+
 /** Extra quick-start body from the spawn options; throws on a combination the server would refuse. */
 export function buildSpawnExtras(options: SpawnOptions): Record<string, unknown> {
   const extras: Record<string, unknown> = {};
+  if (options.model !== undefined) Object.assign(extras, modelFields(options.mode, options.model));
   const env = parseEnvPairs(options.env);
   if (options.permission !== undefined) {
     if (options.permission !== 'allow' && options.permission !== 'ask') {
@@ -664,23 +693,56 @@ export const SPAWN_BODY_BY_MODE: Record<string, Record<string, unknown>> = {
   deepseek: { deepSeekConfig: { permissionMode: 'danger-full-access' } },
 };
 
-/** `agent spawn` — quick-start with lineage, then the readiness ladder where the mode has one. */
-export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promise<number> {
-  const body: Record<string, unknown> = {
-    caseName: options.caseName,
-    mode: options.mode,
-    parentSessionId: deps.ctx.selfId,
-  };
-  if (options.name) body.sessionName = options.name;
-  Object.assign(body, SPAWN_BODY_BY_MODE[options.mode] ?? {});
-  let extras: Record<string, unknown>;
-  try {
-    extras = buildSpawnExtras(options);
-  } catch (err) {
-    return fail(deps, getErrorMessage(err), EXIT.refused);
+/** This session's working directory, from the session list: where an un-placed worker starts. */
+async function parentWorkingDir(deps: AgentDeps): Promise<{ dir: string } | { error: string }> {
+  const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
+  if (!res.json?.success) return { error: describeFailure(res) };
+  const self = ((res.json.data as SessionRow[] | undefined) ?? []).find((s) => s.id === deps.ctx.selfId);
+  if (!self?.workingDir)
+    return { error: 'cannot inherit a directory: this session is not in the list — pass --cwd or a case' };
+  // A remote session's directory is a path on ANOTHER host (a docker one is a workspace its
+  // container runs in): a local worker there would run on the wrong machine, or in a path
+  // that only happens to exist here too. Spawn into its case instead.
+  if (self.remote || self.docker) {
+    return {
+      error: `cannot inherit a ${self.remote ? 'remote' : 'docker'} directory (${self.workingDir}) — spawn into its case or pass --cwd`,
+    };
   }
-  // Per-mode config objects merge (deepseek's permission posture + a resume id both
-  // live in deepSeekConfig); everything else overrides.
+  return { dir: self.workingDir };
+}
+
+/**
+ * Create + start a worker in an existing directory (`POST /sessions` + `/interactive`, the
+ * skill's way for a path that is not a case). A session whose start fails is deleted again,
+ * so a refused launch leaves no dead tab behind.
+ */
+async function spawnInDirectory(
+  deps: AgentDeps,
+  options: SpawnOptions,
+  workingDir: string,
+  extras: Record<string, unknown>
+): Promise<{ sessionId: string } | { error: string }> {
+  const body: Record<string, unknown> = { workingDir, mode: options.mode, parentSessionId: deps.ctx.selfId };
+  if (options.name) body.name = options.name;
+  mergeSpawnBody(body, SPAWN_BODY_BY_MODE[options.mode] ?? {});
+  mergeSpawnBody(body, extras);
+  const created = await deps.request(deps.ctx, { method: 'POST', path: '/api/v1/sessions', body });
+  const sid = (created.json?.data as { session?: { id?: string } } | undefined)?.session?.id;
+  if (!created.json?.success || !sid) return { error: describeFailure(created) };
+  const started = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(sid)}/interactive`,
+    body: {},
+  });
+  if (!started.json?.success) {
+    await deps.request(deps.ctx, { method: 'DELETE', path: `/api/v1/sessions/${encodeURIComponent(sid)}` });
+    return { error: `could not start ${sid.slice(0, 8)} (removed again): ${describeFailure(started)}` };
+  }
+  return { sessionId: sid };
+}
+
+/** Per-mode config objects merge (deepseek's permission posture + a resume id or model both live in deepSeekConfig); everything else overrides. */
+function mergeSpawnBody(body: Record<string, unknown>, extras: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(extras)) {
     const existing = body[key];
     body[key] =
@@ -688,6 +750,59 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
         ? { ...(existing as Record<string, unknown>), ...(value as Record<string, unknown>) }
         : value;
   }
+}
+
+/**
+ * `agent spawn [case]` — a worker with lineage, then the readiness ladder where the mode has
+ * one. Where it starts: a case (quick-start, created if missing), else `--cwd`, else the
+ * directory of the session that spawns it — a coordinator's workers work where it works.
+ */
+export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promise<number> {
+  if (options.caseName !== undefined && options.cwd !== undefined) {
+    return fail(deps, 'refusing: a case and --cwd both place the worker — pass one of them', EXIT.refused);
+  }
+  let extras: Record<string, unknown>;
+  try {
+    extras = buildSpawnExtras(options);
+  } catch (err) {
+    return fail(deps, getErrorMessage(err), EXIT.refused);
+  }
+
+  let sid: string;
+  let data: Record<string, unknown>;
+  let where: string;
+  if (options.caseName === undefined) {
+    const dir = options.cwd !== undefined ? { dir: resolvePath(options.cwd) } : await parentWorkingDir(deps);
+    if ('error' in dir) return fail(deps, dir.error, EXIT.refused);
+    const spawned = await spawnInDirectory(deps, options, dir.dir, extras);
+    if ('error' in spawned) return fail(deps, spawned.error);
+    sid = spawned.sessionId;
+    data = { sessionId: sid, workingDir: dir.dir };
+    where = `dir ${dir.dir}`;
+  } else {
+    const quick = await spawnInCase(deps, options, extras);
+    if ('error' in quick) return fail(deps, quick.error);
+    sid = quick.sessionId;
+    data = quick.data;
+    where = `case ${(quick.data.caseName as string | undefined) ?? options.caseName}`;
+  }
+  return finishSpawn(deps, options, sid, data, where);
+}
+
+/** quick-start in a case: the original spawn path. */
+async function spawnInCase(
+  deps: AgentDeps,
+  options: SpawnOptions,
+  extras: Record<string, unknown>
+): Promise<{ sessionId: string; data: Record<string, unknown> } | { error: string }> {
+  const body: Record<string, unknown> = {
+    caseName: options.caseName,
+    mode: options.mode,
+    parentSessionId: deps.ctx.selfId,
+  };
+  if (options.name) body.sessionName = options.name;
+  Object.assign(body, SPAWN_BODY_BY_MODE[options.mode] ?? {});
+  mergeSpawnBody(body, extras);
   const res = await deps.request(deps.ctx, {
     method: 'POST',
     path: '/api/v1/quick-start',
@@ -695,9 +810,18 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
     headers: { ...AGENT_ORIGIN_HEADER },
   });
   const data = res.json?.data as { sessionId?: string; caseName?: string; casePath?: string } | undefined;
-  if (!res.json?.success || !data?.sessionId) return fail(deps, describeFailure(res));
-  const sid = data.sessionId;
+  if (!res.json?.success || !data?.sessionId) return { error: describeFailure(res) };
+  return { sessionId: data.sessionId, data };
+}
 
+/** Readiness wait and the report, shared by both placements. */
+async function finishSpawn(
+  deps: AgentDeps,
+  options: SpawnOptions,
+  sid: string,
+  data: Record<string, unknown>,
+  where: string
+): Promise<number> {
   let ready: boolean | undefined;
   let readinessError: string | undefined;
   let dead = false;
@@ -726,7 +850,9 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
   } else {
     // Human lines go to stderr so `SID=$(codeman agent spawn …)` captures the id alone.
     const say = (line: string) => deps.io.err(line);
-    say(palette.ok(`${GLYPH.ok} spawned ${sid} (${options.mode}, case ${data.caseName ?? options.caseName})`));
+    say(
+      palette.ok(`${GLYPH.ok} spawned ${sid} (${options.mode}${options.model ? ` ${options.model}` : ''}, ${where})`)
+    );
     if (ready === true) say(palette.muted('  composer up: the worker can take a prompt'));
     if (dead) say(palette.err(`${GLYPH.fail} the worker exited during the readiness wait`));
     if (ready === false && !dead) {
@@ -1759,11 +1885,16 @@ export function registerAgentCommands(program: Command): Command {
     );
 
   agent
-    .command('spawn <case>')
+    .command('spawn [case]')
     .description(
-      'Start a worker session in a case (created if missing) and wait for its composer where the mode draws one'
+      'Start a worker and wait for its composer where the mode draws one. Where: a case (created if missing), else --cwd, else YOUR working directory'
     )
     .option('-m, --mode <mode>', 'Run mode id, as the Run menu names it', 'claude')
+    .option(
+      '--model <id>',
+      'Model for this worker only (claude: --model, e.g. opus, sonnet, claude-opus-5-5; codex/opencode/…: their model id). Default: the standard model'
+    )
+    .option('--cwd <dir>', 'Working directory for the worker (instead of inheriting yours); not with a case')
     .option('-n, --name <name>', 'Session name shown in the UI')
     .option('--no-ready', 'Return as soon as the session exists, without the readiness wait')
     .option('-t, --timeout <ms>', 'Readiness budget in ms', String(DEFAULT_WAIT_MS))
@@ -1784,9 +1915,11 @@ export function registerAgentCommands(program: Command): Command {
     .option('--json', 'Machine-readable output')
     .action(
       (
-        caseName: string,
+        caseName: string | undefined,
         options: {
           mode: string;
+          model?: string;
+          cwd?: string;
           name?: string;
           ready: boolean;
           timeout?: string;
@@ -1799,6 +1932,8 @@ export function registerAgentCommands(program: Command): Command {
         run(Boolean(options.json), (deps) => {
           return agentSpawn(deps, {
             caseName,
+            cwd: options.cwd,
+            model: options.model,
             mode: options.mode,
             name: options.name,
             ready: options.ready,

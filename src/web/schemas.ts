@@ -534,6 +534,14 @@ export const DeepSeekWebStartSchema = z
  */
 const parentSessionIdSchema = z.string().max(100).optional();
 
+/** Claude's per-session `--model` (see CreateSessionSchema.model); shared with quick-start. */
+const sessionModelSchema = z
+  .string()
+  .max(100)
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9._\-[\]]*$/)
+  .or(z.literal(''))
+  .optional();
+
 export const CreateSessionSchema = z.object({
   workingDir: safePathSchema.optional(),
   mode: sessionModeSchema().optional(),
@@ -556,12 +564,7 @@ export const CreateSessionSchema = z.object({
    * means no per-session model, as it does for `modelOverride`. Claude only: the route refuses
    * it for any other CLI and on a remote attach.
    */
-  model: z
-    .string()
-    .max(100)
-    .regex(/^[a-zA-Z0-9][a-zA-Z0-9._\-[\]]*$/)
-    .or(z.literal(''))
-    .optional(),
+  model: sessionModelSchema,
   openCodeConfig: OpenCodeConfigSchema,
   codexConfig: CodexConfigSchema,
   geminiConfig: GeminiConfigSchema,
@@ -1094,6 +1097,9 @@ export const QuickStartSchema = z.object({
    *  a real host dir, so the settings file crosses the bind mount); rejected for
    *  remote cases (the file would be written on the WRONG machine). */
   modelOverride: z.string().max(50).optional(),
+  /** Claude model for THIS session only (`claude --model <id>`), as on POST /api/sessions:
+   *  nothing is written into the case, unlike `modelOverride`. Local cases only. */
+  model: sessionModelSchema,
   mode: sessionModeSchema().optional(),
   openCodeConfig: OpenCodeConfigSchema,
   codexConfig: CodexConfigSchema,
