@@ -115,6 +115,8 @@ import { agentInbox } from './agent-inbox.js';
 import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
 import { CoordinatorReports, type MuteSnapshot } from './coordinator-reports.js';
+import { RemoteModelRefresher } from './remote-model-refresher.js';
+import { remoteReadClaudeTranscriptTail } from '../remote-files.js';
 import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
@@ -332,6 +334,10 @@ export class WebServer extends EventEmitter {
     enabled: () => process.env.CODEMAN_INBOX_NUDGE !== '0',
     now: () => Date.now(),
     log: (message) => console.log(message),
+  });
+  /** Reads a remote claude's model off its transcript at each turn end (no exporter there). */
+  private readonly remoteModelRefresher = new RemoteModelRefresher({
+    readTail: remoteReadClaudeTranscriptTail,
   });
   /**
    * Posts a worker's turn end / dialog / exit into its parent session's mailbox (the
@@ -2012,6 +2018,9 @@ export class WebServer extends EventEmitter {
       // Opt-in: the first prompt lands in the tab name, mux-sessions.json, every
       // session:updated broadcast and /api/search, so it is a choice, not a default.
       isAutoNameEnabled: async () => (await this.readSettings()).autoNameSessions === true,
+      refreshRemoteModel: (session: Session) => {
+        void this.remoteModelRefresher.refresh(session);
+      },
     };
   }
 

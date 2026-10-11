@@ -8,11 +8,13 @@
  *
  * 1. **custom-endpoint**: a session pointed at a Custom Model Endpoint Profile is answered
  *    by that endpoint's `modelId`, whatever alias the CLI itself prints.
- * 2. **statusline / screen**: what the running CLI REPORTS, newest report wins. Claude's
+ * 2. **statusline / screen / transcript**: what the running CLI REPORTS, newest report wins. Claude's
  *    statusLine exporter posts `model.display_name` on every render (it follows an
  *    in-session `/model`); a CLI whose registry entry declares
  *    `capabilities.modelDetect` has its footer read off the pane capture the idle/working
- *    probe already takes.
+ *    probe already takes. A remote claude has no exporter reaching back: its newest
+ *    transcript record names the model instead, read at each turn end
+ *    (`transcript`, src/web/remote-model-refresher.ts).
  * 3. **config**: the model the CLI's own config pins for this session, read by the
  *    reader its registry entry names (`capabilities.modelDetect.configResolver`, e.g. the
  *    dsh-TUI route: src/deepseek-route-config.ts), for while the screen names none. Not
@@ -44,7 +46,7 @@ import { legacyConfigForMode } from './session-cli-registry-bridge.js';
 export const MAX_DISPLAY_MODEL_CHARS = 64;
 
 /** A report from the running CLI itself: the sources a restart may restore. */
-export type ReportedModelSource = Extract<DisplayModelSource, 'statusline' | 'screen'>;
+export type ReportedModelSource = Extract<DisplayModelSource, 'statusline' | 'screen' | 'transcript'>;
 
 export interface ReportedModel {
   model: string;
@@ -144,7 +146,7 @@ export function launchModelFor(mode: string, bag: Record<string, unknown>): stri
 export function restoredReportedModel(saved: unknown): ReportedModel | undefined {
   if (!saved || typeof saved !== 'object') return undefined;
   const { model, source } = saved as { model?: unknown; source?: unknown };
-  if (source !== 'statusline' && source !== 'screen') return undefined;
+  if (source !== 'statusline' && source !== 'screen' && source !== 'transcript') return undefined;
   const name = sanitizeModelName(model);
   return name ? { model: name, source } : undefined;
 }

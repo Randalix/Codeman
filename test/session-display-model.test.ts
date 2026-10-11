@@ -497,6 +497,7 @@ describe('restoredReportedModel', () => {
       source: 'screen',
     });
     expect(restoredReportedModel({ model: 'Opus 4.8', source: 'statusline' })?.source).toBe('statusline');
+    expect(restoredReportedModel({ model: 'Sonnet 5', source: 'transcript' })?.source).toBe('transcript');
     expect(restoredReportedModel({ model: 'opus', source: 'launch' })).toBeUndefined();
     expect(restoredReportedModel({ model: 'qwen3.8-27b', source: 'config' })).toBeUndefined();
     expect(restoredReportedModel({ model: 'x', source: 'custom-endpoint' })).toBeUndefined();

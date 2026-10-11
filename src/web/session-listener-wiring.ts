@@ -93,6 +93,8 @@ interface SessionListenerDeps {
   updateSessionName(sessionId: string, name: string): boolean;
   /** The synced `autoNameSessions` setting, read fresh so a flip applies to the next prompt. */
   isAutoNameEnabled(): Promise<boolean>;
+  /** A remote claude's model, read off its transcript at each turn end (RemoteModelRefresher). */
+  refreshRemoteModel(session: Session): void;
 }
 
 /**
@@ -255,8 +257,14 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       }
     },
 
-    /** Wakes parked `GET /api/agent-watch` requests — the session latched a turn end */
-    turnEnded: () => turnWatch.notify(session.id),
+    /**
+     * Wakes parked `GET /api/agent-watch` requests — the session latched a turn end —
+     * and lets a remote claude's reported model catch up with an in-session `/model`.
+     */
+    turnEnded: () => {
+      turnWatch.notify(session.id);
+      deps.refreshRemoteModel(session);
+    },
 
     /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
     idle: () => {

@@ -659,7 +659,7 @@ export interface CustomModelSelection {
  *   (`capabilities.modelDetect.configResolver`), while its screen names none.
  * - `launch`: what the session was launched with; nothing has reported since.
  */
-export type DisplayModelSource = 'custom-endpoint' | 'statusline' | 'screen' | 'config' | 'launch';
+export type DisplayModelSource = 'custom-endpoint' | 'statusline' | 'screen' | 'transcript' | 'config' | 'launch';
 
 /** The model a session runs as far as the server knows, for a session header. */
 export interface DisplayModel {

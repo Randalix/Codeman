@@ -62,6 +62,21 @@ describe('session listener wiring', () => {
     expect(session.listenerCount('displayModelChanged')).toBe(0);
   });
 
+  it("lets a remote claude's model catch up at every turn end", () => {
+    // A remote claude has no statusline exporter: the transcript read at the turn end is
+    // the only way an in-session /model reaches `agent ls` and the header.
+    const session = new Session({ id: 'wiring-turn-end-model', workingDir: '/tmp', mode: 'claude' });
+    const refreshRemoteModel = vi.fn();
+    const deps = { refreshRemoteModel } as unknown as Parameters<typeof createSessionListeners>[1];
+
+    const refs = createSessionListeners(session, deps);
+    attachSessionListeners(session, refs);
+    session.emit('turnEnded', 'heuristic');
+
+    expect(refreshRemoteModel).toHaveBeenCalledWith(session);
+    detachSessionListeners(session, refs);
+  });
+
   /** The listener reads the setting asynchronously; let its promise chain settle. */
   const flush = () => new Promise((resolve) => setTimeout(resolve, 5));
 

@@ -347,18 +347,20 @@ describe('agent ls', () => {
     const text = deps.out.join('\n');
     expect(text).toMatch(/ID\s+MODE\s+MODEL\s+HOST/);
     expect(text).toMatch(/058ee7b5\s+claude\s+Opus 5\.5 1M\s+local/);
-    expect(text).toMatch(/94990c6d\s+claude\s+opus\s+hufflepuff/);
+    expect(text).toMatch(/94990c6d\s+claude\s+opus\*\s+hufflepuff/);
     expect(text).toMatch(/5c0ffee0\s+claude\s+-\s+hufflepuff/);
-    expect(text).toMatch(/MODEL = what the CLI reports, else what it was started with/);
+    expect(text).toMatch(/MODEL = what the CLI reports \(follows \/model\); \* = only the start value/);
   });
 
   describe('modelCell', () => {
-    it('prefers the report, falls back to the launch model, else -', () => {
+    it('prefers the report, marks a start-only value with *, else -', () => {
       expect(modelCell({ displayModel: { model: 'Sonnet 5.5', source: 'statusline' }, model: 'opus' })).toBe(
         'Sonnet 5.5'
       );
-      expect(modelCell({ model: 'haiku' })).toBe('haiku');
-      expect(modelCell({ displayModel: { model: '  ' }, model: 'opus[1m]' })).toBe('opus[1m]');
+      expect(modelCell({ model: 'haiku' })).toBe('haiku*');
+      expect(modelCell({ model: 'opus', displayModel: { model: 'opus', source: 'launch' } })).toBe('opus*');
+      expect(modelCell({ model: 'opus', displayModel: { model: 'Sonnet 5', source: 'transcript' } })).toBe('Sonnet 5');
+      expect(modelCell({ displayModel: { model: '  ' }, model: 'opus[1m]' })).toBe('opus[1m]*');
       expect(modelCell({})).toBe('-');
     });
 
