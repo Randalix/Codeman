@@ -401,9 +401,14 @@ interface SessionRow {
  * so a remote worker started without `--model` reads `-` rather than a guess.
  */
 export function modelCell(s: Pick<SessionRow, 'displayModel' | 'model'>): string {
-  const name = s.displayModel?.model?.trim() || s.model?.trim();
-  return name ? name.replace(/\s*\(1M context\)$/i, ' 1M') : '-';
+  const name = (s.displayModel?.model?.trim() || s.model?.trim())?.replace(/\s*\(1M context\)$/i, ' 1M');
+  if (!name) return '-';
+  // A custom endpoint's model id runs to 64 chars and would push every column right.
+  return name.length > MODEL_CELL_MAX ? `${name.slice(0, MODEL_CELL_MAX - 1)}…` : name;
 }
+
+/** Widest MODEL cell; `--json` carries the full name. */
+const MODEL_CELL_MAX = 24;
 
 /** Where a session runs: `local`, its remote host id, or `docker`. */
 function hostCell(s: SessionRow): string {

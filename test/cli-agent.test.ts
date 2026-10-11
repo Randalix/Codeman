@@ -362,6 +362,12 @@ describe('agent ls', () => {
       expect(modelCell({})).toBe('-');
     });
 
+    it('cuts a long custom-endpoint model id so the table stays readable', () => {
+      const cell = modelCell({ displayModel: { model: 'accounts/fireworks/models/qwen3-coder-480b-a35b' } });
+      expect(cell).toBe('accounts/fireworks/mode…');
+      expect(cell).toHaveLength(24);
+    });
+
     it('shortens the 1M context suffix only at the end', () => {
       expect(modelCell({ displayModel: { model: 'Opus 5.5 (1M context)' } })).toBe('Opus 5.5 1M');
       expect(modelCell({ displayModel: { model: 'Custom (1M context) v2' } })).toBe('Custom (1M context) v2');
