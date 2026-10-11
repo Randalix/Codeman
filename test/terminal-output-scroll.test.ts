@@ -110,6 +110,18 @@ describe('new output preserves the text being read', () => {
     expect(terminal.markers).toHaveLength(0);
   });
 
+  it('honors an explicit jump while an output write has a queued reading anchor', async () => {
+    const { app, terminal, flush, parsed } = await harness();
+    flush('new output\r\n'.repeat(10));
+    app.scrollTerminalToBottom();
+    await parsed();
+    expect(terminal.buffer.active.viewportY).toBe(terminal.buffer.active.baseY);
+    expect(terminal.markers).toHaveLength(0);
+    flush('more output\r\n'.repeat(10));
+    await parsed();
+    expect(terminal.buffer.active.viewportY).toBe(terminal.buffer.active.baseY);
+  });
+
   it('disposes its marker when a write fails', async () => {
     const { terminal, flush } = await harness();
     vi.spyOn(terminal, 'write').mockImplementation(() => {

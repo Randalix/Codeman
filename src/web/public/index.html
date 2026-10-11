@@ -447,6 +447,13 @@
              on. Populated by app.js _renderHistoryTruncationBanner(). -->
         <div class="history-trunc-bar" id="historyTruncationBar" role="status" aria-live="polite" hidden></div>
         <div class="terminal-container" id="terminalContainer"></div>
+        <button type="button" class="terminal-scroll-bottom" id="terminalScrollBottom"
+          aria-label="Scroll to bottom" title="Scroll to bottom" hidden>
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 4v12m-5-5 5 5 5-5M5 20h14"/>
+          </svg>
+        </button>
         <textarea id="cjkInput" rows="1" placeholder="CJK input (Enter = send, Esc = clear)"
           maxlength="65536" aria-label="CJK IME input field"
           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>

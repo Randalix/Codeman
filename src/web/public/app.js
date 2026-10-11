@@ -6354,6 +6354,7 @@ class CodemanApp {
     if (selectGen === this._selectGeneration) {
       this._terminalReplayVisibilityOwner = { sessionId, selectGen };
       this.terminal?.element?.classList.add('terminal-tab-replay');
+      this._updateTerminalScrollBottomButton?.();
     }
     this._updateTerminalLoadTab(sessionId);
   }
@@ -6366,6 +6367,7 @@ class CodemanApp {
     if (owner?.sessionId === sessionId && owner.selectGen === selectGen) {
       this.terminal?.element?.classList.remove('terminal-tab-replay');
       this._terminalReplayVisibilityOwner = null;
+      this._updateTerminalScrollBottomButton?.();
     }
     this._updateTerminalLoadTab(sessionId);
   }

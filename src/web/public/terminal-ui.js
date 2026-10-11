@@ -615,6 +615,7 @@ Object.assign(CodemanApp.prototype, {
     const container = document.getElementById('terminalContainer');
     this.terminal.open(container);
     this._initMobileImePreview();
+    this._initTerminalScrollBottomButton();
     this._installMobileTapMouseGuard();
     this._installShiftDragSelection();
     this._installTouchSelectionFocusGuard();
@@ -1097,6 +1098,16 @@ Object.assign(CodemanApp.prototype, {
       // 'x' | 'y' | null — locked on the first travel past the tap slop, so a
       // diagonal drag cannot pan and scroll at the same time.
       let panAxis = null;
+      // An explicit jump to live output must win over a still-running flick.
+      this._cancelTerminalTouchScroll = () => {
+        if (scrollFrame) cancelAnimationFrame(scrollFrame);
+        scrollFrame = null;
+        velocity = 0;
+        pixelAccum = 0;
+        isTouching = false;
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      };
       /**
        * Can this gesture pan sideways? Only while the terminal is wider than
        * the box showing it (`.term-overflows-x`, set by
@@ -3751,6 +3762,42 @@ Object.assign(CodemanApp.prototype, {
     // Even one line above the live screen is a reader's position. A tolerance
     // here made small mobile scroll gestures follow new output again.
     return buffer.viewportY >= buffer.baseY;
+  },
+
+  _initTerminalScrollBottomButton() {
+    const button = document.getElementById('terminalScrollBottom');
+    if (!button) return;
+    this._terminalScrollBottomButton = button;
+    // Preserve an already-open keyboard, and do not focus input when it is closed.
+    // Keyboard activation still works through the button's ordinary click event.
+    button.addEventListener('pointerdown', (ev) => ev.preventDefault());
+    button.addEventListener('mousedown', (ev) => ev.preventDefault());
+    button.addEventListener('click', () => this.scrollTerminalToBottom());
+    this.terminal.onScroll(() => this._updateTerminalScrollBottomButton());
+    this.terminal.onRender(() => this._updateTerminalScrollBottomButton());
+    this._updateTerminalScrollBottomButton();
+  },
+
+  _updateTerminalScrollBottomButton() {
+    const button = this._terminalScrollBottomButton;
+    if (!button) return;
+    const hidden = !this.activeSessionId || !!this._terminalReplayVisibilityOwner ||
+      this.terminal?.buffer?.active?.type !== 'normal' || this.isTerminalAtBottom();
+    if (button.hidden !== hidden) button.hidden = hidden;
+  },
+
+  scrollTerminalToBottom() {
+    if (!this.terminal || !this.activeSessionId || this._terminalReplayVisibilityOwner) return;
+    this._cancelTerminalTouchScroll?.();
+    if (this._smoothScrollFrame) cancelAnimationFrame(this._smoothScrollFrame);
+    this._smoothScrollFrame = null;
+    this._smoothScrollPending = 0;
+    // Invalidate queued output/recovery/keyboard anchors captured while reading.
+    this._terminalUserScrollGeneration = (this._terminalUserScrollGeneration || 0) + 1;
+    this._lastUserScrollUpAt = null;
+    this.terminal.scrollToBottom();
+    this._syncStickyScrollBaseline();
+    this._updateTerminalScrollBottomButton();
   },
 
   /**

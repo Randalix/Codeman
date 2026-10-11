@@ -56,6 +56,7 @@
     'Default Codex model may only contain letters, digits, ".", "_", "-" and "/"':
       'Codex 默认模型只能包含字母、数字、"."、"_"、"-" 和 "/"',
     'Skip to terminal': '跳转到终端',
+    'Scroll to bottom': '滚动到底部',
     'Go to main page': '返回主页',
     'Session tabs': '会话标签页',
     /* 'Sessions' (the sidebar heading) is already mapped further down. */

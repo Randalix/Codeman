@@ -208,6 +208,8 @@ than sitting on a green dot showing frozen data.
 
 ## The terminal
 
+When you scroll up in the main terminal, a floating **↓** button appears at its lower-right corner. Tap **Scroll to bottom** to return immediately to the latest output and follow new output again. The button disappears at the bottom and keeps the mobile keyboard's current state.
+
 A real terminal: xterm.js in the browser, a real PTY on the server, tmux in between. Full
 TUIs render correctly.
 
