@@ -1070,6 +1070,7 @@ Object.assign(CodemanApp.prototype, {
               // touch point; the 40ms coalescer batches the per-frame reports.
               this._forwardScrollToApp(touchLastX, touchLastY, lines);
             } else if (!this._maybePageCliTranscript({ shiftKey: false }, lines)) {
+              this._noteTerminalUserScroll(lines);
               this.terminal.scrollLines(lines);
               this._maybeLoadMoreHistoryOnScroll(lines);
             }
@@ -3739,7 +3740,7 @@ Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
 
   /**
-   * Check if terminal viewport is at or near the bottom.
+   * Check if terminal viewport is at the bottom.
    * Used to implement "sticky scroll" behavior - keep user at bottom if they were there.
    */
   isTerminalAtBottom() {
@@ -3747,8 +3748,9 @@ Object.assign(CodemanApp.prototype, {
     const buffer = this.terminal.buffer.active;
     // viewportY is the top line of the viewport, baseY is where scrollback starts
     // If viewportY >= baseY, we're showing the latest content (at bottom)
-    // Allow 2 lines tolerance for edge cases
-    return buffer.viewportY >= buffer.baseY - 2;
+    // Even one line above the live screen is a reader's position. A tolerance
+    // here made small mobile scroll gestures follow new output again.
+    return buffer.viewportY >= buffer.baseY;
   },
 
   /**
@@ -3787,6 +3789,7 @@ Object.assign(CodemanApp.prototype, {
   // short grace window (see _hasRecentUserScrollUp). A downward scroll that
   // lands back at the bottom clears the suppression immediately.
   _noteTerminalUserScroll(lines) {
+    if (lines) this._terminalUserScrollGeneration = (this._terminalUserScrollGeneration || 0) + 1;
     if (lines < 0) {
       this._lastUserScrollUpAt = performance.now();
     } else if (this.isTerminalAtBottom()) {
@@ -3892,6 +3895,7 @@ Object.assign(CodemanApp.prototype, {
       const eased = pending * 0.22;
       const move = pending > 0 ? Math.max(1, Math.floor(eased)) : Math.min(-1, Math.ceil(eased));
       this._smoothScrollPending = pending - move;
+      this._noteTerminalUserScroll(move);
       this.terminal.scrollLines(move);
       this._maybeLoadMoreHistoryOnScroll(move);
       if (Math.abs(this._smoothScrollPending) >= 1) this._smoothScrollFrame = requestAnimationFrame(step);
@@ -4300,7 +4304,7 @@ Object.assign(CodemanApp.prototype, {
    * effect once that callback fires. A null anchor means the user was following
    * live output and nothing needs restoring.
    */
-  _restoreTerminalViewport(preserveViewportY, sessionId) {
+  _restoreTerminalViewport(preserveViewportY, sessionId, marker, scrollGeneration) {
     if (preserveViewportY === null || preserveViewportY === undefined) return;
     // The anchor is a row index into the buffer it was captured from. Now that
     // this runs a parse later instead of synchronously, a session switch can land
@@ -4310,9 +4314,17 @@ Object.assign(CodemanApp.prototype, {
     // arbitrary place. Both checks cover one half of that window.
     if (sessionId !== undefined && sessionId !== this.activeSessionId) return;
     if (this._isLoadingBuffer) return;
+    // A touch drag or momentum step can land while xterm's write is queued.
+    // Its newer position wins over the anchor captured before that gesture.
+    if (scrollGeneration !== undefined && scrollGeneration !== (this._terminalUserScrollGeneration || 0)) return;
     if (typeof this.terminal?.scrollToLine !== 'function') return;
-    if (this.terminal.buffer?.active?.viewportY === preserveViewportY) return;
-    this.terminal.scrollToLine(preserveViewportY);
+    // Markers follow the text when a full scrollback evicts old rows. Restoring
+    // the original index instead would move the reader by each output burst.
+    // A disposed marker means that row itself was evicted: show the oldest
+    // remaining history. Numeric fallback supports terminals without markers.
+    const target = marker ? Math.max(0, marker.line) : preserveViewportY;
+    if (this.terminal.buffer?.active?.viewportY === target) return;
+    this.terminal.scrollToLine(target);
   },
 
   /**
@@ -4350,6 +4362,12 @@ Object.assign(CodemanApp.prototype, {
     // scroll-to-bottom below, where it protects against a mid-flush race.
     const preserveViewportY =
       this.terminal.buffer?.active && !this.isTerminalAtBottom() ? this.terminal.buffer.active.viewportY : null;
+    const buffer = this.terminal.buffer?.active;
+    const viewportMarker =
+      preserveViewportY !== null && typeof buffer?.cursorY === 'number'
+        ? this.terminal.registerMarker?.(preserveViewportY - buffer.baseY - buffer.cursorY)
+        : null;
+    const scrollGeneration = this._terminalUserScrollGeneration || 0;
     // Which buffer the anchor belongs to, checked again when the write parses.
     const flushSessionId = this.activeSessionId;
 
@@ -4378,13 +4396,18 @@ Object.assign(CodemanApp.prototype, {
         // signal, which is the earliest point the anchor can actually be
         // reasserted. (The synchronous version passed its regression test only
         // because the test's write mock moved the viewport synchronously.)
-        this._restoreTerminalViewport(preserveViewportY, flushSessionId);
+        try {
+          this._restoreTerminalViewport(preserveViewportY, flushSessionId, viewportMarker, scrollGeneration);
+        } finally {
+          viewportMarker?.dispose();
+        }
         this._scheduleTerminalWriteFlush();
         this._noteMobileImeAuthoritativeOutput(flushedOutputSeq, flushSessionId);
       });
     } catch (err) {
       this._terminalWriteInFlight = false;
       this._terminalWriteInFlightBytes = 0;
+      viewportMarker?.dispose();
       throw err;
     }
     const bytesThisFrame = deferred ? MAX_FRAME_BYTES : _joinedLen;

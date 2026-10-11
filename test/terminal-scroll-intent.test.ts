@@ -48,9 +48,7 @@ function loadKeyboardHandler(opts: { viewportY: number; baseY: number }) {
       calls.push('syncTerminalGeometry');
       return { cols: 80, rows: 24 };
     },
-    // The real predicate (terminal-ui.js isTerminalAtBottom), reproduced so the
-    // test exercises the same tolerance the runtime uses.
-    isTerminalAtBottom: () => terminal.buffer.active.viewportY >= terminal.buffer.active.baseY - 2,
+    isTerminalAtBottom: () => terminal.buffer.active.viewportY >= terminal.buffer.active.baseY,
     relayoutMobileSubagentWindows: () => {},
   };
   let pendingTimer: (() => void) | null = null;
