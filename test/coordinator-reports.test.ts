@@ -8,8 +8,10 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CoordinatorReports,
+  MAX_MUTE_MS,
   REPORT_DEBOUNCE_MS,
   reportText,
+  type MuteSnapshot,
   type ReportSource,
 } from '../src/web/coordinator-reports.js';
 import { TurnWatch } from '../src/web/agent-watch.js';
@@ -45,6 +47,7 @@ function setup(opts: { enabled?: boolean; postOk?: boolean } = {}) {
   const sessions = new Map<string, Fake>();
   const posts: { to: string; from: string; text: string }[] = [];
   const logs: string[] = [];
+  const saved: MuteSnapshot[] = [];
   const reports = new CoordinatorReports({
     getSession: (id) => sessions.get(id),
     row: (id) => sessions.get(id)?.row ?? null,
@@ -55,6 +58,7 @@ function setup(opts: { enabled?: boolean; postOk?: boolean } = {}) {
     },
     enabled: () => opts.enabled ?? true,
     log: (line) => logs.push(line),
+    saveMutes: (snapshot) => saved.push(snapshot),
   });
   const add = (id: string, over: Partial<Fake> = {}): Fake => {
     const s: Fake = { id, name: id.slice(0, 8), parentSessionId: undefined, turnEndReady: false, row: null, ...over };
@@ -62,7 +66,7 @@ function setup(opts: { enabled?: boolean; postOk?: boolean } = {}) {
     return s;
   };
   add(COORD);
-  return { sessions, posts, logs, reports, add };
+  return { sessions, posts, logs, saved, reports, add };
 }
 
 beforeEach(() => vi.useFakeTimers());
@@ -183,6 +187,108 @@ describe('when nothing is reported', () => {
   });
 });
 
+describe('mute', () => {
+  const MIN = 60_000;
+
+  it('holds IDLE reports, but BLOCKED and EXITED still go out', async () => {
+    const { posts, reports, add } = setup();
+    const w = add(WORKER, { parentSessionId: COORD, row: row() });
+    reports.mute(WORKER, 30 * MIN);
+    for (const [t, over] of [
+      [1_000, {}],
+      [2_000, { reason: 'inbox-unread' }],
+      [3_000, { reason: 'blocked', turnEndSource: null }],
+      [4_000, { reason: 'exited', turnEndSource: 'exit' }],
+    ] as const) {
+      w.row = row({ turnEndedAt: t, ...over } as Partial<WatchRow>);
+      reports.notify(WORKER);
+      await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    }
+    expect(posts.map((p) => p.text.split('  ')[0])).toEqual(['[codeman watch] BLOCKED', '[codeman watch] EXITED']);
+  });
+
+  it('when it runs out, reports the idle state it held back — once', async () => {
+    const { posts, saved, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row({ turnEndedAt: 5_000 }) });
+    const until = reports.mute(WORKER, 10 * MIN);
+    expect(reports.mutedUntil(WORKER)).toBe(until);
+    expect(saved.at(-1)).toEqual({ [WORKER]: until });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(10 * MIN - 1);
+    expect(posts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1 + REPORT_DEBOUNCE_MS);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].text).toContain('IDLE');
+    expect(reports.mutedUntil(WORKER)).toBeNull();
+    expect(saved.at(-1)).toEqual({});
+  });
+
+  it('runs out quietly when the worker is busy again, or its last stamp was reported', async () => {
+    const { posts, reports, add } = setup();
+    const w = add(WORKER, { parentSessionId: COORD, row: row() });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts).toHaveLength(1);
+    reports.mute(WORKER, MIN);
+    await vi.advanceTimersByTimeAsync(MIN + REPORT_DEBOUNCE_MS); // same stamp, already reported
+    reports.mute(WORKER, MIN);
+    w.row = null; // a turn runs
+    await vi.advanceTimersByTimeAsync(MIN + REPORT_DEBOUNCE_MS);
+    expect(posts).toHaveLength(1);
+  });
+
+  it('unmute lifts it at once and catches up; a second mute replaces the first', async () => {
+    const { posts, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row() });
+    reports.mute(WORKER, MIN);
+    const later = reports.mute(WORKER, 60 * MIN);
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(2 * MIN);
+    expect(posts).toEqual([]); // the first (1 min) timer is gone
+    expect(reports.mutedUntil(WORKER)).toBe(later);
+    expect(reports.unmute(WORKER)).toBe(true);
+    expect(reports.unmute(WORKER)).toBe(false);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts).toHaveLength(1);
+  });
+
+  it('is capped at 24 h, and a deleted worker takes its mute along', () => {
+    const { saved, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row() });
+    expect(reports.mute(WORKER, 99 * MAX_MUTE_MS) - Date.now()).toBe(MAX_MUTE_MS);
+    reports.drop(WORKER);
+    expect(reports.mutedUntil(WORKER)).toBeNull();
+    expect(saved.at(-1)).toEqual({});
+  });
+
+  it('survives a restart: live mutes re-armed, run-out and orphaned ones dropped', async () => {
+    const { posts, saved, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row() });
+    const now = Date.now();
+    const restored = reports.restoreMutes(
+      { [WORKER]: now + 5 * MIN, 'gone-0000': now + 5 * MIN, [COORD]: now - 1 },
+      (id) => id === WORKER || id === COORD
+    );
+    expect(restored).toBe(1);
+    expect(reports.mutedUntil(WORKER)).toBe(now + 5 * MIN);
+    expect(saved.at(-1)).toEqual({ [WORKER]: now + 5 * MIN });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(5 * MIN);
+    expect(posts).toHaveLength(1);
+  });
+
+  it('shutdown keeps the persisted mutes (stop does not save an empty set)', () => {
+    const { saved, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row() });
+    reports.mute(WORKER, MIN);
+    const writes = saved.length;
+    reports.stop();
+    expect(saved).toHaveLength(writes);
+  });
+});
+
 describe('turnWatch subscription', () => {
   it('every notify reaches the subscribers, until they unsubscribe', () => {
     const watch = new TurnWatch();
@@ -205,6 +311,15 @@ describe('wiring guard', () => {
     expect(subscribe).toBeGreaterThan(restore);
     expect(server).toContain('this.unsubscribeCoordinatorReports?.();');
     expect(server).toContain('this.coordinatorReports.drop(sessionId);');
+  });
+
+  it('boot restores the mutes before it subscribes, and the route gets the reporter', () => {
+    const restoreMutes = server.indexOf('this.restoreReportMutes();');
+    const subscribe = server.indexOf('turnWatch.subscribe((id) => this.coordinatorReports.notify(id))');
+    expect(restoreMutes).toBeGreaterThan(0);
+    expect(restoreMutes).toBeLessThan(subscribe);
+    expect(server).toContain('registerAgentWatchRoutes(this.app, ctx, { reports: this.coordinatorReports });');
+    expect(server).toContain('saveMutes: (snapshot) => this.persistReportMutes(snapshot),');
   });
 
   it('posts through the nudger path, never the wake registry', () => {

@@ -121,6 +121,46 @@ describe('GET /api/agent-watch', () => {
   });
 });
 
+describe('POST /api/sessions/:id/report-mute', () => {
+  const calls: string[] = [];
+  const reports = {
+    mute: (id: string, ms: number) => {
+      calls.push(`mute ${id} ${ms}`);
+      return 1_000 + ms;
+    },
+    unmute: (id: string) => {
+      calls.push(`unmute ${id}`);
+      return true;
+    },
+  };
+  let harness: RouteTestHarness;
+  const post = (id: string, payload: unknown) =>
+    harness.app.inject({ method: 'POST', url: `/api/sessions/${id}/report-mute`, payload });
+
+  beforeEach(async () => {
+    calls.length = 0;
+    harness = await createRouteTestHarness((app, ctx) => registerAgentWatchRoutes(app, ctx, { reports }));
+  });
+  afterEach(async () => {
+    await harness.app.close();
+  });
+
+  it('mutes for forMs and answers when it ends; 0 unmutes', async () => {
+    const id = harness.ctx._sessionId;
+    expect(JSON.parse((await post(id, { forMs: 60_000 })).body)).toMatchObject({ id, mutedUntil: 61_000 });
+    expect(JSON.parse((await post(id, { forMs: 0 })).body)).toMatchObject({ id, mutedUntil: null });
+    expect(calls).toEqual([`mute ${id} 60000`, `unmute ${id}`]);
+  });
+
+  it('refuses an unknown session, a bad body, more than 24 h', async () => {
+    expect((await post('nope', { forMs: 1 })).statusCode).toBe(404);
+    expect((await post(harness.ctx._sessionId, { forMs: -1 })).statusCode).toBe(400);
+    expect((await post(harness.ctx._sessionId, { forMs: 25 * 3_600_000 })).statusCode).toBe(400);
+    expect((await post(harness.ctx._sessionId, { forMs: 1, extra: 1 })).statusCode).toBe(400);
+    expect(calls).toEqual([]);
+  });
+});
+
 describe('classifyWatchReason', () => {
   const none = { blocked: false, inboxWaiting: false, inboxUnseen: 0, inboxPending: 0, openTodos: 0 };
   const session = (pane = '', source: 'hook' | 'heuristic' | 'exit' | null = 'hook') => ({

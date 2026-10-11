@@ -1468,6 +1468,61 @@ export async function agentWatch(deps: AgentDeps, options: WatchOptions): Promis
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Mute — hold a worker's IDLE reports to its coordinator for a while
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Default `agent mute` length: long enough for a build or a test run. */
+export const DEFAULT_MUTE_MS = 30 * 60_000;
+const MAX_MUTE_MS = 24 * 60 * 60_000;
+
+/** `90s`, `30m`, `2h`, or a bare number of minutes → ms; at most 24 h. */
+export function parseMuteDuration(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_MUTE_MS;
+  const m = /^(\d+)\s*(s|m|h)?$/i.exec(raw.trim());
+  const unit = { s: 1_000, m: 60_000, h: 3_600_000 }[(m?.[2] ?? 'm').toLowerCase() as 's' | 'm' | 'h'];
+  const ms = m ? Number(m[1]) * unit : NaN;
+  if (!Number.isFinite(ms) || ms <= 0 || ms > MAX_MUTE_MS) {
+    throw new Error(`--for must be 1s … 24h (90s, 30m, 2h; a bare number is minutes), got "${raw}"`);
+  }
+  return ms;
+}
+
+/**
+ * `agent mute [ids…] --for 30m` / `agent unmute [ids…]` — hold the IDLE reports a
+ * worker's turn ends post into your mailbox (a worker babysitting a long build ends a
+ * short turn every minute). BLOCKED and EXITED still come. When the mute ends, the
+ * worker's state is reported once if it still stands idle. No ids: all your workers.
+ */
+export async function agentMute(deps: AgentDeps, options: { ids: string[]; forMs: number }): Promise<number> {
+  const targets = await watchTargets(deps, options.ids);
+  if ('error' in targets) return fail(deps, targets.error, EXIT.refused);
+  const out: { id: string; mutedUntil: number | null }[] = [];
+  for (const id of targets.ids) {
+    const res = await deps.request(deps.ctx, {
+      method: 'POST',
+      path: `/api/v1/sessions/${encodeURIComponent(id)}/report-mute`,
+      body: { forMs: options.forMs },
+    });
+    if (!res.json?.success) return fail(deps, `${id.slice(0, 8)}: ${describeFailure(res)}`);
+    const data = res.json.data as { mutedUntil?: number | null } | undefined;
+    out.push({ id, mutedUntil: data?.mutedUntil ?? null });
+  }
+  if (deps.json) emitJson(deps, { sessions: out });
+  else {
+    for (const { id, mutedUntil } of out) {
+      deps.io.out(
+        palette.ok(
+          mutedUntil === null
+            ? `${GLYPH.ok} ${id.slice(0, 8)} unmuted — its current state is reported if it stands idle`
+            : `${GLYPH.ok} ${id.slice(0, 8)} muted until ${clockTime(new Date(mutedUntil).toISOString())} — IDLE reports held; BLOCKED/EXITED still come`
+        )
+      );
+    }
+  }
+  return EXIT.ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Todos (the session's Ralph todo list)
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -1687,7 +1742,7 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description(
-      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, watch, read, interrupt, rm, post, inbox, todo'
+      'Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, watch, mute, read, interrupt, rm, post, inbox, todo'
     );
 
   agent
@@ -1957,6 +2012,25 @@ export function registerAgentCommands(program: Command): Command {
           waitMs: parsePositiveInt(options.timeout, DEFAULT_WAIT_MS),
         })
       )
+    );
+
+  agent
+    .command('mute [ids...]')
+    .description(
+      "Hold a worker's IDLE reports to your mailbox for a while (default: all the sessions you spawned); BLOCKED/EXITED still come, and when the mute ends its state is reported once if it stands idle"
+    )
+    .option('--for <duration>', 'How long: 90s, 30m, 2h (bare number = minutes, max 24h)', '30m')
+    .option('--json', 'Machine-readable output')
+    .action((ids: string[], options: { for?: string; json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentMute(deps, { ids, forMs: parseMuteDuration(options.for) }))
+    );
+
+  agent
+    .command('unmute [ids...]')
+    .description('Lift a mute now (default: all the sessions you spawned); what it held back is reported once')
+    .option('--json', 'Machine-readable output')
+    .action((ids: string[], options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentMute(deps, { ids, forMs: 0 }))
     );
 
   registerTodoCommands(agent);

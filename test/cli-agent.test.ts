@@ -30,6 +30,8 @@ import {
   agentTodoSet,
   agentWait,
   agentWatch,
+  agentMute,
+  parseMuteDuration,
   matchTodoId,
   baseHeaders,
   composerReadyMark,
@@ -1469,5 +1471,59 @@ describe('agent watch', () => {
     expect(header).toMatch(/WAIT\s+ENDED\s+TODO\s+NAME/);
     expect(row1).toMatch(/\d\d:\d\d\s+-\s+w1$/);
     expect(row2).toMatch(/-\s+2\/5\s+w2$/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// mute — hold a worker's IDLE reports
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('agent mute', () => {
+  const W1 = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const W2 = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const sessions = () =>
+    ok([
+      { id: SELF, parentSessionId: null },
+      { id: W1, parentSessionId: SELF },
+      { id: W2, parentSessionId: SELF },
+    ]);
+
+  it('parses 90s, 30m, 2h and bare minutes; refuses 0, junk and more than 24 h', () => {
+    expect(parseMuteDuration(undefined)).toBe(30 * 60_000);
+    expect(parseMuteDuration('90s')).toBe(90_000);
+    expect(parseMuteDuration('30m')).toBe(30 * 60_000);
+    expect(parseMuteDuration('2H')).toBe(2 * 3_600_000);
+    expect(parseMuteDuration('45')).toBe(45 * 60_000);
+    for (const bad of ['0', '-5m', '1d', 'soon', '25h']) expect(() => parseMuteDuration(bad)).toThrow(/--for/);
+  });
+
+  it('mutes the given worker and says until when, and what still comes', async () => {
+    const until = new Date(2026, 9, 11, 9, 30).getTime();
+    const deps = fakeDeps([ok([{ id: W1 }]), ok({ id: W1, mutedUntil: until })]);
+    expect(await agentMute(deps, { ids: ['aaaaaaaa'], forMs: 600_000 })).toBe(EXIT.ok);
+    expect(deps.calls[1]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${W1}/report-mute`,
+      body: { forMs: 600_000 },
+    });
+    expect(deps.out[0]).toMatch(/aaaaaaaa muted until 09:30 .*BLOCKED\/EXITED still come/);
+  });
+
+  it('without ids mutes all workers; forMs 0 is unmute', async () => {
+    const deps = fakeDeps([sessions(), ok({ mutedUntil: null }), ok({ mutedUntil: null })]);
+    expect(await agentMute(deps, { ids: [], forMs: 0 })).toBe(EXIT.ok);
+    expect(deps.calls.slice(1).map((c) => c.path)).toEqual([
+      `/api/v1/sessions/${W1}/report-mute`,
+      `/api/v1/sessions/${W2}/report-mute`,
+    ]);
+    expect(deps.out).toEqual([expect.stringMatching(/aaaaaaaa unmuted/), expect.stringMatching(/bbbbbbbb unmuted/)]);
+  });
+
+  it('refuses itself and surfaces a server refusal', async () => {
+    const self = fakeDeps([]);
+    expect(await agentMute(self, { ids: [SELF.slice(0, 8)], forMs: 1 })).toBe(EXIT.refused);
+    const off = fakeDeps([ok([{ id: W1 }]), apiError(200, 'OPERATION_FAILED', 'Coordinator reports are off')]);
+    expect(await agentMute(off, { ids: ['aaaaaaaa'], forMs: 1 })).toBe(EXIT.error);
+    expect(off.err[0]).toMatch(/aaaaaaaa: .*Coordinator reports are off/);
   });
 });

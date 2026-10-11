@@ -23,6 +23,14 @@
  * - NEVER wakes a host: posting is local; the nudger keeps its own remote rule.
  * - Off globally with `CODEMAN_COORDINATOR_REPORTS=0`.
  *
+ * Mute (`agent mute <worker> --for 30m`): a worker that babysits a long process ends a
+ * short turn every minute, and each one was an IDLE in the coordinator's mailbox (w3c,
+ * ~45 in 34 minutes, 2026-10-11). A muted worker's IDLE reports are dropped; BLOCKED,
+ * EXITED and GONE still go out — a dialog or a dead worker needs the coordinator either
+ * way. A skipped stamp is not marked reported, so when the mute ends (expiry or
+ * `unmute`) the worker's current state is reported once if it still stands idle. Mutes
+ * are persisted: a deploy must not lift one (the nudger's restart lesson, 2026-10-11).
+ *
  * @consumedby web/server (subscribes to turnWatch, drops on delete)
  * @module web/coordinator-reports
  */
@@ -31,6 +39,12 @@ import type { WatchRow } from './routes/agent-watch-routes.js';
 
 /** Signals for one worker arriving within this window share one report. */
 export const REPORT_DEBOUNCE_MS = 1_500;
+
+/** Longest mute one call may set; a forgotten mute must run out on its own. */
+export const MAX_MUTE_MS = 24 * 60 * 60_000;
+
+/** Persisted mutes: worker id → epoch ms when its IDLE reports resume. */
+export type MuteSnapshot = Record<string, number>;
 
 /** The slice of a Session the reporter reads. */
 export interface ReportSource {
@@ -48,6 +62,9 @@ export interface CoordinatorReportDeps {
   post(to: string, from: string, text: string): boolean;
   enabled(): boolean;
   log(message: string): void;
+  /** Persist the current mutes (called on every change). */
+  saveMutes?(snapshot: MuteSnapshot): void;
+  now?(): number;
 }
 
 /** What the worker looked like when the signal came: an exited one may be gone by report time. */
@@ -63,10 +80,18 @@ function clock(ms: number): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
+/** The headline word, as `agent watch` prints it. */
+function reportKind(row: WatchRow): 'EXITED' | 'BLOCKED' | 'IDLE' {
+  return row.reason === 'exited' || row.turnEndSource === 'exit'
+    ? 'EXITED'
+    : row.reason === 'blocked'
+      ? 'BLOCKED'
+      : 'IDLE';
+}
+
 /** The report line; the same columns `agent watch` prints, plus where to look next. */
 export function reportText(row: WatchRow): string {
-  const what =
-    row.reason === 'exited' || row.turnEndSource === 'exit' ? 'EXITED' : row.reason === 'blocked' ? 'BLOCKED' : 'IDLE';
+  const what = reportKind(row);
   const next = what === 'EXITED' ? '' : ` — answer: \`codeman agent read ${row.id.slice(0, 8)}\``;
   return (
     `[codeman watch] ${what}  ${row.id.slice(0, 8)}  ${row.mode}  since ${clock(row.turnEndedAt)} ` +
@@ -79,9 +104,79 @@ export class CoordinatorReports {
   private readonly pending = new Map<string, Pending>();
   /** Worker id → the latch stamp last reported. */
   private readonly reported = new Map<string, number>();
+  /** Worker id → when its mute ends, and the timer that ends it. */
+  private readonly mutes = new Map<string, { until: number; timer: NodeJS.Timeout }>();
   private stopped = false;
 
   constructor(private readonly deps: CoordinatorReportDeps) {}
+
+  private now(): number {
+    return this.deps.now?.() ?? Date.now();
+  }
+
+  /**
+   * Hold `sessionId`'s IDLE reports for `ms` (capped at MAX_MUTE_MS); a second call
+   * replaces the first. Returns when the mute ends.
+   */
+  mute(sessionId: string, ms: number): number {
+    const until = this.now() + Math.min(Math.max(0, ms), MAX_MUTE_MS);
+    this.arm(sessionId, until);
+    this.saveMutes();
+    return until;
+  }
+
+  /** Lift a mute now; the worker's current state is reported if it stands idle unreported. */
+  unmute(sessionId: string): boolean {
+    const had = this.clearMute(sessionId);
+    if (had) {
+      this.saveMutes();
+      this.notify(sessionId);
+    }
+    return had;
+  }
+
+  /** When `sessionId`'s mute ends, or null when it is not muted. */
+  mutedUntil(sessionId: string): number | null {
+    return this.mutes.get(sessionId)?.until ?? null;
+  }
+
+  /** Re-arm persisted mutes at boot; ones that ran out while the server was down are dropped. */
+  restoreMutes(snapshot: MuteSnapshot, keep: (sessionId: string) => boolean): number {
+    let restored = 0;
+    for (const [id, until] of Object.entries(snapshot)) {
+      if (typeof until !== 'number' || until <= this.now() || !keep(id)) continue;
+      this.arm(id, Math.min(until, this.now() + MAX_MUTE_MS));
+      restored++;
+    }
+    if (restored !== Object.keys(snapshot).length) this.saveMutes();
+    return restored;
+  }
+
+  private arm(sessionId: string, until: number): void {
+    this.clearMute(sessionId);
+    const timer = setTimeout(() => {
+      this.mutes.delete(sessionId);
+      this.saveMutes();
+      this.notify(sessionId); // catch up on what the mute held back
+    }, until - this.now());
+    timer.unref?.();
+    this.mutes.set(sessionId, { until, timer });
+  }
+
+  private clearMute(sessionId: string): boolean {
+    const mute = this.mutes.get(sessionId);
+    if (!mute) return false;
+    clearTimeout(mute.timer);
+    this.mutes.delete(sessionId);
+    return true;
+  }
+
+  private saveMutes(): void {
+    if (this.stopped) return;
+    const snapshot: MuteSnapshot = {};
+    for (const [id, m] of this.mutes) snapshot[id] = m.until;
+    this.deps.saveMutes?.(snapshot);
+  }
 
   /** A turn ended, a dialog opened or the pane exited in `sessionId`. Settles, then reports. */
   notify(sessionId: string): void {
@@ -111,6 +206,8 @@ export class CoordinatorReports {
       if (!row) return 'skipped'; // a new turn already runs
       if (this.reported.get(sessionId) === row.turnEndedAt) return 'skipped';
       if (row.reason !== 'blocked' && row.turnEndSource === 'heuristic' && session.turnEndReady) return 'skipped';
+      // Muted: drop an IDLE without marking it reported, so the end of the mute catches up.
+      if (this.mutes.has(sessionId) && reportKind(row) === 'IDLE') return 'skipped';
       this.reported.set(sessionId, row.turnEndedAt);
       text = reportText(row);
     }
@@ -124,10 +221,13 @@ export class CoordinatorReports {
   /** Forget a session (deleted). A pending exit report still goes out. */
   drop(sessionId: string): void {
     this.reported.delete(sessionId);
+    if (this.clearMute(sessionId)) this.saveMutes();
   }
 
   stop(): void {
     this.stopped = true;
+    for (const m of this.mutes.values()) clearTimeout(m.timer);
+    this.mutes.clear();
     for (const p of this.pending.values()) clearTimeout(p.timer);
     this.pending.clear();
   }

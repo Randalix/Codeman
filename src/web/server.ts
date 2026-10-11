@@ -37,7 +37,7 @@ import { pasteImageDirInUseByOtherSession, startPasteImageGc, uploadDirs } from 
 import { CLEAN_EXIT_CLOSE_REASON, shouldCloseCleanlyExitedSession } from '../pane-exit-sweep.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { existsSync, mkdirSync, readFileSync, chmodSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, chmodSync, statSync, writeFileSync, renameSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { hostname as getHostname, uptime as osUptime } from 'node:os';
@@ -114,7 +114,7 @@ import { approvalInbox } from './approval-inbox.js';
 import { agentInbox } from './agent-inbox.js';
 import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
-import { CoordinatorReports } from './coordinator-reports.js';
+import { CoordinatorReports, type MuteSnapshot } from './coordinator-reports.js';
 import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
@@ -352,6 +352,7 @@ export class WebServer extends EventEmitter {
     },
     enabled: () => process.env.CODEMAN_COORDINATOR_REPORTS !== '0',
     log: (message) => console.log(message),
+    saveMutes: (snapshot) => this.persistReportMutes(snapshot),
   });
   private unsubscribeCoordinatorReports: (() => void) | null = null;
   private respawnControllers: Map<string, RespawnController> = new Map();
@@ -1195,7 +1196,7 @@ export class WebServer extends EventEmitter {
     registerApprovalRoutes(this.app, ctx);
     registerRebootRestoreRoutes(this.app, ctx);
     registerInboxRoutes(this.app, ctx, { nudger: this.inboxNudger });
-    registerAgentWatchRoutes(this.app, ctx);
+    registerAgentWatchRoutes(this.app, ctx, { reports: this.coordinatorReports });
     registerReadMyMindRoutes(this.app, ctx);
     registerGitStatusRoutes(this.app, ctx);
     registerStatusTelemetryRoutes(this.app, ctx);
@@ -2702,6 +2703,36 @@ export class WebServer extends EventEmitter {
     return this.agentInboxWrite;
   }
 
+  // ========== Coordinator report mutes ==========
+
+  /** A handful of `id → until` pairs, rewritten whole and atomically on every change. */
+  private reportMutesPath(): string {
+    return dataPath('report-mutes.json');
+  }
+
+  private persistReportMutes(snapshot: MuteSnapshot): void {
+    if (this.testMode) return;
+    const path = this.reportMutesPath();
+    try {
+      writeFileSync(`${path}.tmp`, JSON.stringify(snapshot), { mode: 0o600 });
+      renameSync(`${path}.tmp`, path);
+    } catch (err) {
+      console.warn(`[CoordinatorReports] Could not persist mutes: ${getErrorMessage(err)}`);
+    }
+  }
+
+  private restoreReportMutes(): void {
+    try {
+      const snapshot = JSON.parse(readFileSync(this.reportMutesPath(), 'utf-8')) as MuteSnapshot;
+      const restored = this.coordinatorReports.restoreMutes(snapshot, (id) => this.sessions.has(id));
+      if (restored > 0) console.log(`[CoordinatorReports] ${restored} worker(s) still muted`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(`[CoordinatorReports] Could not restore mutes: ${getErrorMessage(err)}`);
+      }
+    }
+  }
+
   private batchTaskUpdate(sessionId: string, task: BackgroundTask): void {
     this.sse.batchTaskUpdate(sessionId, task);
   }
@@ -3066,7 +3097,9 @@ export class WebServer extends EventEmitter {
         rearmed++;
       }
       if (rearmed > 0) console.log(`[Inbox] will announce restored mail in ${rearmed} session(s)`);
-      // From here on every worker's turn end reaches its coordinator's mailbox.
+      // From here on every worker's turn end reaches its coordinator's mailbox — minus
+      // the workers a coordinator muted, which a restart must not unmute.
+      this.restoreReportMutes();
       this.unsubscribeCoordinatorReports = turnWatch.subscribe((id) => this.coordinatorReports.notify(id));
     }
 

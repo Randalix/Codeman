@@ -1218,6 +1218,17 @@ export const AgentWatchQuerySchema = z
   })
   .strict();
 
+/** POST /api/sessions/:id/report-mute — 0 lifts the mute. */
+export const ReportMuteSchema = z
+  .object({
+    forMs: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(24 * 60 * 60_000),
+  })
+  .strict();
+
 export const InboxReadQuerySchema = z
   .object({
     wait: z.coerce.number().int().positive().optional(),

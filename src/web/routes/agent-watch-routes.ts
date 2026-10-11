@@ -28,14 +28,15 @@
 
 import { FastifyInstance, FastifyReply } from 'fastify';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
-import { AgentWatchQuerySchema } from '../schemas.js';
-import { canAccessOwned, getAuthUser, parseBody } from '../route-helpers.js';
+import { AgentWatchQuerySchema, ReportMuteSchema } from '../schemas.js';
+import { canAccessOwned, findSessionOrFail, getAuthUser, parseBody } from '../route-helpers.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
 import { agentInbox, clampWait } from '../agent-inbox.js';
 import { approvalInbox } from '../approval-inbox.js';
 import type { Session } from '../../session.js';
 import { turnWatch, MAX_TURN_WATCHERS, MAX_WATCH_SESSIONS } from '../agent-watch.js';
 import type { SessionPort } from '../ports/index.js';
+import type { CoordinatorReports } from '../coordinator-reports.js';
 
 export type WatchReason =
   | 'exited'
@@ -143,7 +144,25 @@ function abortOnClientHangUp(reply: FastifyReply): AbortController {
   return controller;
 }
 
-export function registerAgentWatchRoutes(app: FastifyInstance, ctx: SessionPort): void {
+export function registerAgentWatchRoutes(
+  app: FastifyInstance,
+  ctx: SessionPort,
+  options: { reports?: Pick<CoordinatorReports, 'mute' | 'unmute'> } = {}
+): void {
+  // Hold a worker's IDLE reports to its coordinator for a while (`agent mute`); BLOCKED
+  // and EXITED still go out. `forMs: 0` lifts the mute and reports what it held back.
+  app.post('/api/sessions/:id/report-mute', async (req) => {
+    const { id } = req.params as { id: string };
+    findSessionOrFail(ctx, id, req);
+    const body = parseBody(ReportMuteSchema, req.body);
+    if (!options.reports) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Coordinator reports are off');
+    if (body.forMs === 0) {
+      options.reports.unmute(id);
+      return { id, mutedUntil: null };
+    }
+    return { id, mutedUntil: options.reports.mute(id, body.forMs) };
+  });
+
   app.get('/api/agent-watch', async (req, reply) => {
     const query = parseBody(AgentWatchQuerySchema, req.query ?? {});
     const ids = [
