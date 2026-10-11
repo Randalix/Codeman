@@ -3583,8 +3583,19 @@ export function registerSessionRoutes(
       const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === remoteCase.hostId);
       if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
 
+      // A claude `model` DOES cross ssh: the remote launch puts `--model` on the claude
+      // command (buildRemoteLaunchCommand). Not under a `commands.claude` host override —
+      // that admin-set command is authoritative and would drop it without a word.
+      // (`model` on any other CLI was already refused above.)
+      if (model && host.commands?.claude) {
+        return createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          `model is not supported for remote case "${caseName}": host "${host.id}" overrides the claude command (commands.claude). Set the model in that command instead.`
+        );
+      }
+
       // Per-session config that is applied to the LOCAL tmux/CLI wrapper (env vars via
-      // tmux setenv, effort/model CLI args, codex/gemini/antigravity/opencode config) does NOT
+      // tmux setenv, effort CLI args, codex/gemini/antigravity/opencode config) does NOT
       // cross ssh, so it would silently no-op. Reject rather than pretend it worked —
       // remote command/env customization goes through the per-host command override.
       if (
@@ -3592,7 +3603,6 @@ export function registerSessionRoutes(
         effort ||
         advisorModel ||
         modelOverride !== undefined ||
-        model ||
         codexConfig ||
         geminiConfig ||
         antigravityConfig ||
@@ -3605,7 +3615,7 @@ export function registerSessionRoutes(
       ) {
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          'envOverrides, effort, advisorModel, modelOverride, model, per-CLI config, and custom model endpoints are not supported for remote cases (they do not cross ssh). Configure the remote command via the host command override instead.'
+          'envOverrides, effort, advisorModel, modelOverride, per-CLI config, and custom model endpoints are not supported for remote cases (they do not cross ssh). Configure the remote command via the host command override instead.'
         );
       }
 

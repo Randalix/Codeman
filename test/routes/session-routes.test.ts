@@ -2271,6 +2271,56 @@ describe('session-routes', () => {
       expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
     });
 
+    describe('remote claude model (crosses ssh as `claude --model`)', () => {
+      const gpuCase = { name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' };
+      const gpuHost = { id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' };
+
+      it('accepts a model for a remote claude case and stores it on the session', async () => {
+        const start = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
+        try {
+          remoteStore.hosts = [gpuHost];
+          remoteStore.cases = [gpuCase];
+          const res = await harness.app.inject({
+            method: 'POST',
+            url: '/api/quick-start',
+            payload: { caseName: 'gpu-work', mode: 'claude', model: 'haiku' },
+          });
+          expect(res.statusCode, res.body).toBe(200);
+          const { sessionId } = JSON.parse(res.body).data;
+          const session = [...harness.ctx.sessions.values()].find((item) => item.id === sessionId);
+          expect(session?.toState()).toMatchObject({
+            model: 'haiku',
+            remote: expect.objectContaining({ hostId: 'gpu-box' }),
+          });
+        } finally {
+          start.mockRestore();
+        }
+      });
+
+      it('refuses it under a commands.claude host override, which would drop it', async () => {
+        remoteStore.hosts = [{ ...gpuHost, commands: { claude: 'exec claude-wrapper' } }];
+        remoteStore.cases = [gpuCase];
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName: 'gpu-work', mode: 'claude', model: 'haiku' },
+        });
+        expect(res.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+        expect(JSON.parse(res.body).error).toMatch(/commands\.claude/);
+      });
+
+      it('still refuses a model for another CLI on a remote case', async () => {
+        remoteStore.hosts = [gpuHost];
+        remoteStore.cases = [gpuCase];
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: { caseName: 'gpu-work', mode: 'codex', model: 'gpt-5' },
+        });
+        expect(res.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+      });
+    });
+
     it('rejects a remote quick-start when the remote host lacks tmux', async () => {
       remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];

@@ -1058,8 +1058,14 @@ export function buildRemoteLaunchCommand(options: {
   /** OMP only — resume/continue overrides for the remote omp relaunch (dead-pane respawn). */
   ompConfig?: OmpConfig;
   resumeSessionId?: string;
+  /**
+   * Claude only — the session's model (`claude --model`), on every launch AND every
+   * reattach/respawn, like the local wrapper. Ignored under a `commands.claude` host
+   * override (the route refuses an explicit model there).
+   */
+  model?: string;
 }): string {
-  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId } = options;
+  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId, model } = options;
   // §6.3: honor the session's EFFECTIVE claude permission mode on remote instead of
   // hardcoding --dangerously-skip-permissions, so a non-granted multi-user user's
   // downgraded 'auto' actually reaches the remote agent (the default command otherwise
@@ -1086,7 +1092,10 @@ export function buildRemoteLaunchCommand(options: {
     // `commands.claude` override stays authoritative (admin's explicit
     // choice) and skips this entirely.
     const permFlags = buildClaudePermissionFlags(claudeMode, allowedTools);
-    const cmd = `claude${permFlags}`;
+    // A plain id goes in bare (readable in `ps` and the pane); anything else is quoted —
+    // `opus[1m]` would be globbed by the remote shell.
+    const modelFlag = !model ? '' : ` --model ${/^[A-Za-z0-9._-]+$/.test(model) ? model : shellescape(model)}`;
+    const cmd = `claude${permFlags}${modelFlag}`;
     // Defense in depth, mirroring claudeDockerPaneCommand's own belt-and-braces check:
     // sessionId is server-minted and always safe in practice, but this command is built
     // as a single shellescaped string and then executed as shell code on the remote
@@ -1607,6 +1616,8 @@ function buildRemoteSessionCommand(options: {
   /** OMP only — resume/continue overrides for a remote omp relaunch. */
   ompConfig?: OmpConfig;
   resumeSessionId?: string;
+  /** Claude only — see {@link buildRemoteLaunchCommand}. */
+  model?: string;
 }): string {
   const { remote, sessionId } = options;
   if (remote.owned === false) {
@@ -2269,7 +2280,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const fullCmd = docker
         ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
         : remote
-          ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+          ? buildRemoteSessionCommand({
+              mode,
+              remote,
+              sessionId,
+              claudeMode,
+              allowedTools,
+              ompConfig,
+              resumeSessionId,
+              model,
+            })
           : localFullCmd;
       // Best-effort, in the background: the agent CLI (and the skill that tells the
       // agent it exists) is only needed once the agent is asked to use it, and a
@@ -2580,7 +2600,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const fullCmd = docker
       ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
       : remote
-        ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+        ? buildRemoteSessionCommand({
+            mode,
+            remote,
+            sessionId,
+            claudeMode,
+            allowedTools,
+            ompConfig,
+            resumeSessionId,
+            model,
+          })
         : localFullCmd;
     if (remote && remote.owned !== false) {
       void installRemoteAgentCli(remote);

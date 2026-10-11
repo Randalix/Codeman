@@ -217,6 +217,15 @@ claude --resume <id>` (see `buildRemoteLaunchCommand`'s claude branch). The
   first run creates the conversation under the deterministic session id; every
   later reattach/respawn re-runs the same line, `--session-id` fails
   ("already in use"), and the `||` fallback resumes it.
+  A session `model` (quick-start `model`, `codeman agent spawn --model`) goes
+  on both halves as `claude --model <id>`, so a reconnect keeps it. A plain id
+  goes in bare; anything else is shellescaped (`opus[1m]` would glob in the
+  remote shell). Under a per-host `commands.claude` override the admin command
+  is authoritative and carries no `--model`, so quick-start refuses an explicit
+  `model` there (400) rather than dropping it. Every other per-session setting
+  (`envOverrides`, `effort`, `advisorModel`, per-CLI configs, custom model
+  endpoints) is still refused for remote cases: it is applied by the LOCAL
+  wrapper and never crosses ssh.
 - **OMP**: `omp` has no equivalent idempotent single-line form, so
   `Session._pinOmpRespawnId()` resolves and pins an explicit `--resume <id>`
   before a respawn (mirroring the local/docker builders, rendered through the

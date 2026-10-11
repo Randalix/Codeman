@@ -239,6 +239,59 @@ describe('TmuxManager (unit)', () => {
       const sessionIdIdx = command.indexOf('--session-id abc123def456');
       expect(resumeIdx).toBeLessThan(sessionIdIdx);
     });
+
+    describe('remote claude model (Joe, 2026-10-11: model choice did nothing on Hufflepuff cases)', () => {
+      const remote = { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' };
+
+      it('puts --model on every claude attempt, the create AND the resume fallback', () => {
+        const command = buildRemoteLaunchCommand({ mode: 'claude', remote, sessionId: 'abc123def456', model: 'haiku' });
+        expect(command).toContain('claude --dangerously-skip-permissions --model haiku --session-id abc123def456');
+        expect(command).toContain('claude --dangerously-skip-permissions --model haiku --resume abc123def456');
+      });
+
+      it('also on a distinct resumeSessionId launch', () => {
+        const command = buildRemoteLaunchCommand({
+          mode: 'claude',
+          remote,
+          sessionId: 'abc123def456',
+          resumeSessionId: 'old-conversation-uuid',
+          model: 'haiku',
+        });
+        expect(command).toContain('--model haiku --resume old-conversation-uuid');
+        expect(command).toContain('--model haiku --session-id abc123def456');
+      });
+
+      it('adds nothing without a model (the CLI default applies, as before)', () => {
+        const command = buildRemoteLaunchCommand({ mode: 'claude', remote, sessionId: 'abc123def456' });
+        expect(command).not.toContain('--model');
+      });
+
+      it('quotes a model that is not a plain id (real-shell check: remote-claude-model.test.ts)', () => {
+        const command = buildRemoteLaunchCommand({
+          mode: 'claude',
+          remote,
+          sessionId: 'abc123def456',
+          model: 'opus[1m]',
+        });
+        expect(command).not.toContain('--model opus[1m]');
+      });
+
+      it('leaves a commands.claude host override untouched (the admin command is authoritative)', () => {
+        const command = buildRemoteLaunchCommand({
+          mode: 'claude',
+          remote: { ...remote, commands: { claude: 'exec claude-wrapper' } },
+          sessionId: 'abc123def456',
+          model: 'haiku',
+        });
+        expect(command).toContain('claude-wrapper');
+        expect(command).not.toContain('--model');
+      });
+
+      it('ignores a model for any other CLI', () => {
+        const command = buildRemoteLaunchCommand({ mode: 'shell', remote, sessionId: 'abc123def456', model: 'haiku' });
+        expect(command).not.toContain('--model');
+      });
+    });
   });
 
   describe('remote kill command builder', () => {
@@ -803,6 +856,35 @@ describe('TmuxManager (unit)', () => {
       }
     });
 
+    it('starts a remote claude session on its model', async () => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+
+      // createSession also looks for a LOCAL claude binary (pre-existing, even for remote);
+      // this test machine may have none.
+      vi.spyOn(nonTestManager as unknown as { buildPathExport: () => unknown }, 'buildPathExport').mockReturnValue({
+        pathExport: '',
+        dir: '/opt/claude/bin',
+      });
+
+      try {
+        await nonTestManager.createSession({
+          sessionId: 'abc12345-1234-5678-90ab-cdef12345679',
+          workingDir: '/w',
+          mode: 'claude',
+          model: 'haiku',
+          remote: { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' },
+        });
+        const launch = [...mockedExecSync.mock.calls, ...vi.mocked(exec).mock.calls]
+          .map(([cmd]) => cmd)
+          .find((cmd) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
+        expect(launch).toContain('ssh ');
+        expect(launch).toContain('--model haiku --session-id abc12345-1234-5678-90ab-cdef12345679');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
     it('changes the global history default on tmux versions that cannot resize panes', async () => {
       const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
       const nonTestManager = new NonTestTmuxManager();
@@ -883,6 +965,38 @@ describe('TmuxManager (unit)', () => {
           .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abcd1234"`);
         expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project\\" &&');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
+    it('respawns a remote claude pane on its model (every reconnect keeps --model)', async () => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      nonTestManager.registerSession({
+        sessionId: 'respawnremote1',
+        muxName: 'codeman-abcd9999',
+        pid: 1000,
+        createdAt: Date.now(),
+        workingDir: '/w',
+        mode: 'claude',
+        attached: false,
+      });
+
+      try {
+        await nonTestManager.respawnPane({
+          sessionId: 'respawnremote1',
+          workingDir: '/w',
+          mode: 'claude',
+          model: 'haiku',
+          remote: { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' },
+        });
+        const { exec: currentExec } = await import('node:child_process');
+        const respawnCall = vi
+          .mocked(currentExec)
+          .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
+        expect(respawnCall?.[0]).toContain('ssh ');
+        expect(respawnCall?.[0]).toContain('--model haiku --session-id respawnremote1');
       } finally {
         nonTestManager.destroy();
       }
