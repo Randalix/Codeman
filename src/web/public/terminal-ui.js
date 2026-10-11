@@ -4247,6 +4247,60 @@ Object.assign(CodemanApp.prototype, {
   },
 
   /**
+   * Hide the terminal while the session on screen catches up after a wake or an
+   * unlock, so the rewrite's way to the end is never watched — only the final view
+   * is. Same `opacity: 0` as the tab replay (`terminal-tab-replay`), but a class
+   * and an owner of its own: a tab switch during a catch-up drops it
+   * (`_dropTerminalCatchUp`) and reveals through its own selection, never through
+   * this one.
+   *
+   * @param {object} owner identity the matching reveal must present
+   */
+  _hideTerminalCatchUp(owner) {
+    if (!this.terminal?.element) return;
+    clearTimeout(this._terminalCatchUpTimer);
+    this._terminalCatchUpOwner = owner;
+    this.terminal.element.classList.add('terminal-catch-up');
+    this._terminalCatchUpTimer = setTimeout(() => this._revealTerminalCatchUp(owner), TERMINAL_CATCH_UP_MAX_MS);
+  },
+
+  /** End the catch-up `owner` started; a no-op once another owner took over. */
+  _revealTerminalCatchUp(owner) {
+    if (!owner || this._terminalCatchUpOwner !== owner) return;
+    this._dropTerminalCatchUp();
+  },
+
+  /** Show the terminal again whoever hid it (tab switch, teardown). */
+  _dropTerminalCatchUp() {
+    clearTimeout(this._terminalCatchUpTimer);
+    this._terminalCatchUpTimer = null;
+    this._terminalCatchUpOwner = null;
+    this.terminal?.element?.classList.remove('terminal-catch-up');
+  },
+
+  /**
+   * The page came back (unlock, wake, app switch) with output queued while it was
+   * hidden. At the live bottom, draining a backlog longer than one write frame
+   * follows it to the end frame by frame; hide that until the queue is empty
+   * (`_revealDrainedBacklog`). Reading history needs nothing: the flush keeps the
+   * viewport where it is. Ordinary live output is never hidden — only this resume.
+   */
+  _hideResumeBacklog() {
+    if (!this.terminal || this._terminalCatchUpOwner || !this.isTerminalAtBottom()) return;
+    let queued = this._terminalWriteInFlightBytes || 0;
+    for (const chunk of this.pendingWrites) queued += chunk.length;
+    if (queued <= TERMINAL_CATCH_UP_MIN_BYTES) return;
+    this._hideTerminalCatchUp({ backlog: true });
+  },
+
+  /** Reveal a resume backlog's hide once its last chunk is parsed. */
+  _revealDrainedBacklog() {
+    const owner = this._terminalCatchUpOwner;
+    if (!owner?.backlog || this._terminalWriteInFlight || this.pendingWrites.length > 0) return;
+    this._revealTerminalCatchUp(owner);
+  },
+
+  /**
    * Flush the flicker filter buffer to the terminal.
    * Called after the buffer window expires.
    */
@@ -4541,6 +4595,7 @@ Object.assign(CodemanApp.prototype, {
           viewportMarker?.dispose();
         }
         this._scheduleTerminalWriteFlush();
+        this._revealDrainedBacklog();
         this._noteMobileImeAuthoritativeOutput(flushedOutputSeq, flushSessionId);
       });
     } catch (err) {

@@ -1019,7 +1019,10 @@ class CodemanApp {
       // have run for minutes, and a wake/unlock is exactly when a stream
       // comes back zombie. Checking here is what makes recovery feel instant
       // instead of up to a full timeout late.
-      else this._checkSseStale();
+      else {
+        this._hideResumeBacklog?.();
+        this._checkSseStale();
+      }
     });
 
     // Local echo overlay — DOM overlay positioned at the visible ❯ prompt
@@ -3249,6 +3252,11 @@ class CodemanApp {
         const before = this.terminal.buffer?.active;
         const linesFromBottom = before ? Math.max(0, (before.baseY || 0) - (before.viewportY || 0)) : 0;
         const readingAnchor = this._captureTerminalReadingPosition?.();
+        // Unlocking after a lot of output lands here (stale SSE → reconnect →
+        // refresh of the session on screen). The rewrite below walks from the top
+        // of the new buffer to its end; hide that walk, reveal the final view. The
+        // fetch above stays visible: the old content is still worth reading.
+        this._hideTerminalCatchUp?.(refreshOwner);
         // One queued clear, not clear()+reset(): both of those are synchronous
         // and skip xterm's write queue, so live bytes still parsing would land
         // after them and fuse into the buffer written below. See
@@ -3298,6 +3306,9 @@ class CodemanApp {
       console.error('needsRefresh reload failed:', err);
       return err?.name === 'AbortError' ? 'deadline' : false;
     } finally {
+      // Also on a throw or a bail-out mid-write: a failed rewrite must not leave
+      // the pane invisible. A tab switch meanwhile already dropped this hide.
+      this._revealTerminalCatchUp?.(refreshOwner);
       if (this._terminalRefreshOwner === refreshOwner) this._terminalRefreshOwner = null;
     }
   }
@@ -9098,6 +9109,9 @@ class CodemanApp {
     console.log(`[CRASH-DIAG] selectSession START: ${sessionId.slice(0,8)}`);
 
     const selectGen = ++this._selectGeneration;
+    // A catch-up of the previous tab is moot; this selection hides and reveals
+    // its own replay.
+    this._dropTerminalCatchUp?.();
     this._setTerminalLoadState(sessionId, selectGen, 'resizing');
 
     if (selectGen !== this._selectGeneration) {

@@ -434,7 +434,8 @@ textarea:focus-visible {
   outline: none;
 }
 
-.xterm.terminal-tab-replay {
+.xterm.terminal-tab-replay,
+.xterm.terminal-catch-up {
   /* Keep its focused textarea and layout alive while the replay is invisible. */
   opacity: 0;
 }

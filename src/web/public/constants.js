@@ -117,6 +117,11 @@ const THROTTLE_DELAY_MS = 100;              // General UI throttle delay
 const TERMINAL_CHUNK_SIZE = 32 * 1024;      // 32KB chunks for terminal buffer loading
 const TERMINAL_TAIL_SIZE = 1024 * 1024;     // 1MB tail for initial load (more scrollback on tab switch)
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
+// A catch-up after unlock hides the terminal at most this long, so a lost reveal
+// (a parse callback that never lands) can never leave the pane invisible.
+const TERMINAL_CATCH_UP_MAX_MS = 4000;
+// A resume backlog at most one write frame long lands in one paint: nothing to hide.
+const TERMINAL_CATCH_UP_MIN_BYTES = 32 * 1024;
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
 
