@@ -2094,7 +2094,8 @@ function bracePathPrefixDir(text) {
   const before = value.slice(0, set.open);
   const cut = before.lastIndexOf('/');
   if (cut === -1) return null;
-  return cut === 0 ? '/' : before.slice(0, cut);
+  if (cut === 0) return '/';
+  return before.startsWith('~/') && cut === 1 ? '~/' : before.slice(0, cut);
 }
 
 /**

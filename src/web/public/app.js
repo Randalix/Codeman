@@ -2763,7 +2763,8 @@ class CodemanApp {
         // (rebased, no `linkified` mark) already are what the routes expect.
         const sessionId = pathLink.dataset.sessionId || this.activeSessionId;
         const target = pathLink.dataset.linkified ? this._resolveLinkedFilePath?.(filePath, sessionId) : filePath;
-        if (filePath && pathLink.dataset.folder) this.openFolderGrid(target || filePath, sessionId);
+        if (filePath && pathLink.dataset.braces) this.openPathSet(filePath, sessionId);
+        else if (filePath && pathLink.dataset.folder) this.openFolderGrid(target || filePath, sessionId);
         else if (filePath) this.openFilePreview(target || filePath, sessionId);
         return;
       }
@@ -2917,7 +2918,7 @@ class CodemanApp {
       const value = node.nodeValue;
       const frag = document.createDocumentFragment();
       let cursor = 0;
-      for (const { path, index, folder } of found) {
+      for (const { path, index, folder, braces } of found) {
         if (index > cursor) frag.appendChild(document.createTextNode(value.slice(cursor, index)));
         const link = document.createElement('a');
         link.className = 'rv-path';
@@ -2925,6 +2926,7 @@ class CodemanApp {
         link.dataset.path = path;
         link.dataset.linkified = '1';
         if (folder) link.dataset.folder = '1';
+        if (braces) link.dataset.braces = '1';
         link.title = path;
         link.textContent = path;
         frag.appendChild(link);

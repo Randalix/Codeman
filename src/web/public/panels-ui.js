@@ -13,6 +13,17 @@
  * @loadorder 11 of 15 — loaded after settings-ui.js, before session-ui.js
  */
 
+/** The deepest folder that contains every one of `dirs` (absolute paths): `/` when they share only the root. */
+const commonFolder = (dirs) => {
+  const split = dirs.map((d) => d.split('/').filter(Boolean));
+  const shared = [];
+  for (let i = 0; i < Math.min(...split.map((p) => p.length)); i++) {
+    if (!split.every((p) => p[i] === split[0][i])) break;
+    shared.push(split[0][i]);
+  }
+  return `/${shared.join('/')}`;
+};
+
 const AWAY_DIGEST_LAST_VIEWED_KEY = 'codeman-away-digest-last-viewed';
 const FILE_BROWSER_SHOW_HIDDEN_KEY = 'codeman:fileBrowserShowHidden';
 // Bounds for the by-id text preview, mirroring what the workspace text preview
@@ -4388,6 +4399,93 @@ Object.assign(CodemanApp.prototype, {
     body.scrollTop = 0;
   },
 
+  /**
+   * Open a shell brace set (`…/{vorher,nachher}/synth-{sedan,jeep}/{leerlauf,start}.wav`)
+   * as ONE grid of the files it names that exist.
+   *
+   * The set is expanded here (`expandBracePath`), each path resolved like a clicked
+   * one, and the server (`POST …/folder-sets`) answers a listing per folder it
+   * touches, granted and guarded like a folder click. Files are then fetched by
+   * their own `folderId + name`, so two folders holding a `leerlauf.wav` each stay
+   * apart. A set too large to expand, or none of whose files exist, opens the
+   * folder in front of it instead.
+   */
+  async openPathSet(pathText, sessionId = this.activeSessionId) {
+    if (!sessionId || !pathText) return;
+    const overlay = this.$('folderGridOverlay');
+    const body = this.$('folderGridBody');
+    if (!overlay || !body) return;
+    const workingDir = this.sessions?.get?.(sessionId)?.workingDir;
+    const resolve = (path) => (typeof resolveLinkedFilePath === 'function' ? resolveLinkedFilePath(path, workingDir) : path);
+    const prefix = typeof bracePathPrefixDir === 'function' ? bracePathPrefixDir(pathText) : null;
+    const openPrefix = (reason) => {
+      if (prefix) this.openFolderGrid(resolve(prefix), sessionId);
+      else this.showToast(`Cannot open ${pathText}: ${reason}`, 'error');
+    };
+    const expanded = typeof expandBracePath === 'function' ? expandBracePath(pathText) : null;
+    if (!expanded || expanded.tooMany || expanded.paths.length === 0) {
+      openPrefix('too many paths');
+      return;
+    }
+
+    this._bindFolderGridKeys();
+    const load = (this._folderGridLoad = (this._folderGridLoad || 0) + 1);
+    let result = null;
+    let status = 0;
+    try {
+      const res = await fetch(`/api/sessions/${sessionId}/folder-sets`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: expanded.paths.map(resolve) }),
+      });
+      status = res.status;
+      result = await res.json().catch(() => null);
+    } catch (err) {
+      if (load !== this._folderGridLoad) return;
+      this.showToast(`Cannot open ${pathText}: ${err.message || err}`, 'error');
+      return;
+    }
+    if (load !== this._folderGridLoad) return;
+    const listings = result?.success ? result.data?.listings : null;
+    if (!Array.isArray(listings) || listings.length === 0) {
+      openPrefix(result?.error || `HTTP ${status}`);
+      return;
+    }
+
+    // Labels are relative to the folder every listing shares, so a name that
+    // repeats (`leerlauf.wav` in two folders) says which one it is.
+    const common = commonFolder(listings.map((l) => l.path));
+    const relative = (dir) => (dir === common ? '' : dir.slice(common === '/' ? 1 : common.length + 1));
+    const files = [];
+    const folders = [];
+    for (const listing of listings) {
+      const rel = relative(listing.path);
+      for (const file of listing.files) {
+        files.push({
+          ...file,
+          folderId: listing.folderId,
+          dir: listing.path,
+          label: rel ? `${rel}/${file.name}` : file.name,
+        });
+      }
+      for (const name of listing.folders) folders.push(rel ? `${rel}/${name}` : name);
+    }
+    this.folderGrid = {
+      sessionId,
+      set: true,
+      folderId: null,
+      path: common,
+      files,
+      folders,
+      truncated: listings.some((l) => l.truncated),
+      missing: Array.isArray(result.data.missing) ? result.data.missing : [],
+      index: null,
+    };
+    this._renderFolderGrid();
+    overlay.classList.add('visible');
+    body.scrollTop = 0;
+  },
+
   closeFolderGrid() {
     // A listing still on its way must not reopen the grid that was just closed.
     this._folderGridLoad = (this._folderGridLoad || 0) + 1;
@@ -4401,7 +4499,13 @@ Object.assign(CodemanApp.prototype, {
 
   folderGridUp() {
     const grid = this.folderGrid;
-    if (!grid || grid.path === '/') return;
+    if (!grid) return;
+    // A path set's "up" is the folder its files share: the whole listing it is a cut of.
+    if (grid.set) {
+      this.openFolderGrid(grid.path, grid.sessionId);
+      return;
+    }
+    if (grid.path === '/') return;
     this.openFolderGrid(grid.path.slice(0, grid.path.lastIndexOf('/')) || '/', grid.sessionId);
   },
 
@@ -4438,12 +4542,13 @@ Object.assign(CodemanApp.prototype, {
       const tile = document.createElement('button');
       tile.type = 'button';
       tile.className = 'folder-grid-tile';
-      tile.title = `${file.name} • ${this.formatFileSize(file.size)}`;
+      const shown = file.label || file.name;
+      tile.title = `${shown} • ${this.formatFileSize(file.size)}`;
       tile.dataset.index = String(index);
       const thumb = document.createElement('div');
       thumb.className = 'folder-grid-thumb';
       const label = file.extension.toUpperCase();
-      const route = this._folderFileUrl(grid, file.name, '');
+      const route = this._folderFileUrl(grid, file, '');
       // Images load themselves (lazily — a folder can hold hundreds of renders);
       // PDF/Office show their first page where the server can render one (local
       // folders), everything else a type label.
@@ -4457,7 +4562,7 @@ Object.assign(CodemanApp.prototype, {
         const img = document.createElement('img');
         img.loading = 'lazy';
         img.decoding = 'async';
-        img.alt = file.name;
+        img.alt = shown;
         img.src = src;
         img.onerror = () => {
           thumb.textContent = label;
@@ -4468,7 +4573,7 @@ Object.assign(CodemanApp.prototype, {
       }
       const name = document.createElement('span');
       name.className = 'folder-grid-name';
-      name.textContent = file.name;
+      name.textContent = shown;
       tile.append(thumb, name);
       tile.onclick = () => this._openFolderGridFile(index);
       body.appendChild(tile);
@@ -4476,12 +4581,15 @@ Object.assign(CodemanApp.prototype, {
 
     const count = `${grid.files.length} file${grid.files.length === 1 ? '' : 's'}`;
     const subfolders = grid.folders.length ? ` • ${grid.folders.length} folder${grid.folders.length === 1 ? '' : 's'}` : '';
-    footer.textContent = `${count}${subfolders}${grid.truncated ? ' (folder too large — showing the first entries)' : ''}`;
+    const missing = grid.missing?.length ? ` • ${grid.missing.length} not found` : '';
+    footer.textContent = `${count}${subfolders}${missing}${grid.truncated ? ' (folder too large — showing the first entries)' : ''}`;
+    footer.title = grid.missing?.length ? `Not found:\n${grid.missing.slice(0, 20).join('\n')}` : '';
   },
 
-  _folderFileUrl(grid, name, suffix) {
+  /** A grid file's by-name route; a path set's files each carry the folder they came from. */
+  _folderFileUrl(grid, file, suffix) {
     return CodemanBase.url(
-      `/api/sessions/${grid.sessionId}/folders/${encodeURIComponent(grid.folderId)}/files/${encodeURIComponent(name)}${suffix}`
+      `/api/sessions/${grid.sessionId}/folders/${encodeURIComponent(file.folderId || grid.folderId)}/files/${encodeURIComponent(file.name)}${suffix}`
     );
   },
 
@@ -4494,8 +4602,9 @@ Object.assign(CodemanApp.prototype, {
     const tile = body?.querySelector(`.folder-grid-tile[data-index="${index}"]`);
     tile?.classList.add('current');
     tile?.scrollIntoView({ block: 'nearest' });
-    this.openFilePreview(`${grid.path === '/' ? '' : grid.path}/${file.name}`, grid.sessionId, null, {
-      folderFile: { folderId: grid.folderId, name: file.name },
+    const dir = file.dir || grid.path;
+    this.openFilePreview(`${dir === '/' ? '' : dir}/${file.name}`, grid.sessionId, null, {
+      folderFile: { folderId: file.folderId || grid.folderId, name: file.name },
       size: file.size,
     });
     // After openFilePreview: it resets the index for previews from elsewhere.

@@ -139,6 +139,8 @@ describe('bracePathPrefixDir', () => {
     expect(bracePathPrefixDir('src/{a,b}.ts')).toBe('src');
     expect(bracePathPrefixDir('/tmp/x{a,b}/c.png')).toBe('/tmp');
     expect(bracePathPrefixDir('/{a,b}/c.png')).toBe('/');
+    expect(bracePathPrefixDir('~/{a,b}/c.png')).toBe('~/');
+    expect(bracePathPrefixDir('~/x/{a,b}.png')).toBe('~/x');
     expect(bracePathPrefixDir('{a,b}/c.png')).toBeNull();
   });
 });

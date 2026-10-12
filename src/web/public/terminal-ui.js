@@ -1978,9 +1978,15 @@ Object.assign(CodemanApp.prototype, {
    * directory first, and a `~/` path always previews (only the
    * server knows that host's home, and the log viewer cannot ask).
    * A folder path opens the folder grid (which falls back to the
-   * preview if the server finds a file there after all).
+   * preview if the server finds a file there after all). A brace set
+   * (`braces`) opens the grid of the files it expands to (`openPathSet`).
    */
-  _openTerminalPathLink(text, sessionId, folder = false) {
+  _openTerminalPathLink(text, sessionId, folder = false, braces = false) {
+    // A shell brace set (`…/{a,b}/{x,y}.wav`): the grid of the files it names.
+    if (braces) {
+      this.openPathSet(text, sessionId);
+      return;
+    }
     const target = this._resolveLinkedFilePath(text, sessionId);
     if (folder) {
       this.openFolderGrid(target, sessionId);
@@ -2215,7 +2221,7 @@ Object.assign(CodemanApp.prototype, {
         // Pattern 3: Bash() tool output
         const bashPattern = /Bash\([^)]*?(\/(?:home|tmp|var|etc|opt)[^\s"'<>|;&\)\n\x00-\x1f]+)/g;
 
-        const addLink = (filePath, matchIndex, folder = false) => {
+        const addLink = (filePath, matchIndex, folder = false, braces = false) => {
           const startCol = lineText.indexOf(filePath, matchIndex);
           if (startCol === -1) return;
 
@@ -2234,7 +2240,7 @@ Object.assign(CodemanApp.prototype, {
               underline: true,
             },
             activate(_event, text) {
-              self._openTerminalPathLink(text, getSessionId(), folder);
+              self._openTerminalPathLink(text, getSessionId(), folder, braces);
             },
             hover() {
               setHovered(true);
@@ -2255,16 +2261,17 @@ Object.assign(CodemanApp.prototype, {
 
         cmdPattern.lastIndex = 0;
         while ((match = cmdPattern.exec(lineText)) !== null) {
-          addLink(match[2], match.index);
+          // A brace set is one link of its own (findFilePathLinks below), not a path.
+          if (!match[2].includes('{')) addLink(match[2], match.index);
         }
 
         for (const found of findFilePathLinks(lineText)) {
-          addLink(found.path, found.index, !!found.folder);
+          addLink(found.path, found.index, !!found.folder, !!found.braces);
         }
 
         bashPattern.lastIndex = 0;
         while ((match = bashPattern.exec(lineText)) !== null) {
-          addLink(match[1], match.index);
+          if (!match[1].includes('{')) addLink(match[1], match.index);
         }
 
         if (links.length > 0) {

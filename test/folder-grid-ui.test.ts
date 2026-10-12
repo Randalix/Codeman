@@ -25,12 +25,19 @@ const read = (f: string) => readFileSync(resolve(PUBLIC, f), 'utf8');
 
 type Found = { path: string; index: number; folder?: true };
 const constants = vm.createContext({});
-vm.runInContext(`${read('constants.js')}\nglobalThis.__h = { findFilePathLinks, resolveLinkedFilePath };`, constants, {
-  filename: 'constants.js',
-});
-const { findFilePathLinks, resolveLinkedFilePath } = (
+vm.runInContext(
+  `${read('constants.js')}\nglobalThis.__h = { findFilePathLinks, resolveLinkedFilePath, expandBracePath, bracePathPrefixDir };`,
+  constants,
+  { filename: 'constants.js' }
+);
+const { findFilePathLinks, resolveLinkedFilePath, expandBracePath, bracePathPrefixDir } = (
   constants as unknown as {
-    __h: { findFilePathLinks: (t: string) => Found[]; resolveLinkedFilePath: (p: string, w?: string) => string };
+    __h: {
+      findFilePathLinks: (t: string) => Found[];
+      resolveLinkedFilePath: (p: string, w?: string) => string;
+      expandBracePath: unknown;
+      bracePathPrefixDir: unknown;
+    };
   }
 ).__h;
 const folders = (text: string) =>
@@ -75,14 +82,16 @@ describe('folder links (findFilePathLinks)', () => {
 describe('folder links are routed to the grid', () => {
   it('terminal provider opens folder links in the grid', () => {
     const src = read('terminal-ui.js');
-    expect(src).toMatch(/addLink\(found\.path, found\.index, !!found\.folder\)/);
-    expect(src).toMatch(/self\._openTerminalPathLink\(text, getSessionId\(\), folder\)/);
+    expect(src).toMatch(/addLink\(found\.path, found\.index, !!found\.folder, !!found\.braces\)/);
+    expect(src).toMatch(/self\._openTerminalPathLink\(text, getSessionId\(\), folder, braces\)/);
     expect(src).toMatch(/if \(folder\) \{\s*this\.openFolderGrid\(target, sessionId\);/);
   });
 
   it('response viewer marks folder links and opens them in the grid', () => {
     const src = read('app.js');
     expect(src).toMatch(/if \(folder\) link\.dataset\.folder = '1';/);
+    expect(src).toMatch(/if \(braces\) link\.dataset\.braces = '1';/);
+    expect(src).toMatch(/pathLink\.dataset\.braces\) this\.openPathSet\(/);
     expect(src).toMatch(/pathLink\.dataset\.folder\) this\.openFolderGrid\(/);
   });
 
@@ -165,6 +174,8 @@ function loadApp(fetchImpl: (url: string, init?: { body?: string }) => unknown) 
     escapeHtml: (s: string) => String(s),
     CodemanBase: { base: '', url: (p: string) => p },
     resolveLinkedFilePath,
+    expandBracePath,
+    bracePathPrefixDir,
     document: {
       getElementById: () => null,
       createElement: (t: string) => el(t),
@@ -413,5 +424,104 @@ describe('"Show folder" in the preview', () => {
     app.openFolderOfPreview();
     await vi.waitFor(() => expect(elements.folderGridOverlay.classList.contains('visible')).toBe(true));
     expect(JSON.parse(fetch.mock.calls.at(-1)[1].body)).toEqual({ path: '/mnt/raid1/styleframes' });
+  });
+});
+
+describe('openPathSet (shell brace sets)', () => {
+  const SET = '/mnt/raid1/x/uebernahme/{vorher,nachher}/synth-{sedan,jeep}/{leerlauf,start}.wav';
+  const file = (name: string, size = 5) => ({ name, extension: 'wav', attachmentType: 'audio', size, mtimeMs: 1 });
+  const SET_ANSWER = {
+    listings: [
+      {
+        folderId: 'fld_a',
+        path: '/mnt/raid1/x/uebernahme/vorher/synth-sedan',
+        files: [file('leerlauf.wav'), file('start.wav')],
+        folders: [],
+        truncated: false,
+      },
+      {
+        folderId: 'fld_b',
+        path: '/mnt/raid1/x/uebernahme/nachher/synth-jeep',
+        files: [file('leerlauf.wav', 9)],
+        folders: [],
+        truncated: false,
+      },
+    ],
+    missing: ['/mnt/raid1/x/uebernahme/vorher/synth-jeep/start.wav'],
+  };
+
+  it('asks the server for every expansion and renders one grid over the folders', async () => {
+    const { app, elements, fetch } = loadApp(() => ok(SET_ANSWER));
+    await app.openPathSet(SET, 's1');
+
+    expect(fetch).toHaveBeenCalledWith('/api/sessions/s1/folder-sets', expect.objectContaining({ method: 'POST' }));
+    const { paths } = JSON.parse(fetch.mock.calls[0][1].body);
+    expect(paths).toHaveLength(8);
+    expect(paths[0]).toBe('/mnt/raid1/x/uebernahme/vorher/synth-sedan/leerlauf.wav');
+    expect(paths[7]).toBe('/mnt/raid1/x/uebernahme/nachher/synth-jeep/start.wav');
+
+    expect(elements.folderGridOverlay.classList.contains('visible')).toBe(true);
+    expect(elements.folderGridTitle.textContent).toBe('/mnt/raid1/x/uebernahme');
+    const tiles = elements.folderGridBody.children;
+    expect(tiles).toHaveLength(3);
+    // Same name in two folders: the label says which one, the route says it too.
+    const names = (i: number) => tiles[i].children[1].textContent;
+    expect([names(0), names(1), names(2)]).toEqual([
+      'vorher/synth-sedan/leerlauf.wav',
+      'vorher/synth-sedan/start.wav',
+      'nachher/synth-jeep/leerlauf.wav',
+    ]);
+    expect(elements.folderGridFooter.textContent).toBe('3 files • 1 not found');
+  });
+
+  it('previews a tile from ITS folder and pages across folders', async () => {
+    const { app, elements } = loadApp(() => ok(SET_ANSWER));
+    await app.openPathSet(SET, 's1');
+    elements.folderGridBody.children[2].onclick?.();
+    await Promise.resolve();
+
+    expect(app._registerExternalPreview).not.toHaveBeenCalled();
+    expect(app.filePreviewDetachUrl).toBe('/api/sessions/s1/folders/fld_b/files/leerlauf.wav/raw');
+    expect(elements.filePreviewTitle.textContent).toBe('/mnt/raid1/x/uebernahme/nachher/synth-jeep/leerlauf.wav');
+    app.stepFolderPreview(1);
+    expect(app.filePreviewDetachUrl).toBe('/api/sessions/s1/folders/fld_a/files/leerlauf.wav/raw');
+  });
+
+  it('resolves a relative set against the working directory', async () => {
+    const { app, fetch } = loadApp(() => ok(SET_ANSWER));
+    await app.openPathSet('builds/{a,b}/x.wav', 's1');
+    expect(JSON.parse(fetch.mock.calls[0][1].body).paths).toEqual([
+      '/home/joe/wiki/builds/a/x.wav',
+      '/home/joe/wiki/builds/b/x.wav',
+    ]);
+  });
+
+  it('falls back to the folder in front of the set: too many paths, or nothing found', async () => {
+    const big = loadApp(() => ok(LISTING));
+    await big.app.openPathSet('/mnt/raid1/x/{1,2,3,4,5,6,7,8,9,10}{1,2,3,4,5,6,7,8,9,10}{1,2}.wav', 's1');
+    expect(big.fetch).toHaveBeenCalledTimes(1);
+    expect(big.fetch.mock.calls[0][0]).toBe('/api/sessions/s1/folders');
+    expect(JSON.parse(big.fetch.mock.calls[0][1].body)).toEqual({ path: '/mnt/raid1/x' });
+
+    const none = loadApp((url) =>
+      url.endsWith('/folder-sets')
+        ? { ok: false, status: 404, json: async () => ({ error: 'None of these paths exists' }) }
+        : ok(LISTING)
+    );
+    await none.app.openPathSet(SET, 's1');
+    expect(none.fetch.mock.calls.map((c) => c[0])).toEqual([
+      '/api/sessions/s1/folder-sets',
+      '/api/sessions/s1/folders',
+    ]);
+    expect(JSON.parse(none.fetch.mock.calls[1][1].body)).toEqual({ path: '/mnt/raid1/x/uebernahme' });
+  });
+
+  it('"up" from a set opens the folder the files share', async () => {
+    const { app, fetch } = loadApp((url) => (url.endsWith('/folder-sets') ? ok(SET_ANSWER) : ok(LISTING)));
+    await app.openPathSet(SET, 's1');
+    app.folderGridUp();
+    await Promise.resolve();
+    expect(fetch.mock.calls.at(-1)?.[0]).toBe('/api/sessions/s1/folders');
+    expect(JSON.parse(fetch.mock.calls.at(-1)?.[1].body)).toEqual({ path: '/mnt/raid1/x/uebernahme' });
   });
 });
