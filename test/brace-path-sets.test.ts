@@ -87,6 +87,12 @@ describe('findFilePathLinks: brace sets', () => {
     }
   });
 
+  it('stays linear on a token that is nothing but opening braces', () => {
+    const start = Date.now();
+    expect(findFilePathLinks(`/a/${'{'.repeat(4000)}`).some((f) => f.braces)).toBe(false);
+    expect(Date.now() - start).toBeLessThan(100);
+  });
+
   it('keeps the plain forms exactly as they were', () => {
     expect(findFilePathLinks('/mnt/raid1/x/shot.png').map((f) => f.path)).toEqual(['/mnt/raid1/x/shot.png']);
     expect(findFilePathLinks('builds/captures/shot.png ./notes.md').map((f) => f.path)).toEqual([
