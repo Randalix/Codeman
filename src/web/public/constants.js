@@ -2010,6 +2010,116 @@ const RELATIVE_FILE_PATH_LINK_PATTERN =
 /** The `(?:log|txt|…)` extension group, read off the rooted pattern so it cannot drift. */
 const FILE_LINK_EXTENSION_GROUP = /\\\.(\(\?:[^()]*\))\)\\b$/.exec(FILE_PATH_LINK_PATTERN.source)[1];
 
+/** Most files one brace set may name; a bigger set opens the folder in front of it instead. */
+const MAX_BRACE_EXPANSIONS = 100;
+
+/**
+ * The brace group that opens at `open`: where it ends and its top-level
+ * alternatives. `null` when it never closes; `parts: null` when it is a plain
+ * `{name}` (no top-level comma), which a shell leaves literal.
+ */
+function parseBraceGroup(text, open) {
+  let depth = 0;
+  let start = open + 1;
+  const parts = [];
+  for (let i = open; i < text.length; i++) {
+    const c = text[i];
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) {
+        parts.push(text.slice(start, i));
+        return { end: i, parts: parts.length > 1 ? parts : null };
+      }
+    } else if (c === ',' && depth === 1) {
+      parts.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return null;
+}
+
+/** The first brace group in `text` with real alternatives (`{a,b}`), or null. */
+function findBraceSet(text) {
+  for (let i = text.indexOf('{'); i !== -1; i = text.indexOf('{', i + 1)) {
+    const group = parseBraceGroup(text, i);
+    if (group?.parts) return { open: i, end: group.end, parts: group.parts };
+  }
+  return null;
+}
+
+/**
+ * Expand the shell brace sets of a path the way bash does: `/a/{x,y}/{1,2}.png`
+ * is four paths, the first group varying slowest, nested groups and empty
+ * alternatives included. A `{name}` without a comma stays as typed. Numeric
+ * ranges (`{1..5}`) are not expanded.
+ *
+ * @param {string} text
+ * @param {number} [limit] More combinations than this is `tooMany` (and no paths),
+ *   so a pasted `{a,b}{a,b}…` never builds a list.
+ * @returns {{paths: string[], tooMany: boolean} | null} `null` when there is no set.
+ */
+function expandBracePath(text, limit = MAX_BRACE_EXPANSIONS) {
+  const value = String(text || '');
+  if (!findBraceSet(value)) return null;
+  const paths = [];
+  let tooMany = false;
+  const walk = (current) => {
+    const set = findBraceSet(current);
+    if (!set) {
+      if (paths.length >= limit) tooMany = true;
+      else paths.push(current);
+      return;
+    }
+    const head = current.slice(0, set.open);
+    const tail = current.slice(set.end + 1);
+    for (const part of set.parts) {
+      walk(head + part + tail);
+      if (tooMany) return;
+    }
+  };
+  walk(value);
+  return tooMany ? { paths: [], tooMany: true } : { paths, tooMany: false };
+}
+
+/**
+ * The folder in front of a path's first brace set (`…/uebernahme` for
+ * `…/uebernahme/{vorher,nachher}/…`) — what a click opens when the set is too
+ * large or none of its files exist. `null` when no folder precedes the set.
+ */
+function bracePathPrefixDir(text) {
+  const value = String(text || '');
+  const set = findBraceSet(value);
+  if (!set) return null;
+  const before = value.slice(0, set.open);
+  const cut = before.lastIndexOf('/');
+  if (cut === -1) return null;
+  return cut === 0 ? '/' : before.slice(0, cut);
+}
+
+/**
+ * Shell brace sets in `text` as links: a token with a `/` in front of its first
+ * `{a,b}` and an end that reads as a path (`}`, `/` or a known extension).
+ * `${HOME}/…`, a `$(cmd)` result, JSON, URLs and a lone `{name}` are not sets.
+ * Every consumer of {@link findFilePathLinks} gets them from there.
+ */
+function findBraceSetLinks(text, skip) {
+  const found = [];
+  const token = /[^\s"'`<>|;&()[\]=\x00-\x1f]+/g;
+  let match;
+  while ((match = token.exec(text)) !== null) {
+    if (!match[0].includes('{')) continue;
+    const path = match[0].replace(/[.,:;!?]+$/, '');
+    if (path.includes('://') || path.includes('${') || text[match.index - 1] === ')') continue;
+    const set = findBraceSet(path);
+    if (!set || !path.slice(0, set.open).includes('/')) continue;
+    if (!(path.endsWith('}') || path.endsWith('/') || PATH_TOKEN_ENDS_WITH_EXTENSION.test(path))) continue;
+    if (skip(match.index, path.length)) continue;
+    found.push({ path, index: match.index, braces: true });
+  }
+  return found;
+}
+
 /**
  * Every linkable file path in `text`, in order: absolute (rooted) paths first,
  * then `~/` and relative ones, then folder paths — each only where it overlaps
@@ -2019,8 +2129,9 @@ const FILE_LINK_EXTENSION_GROUP = /\\\.(\(\?:[^()]*\))\)\\b$/.exec(FILE_PATH_LIN
  * viewer), so a path form is clickable in both or in neither.
  *
  * @param {string} text
- * @returns {Array<{path: string, index: number, folder?: true}>} `index` is where `path` starts in
- *   `text`; `folder` marks a folder path (folder grid) rather than a file.
+ * @returns {Array<{path: string, index: number, folder?: true, braces?: true}>} `index` is where
+ *   `path` starts in `text`; `folder` marks a folder path (folder grid) rather than a file;
+ *   `braces` a shell brace set (`{a,b}`) that {@link expandBracePath} turns into the files.
  */
 function findFilePathLinks(text) {
   const value = String(text || '');
@@ -2035,9 +2146,15 @@ function findFilePathLinks(text) {
   while ((match = urlPattern.exec(value)) !== null) urls.push({ index: match.index, path: match[0] });
   const inUrl = (index, length) => urls.some((u) => index < u.index + u.path.length && u.index < index + length);
 
+  // Brace sets first: the rooted pattern would take `/a/{x,y}/b.png` whole, braces
+  // and all, and the relative one stops at the first `{`.
+  found.push(...findBraceSetLinks(value, inUrl));
+
   const absolute = absoluteFilePathPattern();
   while ((match = absolute.exec(value)) !== null) {
-    if (!inUrl(match.index, match[1].length)) found.push({ path: match[1], index: match.index });
+    if (!inUrl(match.index, match[1].length) && !overlaps(match.index, match[1].length)) {
+      found.push({ path: match[1], index: match.index });
+    }
   }
   const relative = new RegExp(RELATIVE_FILE_PATH_LINK_PATTERN.source, 'g');
   while ((match = relative.exec(value)) !== null) {
@@ -2244,7 +2361,11 @@ const pathFirstSegment = (path) => path.replace(/^(?:\.?\/)+/, '').split('/')[0]
  */
 function pathContinuation(prevText, nextText) {
   const tail = /[^\s"'<>|;&]+$/.exec(String(prevText || '').replace(/\s+$/, ''))?.[0] || '';
-  if (!tail.includes('/') || !/[\w\-.~+@%/]$/.test(tail) || PATH_TOKEN_ENDS_WITH_EXTENSION.test(tail)) return null;
+  // A brace set broken inside its group ends on `,` or `{` while the group is still open.
+  const insideBraceGroup = /[{,]$/.test(tail) && tail.split('{').length > tail.split('}').length;
+  if (!tail.includes('/') || !(/[\w\-.~+@%/]$/.test(tail) || insideBraceGroup) || PATH_TOKEN_ENDS_WITH_EXTENSION.test(tail)) {
+    return null;
+  }
   const next = String(nextText || '').replace(/^\s+/, '');
   const head = /^[^\s"'<>|;&]+/.exec(next)?.[0] || '';
   if (!head || PATH_TOKEN_STARTS_NEW_PATH.test(head) || PATH_TOKEN_STARTS_EXPLICIT_RELATIVE.test(head)) return null;
@@ -3263,6 +3384,8 @@ if (typeof window !== 'undefined') {
   window.CodemanFilePaths = {
     absoluteFilePathPattern,
     findFilePathLinks,
+    expandBracePath,
+    bracePathPrefixDir,
     resolveLinkedFilePath,
     previewsInFileViewer,
     FILE_PREVIEW_EXTENSIONS,
