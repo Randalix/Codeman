@@ -37,6 +37,12 @@ import { validateSessionFilePath } from './web/route-helpers.js';
 /** Most entries (files + subfolders) one listing returns. */
 export const MAX_FOLDER_ENTRIES = 1000;
 
+/** Most paths one path set (`{a,b}` brace expansion) may name. */
+export const MAX_PATH_SET_PATHS = 100;
+
+/** Most distinct folders one path set may span; each costs one listing (one ssh round trip on a remote case). */
+export const MAX_PATH_SET_FOLDERS = 16;
+
 /** Folder grants kept per session; the oldest is dropped beyond this. */
 const MAX_FOLDER_GRANTS_PER_SESSION = 32;
 
@@ -281,4 +287,96 @@ async function listLocalFolder(dir: string): Promise<{ entries: RemoteFolderEntr
     }
   }
   return { entries, truncated };
+}
+
+export interface PathSetListing {
+  /** One per folder that holds at least one requested name; files and folders narrowed to those names. */
+  listings: FolderListing[];
+  /** Requested paths with no previewable file or folder there (or in a folder the guard refused). */
+  missing: string[];
+}
+
+/**
+ * List the files a set of paths names — what a shell brace set
+ * (`…/{vorher,nachher}/synth-{sedan,jeep}/{leerlauf,start}.wav`) expands to.
+ *
+ * Each distinct folder goes through {@link listFolder}, so it is granted and
+ * guarded exactly like a clicked folder, and the grid serves its files over the
+ * ordinary `folders/:folderId/files/:name` routes: a path set adds no way to read
+ * anything a folder click did not already allow. The answer is each listing cut
+ * down to the requested names, files and subfolders in the order asked.
+ *
+ * A folder the guard refuses (or that is gone) only drops ITS paths into
+ * `missing`; the error surfaces when nothing at all is left.
+ *
+ * @throws FolderListingError 400 for a malformed or oversized request, the first
+ *   non-404 folder error (403, 502, 503) when no folder was usable, else 404.
+ */
+export async function listPathSet(
+  sessionId: string,
+  requestedPaths: unknown,
+  options: ListFolderOptions = {}
+): Promise<PathSetListing> {
+  if (!Array.isArray(requestedPaths) || requestedPaths.length === 0) {
+    throw new FolderListingError('Missing paths');
+  }
+  if (requestedPaths.length > MAX_PATH_SET_PATHS) {
+    throw new FolderListingError(`A path set holds at most ${MAX_PATH_SET_PATHS} paths`);
+  }
+
+  const groups = new Map<string, Array<{ name: string; path: string }>>();
+  for (const raw of requestedPaths) {
+    if (typeof raw !== 'string' || !raw || raw.includes('\0')) throw new FolderListingError('Invalid path');
+    const homeRelative = raw.startsWith('~/');
+    if (!homeRelative && !isAbsolute(raw)) throw new FolderListingError('Path must be absolute');
+    const path = posix.normalize(raw).replace(/\/+$/, '') || '/';
+    const cut = path.lastIndexOf('/');
+    const name = path.slice(cut + 1);
+    if (!name || name === '.' || name === '..') throw new FolderListingError('Invalid path');
+    const dir = cut > 0 ? path.slice(0, cut) : '/';
+    const entries = groups.get(dir) ?? [];
+    entries.push({ name, path });
+    groups.set(dir, entries);
+  }
+  if (groups.size > MAX_PATH_SET_FOLDERS) {
+    throw new FolderListingError(`A path set spans at most ${MAX_PATH_SET_FOLDERS} folders`);
+  }
+
+  const settled = await Promise.all(
+    [...groups].map(async ([dir, entries]) => {
+      try {
+        return { entries, listing: await listFolder(sessionId, dir, options), error: null };
+      } catch (err) {
+        if (err instanceof FolderListingError) return { entries, listing: null, error: err };
+        throw err;
+      }
+    })
+  );
+
+  const listings: FolderListing[] = [];
+  const missing: string[] = [];
+  let firstError: FolderListingError | null = null;
+  for (const { entries, listing, error } of settled) {
+    if (!listing) {
+      missing.push(...entries.map((e) => e.path));
+      if (error && error.statusCode !== 404 && !firstError) firstError = error;
+      continue;
+    }
+    const byName = new Map(listing.files.map((f) => [f.name, f]));
+    const folderNames = new Set(listing.folders);
+    const files: FolderFileEntry[] = [];
+    const folders: string[] = [];
+    for (const { name, path } of entries) {
+      const file = byName.get(name);
+      if (file) files.push(file);
+      else if (folderNames.has(name)) folders.push(name);
+      else missing.push(path);
+    }
+    if (files.length === 0 && folders.length === 0) continue;
+    listings.push({ ...listing, files, folders });
+  }
+  if (listings.length === 0) {
+    throw firstError ?? new FolderListingError('None of these paths exists', 404);
+  }
+  return { listings, missing };
 }

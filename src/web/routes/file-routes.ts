@@ -44,6 +44,7 @@ import {
   folderGrants,
   folderAllowedForUser,
   listFolder,
+  listPathSet,
   validFolderFileName,
 } from '../../folder-listing.js';
 import { generateFirstPageThumbnail } from '../../document-thumbnailer.js';
@@ -2391,6 +2392,21 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     await serveThumbnail(reply, servable.path, record.extension);
   });
 
+  /** A {@link FolderListingError} as its HTTP answer; anything else is a 500. */
+  function sendFolderListingError(reply: FastifyReply, err: unknown, what: string) {
+    if (err instanceof FolderListingError) {
+      const code =
+        err.statusCode === 404
+          ? ApiErrorCode.NOT_FOUND
+          : err.statusCode >= 500
+            ? ApiErrorCode.OPERATION_FAILED
+            : ApiErrorCode.INVALID_INPUT;
+      reply.code(err.statusCode).send(createErrorResponse(code, err.message));
+      return;
+    }
+    return reply.code(500).send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `${what}: ${getErrorMessage(err)}`));
+  }
+
   // ===== Folder grid =====
   // Grant + list a folder (absolute or `~/` on the session's host) for the preview
   // grid. Same guard as a single external attachment; the grid then fetches files by
@@ -2416,19 +2432,35 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       });
       return { success: true, data: listing };
     } catch (err) {
-      if (err instanceof FolderListingError) {
-        const code =
-          err.statusCode === 404
-            ? ApiErrorCode.NOT_FOUND
-            : err.statusCode >= 500
-              ? ApiErrorCode.OPERATION_FAILED
-              : ApiErrorCode.INVALID_INPUT;
-        reply.code(err.statusCode).send(createErrorResponse(code, err.message));
-        return;
-      }
-      return reply
-        .code(500)
-        .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Failed to list folder: ${getErrorMessage(err)}`));
+      return sendFolderListingError(reply, err, 'Failed to list folder');
+    }
+  });
+
+  // A set of paths (what a shell brace set `…/{a,b}/{x,y}.wav` expands to) as
+  // listings of the folders it touches: each folder is granted and guarded like a
+  // `POST …/folders`, the files are fetched through the same folder routes below.
+  app.post('/api/sessions/:id/folder-sets', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const scope = getKnownSessionFileScope(ctx, id, reply, req);
+    if (!scope) return;
+    const body = (req.body || {}) as { paths?: unknown };
+    if (
+      scope.docker &&
+      Array.isArray(body.paths) &&
+      body.paths.some((p) => typeof p === 'string' && p.startsWith('~/'))
+    ) {
+      reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, DOCKER_HOME_PATH_ERROR));
+      return;
+    }
+    try {
+      const set = await listPathSet(id, body.paths, {
+        sessionWorkingDir: scope.workingDir,
+        remote: scope.remote,
+        user: getAuthUser(req),
+      });
+      return { success: true, data: set };
+    } catch (err) {
+      return sendFolderListingError(reply, err, 'Failed to list path set');
     }
   });
 

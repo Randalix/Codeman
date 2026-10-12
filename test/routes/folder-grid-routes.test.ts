@@ -376,6 +376,130 @@ describe('folder grid routes — local folder', () => {
   });
 });
 
+describe('path set routes — POST …/folder-sets', () => {
+  let harness: RouteTestHarness;
+  let sessionId: string;
+  let root: string;
+  const at = (...parts: string[]) => join(root, ...parts);
+
+  beforeEach(async () => {
+    harness = await createRouteTestHarness(registerFileRoutes);
+    sessionId = harness.ctx._sessionId;
+    root = mkdtempSync(join(tmpdir(), 'codeman-path-set-'));
+    for (const dir of ['vorher/synth-sedan', 'vorher/synth-jeep', 'nachher/synth-sedan']) {
+      mkdirSync(at(dir), { recursive: true });
+    }
+    touch(at('vorher/synth-sedan/leerlauf.wav'), 'v-sedan-leerlauf', 1_700_000_000);
+    touch(at('vorher/synth-sedan/start.wav'), 'v-sedan-start', 1_700_000_900);
+    touch(at('vorher/synth-jeep/leerlauf.wav'), 'v-jeep-leerlauf', 1_700_000_100);
+    touch(at('nachher/synth-sedan/leerlauf.wav'), 'n-sedan-leerlauf', 1_700_000_200);
+    harness.ctx._session.workingDir = root;
+  });
+
+  afterEach(async () => {
+    await harness.app.close();
+    folderGrants.clearSession(sessionId);
+    rmSync(root, { recursive: true, force: true });
+    delete process.env.CODEMAN_ATTACHMENT_BLOCKED_PATHS;
+  });
+
+  const post = (paths: unknown) =>
+    harness.app.inject({ method: 'POST', url: `/api/sessions/${sessionId}/folder-sets`, payload: { paths } });
+  const data = (res: { body: string }) => JSON.parse(res.body).data;
+
+  it('answers one listing per folder, narrowed to the requested names, in the order asked', async () => {
+    const res = await post([
+      at('vorher/synth-sedan/start.wav'),
+      at('vorher/synth-sedan/leerlauf.wav'),
+      at('vorher/synth-jeep/leerlauf.wav'),
+      at('nachher/synth-sedan/leerlauf.wav'),
+    ]);
+    expect(res.statusCode).toBe(200);
+    const { listings, missing } = data(res);
+    expect(listings.map((l: { path: string }) => l.path)).toEqual([
+      at('vorher/synth-sedan'),
+      at('vorher/synth-jeep'),
+      at('nachher/synth-sedan'),
+    ]);
+    expect(listings[0].files.map((f: { name: string }) => f.name)).toEqual(['start.wav', 'leerlauf.wav']);
+    expect(listings[0].folderId).toMatch(/^fld_/);
+    expect(missing).toEqual([]);
+  });
+
+  it('reports what does not exist instead of failing, and serves the rest by folder id', async () => {
+    const res = await post([
+      at('vorher/synth-sedan/leerlauf.wav'),
+      at('vorher/synth-sedan/vollgas.wav'),
+      at('vorher/nope/start.wav'),
+    ]);
+    expect(res.statusCode).toBe(200);
+    const { listings, missing } = data(res);
+    expect(listings).toHaveLength(1);
+    expect(missing.sort()).toEqual([at('vorher/nope/start.wav'), at('vorher/synth-sedan/vollgas.wav')].sort());
+
+    const file = await harness.app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/folders/${listings[0].folderId}/files/leerlauf.wav/raw`,
+    });
+    expect(file.statusCode).toBe(200);
+    expect(file.body).toBe('v-sedan-leerlauf');
+  });
+
+  it('lists a named subfolder among the folders, and nothing it did not name', async () => {
+    const res = await post([at('vorher/synth-sedan'), at('vorher/synth-jeep')]);
+    expect(res.statusCode).toBe(200);
+    const { listings } = data(res);
+    expect(listings).toHaveLength(1);
+    expect(listings[0].path).toBe(at('vorher'));
+    expect(listings[0].folders).toEqual(['synth-sedan', 'synth-jeep']);
+    expect(listings[0].files).toEqual([]);
+  });
+
+  it('answers 404 when none of the paths exists', async () => {
+    const res = await post([at('vorher/synth-sedan/nope.wav'), at('gone/x.wav')]);
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('keeps the guard: a blocked folder is dropped, all blocked is 403', async () => {
+    process.env.CODEMAN_ATTACHMENT_BLOCKED_PATHS = at('nachher');
+    const partial = await post([at('vorher/synth-sedan/leerlauf.wav'), at('nachher/synth-sedan/leerlauf.wav')]);
+    expect(partial.statusCode).toBe(200);
+    expect(data(partial).listings).toHaveLength(1);
+    expect(data(partial).missing).toEqual([at('nachher/synth-sedan/leerlauf.wav')]);
+
+    const all = await post([at('nachher/synth-sedan/leerlauf.wav')]);
+    expect(all.statusCode).toBe(403);
+  });
+
+  it('refuses a bad body, a relative path, and a set that is too large', async () => {
+    expect((await post('x')).statusCode).toBe(400);
+    expect((await post([])).statusCode).toBe(400);
+    expect((await post([at('vorher/synth-sedan/start.wav'), 'relative/x.wav'])).statusCode).toBe(400);
+    expect((await post([42])).statusCode).toBe(400);
+    const tooMany = Array.from({ length: 101 }, (_, i) => at(`vorher/synth-sedan/f${i}.wav`));
+    expect((await post(tooMany)).statusCode).toBe(400);
+    const manyFolders = Array.from({ length: 17 }, (_, i) => at(`d${i}/x.wav`));
+    expect((await post(manyFolders)).statusCode).toBe(400);
+  });
+
+  it('turns a ~/ path away in a Docker case', async () => {
+    (harness.ctx._session as { docker?: unknown }).docker = {
+      hostId: 'local',
+      label: 'local',
+      engine: 'docker',
+      image: 'codeman-sandbox',
+      containerName: 'codeman-case-test',
+      hostWorkspacePath: root,
+      containerWorkdir: root,
+      network: 'bridge',
+    };
+    const res = await post(['~/renders/a.wav']);
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/docker/i);
+    expect((await post([at('vorher/synth-sedan/start.wav')])).statusCode).toBe(200);
+  });
+});
+
 describe('folder grid routes — remote (SSH) case', () => {
   const REMOTE_DIR = '/srv/remote/case';
   const remote: SessionRemote = {
@@ -413,6 +537,23 @@ describe('folder grid routes — remote (SSH) case', () => {
     await harness.app.close();
     folderGrants.clearSession(sessionId);
     vi.clearAllMocks();
+  });
+
+  it('lists a path set with one ssh listing per folder and narrows it to the names asked', async () => {
+    const res = await harness.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${sessionId}/folder-sets`,
+      payload: {
+        paths: ['/mnt/raid/styleframes/b.jpg', '/mnt/raid/styleframes/a.png', '/mnt/raid/styleframes/zz.png'],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const { listings, missing } = JSON.parse(res.body).data;
+    expect(mockedListFolder).toHaveBeenCalledTimes(1);
+    expect(listings).toHaveLength(1);
+    expect(listings[0].path).toBe('/mnt/raid/styleframes');
+    expect(listings[0].files.map((f: { name: string }) => f.name)).toEqual(['b.jpg', 'a.png']);
+    expect(missing).toEqual(['/mnt/raid/styleframes/zz.png']);
   });
 
   it('lists the folder on the remote host and serves its files over ssh', async () => {
