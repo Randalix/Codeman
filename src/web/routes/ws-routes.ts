@@ -251,7 +251,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               holdsDesktopClaim = false;
             }
             const force = msg.f === true;
-            session.resize(msg.c, msg.r, { viewportType, force });
+            session.resize(msg.c, msg.r, { viewportType, force, source: 'ws' });
             // Report the geometry that actually took. Resize used to be
             // write-only, so a client whose request was declined by the
             // arbitration above — or floored, or overridden by another device

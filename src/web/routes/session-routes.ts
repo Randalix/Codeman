@@ -2275,7 +2275,7 @@ export function registerSessionRoutes(
     const { cols, rows, viewportType, force } = parseBody(ResizeSchema, req.body);
     const session = findSessionOrFail(ctx, id, req);
 
-    session.resize(cols, rows, { viewportType, force });
+    session.resize(cols, rows, { viewportType, force, source: 'http' });
     // Answer with the geometry the PTY ACTUALLY holds, which is not always the
     // one asked for: `Session.resize` declines small-viewport requests while a
     // desktop connection holds an active sizing claim. A browser terminal left

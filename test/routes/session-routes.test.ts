@@ -761,7 +761,11 @@ describe('session-routes', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
-      expect(harness.ctx._session.resize).toHaveBeenCalledWith(120, 40, { viewportType: undefined, force: undefined });
+      expect(harness.ctx._session.resize).toHaveBeenCalledWith(120, 40, {
+        viewportType: undefined,
+        force: undefined,
+        source: 'http',
+      });
     });
 
     it('passes viewport type through for resize arbitration', async () => {
@@ -773,7 +777,11 @@ describe('session-routes', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
-      expect(harness.ctx._session.resize).toHaveBeenCalledWith(48, 28, { viewportType: 'mobile', force: undefined });
+      expect(harness.ctx._session.resize).toHaveBeenCalledWith(48, 28, {
+        viewportType: 'mobile',
+        force: undefined,
+        source: 'http',
+      });
     });
 
     it('passes force resize through for redraw requests', async () => {
@@ -785,7 +793,11 @@ describe('session-routes', () => {
       expect(res.statusCode).toBe(200);
       const body = JSON.parse(res.body);
       expect(body.success).toBe(true);
-      expect(harness.ctx._session.resize).toHaveBeenCalledWith(120, 40, { viewportType: undefined, force: true });
+      expect(harness.ctx._session.resize).toHaveBeenCalledWith(120, 40, {
+        viewportType: undefined,
+        force: true,
+        source: 'http',
+      });
     });
 
     it('rejects cols exceeding max (500)', async () => {

@@ -153,6 +153,107 @@ describe('Session resize arbitration', () => {
     expect(resize).toHaveBeenCalledWith(120, 40);
   });
 
+  // A pane that is suddenly narrow leaves a second, narrow copy of the
+  // transcript in tmux's history (Claude redraws on every width change). The
+  // only way to find out WHICH client narrowed it is a trace: every change to
+  // the pane geometry, and every request that was refused, leaves one line.
+  describe('resize trace (who changed the pane width)', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    const traceLines = (spy: ReturnType<typeof vi.spyOn>): string[] =>
+      spy.mock.calls.map((args: unknown[]) => args.join(' ')).filter((line: string) => line.includes('resize'));
+
+    it('logs an applied resize with old and new size, path and viewport', () => {
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      attachFakePty(session, 297, 58);
+
+      session.resize(66, 58, { viewportType: 'mobile', source: 'ws' });
+
+      const lines = traceLines(spy);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(session.id.slice(0, 8));
+      expect(lines[0]).toContain('297x58 -> 66x58');
+      expect(lines[0]).toContain('via=ws');
+      expect(lines[0]).toContain('viewport=mobile');
+    });
+
+    it('names the HTTP path and marks a forced resize', () => {
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      attachFakePty(session, 120, 40);
+
+      session.resize(120, 40, { viewportType: 'desktop', source: 'http', force: true });
+
+      const lines = traceLines(spy);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('via=http');
+      expect(lines[0]).toContain('force');
+    });
+
+    it('logs a refused small-viewport request and says the pane stays as it was', () => {
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      attachFakePty(session, 160, 48);
+      session.claimDesktopSizing(Symbol('desktop-conn'));
+
+      session.resize(66, 58, { viewportType: 'mobile', source: 'ws' });
+
+      const lines = traceLines(spy);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('DECLINED');
+      expect(lines[0]).toContain('66x58');
+      expect(lines[0]).toContain('160x48');
+      expect(lines[0]).toContain('viewport=mobile');
+    });
+
+    it('stays silent when the size did not change (debounced browser resizes)', () => {
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      attachFakePty(session, 120, 40);
+
+      session.resize(120, 40, { viewportType: 'desktop', source: 'ws' });
+
+      expect(traceLines(spy)).toHaveLength(0);
+    });
+
+    it('flags a mobile client that takes the pane past an idle desktop claim', () => {
+      vi.useFakeTimers();
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      attachFakePty(session, 160, 48);
+      session.claimDesktopSizing(Symbol('desktop-conn'));
+      vi.advanceTimersByTime(PAST_IDLE_MS);
+
+      session.resize(66, 58, { viewportType: 'mobile', source: 'ws' });
+
+      const lines = traceLines(spy);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('override-idle-desktop');
+    });
+
+    it('labels the re-assert after a mobile override', () => {
+      vi.useFakeTimers();
+      const session = new Session({ workingDir: '/tmp', mode: 'shell' });
+      attachFakePty(session, 160, 48);
+      session.resize(208, 45, { viewportType: 'desktop', source: 'ws' });
+      session.claimDesktopSizing(Symbol('desktop-conn'));
+      vi.advanceTimersByTime(PAST_IDLE_MS);
+      session.resize(48, 28, { viewportType: 'mobile', source: 'ws' });
+
+      const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      session.noteDesktopActivity();
+
+      const lines = traceLines(spy);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain('via=desktop-reassert');
+      expect(lines[0]).toContain('48x28 -> 208x45');
+    });
+  });
+
   describe('idle-desktop override (whoever is active wins)', () => {
     afterEach(() => {
       vi.useRealTimers();

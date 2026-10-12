@@ -158,6 +158,9 @@ export type { RalphTrackerState, RalphTodoItem, ActiveBashTool } from './types.j
 
 export type ResizeViewportType = 'mobile' | 'tablet' | 'desktop';
 
+/** Which path asked for a resize; only used to label the resize trace. */
+export type ResizeSource = 'ws' | 'http' | 'desktop-reassert';
+
 /** Line buffer flush interval (100ms) - forces processing of partial lines */
 const LINE_BUFFER_FLUSH_INTERVAL = 100;
 
@@ -4752,7 +4755,10 @@ export class Session extends EventEmitter {
     this._lastDesktopActivityAt = Date.now();
     if (this._mobileSizeOverride && this._lastDesktopDims) {
       this._mobileSizeOverride = false;
-      this.resize(this._lastDesktopDims.cols, this._lastDesktopDims.rows, { viewportType: 'desktop' });
+      this.resize(this._lastDesktopDims.cols, this._lastDesktopDims.rows, {
+        viewportType: 'desktop',
+        source: 'desktop-reassert',
+      });
     }
   }
 
@@ -4772,8 +4778,13 @@ export class Session extends EventEmitter {
    * @param cols - Number of columns (width in characters)
    * @param rows - Number of rows (height in lines)
    */
-  resize(cols: number, rows: number, options: { viewportType?: ResizeViewportType; force?: boolean } = {}): void {
+  resize(
+    cols: number,
+    rows: number,
+    options: { viewportType?: ResizeViewportType; force?: boolean; source?: ResizeSource } = {}
+  ): void {
     const isSmallViewport = options.viewportType === 'mobile' || options.viewportType === 'tablet';
+    let overrodeIdleDesktop = false;
     if (options.viewportType === 'desktop') {
       this._lastDesktopDims = { cols, rows };
       this._lastDesktopActivityAt = Date.now();
@@ -4785,12 +4796,28 @@ export class Session extends EventEmitter {
         // belongs to the session, not the socket — but the caller MUST report
         // `ptyGeometry` back afterwards so the asking client can adopt
         // the shape it did not get. Both transports do; see issue #464.
+        if (this.ptyProcess) {
+          console.log(
+            `[Session] resize ${this.id.slice(0, 8)} ${cols}x${rows} DECLINED via=${options.source ?? 'api'} ` +
+              `viewport=${options.viewportType} (desktop claim active ` +
+              `${Date.now() - this._lastDesktopActivityAt} ms ago; pane stays ${this._ptyCols}x${this._ptyRows})`
+          );
+        }
         return;
       }
       this._mobileSizeOverride = true;
+      overrodeIdleDesktop = true;
     }
     const dimsChanged = cols !== this._ptyCols || rows !== this._ptyRows;
     if (this.ptyProcess && (dimsChanged || options.force)) {
+      // One line per real change to the pane geometry. A narrow pane leaves a
+      // second, narrow copy of the transcript in tmux's history (the CLI redraws
+      // on every width change); this trace is how to find out who narrowed it.
+      console.log(
+        `[Session] resize ${this.id.slice(0, 8)} ${this._ptyCols}x${this._ptyRows} -> ${cols}x${rows} ` +
+          `via=${options.source ?? 'api'} viewport=${options.viewportType ?? 'none'}` +
+          `${options.force ? ' force' : ''}${overrodeIdleDesktop ? ' override-idle-desktop' : ''}`
+      );
       this._ptyCols = cols;
       this._ptyRows = rows;
       if (!IS_TEST_MODE && this._mux && this._muxSession) {
