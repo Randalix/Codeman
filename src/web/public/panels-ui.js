@@ -4573,6 +4573,8 @@ Object.assign(CodemanApp.prototype, {
       }
       const name = document.createElement('span');
       name.className = 'folder-grid-name';
+      // A path set's label is `dir/dir/file.wav`: wrap it, since both its ends tell the tiles apart.
+      if (file.label) name.classList.add('folder-grid-name-wrap');
       name.textContent = shown;
       tile.append(thumb, name);
       tile.onclick = () => this._openFolderGridFile(index);

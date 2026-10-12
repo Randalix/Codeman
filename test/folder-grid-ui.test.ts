@@ -465,6 +465,8 @@ describe('openPathSet (shell brace sets)', () => {
     const tiles = elements.folderGridBody.children;
     expect(tiles).toHaveLength(3);
     // Same name in two folders: the label says which one, the route says it too.
+    // Set labels wrap (CSS) instead of cutting off an end: `vorher/…` vs `nachher/…` is the point.
+    expect(tiles[0].children[1].classList.contains('folder-grid-name-wrap')).toBe(true);
     const names = (i: number) => tiles[i].children[1].textContent;
     expect([names(0), names(1), names(2)]).toEqual([
       'vorher/synth-sedan/leerlauf.wav',

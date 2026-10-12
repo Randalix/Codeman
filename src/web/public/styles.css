@@ -11553,6 +11553,16 @@ kbd {
   white-space: nowrap;
 }
 
+/* Path-set labels (`vorher/synth-sedan/leerlauf.wav`) wrap instead of cutting off either end. */
+.folder-grid-name-wrap {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
+}
+
 .folder-grid-empty {
   grid-column: 1 / -1;
   padding: 2rem;
