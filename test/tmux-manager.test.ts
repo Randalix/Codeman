@@ -374,6 +374,36 @@ describe('TmuxManager (unit)', () => {
     });
   });
 
+  describe('client scroll by linefeed', () => {
+    // tmux scrolls a client by N lines with `CSI N S` (indn); xterm.js drops those
+    // lines instead of moving them into scrollback, so output bursts lost rows.
+    const SET = `tmux -L 'codeman' set-option -sa terminal-overrides ",*:indn@"`;
+
+    it('removes indn from attach clients once per process', () => {
+      manager.scrollClientsByLinefeed();
+      manager.scrollClientsByLinefeed();
+
+      expect(mockedExecSync.mock.calls.filter(([cmd]) => cmd === SET)).toHaveLength(1);
+    });
+
+    it('does not append it again when the server already has it', () => {
+      mockedExecSync.mockImplementation((cmd: string) =>
+        String(cmd).includes('show-options') ? 'linux*:AX@\n*:Tc\n*:indn@\n' : ''
+      );
+      manager.scrollClientsByLinefeed();
+
+      expect(mockedExecSync.mock.calls.some(([cmd]) => cmd === SET)).toBe(false);
+    });
+
+    it('swallows a tmux that refuses the option', () => {
+      mockedExecSync.mockImplementation(() => {
+        throw new Error('no server running');
+      });
+
+      expect(() => manager.scrollClientsByLinefeed()).not.toThrow();
+    });
+  });
+
   describe('window sizing', () => {
     it('pins a tmux window to manual sizing before browser attach', () => {
       expect(manager.setManualWindowSize('codeman-abc12345')).toBe(true);

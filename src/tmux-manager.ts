@@ -1829,6 +1829,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private trueColorConfigured = false;
   /** enableClientHyperlinks() ran (once per process). */
   private clientHyperlinksConfigured = false;
+  /** scrollClientsByLinefeed() ran (once per process). */
+  private clientLinefeedScrollConfigured = false;
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
   private liveHistoryResizeSupported: boolean | null = null;
 
@@ -4230,6 +4232,37 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       });
     } catch {
       /* Non-critical — OSC 8 links stay plain text (old tmux, no server yet) */
+    }
+  }
+
+  /**
+   * Make tmux scroll attach clients by linefeed, never by `CSI N S`. When one
+   * output burst scrolls a pane by more than a line, tmux scrolls the client in
+   * one go with `indn` (SU) — and xterm.js drops the lines SU scrolls off instead
+   * of moving them into scrollback. Claude's multi-line blocks hit that all the
+   * time: rows vanished from the browser's history and later text sat where they
+   * had been, in the replay buffer too (test/xterm-scroll-up-scrollback.test.ts).
+   * Without `indn` tmux falls back to N linefeeds, which xterm keeps.
+   *
+   * Read at ATTACH like enableClientHyperlinks(), same call site; once per
+   * process, appended only when missing.
+   */
+  scrollClientsByLinefeed(): void {
+    if (this.clientLinefeedScrollConfigured) return;
+    this.clientLinefeedScrollConfigured = true;
+    try {
+      const current = execSync(`${this.tmux()} show-options -sv terminal-overrides`, {
+        encoding: 'utf-8',
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      if (/^\*:indn@$/m.test(String(current))) return;
+      execSync(`${this.tmux()} set-option -sa terminal-overrides ",*:indn@"`, {
+        timeout: EXEC_TIMEOUT_MS,
+        stdio: 'ignore',
+      });
+    } catch {
+      /* Non-critical — bursts keep scrolling by SU (no server yet) */
     }
   }
 

@@ -2232,6 +2232,7 @@ export class Session extends EventEmitter {
       mux.setManualWindowSize?.(this._muxSession!.muxName);
       // Before the attach client starts: tmux reads client features at attach.
       mux.enableClientHyperlinks?.();
+      mux.scrollClientsByLinefeed?.();
     }
     // Query existing tmux window size so re-attach matches (avoids flicker from 120x40 default).
     // MUST go through the dedicated socket (mux.muxSocket); a bare `tmux display` hits the

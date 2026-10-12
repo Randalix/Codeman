@@ -320,6 +320,9 @@ export interface TerminalMultiplexer extends EventEmitter {
   /** Let attach clients receive OSC 8 hyperlinks; call before spawning one. */
   enableClientHyperlinks?(): void;
 
+  /** Keep attach clients' scrolled-off lines in xterm's scrollback; call before spawning one. */
+  scrollClientsByLinefeed?(): void;
+
   /** Explicitly resize a mux window after Codeman accepts a terminal resize. */
   resizeWindow?(muxName: string, cols: number, rows: number): boolean;
 
