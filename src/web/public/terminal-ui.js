@@ -1383,6 +1383,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Handle resize with throttling for performance
     this._resizeTimeout = null;
+    this._resizeHistoryReloadTimer = null;
     this._lastResizeDims = null;
 
     const throttledResize = () => {
@@ -1462,6 +1463,19 @@ Object.assign(CodemanApp.prototype, {
               this.isTerminalAtBottom()
             ) {
               this.terminal.write('\x1b[3J\x1b[H\x1b[2J');
+              // The clear took the scrollback with it, and the SIGWINCH below
+              // only gets the visible screen repainted. Without a reload the
+              // history stayed gone: no scrollbar, and the wheel routed to the
+              // CLI as page keys (baseY 0) until a tab switch or enough new
+              // output. Fetch it once the TUI has redrawn at the new size; a
+              // further resize restarts the wait, and the refresh itself bails
+              // if another tab is showing by then.
+              clearTimeout(this._resizeHistoryReloadTimer);
+              const clearedSessionId = this.activeSessionId;
+              this._resizeHistoryReloadTimer = setTimeout(() => {
+                this._resizeHistoryReloadTimer = null;
+                void this._onSessionNeedsRefresh({ id: clearedSessionId });
+              }, TUI_REDRAW_SETTLE_MS);
             }
             this._lastResizeDims = { cols, rows };
             // Typed + WS-first like sendResize: the viewport type feeds resize
