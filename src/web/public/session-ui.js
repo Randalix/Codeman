@@ -621,9 +621,12 @@ Object.assign(CodemanApp.prototype, {
 
   /** Ensure a newly-created session is visible without waiting for the SSE event.
    *  The POST response and session:created can arrive in either order, so the
-   *  normal idempotent SSE handler remains the single state-upsert path. */
-  async _ensureCreatedSessionVisible(sessionId, sessionSnapshot) {
+   *  normal idempotent SSE handler remains the single state-upsert path.
+   *  `tabLayout` is the layout a grouped creation returns (see run()'s
+   *  `tabGroupId`): adopting it first draws the new tab inside its group. */
+  async _ensureCreatedSessionVisible(sessionId, sessionSnapshot, tabLayout) {
     if (!sessionId) return;
+    if (tabLayout) this._applyTabLayout?.(tabLayout);
 
     let session = sessionSnapshot;
     if (!session && !this.sessions?.has(sessionId)) {
@@ -643,8 +646,13 @@ Object.assign(CodemanApp.prototype, {
     this._renderSessionTabsImmediate?.();
   },
 
-  /** Run using the selected mode (Claude Code, OpenCode, Codex, Gemini, or Antigravity) */
-  async run() {
+  /**
+   * Run using the selected mode (Claude Code, OpenCode, Codex, Gemini, or Antigravity).
+   * `options` comes from the tab group menu's "New session": `count` overrides
+   * the instance steppers for this launch only, `tabGroupId` rides every create
+   * request so the server places the session in that group.
+   */
+  async run(options = {}) {
     if (this._runInFlight) return;
 
     const startedAt = Date.now();
@@ -659,12 +667,12 @@ Object.assign(CodemanApp.prototype, {
     try {
       const mode = this._runMode || 'claude';
       if (mode === 'shell') {
-        return await this.runShell();
+        return await this.runShell(options);
       }
       if (mode === 'claude' || !isExternalCliRunMode(mode)) {
-        return await this.runClaude();
+        return await this.runClaude(options);
       }
-      return await this._runCliMode(mode);
+      return await this._runCliMode(mode, options);
     } finally {
       const remaining = minLockMs - (Date.now() - startedAt);
       if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
@@ -1910,9 +1918,10 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  async runClaude() {
+  async runClaude(options = {}) {
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
-    const tabCount = this._readTabCount();
+    const tabCount = this._readTabCount(options.count);
+    const group = options.tabGroupId ? { tabGroupId: options.tabGroupId } : {};
 
     const ownsLaunchTerminal = this._beginSessionLaunchStatus(
       `Starting ${tabCount} Claude session(s) in ${caseName}...`
@@ -1972,6 +1981,7 @@ Object.assign(CodemanApp.prototype, {
         for (let i = 0; i < tabCount; i++) {
           const quickStartBody = JSON.stringify({
             caseName, mode: 'claude', sessionName: `w${startNumber + i}-${caseName}`,
+            ...group,
             ...(dockerModelOverride !== undefined ? { modelOverride: dockerModelOverride } : {})
           });
           const doQuickStart = async () => {
@@ -2000,7 +2010,7 @@ Object.assign(CodemanApp.prototype, {
             }
           }
           if (!data.success) throw new Error(data.error || 'Failed to start remote Claude session');
-          await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session);
+          await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session, data.data.tabLayout);
           remoteIds.push(data.data.sessionId);
         }
         this._appendSessionLaunchStatus(ownsLaunchTerminal, `All ${tabCount} remote session(s) ready`);
@@ -2046,6 +2056,7 @@ Object.assign(CodemanApp.prototype, {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             workingDir, name,
+            ...group,
             ...(hasEnvOverrides ? { envOverrides } : {}),
             ...(effort ? { effort } : {}),
             ...(advisorModel ? { advisorModel } : {}),
@@ -2059,7 +2070,7 @@ Object.assign(CodemanApp.prototype, {
       const sessionIds = [];
       for (const result of createResults) {
         if (!result.success) throw new Error(result.error);
-        await this._ensureCreatedSessionVisible(result.data.session.id, result.data.session);
+        await this._ensureCreatedSessionVisible(result.data.session.id, result.data.session, result.data.tabLayout);
         sessionIds.push(result.data.session.id);
       }
       firstSessionId = sessionIds[0];
@@ -2128,11 +2139,12 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  async runShell() {
+  async runShell(options = {}) {
     const caseName = document.getElementById('quickStartCase').value || 'testcase';
     // Run Shell reads the toolbar's one instance stepper, like every other run*();
     // its own second `− 1 +` group (#shellCount) was removed (#428).
-    const shellCount = this._readTabCount();
+    const shellCount = this._readTabCount(options.count);
+    const group = options.tabGroupId ? { tabGroupId: options.tabGroupId } : {};
 
     const ownsLaunchTerminal = this._beginSessionLaunchStatus(
       `Starting ${shellCount} Shell session(s) in ${caseName}...`,
@@ -2178,11 +2190,11 @@ Object.assign(CodemanApp.prototype, {
           const res = await fetch('/api/quick-start', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ caseName, mode: 'shell', sessionName: `s${startNumber + i}-${caseName}` })
+            body: JSON.stringify({ caseName, mode: 'shell', sessionName: `s${startNumber + i}-${caseName}`, ...group })
           });
           const data = await res.json();
           if (!data.success) throw new Error(data.error || 'Failed to start remote shell session');
-          await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session);
+          await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session, data.data.tabLayout);
           remoteIds.push(data.data.sessionId);
         }
         if (remoteIds[0]) {
@@ -2208,7 +2220,7 @@ Object.assign(CodemanApp.prototype, {
         fetch('/api/sessions', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...(isRemoteCase ? { caseName } : { workingDir }), mode: 'shell', name })
+          body: JSON.stringify({ ...(isRemoteCase ? { caseName } : { workingDir }), mode: 'shell', name, ...group })
         }).then(r => r.json())
       );
       const createResults = await Promise.all(createPromises);
@@ -2216,7 +2228,7 @@ Object.assign(CodemanApp.prototype, {
       const sessionIds = [];
       for (const result of createResults) {
         if (!result.success) throw new Error(result.error);
-        await this._ensureCreatedSessionVisible(result.data.session.id, result.data.session);
+        await this._ensureCreatedSessionVisible(result.data.session.id, result.data.session, result.data.tabLayout);
         sessionIds.push(result.data.session.id);
       }
 
@@ -2257,8 +2269,8 @@ Object.assign(CodemanApp.prototype, {
    * their try block, to put the count in the opening banner: `#tabCount` ships
    * unconditionally today, but a throw here would escape the launch-error path.
    */
-  _readTabCount() {
-    return Math.min(20, Math.max(1, parseInt(document.getElementById('tabCount')?.value) || 1));
+  _readTabCount(override) {
+    return Math.min(20, Math.max(1, override ?? (parseInt(document.getElementById('tabCount')?.value) || 1)));
   },
 
   /**
@@ -2291,7 +2303,7 @@ Object.assign(CodemanApp.prototype, {
       );
       if (!data.success) throw new Error(data.error || `Failed to start ${label}`);
       customModelAnswered = true;
-      await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session);
+      await this._ensureCreatedSessionVisible(data.data.sessionId, data.data.session, data.data.tabLayout);
       if (!firstSessionId) firstSessionId = data.data.sessionId;
     }
     if (tabCount > 1) {
@@ -2309,7 +2321,7 @@ Object.assign(CodemanApp.prototype, {
    * menu call them directly by name (`app.runOpenCode()` etc.), and several
    * tests assert on that name directly too.
    */
-  async _runCliMode(mode) {
+  async _runCliMode(mode, options = {}) {
     const catalogEntry = registryCliById(mode);
     const entry = RUN_MODE_LAUNCH[mode] ||
       (catalogEntry && {
@@ -2326,7 +2338,7 @@ Object.assign(CodemanApp.prototype, {
     const _runLoc = (this.cases || []).find(c => c.name === caseName)?.location;
     const isRemote = _runLoc === 'remote' || _runLoc === 'docker';
 
-    const tabCount = this._readTabCount();
+    const tabCount = this._readTabCount(options.count);
     const ownsLaunchTerminal = this._beginSessionLaunchStatus(
       `Starting ${tabCount} ${entry.label} session(s) in ${caseName}...`
     );
@@ -2364,6 +2376,7 @@ Object.assign(CodemanApp.prototype, {
           caseName,
           mode,
           sessionName,
+          ...(options.tabGroupId ? { tabGroupId: options.tabGroupId } : {}),
           ...(isRemote ? {} : {
             ...(entry.buildConfig(globalSettings) || {}),
             ...(Object.keys(envOverrides).length > 0 ? { envOverrides } : {}),
@@ -2473,6 +2486,14 @@ Object.assign(CodemanApp.prototype, {
     if (tab) tab.classList.toggle('tab-show-detach', !!on);
   },
 
+  /** Copy the open session's working folder (Session Options > Session > Working folder). */
+  async copySessionPath() {
+    const session = this.sessions.get(this.editingSessionId);
+    if (!session?.workingDir) return;
+    const ok = await this._copyText(session.workingDir);
+    this.showToast(ok ? 'Path copied' : 'Copy failed', ok ? 'success' : 'error');
+  },
+
   openSessionOptions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -2534,6 +2555,7 @@ Object.assign(CodemanApp.prototype, {
     // Populate auto-resume on usage limit (token pause control)
     document.getElementById('modalAutoResumeEnabled').checked = session.autoResumeEnabled ?? false;
     this.updateAutoResumeStatus(sessionId);
+    this.updatePromptCacheStatus(sessionId);
     document.getElementById('modalImageWatcherEnabled').checked = session.imageWatcherEnabled ?? true;
     document.getElementById('modalFlickerFilterEnabled').checked = session.flickerFilterEnabled ?? false;
 
@@ -2551,6 +2573,19 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('modalSessionName').value = session.name || '';
       document.getElementById('modalSessionName').placeholder = 'Auto (directory name)';
     }
+
+    // Working folder: the path the CLI was launched in on the Codeman host
+    const _pathEl = document.getElementById('modalSessionPath');
+    _pathEl.textContent = session.workingDir || '';
+    _pathEl.title = session.workingDir || '';
+    document.getElementById('modalSessionPathCopy').disabled = !session.workingDir;
+    // A remote session's workingDir is the REMOTE path; a docker session's is the
+    // host bind-mount source the container sees.
+    document.getElementById('modalSessionPathDesc').textContent = session.remote
+      ? "Where this session's CLI runs, on the remote host it reaches over SSH, not on this machine."
+      : session.docker
+        ? "On the machine hosting Codeman, mounted into the Docker container this session's CLI runs in."
+        : "Where this session's CLI runs, on the machine hosting Codeman.";
 
     // Initialize color picker with current session color
     const currentColor = session.color || 'default';
@@ -2782,6 +2817,27 @@ Object.assign(CodemanApp.prototype, {
       el.textContent = '';
       el.classList.remove('active');
     }
+  },
+
+  /**
+   * Session Options → Respawn → "Prompt cache": the main conversation's cache state as
+   * Claude Code reports it on the statusline (`session.promptCache`, v2.1.251+), worded by
+   * the pure `CodemanPromptCache.format` (constants.js). Refreshed on open and on the
+   * `session:promptCache` SSE event while the modal shows that session.
+   */
+  updatePromptCacheStatus(sessionId) {
+    const el = document.getElementById('promptCacheStatus');
+    if (!el || this.editingSessionId !== sessionId) return;
+    const session = this.sessions.get(sessionId);
+    el.textContent = window.CodemanPromptCache.format(session?.promptCache, Date.now(), session?.statusLineExporter);
+  },
+
+  _onSessionPromptCache(data) {
+    const { sessionId, ...promptCache } = data;
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.promptCache = promptCache;
+    this.updatePromptCacheStatus(sessionId);
   },
 
   async toggleSessionImageWatcher() {

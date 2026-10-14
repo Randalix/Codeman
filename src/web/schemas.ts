@@ -129,6 +129,24 @@ export const FileWriteSchema = z
   .strict();
 
 /**
+ * Body validation for `POST /api/sessions/:id/html-view` (render a local HTML file
+ * as a sandboxed page). `path` is absolute or relative to the session workspace;
+ * the extension, containment, guard and broad-root checks are the route's
+ * (html-view-routes.ts), after parsing.
+ */
+export const HtmlViewOpenSchema = z
+  .object({
+    path: z
+      .string({ error: 'Missing path parameter' })
+      .min(1, 'Missing path parameter')
+      .max(4096)
+      .refine((p) => !p.includes('\0') && !p.includes('\n') && !p.includes('\r'), {
+        message: 'Invalid path',
+      }),
+  })
+  .strict();
+
+/**
  * The run-mode ids the API currently accepts: every ENABLED registry entry.
  *
  * Exported so anything needing the authoritative list derives it from here rather than
@@ -542,12 +560,23 @@ const sessionModelSchema = z
   .or(z.literal(''))
   .optional();
 
+/**
+ * Tab group the new session should be placed in (the group's "New session"
+ * action). Advisory like parentSessionId: the layout service looks the id up in
+ * the creating owner's own layout and ignores one it cannot find, so a stale or
+ * foreign id never fails a spawn. A malformed value (null, empty, over-long) is
+ * still a 400, because only the browser sends it.
+ */
+const tabGroupIdSchema = z.string().min(1).max(100).optional();
+
 export const CreateSessionSchema = z.object({
   workingDir: safePathSchema.optional(),
   mode: sessionModeSchema().optional(),
   name: z.string().max(100).optional(),
   /** Session that spawned this one — see parentSessionIdSchema. */
   parentSessionId: parentSessionIdSchema,
+  /** Tab group to place the new session in: see tabGroupIdSchema. */
+  tabGroupId: tabGroupIdSchema,
   envOverrides: safeEnvOverridesSchema,
   /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */
   effort: effortLevelSchema,
@@ -657,6 +686,34 @@ export const StatusTelemetrySchema = z.object({
         .nullish(),
       cost: z.object({ total_cost_usd: z.number().nullish() }).nullish(),
       model: z.object({ display_name: z.string().max(100).nullish() }).nullish(),
+      // Main-conversation prompt-cache statistics (Claude Code v2.1.251+). Every documented
+      // scalar field is listed nullish: `expires_at`/`hit_ratio`/`last_miss_at`/
+      // `recache_tokens_if_cold` are all documented as possibly null, and the object gains
+      // fields over CLI versions, so a stricter shape would 400 the whole post and blank the
+      // footer (the recurring .optional()/null trap). Causes stay `unknown` (the parser keeps
+      // the strings); `last_miss_cause`'s extra numeric keys and the `miss_causes` record are
+      // stripped by Zod unread, which keeps the stored object bounded — a hostile localhost
+      // payload cannot bloat state, since only the normalized subset below is ever stored.
+      prompt_cache: z
+        .object({
+          warm: z.boolean().nullish(),
+          caching_observed: z.boolean().nullish(),
+          // No length cap: a future TTL longer than today's `5m`/`1h` must not 400 the whole
+          // post and blank the footer. parsePromptCache discards any TTL it does not know, so
+          // the stored value stays bounded to those two regardless.
+          ttl: z.string().nullish(),
+          expires_at: z.number().nullish(),
+          requests: z.number().nullish(),
+          misses: z.number().nullish(),
+          expected_rebuilds: z.number().nullish(),
+          hit_ratio: z.number().nullish(),
+          cache_write_tokens: z.number().nullish(),
+          miss_recache_tokens: z.number().nullish(),
+          last_miss_at: z.number().nullish(),
+          recache_tokens_if_cold: z.number().nullish(),
+          last_miss_cause: z.object({ causes: z.array(z.unknown()).max(20).nullish() }).nullish(),
+        })
+        .nullish(),
     })
     .nullish(),
 });
@@ -1092,6 +1149,8 @@ export const QuickStartSchema = z.object({
   sessionName: z.string().max(128).optional(),
   /** Session that spawned this one — see parentSessionIdSchema. */
   parentSessionId: parentSessionIdSchema,
+  /** Tab group to place the new session in: see tabGroupIdSchema. */
+  tabGroupId: tabGroupIdSchema,
   /** Model override written to <case>/.claude/settings.local.json (e.g. "opus[1m]").
    *  Empty string clears. Applied for local AND docker cases (the docker workspace is
    *  a real host dir, so the settings file crosses the bind mount); rejected for
@@ -1417,6 +1476,14 @@ export const SettingsUpdateSchema = z
      * broadcast and /api/search, which is the user's choice to make.
      */
     autoNameSessions: z.boolean().optional(),
+    /**
+     * Spawned tabs follow their parent: a session created by another one keeps
+     * following its parent's tab (into its group, moving with it) until moved by
+     * hand. SYNCED, default OFF, because the server does the placement:
+     * TabLayoutService.sessionCreated() reads it at every creation, and with it
+     * off the child lands after its parent once and is hand-placed from then on.
+     */
+    spawnedTabsFollowParent: z.boolean().optional(),
     /**
      * Read My Mind (docs/readmymind-plan.md): capture the user's submitted
      * prompts into per-case intent profiles. SYNCED, default OFF (opt-in:

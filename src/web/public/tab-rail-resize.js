@@ -327,15 +327,32 @@ Object.assign(CodemanApp.prototype, {
     const settings = this.loadAppSettingsFromStorage();
     const actions = [
       { label: 'Session options', run: () => this.openSessionOptions(sessionId) },
-      // Group placement (vertical rail with a tab layout only; [] elsewhere).
+      // Focus and group placement (vertical rail with a tab layout only; [] elsewhere).
+      ...(this._tabRefFocusActions?.({ kind: 'session', id: sessionId }) || []),
       ...(this._tabRefMoveActions?.({ kind: 'session', id: sessionId }) || []),
-      ...((this.tabDetachButtonEnabled?.(settings) ?? settings.showTabDetachButton) ||
-      this.detachedSessions?.has(sessionId)
-        ? [{ label: 'Open in a new window', run: () => this.detachSession(sessionId) }]
-        : []),
+      // A tile (Detach Tiles on) opens its own size, over where it is: the
+      // keyboard's way to what dragging its header out of the window does.
+      ...(this._tileGrid?.has?.(sessionId) && this._tileDetachAllowed?.()
+        ? [{ label: 'Open in a new window', run: () => this.detachTile(sessionId) }]
+        : (this.tabDetachButtonEnabled?.(settings) ?? settings.showTabDetachButton) ||
+            this.detachedSessions?.has(sessionId)
+          ? [{ label: 'Open in a new window', run: () => this.detachSession(sessionId) }]
+          : []),
       { label: 'Close session', className: 'danger', run: () => this.requestCloseSession(sessionId) },
     ];
     for (const action of actions) {
+      // A note (a child session's placement) is plain text, not a menu item: it
+      // takes no focus and no arrow stop, and describes the menu instead.
+      if (action.note) {
+        const note = document.createElement('div');
+        note.className = 'tab-rail-action-menu-note';
+        note.setAttribute('role', 'none');
+        note.id = 'tabRailActionMenuNote';
+        note.textContent = action.label;
+        menu.setAttribute('aria-describedby', note.id);
+        menu.appendChild(note);
+        continue;
+      }
       const button = document.createElement('button');
       button.type = 'button';
       button.setAttribute('role', 'menuitem');

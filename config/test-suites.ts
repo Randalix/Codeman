@@ -23,6 +23,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/tab-activation.browser.test.ts',
   'test/tab-layout-editing.browser.test.ts',
   'test/tab-rail-search.browser.test.ts',
+  'test/tab-focus.browser.test.ts',
   'test/session-sidebar-ux.browser.test.ts',
   'test/session-options-responsive.browser.test.ts',
   'test/inline-rename.test.ts',
@@ -35,6 +36,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/codex-predictive-echo.test.ts', // also needs a real codex binary
   'test/split-pane-terminal.browser.test.ts',
   'test/terminal-tile-scroll.browser.test.ts',
+  'test/terminal-touch-paging.browser.test.ts',
   'test/shift-enter-keypress.browser.test.ts',
   'test/key-tester.browser.test.ts',
   'test/webhook-settings.browser.test.ts',
@@ -47,6 +49,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/mobile-ime-preview.browser.test.ts',
   'test/run-mode-menu-scroll.browser.test.ts',
   'test/markdown-anchor-links.browser.test.ts',
+  'test/fullscreen-tab-switch-capture.browser.test.ts',
 ];
 
 /**

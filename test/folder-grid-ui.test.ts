@@ -176,6 +176,8 @@ function loadApp(fetchImpl: (url: string, init?: { body?: string }) => unknown) 
     resolveLinkedFilePath,
     expandBracePath,
     bracePathPrefixDir,
+    // Also from constants.js: no file in this suite renders as an HTML page.
+    rendersAsPage: () => false,
     document: {
       getElementById: () => null,
       createElement: (t: string) => el(t),

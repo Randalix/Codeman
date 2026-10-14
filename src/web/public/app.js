@@ -193,6 +193,7 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.SESSION_RESPAWN_BREAKER_TRIPPED, '_onSessionRespawnBreakerTripped'],
   [SSE_EVENTS.SESSION_CLI_INFO, '_onSessionCliInfo'],
   [SSE_EVENTS.SESSION_STATUS_TELEMETRY, '_onSessionStatusTelemetry'],
+  [SSE_EVENTS.SESSION_PROMPT_CACHE, '_onSessionPromptCache'],
 
   // Scheduled runs
   [SSE_EVENTS.SCHEDULED_CREATED, '_onScheduledCreated'],
@@ -713,6 +714,9 @@ const URL_SESSION_WAIT_MS = 30000;
  */
 const TAB_LAYOUT_PENDING_MAX_AGE_MS = 60000;
 
+/** How long a collapsed group's header stays marked after a tab arrives in it. */
+const TAB_GROUP_ARRIVAL_MS = 2000;
+
 class CodemanApp {
   constructor() {
     this.sessions = new Map();
@@ -778,6 +782,12 @@ class CodemanApp {
     // their scrollback can be very large; full history stays available on demand.
     // Tracked PER SESSION rather than as a single "first load" flag (issue #205).
     this._fullHistoryLoaded = new Set();
+    // Rows of scrollback tmux reported above the visible frame on this session's
+    // last capture (`paneHistoryLines`). 0 marks a pane with no history to load
+    // (a fullscreen CLI in the alternate screen), which a tab switch serves from
+    // the small `full=1` capture instead of the 1 MiB byte tail: see
+    // _notePaneHistory and selectSession.
+    this._paneHistoryLines = new Map(); // Map<sessionId, number>
     // Cooldown per session for the scroll-to-top "load more history" re-pull.
     this._fullHistoryRepullAt = new Map(); // Map<sessionId, timestamp>
     this._fullHistoryRepullInFlight = false;
@@ -1681,8 +1691,12 @@ class CodemanApp {
    * side-effect-light. Calling it again for an already-open window just raises
    * that window.
    * @param {string} id session id
+   * @param {{width?: number, height?: number, left?: number, top?: number}} [placement]
+   *   the new window's size and screen position (a detached tile opens its own
+   *   size, where it was let go); omitted, the default 960x680 wherever the
+   *   browser puts it. A host window ignores it.
    */
-  detachSession(id) {
+  detachSession(id, placement = null) {
     if (this.isSoloWindow) return;            // a solo window can't spawn more
     if (!this.sessions.has(id)) return;
     // Already detached → raise the existing popup instead of opening (or
@@ -1710,7 +1724,7 @@ class CodemanApp {
       this._postWindowMessage({ type: 'detached', id });
       return;
     }
-    const features = 'width=960,height=680,menubar=no,toolbar=no,location=no,status=no';
+    const features = this._detachWindowFeatures(placement);
     let win = null;
     try { win = window.open(CodemanBase.url('/session/' + encodeURIComponent(id)), 'codeman-session-' + id, features); } catch {}
     if (!win) {
@@ -1722,6 +1736,21 @@ class CodemanApp {
     this._watchDetachedWindow(id, win);
     this._postWindowMessage({ type: 'detached', id });
     try { win.focus(); } catch {}
+  }
+
+  /**
+   * The window.open features of a pop-out: `placement`'s size (default
+   * 960x680) and, when it has one, its screen position. Only finite numbers
+   * make it into the string.
+   */
+  _detachWindowFeatures(placement) {
+    const int = (v) => (Number.isFinite(v) ? Math.round(v) : null);
+    const width = int(placement?.width) ?? 960;
+    const height = int(placement?.height) ?? 680;
+    const left = int(placement?.left);
+    const top = int(placement?.top);
+    const at = left !== null && top !== null ? `,left=${left},top=${top}` : '';
+    return `width=${width},height=${height}${at},menubar=no,toolbar=no,location=no,status=no`;
   }
 
   /**
@@ -1892,11 +1921,15 @@ class CodemanApp {
     if (!msg || typeof msg !== 'object') return;
     if (this.isSoloWindow) {
       // Roll-call has no id (broadcast to all) — answer before the id filter.
-      if (msg.type === 'roll-call') { this._postWindowMessage({ type: 'detached', id: this.soloSessionId }); return; }
+      // A window that has handed its session back stays silent.
+      if (msg.type === 'roll-call') {
+        if (!this._soloReleased) this._postWindowMessage({ type: 'detached', id: this.soloSessionId });
+        return;
+      }
       if (msg.id !== this.soloSessionId) return;
       // A host window ignores window.close()/focus() from script it did not
       // open by window.open, so ask the host when it offers the call.
-      if (msg.type === 'close-request') { this._closeSoloWindow(); }
+      if (msg.type === 'close-request') { this._releaseSoloWindow(); }
       else if (msg.type === 'focus-request') {
         try { if (typeof window.CodemanHost?.focusWindow === 'function') window.CodemanHost.focusWindow(); else window.focus(); } catch {}
       }
@@ -1904,6 +1937,10 @@ class CodemanApp {
     }
     // Dashboard side.
     if (msg.type === 'detached' && msg.id) {
+      // A pop-out this window just docked as a tile (Detach Tiles), answering
+      // a roll-call on its way out: not a new pop-out, which would take the
+      // tile straight back off.
+      if (this._tileDockedRecently?.(msg.id)) return;
       this._cancelPendingRedock(msg.id);    // a re-announce (e.g. popup reload) cancels a deferred redock
       this._detachPingPending?.delete(msg.id);  // and proves liveness for this tick
       this._detachOrphanStrikes.delete(msg.id); // any answer clears accumulated misses
@@ -1913,6 +1950,9 @@ class CodemanApp {
     } else if (msg.type === 'detach-request' && msg.id) {
       // Future gesture hook: another window asks the dashboard to detach a tab.
       this.detachSession(msg.id);
+    } else if (msg.type === 'tile-adopted' && msg.id && msg.by !== this._wsTabNonce) {
+      // Another window docked a tile dragged out of this one (tile-grid.js).
+      this._onTileAdoptedElsewhere?.(msg.id);
     }
   }
 
@@ -1959,6 +1999,41 @@ class CodemanApp {
     } catch {}
   }
 
+  /**
+   * Solo window: a dashboard took the session back (its re-dock, or a
+   * dashboard docked it as a tile). Says so at once and stops answering
+   * roll-calls, then closes. A window the browser will not let a script
+   * close (one opened by typing its URL) says where the session went
+   * instead, rather than staying a live pop-out that every dashboard would
+   * mark detached again at its next roll-call.
+   */
+  _releaseSoloWindow() {
+    if (this._soloReleased) return;
+    this._soloReleased = true;
+    this._postWindowMessage({ type: 'redocked', id: this.soloSessionId });
+    this._closeSoloWindow();
+    setTimeout(() => {
+      if (!window.closed) this._showSoloReleased();
+    }, 300);
+  }
+
+  /** Solo window: the session went back to a dashboard and this window could not close. */
+  _showSoloReleased() {
+    if (document.querySelector('.solo-gone-overlay')) return;
+    const el = document.createElement('div');
+    el.className = 'solo-gone-overlay';
+    const title = document.createElement('h2');
+    title.textContent = 'Session moved';
+    const text = document.createElement('p');
+    text.textContent = 'This session is back in a Codeman window. This one can be closed.';
+    const btn = document.createElement('button');
+    btn.className = 'btn-primary';
+    btn.textContent = 'Close window';
+    btn.addEventListener('click', () => this._closeSoloWindow());
+    el.append(title, text, btn);
+    document.body.appendChild(el);
+  }
+
   /** Solo window: select the target session and apply minimal single-session
    *  chrome. Called from handleInit once the session list has loaded. */
   _applySoloMode() {
@@ -1974,6 +2049,8 @@ class CodemanApp {
     if (titleEl) { titleEl.textContent = name; titleEl.style.display = ''; }
     const redock = document.getElementById('soloRedockBtn');
     if (redock) redock.style.display = '';
+    // Detach Tiles: the title drags onto a dashboard's tiles to dock there.
+    this._installSoloTileHandle?.();
     document.title = name + ' — ' + (window.CodemanI18n?.displayName || 'Codeman');
     if (this.notificationManager) this.notificationManager.originalTitle = document.title;
     // Neutralize the dashboard-only brand click in a solo window.
@@ -2314,10 +2391,13 @@ class CodemanApp {
     // A session this tab is closing stays closed until the server answers.
     if (this._closingSessions?.has(data.id)) return;
     this.sessions.set(data.id, data);
-    // Add new session to end of tab order
     if (!this.sessionOrder.includes(data.id)) {
-      this.sessionOrder.push(data.id);
-      this.saveSessionOrder();
+      // The server placed it when it recorded the creation (a child after its
+      // parent, a grouped creation in its group) and broadcast that order
+      // (session:orderChanged); adopt it, appending only while that broadcast is
+      // still on its way. Never echo it back through PUT /api/session-order:
+      // the server reads that as a hand arrangement of every tab.
+      this.syncSessionOrder();
     }
     // Idempotent per id: the POST response and the session:created event both
     // land here, and a batch launched together cascades in creation order.
@@ -3224,15 +3304,16 @@ class CodemanApp {
     this._terminalRefreshOwner = refreshOwner;
     try {
       // A shell can retain a multi-megabyte/100k-line tmux history. Automatic
-      // recovery stays bounded just like normal shell selection; only the
-      // explicit "Load full history" action is allowed to pay for a full replay.
+      // recovery stays bounded just like normal shell selection (tmux's rendered
+      // history, SHELL_LOAD_QUERY); only the explicit "Load full history" action
+      // is allowed to pay for a full replay.
       // TUI modes still recover the whole picture, with the downgrade guard for
       // repaint-mode panes whose tmux capture can be smaller than xterm's buffer.
       const useFullHistory = this.sessions.get(sessionId)?.mode !== 'shell';
       let capture = await this._fetchTerminalCapture(
         useFullHistory
           ? `/api/sessions/${sessionId}/terminal?full=1`
-          : `/api/sessions/${sessionId}/terminal?tail=${TERMINAL_TAIL_SIZE}`,
+          : `/api/sessions/${sessionId}/terminal?${SHELL_LOAD_QUERY}`,
         { full: useFullHistory }
       );
       let headersReceivedAt = capture.headersAt;
@@ -3242,6 +3323,7 @@ class CodemanApp {
         headersReceivedAt = capture.headersAt;
         data = capture.json?.data ?? {};
       }
+      this._notePaneHistory?.(sessionId, data);
       // Bail on a tab switch mid-fetch: writing here would paint this session's
       // history into the terminal the user is now looking at. The window is two
       // fetches wide in the fallback case, so this guard is not optional.
@@ -3340,8 +3422,13 @@ class CodemanApp {
       try {
         // No-param capture: `terminalBufferMaxBytes` (32MB) is its only ceiling,
         // so it needs the full-history budget. Defaulting to the tail budget
-        // gave the largest payload the smallest deadline.
-        const capture = await this._fetchTerminalCapture(`/api/sessions/${data.id}/terminal`, { full: true });
+        // gave the largest payload the smallest deadline. A shell reloads tmux's
+        // rendered history instead (SHELL_LOAD_QUERY), never the byte recording.
+        const shellSession = this.sessions.get(data.id)?.mode === 'shell';
+        const capture = await this._fetchTerminalCapture(
+          shellSession ? `/api/sessions/${data.id}/terminal?${SHELL_LOAD_QUERY}` : `/api/sessions/${data.id}/terminal`,
+          { full: !shellSession }
+        );
         const headersReceivedAt = capture.headersAt;
         const termData = capture.json?.data ?? {};
 
@@ -6190,6 +6277,8 @@ class CodemanApp {
       }
     }
     this._syncTabTreeSelection(container);
+    // The Focus shortcut of the selected tab is marked aria-current.
+    this._renderTabFocus();
     // #257: selection used to stop at the class toggle. On phones/tablets the
     // strip scrolls horizontally, so a tab selected from the palette, a swipe,
     // Alt+N or a push notification could stay parked off-screen.
@@ -6722,6 +6811,10 @@ class CodemanApp {
     this._refreshMobileOverviewIfVisible?.();
     // Same deal for the desktop home screen's tab column.
     this._refreshHomeSessionsIfVisible?.();
+    // Focus shortcuts carry the status dot and alert of the tab they stand for.
+    // A no-op unless what the section would draw changed (and after a full
+    // rebuild above it already has).
+    this._renderTabFocus();
     // The full-render path already redraws the connection SVG; this incremental
     // one does not, and a badge appearing widens a tab and shifts every tab after
     // it, sliding the lineage lines off their anchors. Only pay for it when there
@@ -7050,6 +7143,7 @@ class CodemanApp {
       this._applyTabTreeSemantics(container, { identity: focusIdentity, refocus: focusWasInside });
       this._syncTabGroupHeaderAlerts(container, groupProjection);
     }
+    this._noteTabGroupArrivals(container, groupProjection);
     this._syncTabTriageChrome(container, triage);
     this._syncTabArrangementClasses(container, { clusters: !!clusterLayout, groupProjection });
     const activeBandMoved = this._noteActiveTabBand(container) && this._isScrollingTabRow(container);
@@ -7075,6 +7169,10 @@ class CodemanApp {
 
     // Set up keyboard navigation for tabs
     this.setupTabKeyboardNavigation(container);
+
+    // The Focus section sits above this list in the rail, so it is drawn before
+    // the connection lines measure the rows.
+    this._renderTabFocus();
 
     // Update connection lines after tabs change (positions may have shifted)
     this.updateConnectionLines();
@@ -7321,6 +7419,38 @@ class CodemanApp {
       const alert = alerts[header.dataset.tabGroupHeader];
       header.classList.toggle('tab-alert-action', alert === 'action');
       header.classList.toggle('tab-alert-idle', alert === 'idle');
+    }
+  }
+
+  /**
+   * A tab that first appears inside a COLLAPSED group (a spawned child, a session
+   * another device placed there) would otherwise arrive silently, the header
+   * count being its only trace. Its group header is marked for a moment instead
+   * (`.tab-layout-group-arrived`). Only a ref absent from the previous grouped
+   * render counts, so collapsing a group, or the first paint, marks nothing.
+   */
+  _noteTabGroupArrivals(container, projection) {
+    const previous = this._renderedTabGroupRefs;
+    this._renderedTabGroupRefs = projection ? new Set(Object.keys(projection.sectionByRef || {})) : null;
+    if (!projection) return;
+    const now = Date.now();
+    const arrivals = (this._tabGroupArrivals ||= new Map());
+    if (previous) {
+      for (const [key, groupId] of Object.entries(projection.hiddenTabGroupByRef || {})) {
+        if (previous.has(key)) continue;
+        arrivals.set(groupId, now + TAB_GROUP_ARRIVAL_MS);
+        setTimeout(() => {
+          if ((arrivals.get(groupId) ?? 0) > Date.now()) return;
+          arrivals.delete(groupId);
+          for (const header of this.$('sessionTabs')?.querySelectorAll('[data-tab-group-header]') || []) {
+            if (header.dataset.tabGroupHeader === groupId) header.classList.remove('tab-layout-group-arrived');
+          }
+        }, TAB_GROUP_ARRIVAL_MS);
+      }
+    }
+    for (const header of container.querySelectorAll('[data-tab-group-header]')) {
+      const until = arrivals.get(header.dataset.tabGroupHeader) ?? 0;
+      header.classList.toggle('tab-layout-group-arrived', until > now);
     }
   }
 
@@ -7610,6 +7740,9 @@ class CodemanApp {
     // rail (always so on the flat rail, which is every owner without groups).
     // Rebuild only when what the rail would draw actually changed.
     if (this._isTabGroupStructureStale()) this._fullRenderSessionTabs();
+    // A Focus flag set on another device is not a structural change of the
+    // list, so it would not rebuild it: draw the section on its own.
+    else if (this._renderTabFocus()) this.updateConnectionLines?.();
     // Edits left unsaved by the previous page (see _persistPendingTabLayoutEdits).
     if (next && !this._tabLayoutRestoreChecked) {
       this._tabLayoutRestoreChecked = true;
@@ -7646,6 +7779,8 @@ class CodemanApp {
       collapsedGroupIds: this._tabRailSearchActive() ? [] : [...this.collapsedTabGroupIds],
       activeSessionId: this.activeSessionId,
       activeWebviewId: this.activeWebviewId,
+      // A session spawned by another one shows up in its parent's group at once.
+      parents: this._tabLayoutParents(),
     });
   }
 
@@ -7681,6 +7816,226 @@ class CodemanApp {
     // The full render also redraws connectors anchored to rows that just moved.
     this._fullRenderSessionTabs();
     return this.collapsedTabGroupIds.has(groupId) === shouldCollapse;
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Owner tab layout: the Focus section (pinned shortcuts)
+  // ═══════════════════════════════════════════════════════════════
+  //
+  // A ref flagged `focus: true` in the layout gets a SHORTCUT in a small
+  // "Focus" section pinned to the top of the vertical rail; the row itself stays
+  // in its group. The section is its own element in #tabRail, OUTSIDE
+  // #sessionTabs, on purpose: it shows above the flat rail as well as the
+  // grouped one, and nothing that walks #sessionTabs (Alt+N badges, the tree's
+  // roving stop and posinset, lineage lines, drag, the row filters, the rail
+  // sort) ever sees a shortcut. Its own keyboard model is a list with one tab
+  // stop and Up/Down/Home/End between shortcuts; each shortcut is a button, so
+  // Enter/Space select its tab, and the context-menu key opens "Remove from
+  // Focus". Collapse is per-device localStorage, like a group's.
+
+  /** True when `ref` carries `focus: true` in the held layout. */
+  _tabRefFocused(ref) {
+    const location = this._tabRefLocation(ref);
+    return location?.refs[location.index]?.focus === true;
+  }
+
+  /** Pin or unpin a row. One named operation through the edit coordinator. */
+  setTabRefFocus(ref, focused) {
+    if (!this._tabRefLocation(ref)) return false;
+    return this.editTabLayout({ type: 'setFocus', ref: { kind: ref.kind, id: ref.id }, focused: focused === true }, `${ref.kind}:${ref.id}`);
+  }
+
+  /** The row menu's Focus entry ([] where the rail cannot edit the layout). */
+  _tabRefFocusActions(ref) {
+    if (!this._tabLayoutEditable() || !this._tabRefLocation(ref)) return [];
+    const focused = this._tabRefFocused(ref);
+    return [{ label: focused ? 'Remove from Focus' : 'Add to Focus', run: () => this.setTabRefFocus(ref, !focused) }];
+  }
+
+  _tabFocusCollapsedNow() {
+    if (this._tabFocusCollapsed === undefined) {
+      const storage = this._getTabCollapseStorage();
+      const loaded = storage ? window.CodemanTabLayout.loadFocusCollapsed(storage) : { collapsed: false, ok: false };
+      if (!loaded.ok) this._tabCollapseStorageFailed = true;
+      this._tabFocusCollapsed = loaded.collapsed;
+    }
+    return this._tabFocusCollapsed;
+  }
+
+  /** Collapse/expand the Focus section. Per-device; a store failure leaves it expanded. */
+  toggleTabFocusCollapsed(forceCollapsed) {
+    const shouldCollapse = forceCollapsed === undefined ? !this._tabFocusCollapsedNow() : forceCollapsed === true;
+    const storage = this._getTabCollapseStorage();
+    const saved = storage ? window.CodemanTabLayout.saveFocusCollapsed(storage, shouldCollapse) : { collapsed: false, ok: false };
+    if (!saved.ok) this._tabCollapseStorageFailed = true;
+    this._tabFocusCollapsed = saved.collapsed;
+    if (this._renderTabFocus()) this.updateConnectionLines?.();
+    document.getElementById('tabFocusToggle')?.focus();
+    return this._tabFocusCollapsed === shouldCollapse;
+  }
+
+  /** The focused refs this rail draws now ([] off the vertical rail or without a layout). */
+  _tabFocusRefs() {
+    if (!this.tabLayout || this._tabOrientation() !== 'vertical' || !window.CodemanTabLayout) return [];
+    return window.CodemanTabLayout.focusRefs(this.tabLayout, {
+      liveSessionIds: this.sessionOrder.filter((id) => this.sessions.has(id)),
+      openWebviewIds: (this.webviewOrder || []).filter((id) => this.webviews?.has(id)),
+    });
+  }
+
+  /** The Focus section element, created once inside #tabRail just above the list. */
+  _tabFocusHost() {
+    let host = document.getElementById('tabFocus');
+    if (host) return host;
+    const rail = document.getElementById('tabRail');
+    if (!rail) return null;
+    host = document.createElement('section');
+    host.id = 'tabFocus';
+    host.className = 'tab-focus';
+    host.hidden = true;
+    host.setAttribute('aria-labelledby', 'tabFocusTitle');
+    // Delegated, so the listeners survive every repaint of the section.
+    host.addEventListener('keydown', (event) => this._handleTabFocusKeydown(event));
+    host.addEventListener('click', (event) => {
+      if (event.target?.closest?.('#tabFocusToggle')) {
+        this.toggleTabFocusCollapsed();
+        return;
+      }
+      const item = event.target?.closest?.('.tab-focus-item');
+      if (item) this.openTabFocusShortcut(event, item.dataset.focusKey);
+    });
+    host.addEventListener('contextmenu', (event) => {
+      const item = event.target?.closest?.('.tab-focus-item');
+      if (item) this.openTabFocusMenu(event, item.dataset.focusKey, item);
+    });
+    const list = this.$('sessionTabs');
+    if (list && list.parentElement === rail) rail.insertBefore(host, list);
+    else rail.appendChild(host);
+    return host;
+  }
+
+  /**
+   * Draw the Focus section from the held layout. Cheap enough for every render
+   * pass: the markup is compared with what was drawn last, and the DOM is only
+   * touched when it changed. Returns true when it did (the rail's list moved,
+   * so connector lines anchored to its rows need a redraw).
+   */
+  _renderTabFocus() {
+    const refs = this._tabFocusRefs();
+    const host = refs.length ? this._tabFocusHost() : document.getElementById('tabFocus');
+    if (!host) return false;
+    if (!refs.length) {
+      if (host.hidden && !host.firstChild) return false;
+      host.hidden = true;
+      host.replaceChildren();
+      this._lastTabFocusHtml = '';
+      return true;
+    }
+    // Keep the rail's list just below the section: applyTabOrientation()
+    // re-appends #sessionTabs to the rail when the orientation flips.
+    const list = this.$('sessionTabs');
+    const rail = host.parentElement;
+    if (list && rail && list.parentElement === rail && host.nextElementSibling !== list) rail.insertBefore(host, list);
+    const collapsed = this._tabFocusCollapsedNow();
+    const activeKey = this.activeWebviewId
+      ? `webview:${this.activeWebviewId}`
+      : this.activeSessionId
+        ? `session:${this.activeSessionId}`
+        : '';
+    const focusedEl = host.contains(document.activeElement) ? document.activeElement : null;
+    const focusedKey = focusedEl?.dataset?.focusKey || (focusedEl?.id === 'tabFocusToggle' ? 'toggle' : null);
+    const keys = refs.map((ref) => `${ref.kind}:${ref.id}`);
+    // One tab stop in the list: the shortcut that had it, else the selected
+    // tab's, else the first.
+    const stopKey = [focusedKey, this._tabFocusStopKey, activeKey].find((key) => key && keys.includes(key)) || keys[0];
+    const items = refs
+      .map((ref) => {
+        const key = `${ref.kind}:${ref.id}`;
+        let name;
+        let statusHtml;
+        let alertClass = '';
+        if (ref.kind === 'session') {
+          const session = this.sessions.get(ref.id);
+          name = this.getSessionName(session);
+          statusHtml = `<span class="tab-status ${escapeHtml(session.status || 'idle')}" aria-hidden="true"></span>`;
+          const alert = this.tabAlerts?.get(ref.id);
+          alertClass = alert === 'action' ? ' tab-alert-action' : alert === 'idle' ? ' tab-alert-idle' : '';
+        } else {
+          const webview = this.webviews.get(ref.id);
+          name = webview?.name || ref.id;
+          statusHtml = `<span class="tab-web-icon" aria-hidden="true">${webview?.icon ? escapeHtml(webview.icon) : this._webviewGlobeIcon?.() || ''}</span>`;
+        }
+        // The name is user text: the whole button is kept away from the
+        // translator (a session named "3 sessions" must not come out in Chinese).
+        return (
+          `<li class="tab-focus-entry"><button type="button" class="tab-focus-item${alertClass}" data-focus-key="${escapeHtml(key)}" data-i18n-skip ` +
+          `tabindex="${key === stopKey ? '0' : '-1'}" aria-current="${key === activeKey ? 'true' : 'false'}" aria-label="${escapeHtml(name)}" title="${escapeHtml(name)}">` +
+          `${statusHtml}<span class="tab-focus-name">${escapeHtml(name)}</span></button></li>`
+        );
+      })
+      .join('');
+    const html =
+      `<button type="button" id="tabFocusToggle" class="tab-focus-toggle" aria-expanded="${collapsed ? 'false' : 'true'}" aria-controls="tabFocusList">` +
+      `<span class="tab-layout-group-chevron" aria-hidden="true"></span><span class="tab-focus-title" id="tabFocusTitle">Focus</span>` +
+      `<span class="tab-focus-count" aria-hidden="true">${refs.length}</span></button>` +
+      `<ul class="tab-focus-list" id="tabFocusList" aria-labelledby="tabFocusTitle"${collapsed ? ' hidden' : ''}>${items}</ul>`;
+    if (!host.hidden && this._lastTabFocusHtml === html) return false;
+    host.classList.toggle('tab-focus--collapsed', collapsed);
+    host.innerHTML = html;
+    host.hidden = false;
+    this._lastTabFocusHtml = html;
+    if (focusedKey === 'toggle') document.getElementById('tabFocusToggle')?.focus();
+    else if (focusedKey) host.querySelector(`[data-focus-key="${CSS.escape(focusedKey)}"]`)?.focus();
+    return true;
+  }
+
+  _tabFocusRefFromKey(key) {
+    const at = typeof key === 'string' ? key.indexOf(':') : -1;
+    if (at < 0) return null;
+    const kind = key.slice(0, at);
+    return kind === 'session' || kind === 'webview' ? { kind, id: key.slice(at + 1) } : null;
+  }
+
+  /** A shortcut was clicked: select its tab, exactly as the row would. */
+  openTabFocusShortcut(event, key) {
+    const ref = this._tabFocusRefFromKey(key);
+    if (!ref) return undefined;
+    this._tabFocusStopKey = key;
+    if (ref.kind === 'webview') return this.handleWebviewTabClick?.(event, ref.id);
+    return this.handleSessionTabClick(event, ref.id);
+  }
+
+  /** Right-click, Shift+F10 or the menu key on a shortcut (`trigger` anchors the menu). */
+  openTabFocusMenu(event, key, trigger) {
+    const ref = this._tabFocusRefFromKey(key);
+    if (!ref) return false;
+    this._tabFocusStopKey = key;
+    // A delegated listener's currentTarget is the section; anchor on the shortcut.
+    const anchored = trigger
+      ? { preventDefault: () => event?.preventDefault?.(), stopPropagation: () => event?.stopPropagation?.(), currentTarget: trigger, type: event?.type, clientX: event?.clientX }
+      : event;
+    return this._openTabLayoutMenu(anchored, `focus:${key}`, 'Focus actions', [
+      { label: 'Remove from Focus', run: () => this.setTabRefFocus(ref, false) },
+    ]);
+  }
+
+  /** Up/Down/Home/End move between shortcuts; the list keeps one tab stop. */
+  _handleTabFocusKeydown(event) {
+    const current = event.target?.closest?.('.tab-focus-item');
+    if (!current || !['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const items = [...event.currentTarget.querySelectorAll('.tab-focus-item')];
+    const index = items.indexOf(current);
+    const next =
+      event.key === 'Home'
+        ? items[0]
+        : event.key === 'End'
+          ? items[items.length - 1]
+          : items[(index + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length];
+    if (!next) return;
+    event.preventDefault();
+    for (const item of items) item.tabIndex = item === next ? 0 : -1;
+    this._tabFocusStopKey = next.dataset.focusKey;
+    next.focus();
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -7846,8 +8201,8 @@ class CodemanApp {
     if (!this._tabLayoutEditable()) return [];
     const location = this._tabRefLocation(ref);
     if (!location) return [];
-    const actions = [];
     const grouped = this.tabLayout.groups.length > 0;
+    const actions = grouped ? this._tabRefPlacementActions(ref) : [];
     // Up/down follow the STORED order, which is what the rail paints unless a
     // sort is on (then the sort decides and there is nothing to reorder).
     if (grouped && !this.isTabRailSorted()) {
@@ -7872,6 +8227,55 @@ class CodemanApp {
     return actions;
   }
 
+  /**
+   * A child session's placement, for its row menu: an informational note (where
+   * it sits and why: plain text, never focusable) and, for a child placed by hand, "Follow
+   * parent again". A child follows its parent into the parent's group until it
+   * is moved by hand; a child whose parent is gone stands on its own and is
+   * never re-adopted automatically.
+   */
+  _tabRefPlacementActions(ref) {
+    // Following is the synced "Spawned tabs follow their parent" setting (off by
+    // default): off, every spawned tab is hand-placed, so there is nothing to say.
+    if (this.loadAppSettingsFromStorage?.()?.spawnedTabsFollowParent !== true) return [];
+    const parents = this._tabLayoutParents();
+    const placement = window.CodemanTabLayout.placementState(this.tabLayout, ref, parents);
+    if (!placement) return [];
+    const parent = this.sessions.get(placement.parentId);
+    const parentName = parent ? this.getSessionName(parent) : placement.parentId;
+    const summary = {
+      inherited: `Follows ${parentName}`,
+      manual: `Placed by hand (parent: ${parentName})`,
+      dangling: 'Parent closed; placed on its own',
+      cycle: 'Parent loop; placed on its own',
+    }[placement.state];
+    const actions = [{ label: summary, note: true }];
+    if (placement.canFollow) {
+      actions.push({
+        label: 'Follow parent again',
+        run: () => this.editTabLayout({ type: 'followParent', ref, parents: this._tabLayoutParents() }, `${ref.kind}:${ref.id}`),
+      });
+    }
+    return actions;
+  }
+
+  /**
+   * The group menu's "New session": launch ONE session with the current case and
+   * run mode, placed at the end of this group by the server in the same write
+   * that records it (the group id rides the create request). A collapsed group
+   * expands first so the new tab is visible when it arrives.
+   */
+  async createSessionInTabGroup(groupId) {
+    if (!this._tabLayoutEditable() || !this.tabLayout.groups.some((group) => group.id === groupId)) return false;
+    if (this._runInFlight) {
+      this.showToast?.('A session is already starting.', 'info');
+      return false;
+    }
+    this.toggleTabGroupCollapsed(groupId, false);
+    await this.run({ count: 1, tabGroupId: groupId });
+    return true;
+  }
+
   // ─── Group and web-tab menus (right-click, the header's ⋯, Shift+F10) ──
 
   /**
@@ -7894,10 +8298,11 @@ class CodemanApp {
     menu.remove();
     if (!restoreFocus) return;
     // The trigger may have been re-rendered while the menu was open; find the
-    // live tree item by identity.
+    // live tree item by identity. A flat-rail row (a web tab's menu opens there
+    // too, from ContextMenu or Shift+F10) is a `.session-tab` with role=tab.
     const rail = this.$('sessionTabs');
     const item =
-      (trigger?.isConnected && trigger.closest('[role="treeitem"]')) ||
+      (trigger?.isConnected && trigger.closest('[role="treeitem"], .tab-focus-item, .session-tab')) ||
       [...(rail?.querySelectorAll('[role="treeitem"]') || [])].find((el) => this._tabTreeIdentity(el) === identity);
     item?.focus();
   }
@@ -7912,6 +8317,7 @@ class CodemanApp {
     const index = groups.findIndex((group) => group.id === groupId);
     if (index < 0) return false;
     return this._openTabLayoutMenu(event, `group:${groupId}`, 'Group actions', [
+      { label: 'New session', run: () => this.createSessionInTabGroup(groupId) },
       ...(this.canOpenTileGrid?.() ? [{ label: 'Open group as tiles', run: () => this.openGroupAsTiles(groupId) }] : []),
       { label: 'Rename group', run: () => this.startTabGroupRename(groupId) },
       ...(this._canCreateTabGroup() ? [{ label: 'New group', run: () => this.createTabGroup({ index: index + 1 }) }] : []),
@@ -7923,7 +8329,8 @@ class CodemanApp {
 
   /** Keyboard actions for a web-tab row in the vertical rail: its settings plus group moves. */
   openTabWebviewMenu(event, webviewId) {
-    const moves = this._tabRefMoveActions({ kind: 'webview', id: webviewId });
+    const ref = { kind: 'webview', id: webviewId };
+    const moves = [...this._tabRefFocusActions(ref), ...this._tabRefMoveActions(ref)];
     if (!moves.length) {
       this.showWebviewModal?.(webviewId);
       return false;
@@ -8815,6 +9222,7 @@ class CodemanApp {
       const headersReceivedAt = capture.headersAt;
       const payload = capture.json?.data ?? {};
       const bodyParsedAt = performance.now();
+      this._notePaneHistory?.(sessionId, payload);
       const buffer = payload.terminalBuffer;
       const timing = {
         trigger: force ? 'full-history-button' : 'full-history-scroll',
@@ -8952,9 +9360,14 @@ class CodemanApp {
       source: payload.source ?? null,
       fullSize: payload.fullSize ?? 0,
       retainedBytes: payload.retainedBytes ?? 0,
+      // tmux holds lines beyond a `lines=` window, so fullSize undercounts.
+      historyLinesCut: !!payload.historyLinesCut,
       // Set once a full-history pull has been refused as a downgrade: the
       // browser holds more than the server can return, so there is no more.
       exhausted: !!payload.exhausted,
+      // tmux scrollback above the frame (null = not reported). 0 is a pane with
+      // nothing a pull could add, which hides the notice outright.
+      paneHistoryLines: payload.paneHistoryLines ?? null,
     });
     if (sessionId === this.activeSessionId) this._renderHistoryTruncationBanner();
   }
@@ -8962,7 +9375,43 @@ class CodemanApp {
   /** Drop banner state for a session that is going away. */
   _clearHistoryTruncation(sessionId) {
     this._historyTruncation?.delete(sessionId);
+    this._historyNoticeDismissed?.delete(sessionId);
+    this._paneHistoryLines?.delete(sessionId);
     if (sessionId === this.activeSessionId) this._renderHistoryTruncationBanner();
+  }
+
+  /**
+   * Remember how much scrollback tmux holds for a session's pane, from any
+   * terminal response. Called whether or not the response was written, since
+   * it describes the PANE, not the payload. A response without the field (a
+   * byte-history fallback, an older server) forgets it, so the next tab switch
+   * goes back to the bounded tail: unknown never counts as empty.
+   */
+  _notePaneHistory(sessionId, payload) {
+    if (!sessionId) return;
+    const lines = payload?.paneHistoryLines;
+    if (typeof lines === 'number' && Number.isFinite(lines) && lines >= 0) {
+      (this._paneHistoryLines ||= new Map()).set(sessionId, lines);
+    } else {
+      this._paneHistoryLines?.delete(sessionId);
+    }
+  }
+
+  /**
+   * Bring the partial-history notice up for `sessionId`, or retire it (null).
+   *
+   * The notice is LAZY: a tail replay is truncated on nearly every tab switch,
+   * and a bar over the top rows on every switch described history the user had
+   * not reached for. It now waits for the scroll gesture that reaches the top of
+   * the browser's buffer (the moment the missing part matters, and the same
+   * gesture that already re-pulls history), and goes away again once the user
+   * scrolls back down to live output. A tab switch retires it (selectSession).
+   */
+  _setHistoryNoticeRevealed(sessionId) {
+    const next = sessionId || null;
+    if ((this._historyNoticeRevealedFor ?? null) === next) return;
+    this._historyNoticeRevealedFor = next;
+    this._renderHistoryTruncationBanner();
   }
 
   /**
@@ -8974,13 +9423,22 @@ class CodemanApp {
    *   - recoverable  → offer to load the rest
    *   - exhausted    → say so plainly, offer nothing
    *   - at the limit → the full capture ITSELF hit the byte ceiling
+   *
+   * Shown only while revealed (`_setHistoryNoticeRevealed`: the user scrolled
+   * to the top of this tab's buffer) and never again for a session whose notice
+   * the user dismissed on this page.
    */
   _renderHistoryTruncationBanner() {
     const bar = document.getElementById('historyTruncationBar');
     if (!bar) return;
-    const state = this.activeSessionId ? this._historyTruncation?.get(this.activeSessionId) : null;
+    const sessionId = this.activeSessionId;
+    const state = sessionId ? this._historyTruncation?.get(sessionId) : null;
     const notice = computeHistoryTruncationNotice(state || {});
-    if (!notice.visible) {
+    if (
+      !notice.visible ||
+      this._historyNoticeRevealedFor !== sessionId ||
+      this._historyNoticeDismissed?.has(sessionId)
+    ) {
       bar.hidden = true;
       return;
     }
@@ -9013,6 +9471,9 @@ class CodemanApp {
     dismiss.setAttribute('aria-label', 'Dismiss history notice');
     dismiss.textContent = '×';
     dismiss.onclick = () => {
+      // Sticky for this session until the page reloads: a dismissed notice used
+      // to come straight back on the next tab switch.
+      (this._historyNoticeDismissed ||= new Set()).add(sessionId);
       bar.hidden = true;
     };
     bar.appendChild(dismiss);
@@ -9129,7 +9590,9 @@ class CodemanApp {
     this._activateFileBrowserSession?.(sessionId);
     // Repaint the partial-history banner for the tab being switched TO. The
     // replay paths refresh it when their fetch lands; without this the previous
-    // session's notice stays on screen until then (#258).
+    // session's notice stays on screen until then (#258). The switch lands at
+    // live output, so the notice waits for a scroll to the top again.
+    this._historyNoticeRevealedFor = null;
     this._renderHistoryTruncationBanner();
     try { localStorage.setItem('codeman-active-session', sessionId); } catch {}
     // Narrow SSE filter to the active session — server stops streaming
@@ -9399,16 +9862,41 @@ class CodemanApp {
       // TUI sessions still get one canonical full replay per page (COD-47/#205).
       // A shell can retain hundreds of thousands of plain scrollback lines, so
       // automatically replaying all of them makes tab selection scale with the
-      // entire session. Load its bounded 1MB tail first; the existing truncation
-      // banner action fetches ?full=1 when the user explicitly asks for it.
-      const useFullHistory = session?.mode !== 'shell' && !this._fullHistoryLoaded.has(sessionId);
+      // entire session. Load a bounded window of tmux's RENDERED history first
+      // (SHELL_LOAD_QUERY: never the raw byte recording, whose repaints replay
+      // wrong at another pane height); the existing truncation banner action
+      // fetches ?full=1 when the user explicitly asks for it.
+      //
+      // A TUI pane whose last capture reported NO tmux scrollback (fullscreen
+      // claude: it lives in the alternate screen and keeps its transcript itself)
+      // takes `full=1` on every switch, not only the first. For such a pane that
+      // capture IS the visible frame, a few KB, while the tail is 1 MiB of the
+      // byte stream's old repaints. Measured on 11 live fullscreen claude panes:
+      // the tail took 250-1070 ms on the server and 70-510 ms to parse, and
+      // rendered one frame repeated (450 rows, 44 distinct); `full=1` took
+      // 150-330 ms and returned 0.9-5.6 KB. It also matches what a page load
+      // already shows, and an empty local buffer is what lets
+      // _maybePageCliTranscript send a wheel to the CLI's own transcript. The
+      // response re-reports the count, so a pane that starts keeping history
+      // (claude switched to its inline view) goes back to the tail on the next
+      // switch.
+      // A remote (ssh) or Docker session's local pane hosts a nested tmux client in the
+      // alternate screen, so it reports 0 while its byte tail is real scrollback.
+      const shellSession = session?.mode === 'shell';
+      const paneKeepsNoHistory =
+        !session?.remote && !session?.docker && this._paneHistoryLines?.get(sessionId) === 0;
+      const useFullHistory = !shellSession && (paneKeepsNoHistory || !this._fullHistoryLoaded.has(sessionId));
       if (useFullHistory) this._fullHistoryLoaded.add(sessionId);
       const fetchStartedAt = performance.now();
       const tailUrl = `/api/sessions/${sessionId}/terminal?tail=${TERMINAL_TAIL_SIZE}`;
       let capture;
       try {
         capture = await this._fetchTerminalCapture(
-          useFullHistory ? `/api/sessions/${sessionId}/terminal?full=1` : tailUrl,
+          useFullHistory
+            ? `/api/sessions/${sessionId}/terminal?full=1`
+            : shellSession
+              ? `/api/sessions/${sessionId}/terminal?${SHELL_LOAD_QUERY}`
+              : tailUrl,
           { full: useFullHistory }
         );
       } catch (err) {
@@ -9431,6 +9919,7 @@ class CodemanApp {
       }
       const data = capture.json?.data ?? {};
       const bodyParsedAt = performance.now();
+      this._notePaneHistory?.(sessionId, data);
       // How this load must end, decided here because `chunkedTerminalWrite` is
       // what actually ends it for a non-empty buffer. A tmux pane capture is a
       // point-in-time frame, so nothing that reached the browser after the
@@ -9731,8 +10220,9 @@ class CodemanApp {
         //
         // UNREACHABLE as written, and kept for the invariant rather than the
         // branch. A `useFullHistory` pass sends `full=1`, and the route answers
-        // `full=1` with `mux-full-history` or `history`, never `mux-visible`
-        // (see the source ladder in session-routes.ts), so the gate above
+        // a `full=1` pass without `alt=recording` (every `useFullHistory` pass;
+        // only shell loads send it) with `mux-full-history` or `history`, never
+        // `mux-visible` (see the source ladder in session-routes.ts), so the gate above
         // already rules out every pass that consumed the flag. Do not read this
         // line as evidence that a page load retries: it does not, and the test
         // suite pins that it does not.
@@ -9873,8 +10363,8 @@ class CodemanApp {
     // Remove from tab order
     const orderIndex = this.sessionOrder.indexOf(sessionId);
     if (orderIndex !== -1) {
+      // Not saved: the server's deletion already re-projected and broadcast the order.
       this.sessionOrder.splice(orderIndex, 1);
-      this.saveSessionOrder();
     }
     this.terminalBuffers.delete(sessionId);
     this.terminalBufferCache.delete(sessionId);

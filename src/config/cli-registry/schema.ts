@@ -15,7 +15,10 @@
 import { z } from 'zod';
 import { compileVersionRegex, countCaptureGroups, TOKEN_PATTERNS } from './patterns.js';
 import { isKnownLauncherProfile, isKnownSetenvProfile } from './profiles.js';
-import type { LaunchDefaultSettingKey, McpConfigFormat, ModelConfigResolverName } from './types.js';
+import type { AgentSkillDir, LaunchDefaultSettingKey, McpConfigFormat, ModelConfigResolverName } from './types.js';
+
+/** `capabilities.agentSkillDir`: every value must stay a fixed, relative, `..`-free path. */
+export const AGENT_SKILL_DIRS = ['.claude/skills', '.agents/skills'] as const satisfies readonly AgentSkillDir[];
 
 /** A bare CLI id: lowercase, starts with a letter, at most 24 chars. Also used as a CSS/URL token. */
 const cliId = z
@@ -294,6 +297,10 @@ const capabilitiesSchema = z
     wheelForward: z
       .object({ mode: z.enum(['never', 'version-gated']), minVersion: z.string().max(20).optional() })
       .strict(),
+    // Whether a hollow pane's wheel/touch scroll may be turned into PageUp/PageDown for
+    // the CLI to page its own transcript. Distinct from wheelForward (SGR reports).
+    // Optional: absent means no paging, the safe default for an unmeasured CLI.
+    transcriptPageKeys: z.boolean().optional(),
     keyboardAccessory: z.enum(['agent', 'shell']),
     privilegedCommandGate: z.boolean(),
     startMode: z.enum(['interactive', 'shell']),
@@ -302,6 +309,9 @@ const capabilitiesSchema = z
     respawn: z.boolean(),
     effort: z.boolean(),
     agentSkillInjection: z.boolean(),
+    // A closed list on purpose: it decides where the server WRITES, and this file is
+    // user-editable, so it can never be a free path (`..`, absolute).
+    agentSkillDir: z.enum(AGENT_SKILL_DIRS).optional(),
     statusLineTelemetry: z.boolean(),
     // How many columns this CLI indents its transcript body by, so a copy can take
     // that much off the clipboard. Bounded, because it is the whole strip: a copy
@@ -443,6 +453,9 @@ const capabilitiesSchema = z
       .object({
         // Home-relative, no traversal: sync writes to this path.
         path: mcpRelativePath,
+        // Home-relative fallback used when `path` is absent. Same no-traversal rule as `path`:
+        // sync reads it and, when it parses as plain JSON, writes to it.
+        altPath: mcpRelativePath.optional(),
         // Every value must be a known McpConfigFormat (types.ts); mcp-sync.ts's dialect table is
         // keyed by the same type, so an adapter-less format fails to compile there.
         format: z.enum([

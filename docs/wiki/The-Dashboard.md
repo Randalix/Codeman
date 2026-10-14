@@ -29,7 +29,7 @@ Session List Layout** can move it into a vertical sidebar on the left instead, a
 | -------------------- | --------------------------------------------------------------------------------- |
 | **Header tab strip** | The default. One list in tab order unless you pick another [Tab layout](#tab-layouts); it scrolls sideways on a phone. |
 | **Left sidebar**     | A vertical list with a filter box and a live session count. `Alt+B` collapses it to a narrow rail that keeps the status dots and task badges visible. On a phone it is an off-canvas drawer rather than a docked rail. A detailed variant adds the home screen's per-session line (`created 3d ago · working 12m`) and a status pill. |
-| **Vertical rail**    | The strip turned vertical beside the terminal, resizable, with detailed rows by default. **Vertical Rail Order** sorts it by activity (blocked on you first, then longest running, then most recently quiet), the same order as the home screens; pick *Manual* to get your own order and drag-reordering back. **Tab groups:** pick *Move to new group* from a row's ⋯ menu (or Shift+F10 on it) to make the first one; a group header's menu (right-click, Shift+F10 or its ⋯ glyph) renames it (also F2), reorders or deletes it, rows move between groups from their own menu or by dragging with a mouse or pen, and a collapsed group stays collapsed on that device. **Search sessions** at the top of the rail narrows it to the tabs whose name matches (a web tab by its title), across every group, collapsed ones included, without changing the groups or the order; a tab with an alert stays visible even when its name does not match; Escape or × clears it, and it is never saved. Desktop and tablet only. |
+| **Vertical rail**    | The strip turned vertical beside the terminal, resizable, with detailed rows by default. **Vertical Rail Order** sorts it by activity (blocked on you first, then longest running, then most recently quiet), the same order as the home screens; pick *Manual* to get your own order and drag-reordering back. **Tab groups:** pick *Move to new group* from a row's ⋯ menu (or Shift+F10 on it) to make the first one; a group header's menu (right-click, Shift+F10 or its ⋯ glyph) renames it (also F2), reorders or deletes it, rows move between groups from their own menu or by dragging with a mouse or pen, and a collapsed group stays collapsed on that device. **Search sessions** at the top of the rail narrows it to the tabs whose name matches (a web tab by its title), across every group, collapsed ones included, without changing the groups or the order; a tab with an alert stays visible even when its name does not match; Escape or × clears it, and it is never saved. **Focus:** *Add to Focus* in a row's ⋯ menu (right-click on a web tab) pins a shortcut to that tab in a **Focus** section at the top of the rail, with or without groups; the tab itself stays where it is. Click a shortcut to switch to its tab, right-click it (or press the menu key) for *Remove from Focus*. Focus follows you across devices; whether it is collapsed is kept per device. Desktop and tablet only. |
 
 It is the same list either way, just re-hosted: tab order, drag-to-reorder, the `Alt+1`
 to `Alt+9` numbers and every status colour below behave identically in both. The setting is
@@ -216,17 +216,26 @@ TUIs render correctly.
 Worth knowing:
 
 - **Scrollback.** Agent/TUI sessions pull their entire tmux scrollback on first open.
+  A fullscreen Claude tab keeps its history inside Claude, so switching back to it
+  reloads only the current screen, which keeps tab switches fast.
   Shell sessions open from a bounded recent tail so a large transcript cannot stall tab
   switching. Scrolling to the top of a Shell pane pulls the most recent 1 MiB of its tmux
-  history; press **Load full history** to pull the rest explicitly. Automatic output
+  history; press **Load full history** to pull the rest explicitly. That notice only
+  appears once you scroll to the top, leaves when you scroll back down, and stays away
+  for that tab once you close it. Sessions whose CLI keeps its own history (fullscreen
+  Claude) never show it, since there is nothing more to load. Automatic output
   recovery stays within the bounded browser buffer.
 - **Wheel and touch scrolling** are forwarded into Claude's own transcript when a recent
   Claude runs fullscreen (`CLAUDE_CODE_NO_FLICKER=1`, or `"tui": "fullscreen"` in
   `~/.claude/settings.json`), so the wheel scrolls the conversation rather than the terminal.
   Claude's default inline view keeps its history in the terminal and scrolls locally. `Shift+Wheel` is
   always local scrollback. OpenCode's wheel and swipes page its own conversation
-  (PageUp/PageDown); in a grid tile or the split view's second pane the wheel does
-  too. Other CLIs scroll locally.
+  (PageUp/PageDown), and so do newer Codex versions, which draw on the alternate screen
+  and leave the terminal no history of its own (an older Codex that draws inline keeps
+  its history in the terminal and scrolls locally). The first small movement of a
+  gesture pages at once, then one page per half screen of travel; one finger on the
+  screen is one gesture however slowly it moves. In a grid tile or the split view's
+  second pane the wheel pages too. Other CLIs scroll locally.
 - **Selection copy.** `Ctrl+C` copies when text is selected and interrupts when it is not.
   `Ctrl+Shift+C` always copies.
 - **Selecting where the CLI owns the mouse.** `Shift+drag` starts a selection even in a pane
@@ -260,7 +269,7 @@ Two extras depending on the device:
 | Respawn          | Session Options                    | [Keeping Agents Running](Keeping-Agents-Running)                  |
 | Ralph            | Session Options                    | [Autonomous Loops](Autonomous-Loops)                              |
 | Orchestrator     | Toolbar                            | [Autonomous Loops](Autonomous-Loops)                              |
-| Cron             | Header ⏰ (opt-in)                 | [Cron Jobs](Cron-Jobs)                                            |
+| Cron             | Bottom toolbar ⏰ (opt-in)         | [Cron Jobs](Cron-Jobs)                                            |
 | Subagents        | Automatic while agents run         | [Watching Agents Work](Watching-Agents-Work)                      |
 | Ultracode        | Header (opt-in)                    | [Watching Agents Work](Watching-Agents-Work)                      |
 | File Viewer      | Header                             | [Working With Files](Working-With-Files)                          |

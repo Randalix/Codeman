@@ -116,6 +116,21 @@ const MAX_NOTIFICATION_DURATION_MS = 300000; // Longest configurable toast / bro
 const THROTTLE_DELAY_MS = 100;              // General UI throttle delay
 const TERMINAL_CHUNK_SIZE = 32 * 1024;      // 32KB chunks for terminal buffer loading
 const TERMINAL_TAIL_SIZE = 1024 * 1024;     // 1MB tail for initial load (more scrollback on tab switch)
+// A shell's automatic loads (tab select, drop recovery, a tile's load) read
+// tmux's RENDERED history, never the raw byte recording: that recording holds
+// full-screen repaints (an ssh'd tmux, less, a TUI) drawn for the pane size of
+// the moment, and replayed into a terminal of another height each repaint
+// scrolls its top row into scrollback, so one line shows up dozens of times.
+// `lines=` bounds the synchronous capture-pane (~8 ms per 1000 lines measured,
+// so ~0.1 s here); the server reports a cut as 'tail', and scroll-to-top pulls
+// the older lines as before. `alt=recording`: a pane in the alternate screen (a
+// nested tmux, as in remote SSH and Docker cases, but also vim or less while
+// open) gains no tmux history, so the server loads it the old way, visible
+// frame over the tailed byte recording.
+// A grid tile appends its own `lines=` to SHELL_LOAD_BASE_QUERY.
+const SHELL_LOAD_HISTORY_LINES = 10000;
+const SHELL_LOAD_BASE_QUERY = `full=1&tail=${TERMINAL_TAIL_SIZE}&alt=recording`;
+const SHELL_LOAD_QUERY = `${SHELL_LOAD_BASE_QUERY}&lines=${SHELL_LOAD_HISTORY_LINES}`;
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 // A catch-up after unlock hides the terminal at most this long, so a lost reveal
 // (a parse callback that never lands) can never leave the pane invisible.
@@ -714,6 +729,45 @@ function computeConnectionLossUi(input) {
       'If you reach Codeman over Tailscale or a VPN, check that it is connected.',
     retryInSec,
   };
+}
+
+// Session Options → Respawn → "Prompt cache": one sentence of the main
+// conversation's cache state as Claude Code reports it on the statusline
+// (`session.promptCache`, v2.1.251+). A clock time rather than a countdown
+// because the row refreshes on SSE, not on a timer, and a countdown would sit
+// stale between turns. Pure: no DOM, `now` is passed in. `statusLine` is the
+// session's `statusLineExporter`: a launch without the exporter never reports, so
+// it says why instead of "not reported yet" forever.
+const PROMPT_CACHE_NOT_COLLECTED = {
+  'collection-off':
+    'Not collected: Plan Usage was off when this session started. Turn it on in App Settings; sessions started after that report it.',
+  'workspace-statusline':
+    "Not collected: this workspace's .claude/settings.local.json sets its own statusLine, which Codeman never replaces.",
+  remote: 'Not collected for remote and Docker sessions.',
+};
+function formatPromptCacheStatus(cache, now, statusLine) {
+  if (PROMPT_CACHE_NOT_COLLECTED[statusLine]) return PROMPT_CACHE_NOT_COLLECTED[statusLine];
+  if (!cache || typeof cache.warm !== 'boolean') {
+    return 'Not reported yet. Claude Code 2.1.251 or newer reports it after the first response.';
+  }
+  const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const kTokens = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`);
+  const stake = cache.recacheTokensIfCold;
+  const tokens = Number.isFinite(stake) && stake > 0 ? kTokens(stake) : null;
+  const parts = [];
+  if (cache.warm && Number.isFinite(cache.expiresAt) && cache.expiresAt > now) {
+    const ttl = cache.ttl ? ` (${cache.ttl} cache)` : '';
+    parts.push(`Warm until ${clock(cache.expiresAt)}${ttl}.`);
+    if (tokens) parts.push(`About ${tokens} tokens would be re-cached if it goes cold.`);
+  } else {
+    parts.push(tokens ? `Cold. The next turn re-caches about ${tokens} tokens.` : 'Cold.');
+  }
+  // A compaction or a tool-result clearing leaves no re-cache stake to show until the next
+  // request; naming when it happened explains the gap. Never an alert.
+  if (Number.isFinite(cache.compactedAt)) parts.push(`Context compacted at ${clock(cache.compactedAt)}.`);
+  if (Number.isFinite(cache.hitRatio)) parts.push(`${Math.round(cache.hitRatio * 100)}% cache hit rate.`);
+  if (cache.lastMissCauses && cache.lastMissCauses.length) parts.push(`Last miss: ${cache.lastMissCauses.join(', ')}.`);
+  return parts.join(' ');
 }
 
 // SSE staleness policy: is this stream a zombie?
@@ -1454,6 +1508,9 @@ if (typeof window !== 'undefined') {
     compute: computeSseStale,
     TIMEOUT_MS: SSE_STALE_TIMEOUT_MS,
   };
+  window.CodemanPromptCache = {
+    format: formatPromptCacheStatus,
+  };
   window.CodemanSessionOrder = {
     RANK: SESSION_ACTIVITY_RANK,
     anchor: sessionActivityAnchor,
@@ -1513,6 +1570,15 @@ function scheduleBackground(fn) {
 // DEC mode 2026 marker stripping — xterm.js 6.0 handles sync natively,
 // but server-sent terminal buffers may still contain markers from Claude CLI.
 const DEC_SYNC_STRIP_RE = /\x1b\[\?2026[hl]/g;
+
+// OSC 52 clipboard writes stripping — a replay re-feeds the raw byte history, and
+// xterm parses it after chunkedTerminalWrite has already released the load
+// gate, so an OSC 52 left in would re-copy old text on every tab switch. The
+// 8-bit C1 forms (OSC \x9d, ST \x9c) too: xterm.js still parses those.
+const OSC52_STRIP_RE = /(?:\x1b\]|\x9d)52;[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)/g;
+// The same OSC 52 text arriving again within this window is one copy delivered
+// several ways (direct, tmux load-buffer -w, tmux set-clipboard forwarding).
+const OSC52_DEDUPE_MS = 1000;
 
 // Built-in respawn configuration presets
 const BUILTIN_RESPAWN_PRESETS = [
@@ -1639,6 +1705,7 @@ const SSE_EVENTS = {
   SESSION_INTERACTIVE: 'session:interactive',
   SESSION_RUNNING: 'session:running',
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
+  SESSION_PROMPT_CACHE: 'session:promptCache',
 
   // Scheduled runs
   SCHEDULED_CREATED: 'scheduled:created',
@@ -1868,7 +1935,10 @@ function escapeHtml(text) {
 function formatHistoryBytes(bytes) {
   const n = typeof bytes === 'number' && isFinite(bytes) && bytes > 0 ? bytes : 0;
   if (n < 1024) return 'less than 1 KB';
-  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  // Switch on the ROUNDED value: a 1 MiB tail cut back to a line boundary is
+  // just under 1 MiB and used to print as "1024 KB".
+  const kb = Math.round(n / 1024);
+  if (kb < 1024) return `${kb} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -1882,12 +1952,27 @@ function formatHistoryBytes(bytes) {
  *   - atCeiling:   the FULL capture itself hit the byte ceiling
  *   - exhausted:   a full pull was refused as a downgrade, so this is all there is
  *
+ * ⚠️ `truncated` measures the server's BYTE stream, not history a pull can
+ * return. `paneHistoryLines` (tmux `#{history_size}`) is the latter: 0 means the
+ * pane keeps no scrollback at all (a fullscreen CLI in the alternate screen,
+ * whose transcript lives in the CLI and is scrolled there), so the bytes a tail
+ * cut dropped are old repaint frames that `full=1` cannot bring back. Measured
+ * on live fullscreen claude panes: "4.8 MB more" was ~33 copies of one frame,
+ * and the button only ever ended in the downgrade refusal. Nothing to offer,
+ * nothing to say. Absent means unknown and keeps the byte-based behaviour.
+ *
  * @param {{truncated?: boolean, reason?: string|null, source?: string|null,
- *          fullSize?: number, retainedBytes?: number, exhausted?: boolean}} state
+ *          fullSize?: number, retainedBytes?: number, exhausted?: boolean,
+ *          paneHistoryLines?: number|null, historyLinesCut?: boolean}} state
  * @returns {{visible: boolean, message: string, canLoadMore: boolean}}
  */
 function computeHistoryTruncationNotice(state = {}) {
   if (!state.truncated) return { visible: false, message: '', canLoadMore: false };
+  const historyLines =
+    typeof state.paneHistoryLines === 'number' && Number.isFinite(state.paneHistoryLines)
+      ? Math.max(0, state.paneHistoryLines)
+      : null;
+  if (historyLines === 0) return { visible: false, message: '', canLoadMore: false };
 
   const retained = Math.max(0, state.retainedBytes || 0);
   const dropped = Math.max(0, (state.fullSize || 0) - retained);
@@ -1910,9 +1995,22 @@ function computeHistoryTruncationNotice(state = {}) {
       canLoadMore: false,
     };
   }
+  // Name what a pull can actually return when the server said: the byte gap
+  // counts repaints and redraw bloat, and overstates it many times over.
+  // Without that count, a `lines=`-bounded capture is cut by tmux before any
+  // bytes are counted, so its fullSize is the window itself and the remainder's
+  // size is unknown: say that more exists without inventing an amount. That
+  // holds even when `tail` also cut bytes off the window (`dropped`), since tmux
+  // still holds more beyond it (`historyLinesCut`, set by the server).
+  const remainder =
+    dropped > 0 && !state.historyLinesCut ? `${formatHistoryBytes(dropped)} more` : 'Earlier output';
+  const more =
+    historyLines !== null
+      ? `${historyLines.toLocaleString('en-US')} ${historyLines === 1 ? 'line of scrollback is' : 'lines of scrollback are'} retained.`
+      : `${remainder} may still be retained.`;
   return {
     visible: true,
-    message: `Showing the most recent ${shown} of this session. ${formatHistoryBytes(dropped)} more may still be retained.`,
+    message: `Showing the most recent ${shown} of this session. ${more}`,
     canLoadMore: true,
   };
 }
@@ -1957,7 +2055,7 @@ function computeRewriteScrollLine(input) {
  * a `/g` regex, so {@link absoluteFilePathPattern} mints a fresh one per call.
  */
 const FILE_PATH_LINK_PATTERN =
-  /(\/(?:home|Users|tmp|var|private|opt|mnt|srv|media|data|workspace)\/[^\s"'<>|;&\n\x00-\x1f]*\.(?:log|txt|json|md|ya?ml|csv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|mp4|webm|mov|mp3|wav))\b/g;
+  /(\/(?:home|Users|tmp|var|private|opt|mnt|srv|media|data|workspace)\/[^\s"'<>|;&\n\x00-\x1f]*\.(?:log|txt|json|markdown|md|ya?ml|csv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html?|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|mp4|webm|mov|m4v|ogv|mp3|wav))\b/g;
 
 /** A fresh, zero-state instance of {@link FILE_PATH_LINK_PATTERN}. */
 function absoluteFilePathPattern() {
@@ -1969,13 +2067,18 @@ function absoluteFilePathPattern() {
  * points at goes to the tail/log viewer, which is the right home for a growing
  * text file and the wrong one for bytes (tailing a PNG shows binary noise).
  *
+ * Markdown is here too (owner decision 2026-10-13): an agent's `.md` is a
+ * document to read, so the preview renders it (its MD pill gives the source)
+ * instead of the log viewer streaming it as raw text. Other text (.log, .txt,
+ * .json, code) keeps the log viewer, which follows a file still being written.
+ *
  * The media entries mirror VIDEO_ATTACHMENT_EXTENSIONS/AUDIO_ATTACHMENT_EXTENSIONS
  * (src/attachment-registry.ts, the single source) — they diverged once and an
  * in-workspace `.m4a` opened as binary noise in the log viewer while the same
  * file in /tmp played fine. test/media-extension-parity.test.ts pins the sync.
  */
 const FILE_PREVIEW_EXTENSIONS = new Set(
-  ('png jpg jpeg gif webp avif bmp ico svg pdf docx pptx xlsx mp4 webm mov m4v ogv mp3 wav ogg oga m4a aac flac opus').split(' ')
+  ('png jpg jpeg gif webp avif bmp ico svg pdf docx pptx xlsx mp4 webm mov m4v ogv mp3 wav ogg oga m4a aac flac opus md markdown').split(' ')
 );
 
 /** Whether a path's extension is one {@link FILE_PREVIEW_EXTENSIONS} covers. */
@@ -2005,7 +2108,7 @@ function previewsInFileViewer(filePath) {
  * {@link findFilePathLinks}.
  */
 const RELATIVE_FILE_PATH_LINK_PATTERN =
-  /(^|[\s"'`(\[{<>=,])((?![^\s"'`<>|;&()[\]{}=,\n\x00-\x1f]*:\/\/)(?:~\/|[^\s"'`<>|;&()[\]{}=,\/~\n\x00-\x1f])[^\s"'`<>|;&()[\]{}=,\n\x00-\x1f]*\.(?:log|txt|json|md|ya?ml|csv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|mp4|webm|mov|mp3|wav))\b/g;
+  /(^|[\s"'`(\[{<>=,])((?![^\s"'`<>|;&()[\]{}=,\n\x00-\x1f]*:\/\/)(?:~\/|[^\s"'`<>|;&()[\]{}=,\/~\n\x00-\x1f])[^\s"'`<>|;&()[\]{}=,\n\x00-\x1f]*\.(?:log|txt|json|markdown|md|ya?ml|csv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html?|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|mp4|webm|mov|m4v|ogv|mp3|wav))\b/g;
 
 /** The `(?:log|txt|…)` extension group, read off the rooted pattern so it cannot drift. */
 const FILE_LINK_EXTENSION_GROUP = /\\\.(\(\?:[^()]*\))\)\\b$/.exec(FILE_PATH_LINK_PATTERN.source)[1];
@@ -2200,7 +2303,9 @@ const FOLDER_PATH_LINK_PATTERN =
  * without a slash at the end is prose, not a folder.
  */
 function folderLinkPath(candidate) {
-  const path = String(candidate || '').replace(/[.,:;!?'"]+$/, '');
+  // `$` and `#` too: a shell prompt (`user@host:~/proj$ `, `root@c:/app# `) ends
+  // its cwd with one. A folder whose name really ends in one links one short.
+  const path = String(candidate || '').replace(/[.,:;!?'"$#]+$/, '');
   if (!path || path === '~/' || /^\/[^/]+\/$/.test(path)) return null;
   if (path.endsWith('/')) return /[^/.]/.test(path) ? path : null;
   if (!path.startsWith('/') && !path.startsWith('~/')) return null;
@@ -2232,6 +2337,21 @@ function resolveLinkedFilePath(filePath, workingDir) {
     else parts.push(part);
   }
   return `/${parts.join('/')}`;
+}
+
+/**
+ * Extensions the file preview renders as a PAGE, from the sandboxed
+ * `/html-view/<cap>/` route (src/web/routes/html-view-routes.ts, whose
+ * HTML_VIEW_EXTENSIONS this mirrors; test/file-preview-html-page.test.ts pins
+ * the two equal). The terminal sends a click on one to the preview, never to
+ * the log viewer, and the preview renders it with a Page pill back to source.
+ */
+const HTML_PAGE_EXTENSIONS = new Set(['html', 'htm']);
+
+/** Whether a path names a file the preview renders as a page ({@link HTML_PAGE_EXTENSIONS}). */
+function rendersAsPage(filePath) {
+  const ext = String(filePath || '').split('.').pop().toLowerCase();
+  return HTML_PAGE_EXTENSIONS.has(ext);
 }
 
 
@@ -3390,6 +3510,8 @@ if (typeof window !== 'undefined') {
     resolveLinkedFilePath,
     previewsInFileViewer,
     FILE_PREVIEW_EXTENSIONS,
+    rendersAsPage,
+    HTML_PAGE_EXTENSIONS,
   };
   window.CodemanTerminalLines = { terminalLogicalLine, terminalPathLine };
   window.CodemanUrlSession = { sessionIdFromFragment };

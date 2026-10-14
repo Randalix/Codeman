@@ -94,6 +94,16 @@
     'Move down': '下移',
     'Move to Ungrouped': '移到未分组',
     'Move to new group': '移到新分组',
+    'New session': '新建会话',
+    'A session is already starting.': '已有会话正在启动。',
+    'Follow parent again': '重新跟随父会话',
+    'Parent closed; placed on its own': '父会话已关闭；单独放置',
+    'Parent loop; placed on its own': '父会话形成循环；单独放置',
+    // The Focus section pinned at the top of the vertical rail (shortcuts to tabs).
+    Focus: '焦点',
+    'Add to Focus': '添加到焦点',
+    'Remove from Focus': '从焦点移除',
+    'Focus actions': '焦点操作',
     'Could not save tab groups.': '无法保存标签分组。',
     'Tab groups changed elsewhere; part of your edit no longer applies.':
       '标签分组已在别处更改；你的部分编辑已不再适用。',
@@ -140,6 +150,8 @@
     Drag: '拖动',
     "a tile's header": '窗格的标题栏',
     'Move the Tile (onto Another: Swap)': '移动窗格（拖到另一个窗格上：互换位置）',
+    "a tile's header out of the window": '窗格的标题栏到窗口之外',
+    'Open the Tile in Its Own Window (Detach Tiles)': '在独立窗口中打开窗格（分离窗格）',
     'Zoom Focused Tile': '放大聚焦的窗格',
     'Remove Focused Tile': '移除聚焦的窗格',
     'Add the Session to the Tile Grid': '将该会话加入平铺网格',
@@ -157,8 +169,9 @@
     'Restore the grid': '恢复平铺网格',
     'Remove tile (the session keeps running)': '移除窗格（会话继续运行）',
     'Drop a tab or a tile here': '将标签页或窗格拖放到此处',
-    // A file dropped on a tile (tile-grid.js) or the single view (image-input.js).
-    'Only image files are supported': '仅支持图像文件',
+    // A file of an unsupported type dropped on a tile (tile-grid.js); the single
+    // view's drop (image-input.js) uses 'Only image or video files are supported'.
+    'Unsupported file type': '不支持的文件类型',
     // Redraw (Ctrl+Shift+R, terminal-ui.js restoreTerminalSize) on the main pane, a tile or Pane B.
     'No active session': '没有活动会话',
     'This session is sized by its own window': '此会话的尺寸由它自己的窗口决定',
@@ -167,6 +180,11 @@
     'Failed to restore terminal size': '恢复终端尺寸失败',
     // A tile header's tooltip while tiles can move (with the state above it: a pattern below).
     'Drag to move the tile': '拖动可移动窗格',
+    // The same with Detach Tiles on (tile-grid.js _paintTileHandle), and a
+    // pop-out window's title as a handle back onto the tiles.
+    'Drag to move the tile, or out of the window to open it on its own': '拖动可移动窗格，拖出窗口可在独立窗口中打开',
+    'Drag out of the window to open the tile on its own': '拖出窗口可在独立窗口中打开此窗格',
+    "Drag onto a Codeman window's tiles to dock this session there": '拖到 {name} 窗口的窗格上，即可将此会话停靠到那里',
     'Resize tile columns': '调整窗格列宽',
     'Resize tile rows': '调整窗格行高',
     Attach: '附加',
@@ -215,6 +233,9 @@
     'Close window': '关闭窗口',
     'Session unavailable': '会话不可用',
     'This session has ended or is no longer available.': '此会话已结束或不再可用。',
+    // A pop-out whose session a dashboard took back, when it cannot close itself (app.js _showSoloReleased).
+    'Session moved': '会话已移走',
+    'This session is back in a Codeman window. This one can be closed.': '此会话已回到 {name} 窗口中。可以关闭此窗口。',
 
     // Welcome / quick start / common actions
     'Manage AI Coding tools in persistent tmux sessions.': '在持久化 tmux 会话中管理 AI 编程工具。',
@@ -406,6 +427,9 @@
     'CLI Logos on Tabs': '标签页上的 CLI 图标',
     "Show each agent's CLI logo before the session name on tabs and the home screen's tab list. Off leaves the status dot and the shell's SH badge. Tiles, split headers and the Run menus keep their logos.":
       '在标签页和主界面的标签列表中，于会话名称前显示每个智能体的 CLI 图标。关闭后仍保留状态圆点和 Shell 的 SH 标记。平铺、分屏标题栏和运行菜单中的图标不受影响。',
+    'Detach Tiles': '分离窗格',
+    "Drag a tile's header out of the browser to open it in its own window, or onto another Codeman window's tiles to move it there. A popped-out window's title drags back onto tiles.":
+      '将窗格的标题栏拖出浏览器，即可在独立窗口中打开它；拖到另一个 {name} 窗口的窗格上，即可将它移到那里。弹出窗口的标题也可以拖回窗格中。',
     // Tab Layout and Header Stats Style (Discussion #426). The header style's
     // "Tiles" is 磁贴, never 平铺: that is the tile grid's word (the Tiles
     // button), and "Tiles (label over value)" must not read as the grid.
@@ -462,6 +486,9 @@
     'Ultracode Floating Windows': 'Ultracode 浮动窗口',
     'Approvals Inbox': '审批收件箱',
     'Auto-name Sessions': '自动命名会话',
+    'Spawned Tabs Follow Their Parent': '派生的标签跟随父会话',
+    "A session started by another one keeps following its parent's tab into its group and moves with it, until you move it by hand. Off: it starts next to its parent and stays where it is.":
+      '由另一个会话启动的会话会跟随父会话的标签进入其分组并随之移动，直到你手动移动它。关闭时：它出现在父会话旁边并停留在原处。',
     Approvals: '审批',
     'Prompts waiting on you, across all sessions': '所有会话中等待您处理的提示',
     'No pending approvals': '没有待处理的审批',
@@ -664,6 +691,8 @@
     // placeholder and label are looked up by the module at build time, since
     // the DOM translator skips <textarea> subtrees.
     'Compose prompt': '撰写提示词',
+    'Open a session to attach a file': '请先打开一个会话再添加附件',
+    'Only image or video files are supported': '仅支持图片或视频文件',
     'Compose prompt, draft saved': '撰写提示词，草稿已保存',
     'Resume saved prompt draft': '继续编辑已保存的提示词草稿',
     'Enter adds a new line': '按 Enter 换行',
@@ -700,6 +729,16 @@
     'Session Color': '会话颜色',
     'Working Directory': '工作目录',
     'Set working directory': '设置工作目录',
+    // Session Options > Session > Working folder (session-ui.js openSessionOptions).
+    'Working folder': '工作目录',
+    "Where this session's CLI runs, on the machine hosting Codeman.":
+      '此会话的 CLI 运行所在的目录，位于运行{name}的机器上。',
+    "Where this session's CLI runs, on the remote host it reaches over SSH, not on this machine.":
+      '此会话的 CLI 运行所在的目录，位于通过 SSH 连接的远程主机上，而不是本机。',
+    "On the machine hosting Codeman, mounted into the Docker container this session's CLI runs in.":
+      '位于运行{name}的机器上，并挂载到此会话 CLI 运行所在的 Docker 容器中。',
+    'Path copied': '路径已复制',
+    'Copy failed': '复制失败',
     'Resume Conversation': '继续对话',
     'Close Session': '关闭会话',
     'Choose how to close': '选择关闭方式',
@@ -1216,6 +1255,9 @@
       [/^(\d+) unsupported number formats$/, (_m, n) => `${n} 种不支持的数字格式`],
       // Group names are user text: they pass through untranslated.
       [/^Move to "(.+)"$/, (_m, group) => `移到“${group}”`],
+      // Session names are user text too.
+      [/^Follows (.+)$/, (_m, parent) => `跟随 ${parent}`],
+      [/^Placed by hand \(parent: (.+)\)$/, (_m, parent) => `已手动放置（父会话：${parent}）`],
       [
         /^Delete group "(.+)"\? Its tabs move to Ungrouped\.$/,
         (_m, group) => `删除分组“${group}”？其中的标签将移到未分组。`,
@@ -1281,9 +1323,8 @@
       // The same while tiles can move, with the drag hint on a second line.
       // Anchored on the hint, so a bare state word is safe here.
       [
-        /^(needs you|error|waiting|working|idle|done|exited)(?: (<1m|\d+[dhm](?: \d+[hm])?))?\nDrag to move the tile$/,
-        (_m, state, duration) =>
-          `${TILE_STATE_ZH[state]}${duration ? ` ${duration}` : ''}\n${ZH_CN['Drag to move the tile']}`,
+        /^(needs you|error|waiting|working|idle|done|exited)(?: (<1m|\d+[dhm](?: \d+[hm])?))?\n(Drag to move the tile|Drag to move the tile, or out of the window to open it on its own|Drag out of the window to open the tile on its own)$/,
+        (_m, state, duration, hint) => `${TILE_STATE_ZH[state]}${duration ? ` ${duration}` : ''}\n${ZH_CN[hint]}`,
       ],
     ];
     for (const [pattern, replacement] of patterns) {

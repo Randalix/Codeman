@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
+import { finished } from 'node:stream/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import {
@@ -40,6 +41,7 @@ import {
 import type { PaneCaptureOptions } from '../../mux-interface.js';
 import { SseEvent } from '../sse-events.js';
 import { webviewCapabilities } from '../../webview-capabilities.js';
+import { htmlViewCapabilities } from '../../html-view-capabilities.js';
 import {
   CreateSessionSchema,
   SessionNameSchema,
@@ -113,7 +115,7 @@ import { buildAgentCaseMarker, writeAgentCaseMarker } from '../../agent-case-mar
 import { canUsernameRunPrivilegedCommands, resolveClaudeModeForUsername } from '../../user-store.js';
 import { clampEnvOverridesForOwner } from '../../session-env-clamp.js';
 import { enabledClis, getCli } from '../../config/cli-registry/registry.js';
-import type { NewlineSequence } from '../../config/cli-registry/types.js';
+import type { AgentSkillDir, NewlineSequence } from '../../config/cli-registry/types.js';
 import { resolveCliLaunchError } from '../../utils/cli-launcher.js';
 import { applyLaunchDefaults } from '../launch-defaults.js';
 import { legacyConfigForMode } from '../../session-cli-registry-bridge.js';
@@ -123,6 +125,8 @@ import {
   writeHooksConfig,
   updateCaseModel,
   stripCaseEnvKeys,
+  agentSkillDir,
+  agentSkillDirFor,
   applyAgentSkill,
   refreshUserAgentSkill,
   seedAgentSessionPreamble,
@@ -152,7 +156,8 @@ import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayout
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
-import { MAX_PASTE_IMAGE_BYTES } from '../../config/buffer-limits.js';
+import { MAX_PASTE_IMAGE_BYTES, MAX_PASTE_VIDEO_BYTES } from '../../config/buffer-limits.js';
+import { VIDEO_ATTACHMENT_EXTENSIONS } from '../../attachment-registry.js';
 import { dataPath, getDataDir } from '../../config/instance.js';
 import {
   checkRemoteTmuxAvailable,
@@ -162,6 +167,7 @@ import {
   toAttachedSessionRemote,
   toSessionRemote,
 } from '../../remote-hosts.js';
+import { fetchRemoteScrollback } from '../../remote-pane-history.js';
 import {
   checkDockerAvailable,
   checkDockerConfigDrift,
@@ -365,6 +371,19 @@ export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
       const brand = data.subarray(8, 12).toString('ascii');
       return ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'].includes(brand);
     }
+    case '.mp4':
+    case '.m4v':
+    case '.mov':
+      // ISO Base Media File Format / QuickTime: size + a top-level atom type. Brands
+      // vary too widely to enumerate (qt, isom, mp42, avc1, hev1, ...), and an older
+      // QuickTime file can open on an atom other than ftyp.
+      return ['ftyp', 'moov', 'mdat', 'wide', 'free', 'skip'].includes(data.subarray(4, 8).toString('ascii'));
+    case '.webm':
+      // EBML header (Matroska's WebM subset)
+      return u32be(0) === 0x1a45dfa3;
+    case '.ogv':
+      // Ogg container ("OggS")
+      return u32be(0) === 0x4f676753;
     default:
       return false;
   }
@@ -382,7 +401,9 @@ export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
  * touched, and a file already there is theirs and stays as it is.
  */
 async function ensureUploadDir(workingDir: string): Promise<string | null> {
-  // workingDir is guaranteed to exist (live session).
+  // workingDir exists (live session) and the caller bounded-probed its mount, so
+  // the lstat/mkdir below normally start on a reachable path; a mount that dies
+  // after that probe is the same residual race POST /api/sessions accepts.
   const uploadDir = join(workingDir, UPLOADS_DIR);
   try {
     const dirStat = await fs.lstat(uploadDir);
@@ -415,37 +436,70 @@ async function ensureUploadDir(workingDir: string): Promise<string | null> {
   return uploadDir;
 }
 
-// Per-(IP, sessionId) token bucket for paste-image. 30 requests/minute.
-// Bucket map entries are pruned when they drift > 1h stale to bound memory
-// against a flood of unique IP keys.
+/** Open a fresh, uniquely named paste file for writing. */
+async function openPasteFile(imageDir: string, ext: string) {
+  // Date.now() collides on same-ms uploads from two tabs (last-write wins
+  // silently). Append 8 hex chars so concurrent pastes get distinct names.
+  const filename = `paste-${Date.now()}-${randomBytes(4).toString('hex')}${ext}`;
+  const filepath = join(imageDir, filename);
+  // O_EXCL: refuse to overwrite (collision is impossible with random suffix,
+  // but defends against TOCTOU). O_NOFOLLOW: refuse if filepath is a symlink.
+  const fh = await fs.open(
+    filepath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW
+  );
+  return { filename, filepath, fh };
+}
+
+// Per-(IP, sessionId) token buckets for paste-image. Images: 30/min. Videos: 3/min,
+// a much lower rate because one video can be up to MAX_PASTE_VIDEO_BYTES (1GB), so the
+// 30/min cap would let a single authenticated client write 30GB of disk a minute; 3/min
+// bounds that to 3GB. Bucket entries are pruned when they drift > 1h stale to bound
+// memory against a flood of unique IP keys.
 const PASTE_RATE_TOKENS = 30;
-const PASTE_RATE_REFILL_PER_MS = PASTE_RATE_TOKENS / 60_000;
+const VIDEO_RATE_TOKENS = 3;
 const PASTE_BUCKET_TTL_MS = 60 * 60 * 1000;
 const PASTE_BUCKET_GC_THRESHOLD = 1000;
 const pasteRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
+const videoRateBuckets = new Map<string, { tokens: number; lastRefill: number }>();
 
-export function consumePasteToken(key: string, now: number = Date.now()): boolean {
-  if (pasteRateBuckets.size > PASTE_BUCKET_GC_THRESHOLD) {
-    for (const [k, b] of pasteRateBuckets) {
-      if (now - b.lastRefill > PASTE_BUCKET_TTL_MS) pasteRateBuckets.delete(k);
+function takeToken(
+  buckets: Map<string, { tokens: number; lastRefill: number }>,
+  key: string,
+  capacity: number,
+  now: number
+): boolean {
+  if (buckets.size > PASTE_BUCKET_GC_THRESHOLD) {
+    for (const [k, b] of buckets) {
+      if (now - b.lastRefill > PASTE_BUCKET_TTL_MS) buckets.delete(k);
     }
   }
-  let b = pasteRateBuckets.get(key);
+  let b = buckets.get(key);
   if (!b) {
-    b = { tokens: PASTE_RATE_TOKENS, lastRefill: now };
-    pasteRateBuckets.set(key, b);
+    b = { tokens: capacity, lastRefill: now };
+    buckets.set(key, b);
   }
-  const delta = (now - b.lastRefill) * PASTE_RATE_REFILL_PER_MS;
-  b.tokens = Math.min(PASTE_RATE_TOKENS, b.tokens + delta);
+  b.tokens = Math.min(capacity, b.tokens + (now - b.lastRefill) * (capacity / 60_000));
   b.lastRefill = now;
   if (b.tokens < 1) return false;
   b.tokens -= 1;
   return true;
 }
 
+export function consumePasteToken(key: string, now: number = Date.now()): boolean {
+  return takeToken(pasteRateBuckets, key, PASTE_RATE_TOKENS, now);
+}
+
+// Videos stream to disk under a far larger per-file cap, so they draw on their own,
+// much lower bucket (see the comment above the constants).
+export function consumeVideoToken(key: string, now: number = Date.now()): boolean {
+  return takeToken(videoRateBuckets, key, VIDEO_RATE_TOKENS, now);
+}
+
 // Test hook: reset between runs.
 export function _resetPasteRateBuckets(): void {
   pasteRateBuckets.clear();
+  videoRateBuckets.clear();
 }
 
 /**
@@ -800,8 +854,8 @@ function abortOnClientHangUp(reply: FastifyReply): AbortController {
  * Injection is best-effort and stays that way: neither a refusal nor a thrown error
  * may fail the create.
  */
-async function injectAgentSkill(casePath: string): Promise<void> {
-  const skillDir = join(casePath, '.claude', 'skills', 'codeman');
+async function injectAgentSkill(casePath: string, dir: AgentSkillDir): Promise<void> {
+  const skillDir = agentSkillDirFor(casePath, dir);
   try {
     // Claude Code loads a same-named USER-LEVEL skill (`~/.claude/skills/codeman`,
     // written once by `codeman skill install`) over the case copy injected below, so a
@@ -810,7 +864,7 @@ async function injectAgentSkill(casePath: string): Promise<void> {
     // current on the same trigger. Refresh-only + marker-guarded; quiet on refusal,
     // since a foreign user copy is the user's own authored skill, not a config error.
     await refreshUserAgentSkill();
-    const result = await applyAgentSkill(casePath, true);
+    const result = await applyAgentSkill(casePath, true, dir);
     if (result === 'foreign') {
       console.warn(
         `[agent-skill] not injected: ${skillDir} exists but is not Codeman-managed (no marker), refusing to touch it. Remove that copy if you want the packaged skill there.`
@@ -931,6 +985,7 @@ export function registerSessionRoutes(
     // logout has to retire them too or every dashboard URL opened during this
     // login keeps relaying without one (WebviewCapabilityStore.revokeOwner).
     webviewCapabilities.revokeOwner(ownerFor(req));
+    htmlViewCapabilities.revokeOwner(ownerFor(req));
     reply.clearCookie(AUTH_COOKIE_NAME, { path: '/' });
     return {};
   });
@@ -1121,13 +1176,6 @@ export function registerSessionRoutes(
     // materializing in ~/.claude/settings.local.json was never asked for.
     if (!remote && body.workingDir && (body.mode ?? 'claude') === 'claude') {
       await applyWorkspaceHooks(workingDir, await ctx.getWorkspaceHooksEnabled());
-      // Agent skill (docs/agent-control-plan.md §2): ADD-ONLY on create, same shared-
-      // .claude rationale as the statusLine above: a create must never remove the
-      // skill from under other live sessions in the repo. Marker-guarded, so a
-      // user's own skills/codeman is never touched.
-      if (await ctx.getAgentSkillEnabled()) {
-        await injectAgentSkill(workingDir);
-      }
     }
 
     // Refuse up front if the requested CLI cannot start, rather than spawning a pane that
@@ -1149,6 +1197,18 @@ export function registerSessionRoutes(
       if (cliLaunchError) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, cliLaunchError);
       }
+    }
+
+    // Agent skill (docs/agent-control-plan.md §2): ADD-ONLY on create, same shared-
+    // workspace rationale as the statusLine above: a create must never remove the
+    // skill from under other live sessions in the repo. Marker-guarded, so a user's
+    // own copy is never touched. Every CLI that takes the skill gets it in the directory
+    // that CLI scans (`capabilities.agentSkillDir`); the same remote and named-workingDir
+    // conditions as the hooks above, and only once the launch pre-flight passed, so a
+    // CLI that cannot start leaves nothing in the workspace.
+    const createSkillDir = agentSkillDir(getCli(body.mode ?? 'claude')?.capabilities);
+    if (!remote && body.workingDir && createSkillDir && (await ctx.getAgentSkillEnabled())) {
+      await injectAgentSkill(workingDir, createSkillDir);
     }
 
     // Pre-validate resumeSessionId: check that the conversation file actually exists
@@ -1257,13 +1317,16 @@ export function registerSessionRoutes(
       parentSessionId: resolveParentSessionId(ctx, req, body.parentSessionId, owner),
     });
 
-    await ctx.addSession(session);
+    const tabLayout = body.tabGroupId
+      ? await ctx.addSession(session, { tabGroupId: body.tabGroupId })
+      : await ctx.addSession(session);
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
     // Pre-seed the agent skill's preamble cache so its §0 bootstrap is a two-line
-    // loader (see seedAgentSessionPreamble). Local claude sessions only; best-effort.
-    if (getCli(mode)?.capabilities.agentSkillInjection && !remote && (await ctx.getAgentSkillEnabled())) {
+    // loader (see seedAgentSessionPreamble). Local sessions of a CLI that takes the
+    // skill; best-effort.
+    if (agentSkillDir(getCli(mode)?.capabilities) && !remote && (await ctx.getAgentSkillEnabled())) {
       await seedAgentSessionPreamble(session.id).catch((err: unknown) =>
         console.warn(`[agent-skill] preamble seed failed for ${session.id}: ${getErrorMessage(err)}`)
       );
@@ -1274,7 +1337,9 @@ export function registerSessionRoutes(
     // Avoids serializing 2-3MB of terminal+text buffers per session creation.
     const lightState = ctx.getSessionStateWithRespawn(session);
     ctx.broadcast(SseEvent.SessionCreated, lightState);
-    return { session: lightState };
+    // A grouped creation also returns the layout that placed it, so the browser
+    // draws the tab inside its group at once instead of after a re-read.
+    return { session: lightState, ...(body.tabGroupId ? { tabLayout } : {}) };
   });
 
   // ========== Rename Session ==========
@@ -3138,10 +3203,12 @@ export function registerSessionRoutes(
   // Query params:
   //   tail=<bytes> - Only return last N bytes (faster initial load)
   //   full=1       - Explicitly request the entire tmux scrollback (COD-47)
+  //   alt=recording - With full=1: if the pane is in the alternate screen, load
+  //                  the visible frame over the byte recording instead
   app.get('/api/sessions/:id/terminal', async (req, reply) => {
     const routeStartedAt = performance.now();
     const { id } = req.params as { id: string };
-    const query = req.query as { tail?: string; full?: string; lines?: string };
+    const query = req.query as { tail?: string; full?: string; lines?: string; alt?: string };
     const session = findSessionOrFail(ctx, id, req);
 
     // `full=1` is the EXPLICIT full-history signal (COD-47): capture the ENTIRE
@@ -3149,7 +3216,7 @@ export function registerSessionRoutes(
     // Requests WITHOUT it — shell selection/tab switches (`tail=`) and legacy
     // no-param callers — keep the fast visible-frame capture.
     const tailBytes = query.tail ? parseInt(query.tail, 10) : 0;
-    const isFullReload = query.full === '1' || query.full === 'true';
+    let isFullReload = query.full === '1' || query.full === 'true';
     const { tmuxHistoryLimit, terminalBufferMaxBytes } = await ctx.getTerminalHistoryConfig();
 
     // Prepend the live tmux pane buffer so tab-switch replay shows the current
@@ -3167,17 +3234,56 @@ export function registerSessionRoutes(
     // for. See PaneCaptureOptions.capturedGeometry.
     // `lines` bounds only the history a FULL capture reads; the visible-frame
     // path reads no history and is untouched by it.
-    const captureOpts: PaneCaptureOptions = isFullReload
+    let captureOpts: PaneCaptureOptions = isFullReload
       ? {
           fullHistory: true,
           historyLimitLines: captureHistoryLines(query.lines, tmuxHistoryLimit),
           maxCaptureBytes: terminalBufferMaxBytes,
         }
       : {};
-    const liveMuxBuffer =
+    // A remote session's local pane only sees the remote tmux client's repaints,
+    // so its own scrollback is a fraction of the real one: read that from the
+    // remote tmux and splice it above the local frame. Null (host unreachable,
+    // no remote session, back-off) keeps the local capture as before.
+    if (isFullReload && session.remote && muxName && captureOpts.historyLimitLines !== undefined) {
+      const remoteScrollback = await fetchRemoteScrollback(
+        session.remote,
+        session.id,
+        captureOpts.historyLimitLines,
+        terminalBufferMaxBytes
+      );
+      if (remoteScrollback !== null) {
+        captureOpts.scrollbackOverride = remoteScrollback.scrollback;
+        captureOpts.scrollbackOverrideScreen = remoteScrollback.screen;
+      }
+    }
+    const capture = (opts: PaneCaptureOptions): string | null =>
       muxName && typeof ctx.mux.captureActivePaneBuffer === 'function'
-        ? ctx.mux.captureActivePaneBuffer(muxName, captureOpts)
+        ? ctx.mux.captureActivePaneBuffer(muxName, opts)
         : null;
+    let liveMuxBuffer = capture(captureOpts);
+    // tmux adds no history while a pane is in the alternate screen, and a
+    // nested tmux client (a remote SSH or Docker case, or `tmux` run by hand
+    // in a shell) holds its pane there for good, so the full capture above is
+    // one screen plus whatever came before. The byte recording still carries
+    // the scrollback, so a caller that opts in (a shell's automatic load,
+    // `alt=recording`) gets the old visible-frame load over it, tailed, rather
+    // than losing everything above the screen. `alternate_on` cannot tell a
+    // nested tmux from vim or less, so those take this path too while open:
+    // the load the shell had before tmux-rendered loads existed. Not when the
+    // history came from the remote tmux (`scrollbackOverride`): a remote pane is
+    // in the alternate screen only because it hosts that tmux's client, and
+    // the fallback would throw the remote scrollback away.
+    if (
+      isFullReload &&
+      query.alt === 'recording' &&
+      captureOpts.scrollbackOverride === undefined &&
+      captureOpts.capturedAlternateOn === true
+    ) {
+      isFullReload = false;
+      captureOpts = {};
+      liveMuxBuffer = capture(captureOpts);
+    }
     const captureFinishedAt = performance.now();
     const hasLiveMuxBuffer = liveMuxBuffer !== null && liveMuxBuffer.length > 0;
     const source: 'history' | 'mux-visible' | 'mux-full-history' = hasLiveMuxBuffer
@@ -3217,6 +3323,31 @@ export function registerSessionRoutes(
     // why the UI could only ever say "truncated for performance".
     let truncationReason: 'capped' | 'tail' | null = null;
     let cleanBuffer: string;
+
+    // A `lines=` bound shallower than tmux's history left the older lines in
+    // tmux: an intentional partial read, so 'tail', and a later pull with a
+    // deeper (or no) bound recovers them. Without this a bounded window looks
+    // like the whole history to the client. The byte cap below still wins.
+    // Only a bound the CLIENT set and below the configured ceiling counts:
+    // without `lines=` the bound is the ceiling itself, and on tmux before 3.7
+    // a live pane can hold more than a lowered ceiling, which no request can
+    // read, so calling that a recoverable cut would offer a button that can
+    // never return more.
+    // `historyLinesCut` tells the client this happened, apart from any byte
+    // cut below: `fullSize` counts only what tmux returned, so the bytes a
+    // later `tail` cut are not all that is left, and the client must not name
+    // them as the remainder.
+    const capturedHistoryLines = captureOpts.capturedHistoryLines;
+    const historyLinesCut =
+      isFullCapture &&
+      captureOpts.historyLimitLines !== undefined &&
+      captureOpts.historyLimitLines < tmuxHistoryLimit &&
+      capturedHistoryLines !== undefined &&
+      capturedHistoryLines > captureOpts.historyLimitLines;
+    if (historyLinesCut) {
+      truncated = true;
+      truncationReason = 'tail';
+    }
 
     // Cap the payload EARLY — before the regex normalization passes below run
     // over it. A full-history tmux capture can be tens of MB of scrollback;
@@ -3306,6 +3437,9 @@ export function registerSessionRoutes(
       fullSize,
       truncated,
       truncationReason,
+      // The `lines=` bound left older lines in tmux (see above): the remainder
+      // is more than `fullSize - retainedBytes`, by an amount unknown here.
+      historyLinesCut,
       // `retainedBytes` is what this response actually carries; `fullSize` is
       // what existed before the cut. The gap is what the indicator reports.
       retainedBytes: cleanBuffer.length,
@@ -3329,6 +3463,15 @@ export function registerSessionRoutes(
       // damage that does not exist.
       captureCols: hasLiveMuxBuffer ? captureOpts.capturedGeometry?.cols : undefined,
       captureRows: hasLiveMuxBuffer ? captureOpts.capturedGeometry?.rows : undefined,
+      // Rows tmux holds above the visible frame, which is the most a `full=1`
+      // pull can add. `truncated` measures the BYTE stream, and for a pane that
+      // keeps no scrollback (a fullscreen CLI in the alternate screen) the bytes
+      // a tail cut drops are old repaints that no request can bring back, so a
+      // client must not offer to load them. Absent when the pane was not read,
+      // and for a remote session: its local pane hosts the remote tmux client in
+      // the alternate screen, so it always reports 0, while a `full=1` load reads
+      // the real scrollback from the remote tmux (`fetchRemoteScrollback`).
+      paneHistoryLines: hasLiveMuxBuffer && !session.remote ? captureOpts.capturedHistoryLines : undefined,
     };
   });
 
@@ -3590,6 +3733,7 @@ export function registerSessionRoutes(
       parentSessionId,
       agentOrigin,
       customModel,
+      tabGroupId,
     } = parseBody(QuickStartSchema, req.body);
     // Same rule as the create path: only claude takes a session `model`; any other CLI
     // would drop it without a word (its model lives in its own config object).
@@ -3949,12 +4093,14 @@ export function registerSessionRoutes(
     }
 
     // Agent skill injection (docs/agent-control-plan.md §2): ADD-ONLY on create,
-    // marker-guarded (a user's own skills/codeman is never touched). Claude mode only
-    // (`.claude/skills/` is a Claude Code surface); skipped for remote cases, whose
-    // casePath lives on another host. Docker cases qualify: hostWorkspacePath is a
-    // real host dir and the skill crosses the bind mount like the rest of `.claude/`.
-    if (!remote && getCli(mode)?.capabilities.agentSkillInjection && (await ctx.getAgentSkillEnabled())) {
-      await injectAgentSkill(resolvedCasePath);
+    // marker-guarded (a user's own copy is never touched). Each CLI that takes the
+    // skill gets it in the directory it scans (`capabilities.agentSkillDir`:
+    // `.claude/skills` for claude, `.agents/skills` for most others); skipped for
+    // remote cases, whose casePath lives on another host. Docker cases qualify:
+    // hostWorkspacePath is a real host dir and the skill crosses the bind mount.
+    const quickStartSkillDir = agentSkillDir(getCli(mode)?.capabilities);
+    if (!remote && quickStartSkillDir && (await ctx.getAgentSkillEnabled())) {
+      await injectAgentSkill(resolvedCasePath, quickStartSkillDir);
     }
 
     // Docker cases: the workspace is a REAL host dir bind-mounted into the container.
@@ -4262,13 +4408,14 @@ export function registerSessionRoutes(
       }
     }
 
-    await ctx.addSession(session);
+    const tabLayout = tabGroupId ? await ctx.addSession(session, { tabGroupId }) : await ctx.addSession(session);
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
     // Pre-seed the agent skill's preamble cache so its §0 bootstrap is a two-line
-    // loader (see seedAgentSessionPreamble). Local claude sessions only; best-effort.
-    if (getCli(mode)?.capabilities.agentSkillInjection && !remote && !docker && (await ctx.getAgentSkillEnabled())) {
+    // loader (see seedAgentSessionPreamble). Local sessions of a CLI that takes the
+    // skill; best-effort.
+    if (agentSkillDir(getCli(mode)?.capabilities) && !remote && !docker && (await ctx.getAgentSkillEnabled())) {
       await seedAgentSessionPreamble(session.id).catch((err: unknown) =>
         console.warn(`[agent-skill] preamble seed failed for ${session.id}: ${getErrorMessage(err)}`)
       );
@@ -4347,6 +4494,7 @@ export function registerSessionRoutes(
         casePath: resolvedCasePath,
         caseName,
         ...(customModel ? { modelSwapInProgress: qsCustomModelSwapInProgress } : {}),
+        ...(tabGroupId ? { tabLayout } : {}),
       };
     } catch (err) {
       // Clean up session on error to prevent orphaned resources
@@ -5277,6 +5425,17 @@ export function registerSessionRoutes(
   // ═══════════════════════════════════════════════════════════════
 
   const ALLOWED_IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif']);
+  // Single-sourced from the attachment registry (what the file viewer can also play),
+  // so an uploaded video is a type that previews. 3gp/mkv are deliberately out: they
+  // would upload but not preview, and a phone's camera roll produces neither.
+  const ALLOWED_VIDEO_EXTS = new Set([...VIDEO_ATTACHMENT_EXTENSIONS].map((e) => `.${e}`));
+  const VIDEO_MIME_EXT: Record<string, string> = {
+    mp4: '.mp4',
+    quicktime: '.mov',
+    'x-m4v': '.m4v',
+    webm: '.webm',
+    ogg: '.ogv',
+  };
   // The per-file size cap (MAX_PASTE_IMAGE_BYTES) is enforced by @fastify/multipart (registered in server.ts).
 
   app.post('/api/sessions/:id/paste-image', async (req, reply) => {
@@ -5312,13 +5471,23 @@ export function registerSessionRoutes(
     }
 
     const { id } = req.params as { id: string };
+    // `?kind=video` selects the disk-streamed path (see below). It is read here so the
+    // rate check draws on the right bucket before any work: videos get 3/min, images 30.
+    const isVideo = (req.query as { kind?: string }).kind === 'video';
 
-    // Rate limit per (IP, sessionId): 30/min. Defends against disk-fill DoS
-    // — even an authenticated attacker can otherwise loop large image POSTs.
-    if (!consumePasteToken(`${req.ip}:${id}`)) {
+    // Rate limit per (IP, sessionId). Defends against disk-fill DoS — even an
+    // authenticated client can otherwise loop large uploads. Videos get their own,
+    // far lower bucket because the per-file cap is 1GB (see the bucket constants).
+    const rateKey = `${req.ip}:${id}`;
+    if (!(isVideo ? consumeVideoToken(rateKey) : consumePasteToken(rateKey))) {
       reply.code(429);
       reply.header('Retry-After', '60');
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Rate limit exceeded (30 uploads/min per session)');
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        isVideo
+          ? 'Rate limit exceeded (3 video uploads/min per session)'
+          : 'Rate limit exceeded (30 uploads/min per session)'
+      );
     }
 
     const session = findSessionOrFail(ctx, id, req);
@@ -5337,6 +5506,20 @@ export function registerSessionRoutes(
       );
     }
 
+    // The upload is written under session.workingDir (ensureUploadDir below), and
+    // a live session's workspace can sit on a network mount that stopped answering.
+    // Probe it bounded before the first disk touch, as #516 requires for a path the
+    // user named, so one dead mount cannot freeze a libuv threadpool worker per
+    // upload. Only "unknown" (the mount is not answering) is refused here, the way
+    // the create route does; absent / not-a-directory keep ensureUploadDir's own
+    // errors, since a live session's workspace should be neither.
+    if ((await probePathKind(session.workingDir, { pastCap: true })) === 'unknown') {
+      return createErrorResponse(
+        ApiErrorCode.OPERATION_FAILED,
+        describeUnknownPath('Workspace', session.workingDir, { pastCap: true })
+      );
+    }
+
     if (!req.isMultipart()) {
       reply.code(400);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
@@ -5348,9 +5531,17 @@ export function registerSessionRoutes(
     // boundary scanner with several bugs: literal boundary matches anywhere in
     // body, LF-only clients silently corrupted the last byte (hard-coded \r\n
     // offsets), no part-count cap.
+    // `?kind=video` (read above for the rate check) is the ONLY way onto the video
+    // path: it selects the larger, disk-streamed budget before the part is seen
+    // (busboy takes its limits up front), and it admits video types alone, so an
+    // image can never ride the video cap through memory. Without it the route is
+    // byte-identical to the image-only version. Truncation is checked on the stream
+    // below rather than thrown, since the file is being written as it arrives.
     let part: import('@fastify/multipart').MultipartFile | undefined;
     try {
-      part = await req.file();
+      part = await req.file(
+        isVideo ? { limits: { fileSize: MAX_PASTE_VIDEO_BYTES }, throwFileSizeLimit: false } : undefined
+      );
     } catch (err: unknown) {
       reply.code(413);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || 'Invalid multipart payload');
@@ -5363,6 +5554,75 @@ export function registerSessionRoutes(
       reply.code(400);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unexpected field "${part.fieldname}", expected "image"`);
     }
+
+    if (isVideo) {
+      let ext = '';
+      if (part.filename) {
+        const origExt = extname(part.filename).toLowerCase();
+        if (ALLOWED_VIDEO_EXTS.has(origExt)) ext = origExt;
+      }
+      const videoMime = (part.mimetype || '').toLowerCase().match(/^video\/(mp4|quicktime|x-m4v|webm|ogg)$/);
+      if (videoMime) ext = VIDEO_MIME_EXT[videoMime[1]] ?? ext;
+      if (!ext) {
+        await finished(part.file.resume()).catch(() => {});
+        reply.code(400);
+        return createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          `Unsupported video type. Allowed: ${[...ALLOWED_VIDEO_EXTS].join(', ')}`
+        );
+      }
+      const imageDir = await ensureUploadDir(session.workingDir);
+      if (!imageDir) {
+        await finished(part.file.resume()).catch(() => {});
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
+      }
+      const { filename, filepath, fh } = await openPasteFile(imageDir, ext);
+      // Written as it arrives: a phone video is far too large to buffer the way an
+      // image is. The container is judged on the first 12 bytes as soon as they are
+      // in, so a mislabeled upload stops touching disk at its first chunk; the rest
+      // of the body is drained unwritten (as busboy does past its own size limit),
+      // which is what lets the answer reach the client. A transfer that dies midway
+      // (the phone left the network) leaves no partial file behind.
+      const head = Buffer.alloc(12);
+      let headLen = 0;
+      let mislabeled = false;
+      try {
+        for await (const chunk of part.file) {
+          if (mislabeled) continue;
+          if (headLen < head.length) {
+            headLen += chunk.copy(head, headLen, 0, head.length - headLen);
+            mislabeled = headLen === head.length && !imageMagicMatchesExt(head, ext);
+            if (mislabeled) continue;
+          }
+          // writeFile loops until the whole chunk is on disk; a bare write() may be short.
+          await fh.writeFile(chunk);
+        }
+      } catch (err: unknown) {
+        await fs.unlink(filepath).catch(() => {});
+        throw err;
+      } finally {
+        await fh.close();
+      }
+      let failure: { status: number; message: string } | null = null;
+      if (headLen === 0) failure = { status: 400, message: 'Empty file' };
+      else if (!imageMagicMatchesExt(head.subarray(0, headLen), ext)) {
+        console.warn(
+          `[paste-image] video magic mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${ext} magic=${head.subarray(0, headLen).toString('hex')}`
+        );
+        failure = { status: 415, message: `Video bytes do not match declared type ${ext}` };
+      } else if (part.file.truncated) {
+        const maxMb = Math.round(MAX_PASTE_VIDEO_BYTES / (1024 * 1024));
+        failure = { status: 413, message: `File too large (max ${maxMb}MB)` };
+      }
+      if (failure) {
+        await fs.unlink(filepath).catch(() => {});
+        reply.code(failure.status);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, failure.message);
+      }
+      return { path: filepath, filename };
+    }
+
     let imageBytes: Buffer;
     try {
       imageBytes = await part.toBuffer();
@@ -5439,16 +5699,7 @@ export function registerSessionRoutes(
       reply.code(403);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
     }
-    // Date.now() collides on same-ms uploads from two tabs (last-write wins
-    // silently). Append 8 hex chars so concurrent pastes get distinct names.
-    const filename = `paste-${Date.now()}-${randomBytes(4).toString('hex')}${ext}`;
-    const filepath = join(imageDir, filename);
-    // O_EXCL: refuse to overwrite (collision is impossible with random suffix,
-    // but defends against TOCTOU). O_NOFOLLOW: refuse if filepath is a symlink.
-    const fh = await fs.open(
-      filepath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW
-    );
+    const { filename, filepath, fh } = await openPasteFile(imageDir, ext);
     try {
       await fh.writeFile(imageBytes);
     } finally {

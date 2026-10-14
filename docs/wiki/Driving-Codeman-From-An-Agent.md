@@ -4,26 +4,34 @@ Everything the dashboard does is HTTP, so an agent can do it too. This page is f
 that makes Codeman interesting: **Claude Code running inside a Codeman session, spawning and
 supervising other sessions.**
 
-Three routes. In a Claude session, start with the skill. In any other CLI mode, use the
-`codeman agent` commands. Raw HTTP is there for everything else.
+Three routes. Start with the skill, whichever CLI the agent is. Where the skill does not
+reach (a pi or shell session), use the `codeman agent` commands. Raw HTTP is there for
+everything else.
 
 ## The agent skill
 
-A Claude Code skill that teaches the agent the whole API, so you ask in plain English
-instead of pasting endpoint documentation into prompts.
+A skill in the `SKILL.md` format that Claude Code, Codex, Gemini CLI, OpenCode, Grok, OMP
+and most other agent CLIs read. It teaches the agent the whole API, so you ask in plain
+English instead of pasting endpoint documentation into prompts.
 
 ### Install it
 
 | How          | Command                                                     | Scope                                                       |
 | ------------ | ----------------------------------------------------------- | ----------------------------------------------------------- |
-| Skills CLI   | `npx skills add Ark0N/Codeman --skill codeman -g`            | Global, any skills-aware agent.                              |
+| Skills CLI   | `npx skills add Ark0N/Codeman --skill codeman -g`            | Global, any skills-aware agent. The way to give it to pi.    |
 | Claude Code plugin | `/plugin marketplace add Ark0N/Codeman`, then `/plugin install codeman@codeman` | Global, through Claude Code's plugin manager. `/plugin update codeman` follows releases. Pick this or `codeman skill install`, not both, or the skill is listed twice (`codeman` and `codeman:codeman`). |
 | Bundled CLI  | `codeman skill install`                                      | Global, at `~/.claude/skills/codeman`.                       |
-| Bundled CLI  | `codeman skill install --case <name>`                        | One case.                                                    |
-| Web UI       | **App Settings → Agents & CLIs → Claude → Agent Skill**      | Injects into each case when a Claude session is created. Off by default. |
+| Bundled CLI  | `codeman skill install --case <name> [--mode <mode>]`        | One case. `--mode codex` (or any other run mode) writes it where that CLI looks for skills. |
+| Web UI       | **App Settings → Agents & CLIs → All agent CLIs → Codeman Agent Skill** | Injects into each case when a session is created, where that session's CLI looks: `.claude/skills/` for Claude Code, `.agents/skills/` for Codex, Gemini CLI, OpenCode, Antigravity, Grok, DeepSeek and OMP. Not pi: a project skill makes pi ask to trust the folder at startup. Off by default. |
 
-`codeman skill uninstall [--case <name>]` reverses the CLI installs, and never touches a
-`skills/codeman` you wrote yourself.
+`codeman skill uninstall [--case <name>]` reverses the CLI installs (with `--case`, every
+Codeman-managed copy in that case), and never touches a `skills/codeman` you wrote yourself.
+
+Two things to know when the agent is **Codex**: its default sandbox blocks network access
+even to this machine, so the skill needs **Bypass approvals and sandbox** (App Settings,
+Codex); and Codex 0.162 runs its commands in a shared background process, whose Codeman
+variables can belong to the session that started it. The skill checks for both and says so
+instead of acting.
 
 ### Then just ask
 
@@ -62,12 +70,12 @@ completion signals.
 
 ## The `codeman agent` commands
 
-The skill is Claude-shaped: Codeman seeds its preamble for Claude sessions only. An
-`opencode`, `codex`, `pi` or `gemini` agent runs in the same environment but has nothing
-that teaches it the API, so `codeman agent` packages the same verbs as shell commands. It is
-a thin client over the endpoints in [the manual path](#the-manual-path), so auth and
-ownership apply unchanged, and it refuses to act outside a Codeman session. One line in a
-case's `AGENTS.md` is enough: *"other sessions: `codeman agent --help`"*.
+The skill drives the API with `curl` and `jq`. Where it does not reach (a pi or shell
+session, a machine without `jq`), the agent runs in the same environment, so `codeman agent`
+packages the same verbs as shell commands. It is a thin client over the endpoints in
+[the manual path](#the-manual-path), so auth and ownership apply unchanged, and it refuses to
+act outside a Codeman session. One line in a case's `AGENTS.md` is enough: *"other sessions:
+`codeman agent --help`"*.
 
 ```bash
 codeman agent ls                                          # sessions; * marks this one
@@ -90,6 +98,52 @@ codeman agent rm "$SID"                                   # any session except t
   prompt is output too, so ask for the marker in halves and wait on the joined form.
 - **Exit codes** are the same for every verb: `0` done, `1` error, `2` timeout, `3` the
   worker exited, `4` refused. `--json` prints the response's `data`.
+
+## The MCP server
+
+`codeman mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server, so any MCP
+client (Claude Code, Claude Desktop, Codex, Gemini CLI, Cursor) can drive Codeman, from
+inside a Codeman session or from an assistant on your desktop. It is a client of the same
+HTTP API, with seven tools: `list_sessions`, `start_session`, `send_prompt`,
+`wait_for_session`, `read_output`, `interrupt_session` and `delete_session`.
+
+```bash
+# Claude Code
+claude mcp add codeman -e CODEMAN_API_URL=https://127.0.0.1:3000 -- codeman mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "codeman": {
+      "command": "codeman",
+      "args": ["mcp"],
+      "env": { "CODEMAN_API_URL": "https://127.0.0.1:3000" }
+    }
+  }
+}
+```
+
+```toml
+# Codex (~/.codex/config.toml): raise the 60 s default tool timeout for long waits
+[mcp_servers.codeman]
+command = "codeman"
+args = ["mcp"]
+env = { CODEMAN_API_URL = "https://127.0.0.1:3000" }
+env_vars = ["CODEMAN_MUX", "CODEMAN_SESSION_ID"]  # Codex passes MCP servers a minimal env; these let it know the Codeman session it runs in
+tool_timeout_sec = 120
+```
+
+The JSON form is what Claude Desktop, Cursor and Gemini CLI take. Add `CODEMAN_PASSWORD` to
+`env` when the server has a password.
+
+- **It never guesses a server.** Without `CODEMAN_API_URL` (or `--url`) every call says how
+  to configure it.
+- **Only its own sessions.** Prompting, interrupting and deleting are limited to sessions it
+  started; listing, reading and waiting work on everything. `codeman mcp
+  --allow-any-session` lifts that, for an assistant that should drive your existing tabs.
+- **Waits are short by default** (45 s, at most 600 s), so they fit a client's tool
+  timeout. A `timed_out` answer means call again.
 
 ## The manual path
 

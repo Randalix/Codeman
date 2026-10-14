@@ -25,6 +25,7 @@ import type {
   SessionRemote,
   SessionDocker,
   PaneExit,
+  StatusLineExporter,
 } from './types.js';
 
 /**
@@ -57,6 +58,8 @@ export interface MuxSession {
   respawnConfig?: PersistedRespawnConfig;
   /** Whether Ralph / Todo tracking is enabled */
   ralphEnabled?: boolean;
+  /** Whether the current launch carries the statusLine exporter; set on every create and respawn. */
+  statusLine?: StatusLineExporter;
   /**
    * This record was rebuilt from the tmux socket rather than from Codeman's own
    * bookkeeping, so everything on it but the name and the pid is a guess. Its
@@ -190,6 +193,21 @@ export interface PaneCaptureOptions {
   /** Bound the full-history capture to this many scrollback lines (`-S -<N>`). */
   historyLimitLines?: number;
   /**
+   * Full-history only: scrollback rows read from somewhere other than this pane
+   * (raw `capture-pane -p -e -J` text, oldest first). The pane then contributes
+   * only its visible frame and caret, and its own history is not read. A remote
+   * session's real history lives in the REMOTE tmux (`remote-pane-history.ts`).
+   */
+  scrollbackOverride?: string;
+  /**
+   * With `scrollbackOverride`: the screen rows of the pane that history came
+   * from, read right after it. The frame this pane captures later can have
+   * scrolled past some of them, or show only part of a taller screen, so the
+   * rows above where the frame's top overlaps them are kept between the
+   * scrollback and the frame (`joinScrollbackAndFrame`).
+   */
+  scrollbackOverrideScreen?: string;
+  /**
    * Byte cap the consumer will keep from the capture. Sizes the child-process
    * stdout buffer (with slack) so multi-MB scrollback dumps aren't killed by
    * the 1MB execSync default (ENOBUFS).
@@ -204,6 +222,24 @@ export interface PaneCaptureOptions {
    * rendering it needs the real height to know the frame fits.
    */
   capturedGeometry?: { cols: number; rows: number };
+  /**
+   * Filled in by the implementation with the number of rows the pane holds in
+   * scrollback ABOVE the visible frame (tmux `#{history_size}`), read in the
+   * same query as the geometry. 0 means a full-history capture can return
+   * nothing beyond the visible frame: a pane in the alternate screen (a
+   * fullscreen CLI that keeps its transcript itself) never accumulates any.
+   * A full-history capture bounded by `historyLimitLines` below this depth
+   * left older lines behind in the multiplexer, which the caller must report
+   * as recoverable. Absent when the pane could not be queried.
+   */
+  capturedHistoryLines?: number;
+  /**
+   * Filled in by the implementation with whether the pane was in the alternate
+   * screen at capture time, when it can tell. tmux keeps no history for such a
+   * pane (a nested tmux client puts it there), so a full-history capture of it
+   * holds one screen plus whatever the pane held before.
+   */
+  capturedAlternateOn?: boolean;
 }
 
 /**

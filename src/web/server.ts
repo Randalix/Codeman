@@ -59,7 +59,8 @@ import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
 import { createMultiplexer } from '../mux-factory.js';
 import { getStore } from '../state-store.js';
-import { TabLayoutService } from '../tab-layout-service.js';
+import { TabLayoutService, type SessionPlacementHint } from '../tab-layout-service.js';
+import type { TabLayout } from '../tab-layout.js';
 import { ownerLayoutKey } from '../tab-layout-persistence.js';
 import { readWebviews } from '../webview-store.js';
 import { extractCompletionPhrase } from '../ralph-config.js';
@@ -188,6 +189,7 @@ import {
   registerTeamRoutes,
   registerMuxRoutes,
   registerFileRoutes,
+  registerHtmlViewRoutes,
   registerScheduledRoutes,
   registerHookEventRoutes,
   registerApprovalRoutes,
@@ -532,6 +534,9 @@ export class WebServer extends EventEmitter {
         this.cachedLightState = null;
         this.sse.broadcastSessionOrder(change);
       },
+      // Fresh, not the 2s cache: the settings PUT does not invalidate it, and a
+      // flip must apply to the very next spawn.
+      childrenFollowParent: async () => (await this.readSettings(true)).spawnedTabsFollowParent === true,
     });
     if (this.testMode) this.tabLayouts.markRestorationSkipped();
 
@@ -793,15 +798,19 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  /** Add a tentative session only after its owner layout accepts the creation. */
-  private async registerSessionWithLayout(session: Session): Promise<void> {
-    this.sessions.set(session.id, session);
-    try {
-      await this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner));
-    } catch (error) {
-      this.sessions.delete(session.id);
-      throw error;
-    }
+  /**
+   * Add a tentative session only after its owner layout accepts the creation.
+   * The session enters the live map inside the layout service's owner lock, so
+   * the placement it asked for (`tabGroupId`) lands in the same versioned write
+   * that first records it.
+   */
+  private async registerSessionWithLayout(session: Session, placement?: SessionPlacementHint): Promise<TabLayout> {
+    return this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner), session.id, placement, () => {
+      this.sessions.set(session.id, session);
+      return () => {
+        if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
+      };
+    });
   }
 
   /**
@@ -1212,6 +1221,7 @@ export class WebServer extends EventEmitter {
     registerTeamRoutes(this.app, ctx);
     registerMuxRoutes(this.app, ctx);
     registerFileRoutes(this.app, ctx);
+    registerHtmlViewRoutes(this.app, ctx);
     registerScheduledRoutes(this.app, ctx);
     registerHookEventRoutes(this.app, ctx);
     registerApprovalRoutes(this.app, ctx);
@@ -1889,6 +1899,19 @@ export class WebServer extends EventEmitter {
     html = html.replace(
       '</head>',
       () => `<script>window.__codemanTranscriptGutter=${JSON.stringify(gutterClis)};</script>\n</head>`
+    );
+    // Which run modes page their own transcript on PageUp/PageDown, for the scroll
+    // fallback over a pane with no local history (`_maybePageCliTranscript`). Read off
+    // the `transcriptPageKeys` capability, never an id list here, and injected for a
+    // solo window too for the same reason as the gutter map: it scrolls a terminal.
+    // Ids only, which the registry schema bounds to kebab tokens, so JSON.stringify
+    // alone is enough.
+    const pageKeyClis = enabledClis()
+      .filter((entry) => entry.capabilities.transcriptPageKeys === true)
+      .map((entry) => entry.id);
+    html = html.replace(
+      '</head>',
+      () => `<script>window.__codemanTranscriptPageKeys=${JSON.stringify(pageKeyClis)};</script>\n</head>`
     );
     if (!soloSessionId && process.env.CODEMAN_GESTURE === '1') {
       html = html.replace('</head>', () => `<script>window.__codemanGestureAvailable=true;</script>\n</head>`);
@@ -2947,9 +2970,12 @@ export class WebServer extends EventEmitter {
       // Approvals Inbox item id: lets sw.js answer an Approve/Deny action
       // click directly (POST /api/approvals/:id/answer) with no tab open.
       // Gated on the opt-in setting together with the action buttons.
+      // Approve/Deny only when we also have an approvalId to answer with.
+      // Supervised-hook CLIs (DeepSeek) omit approvalId upstream so this also
+      // strips their action buttons — buttons without an id can never answer.
       approvalId: approvalsEnabled && typeof data.approvalId === 'string' ? data.approvalId : undefined,
       urgency: template.urgency,
-      actions: approvalsEnabled ? template.actions : undefined,
+      actions: approvalsEnabled && typeof data.approvalId === 'string' ? template.actions : undefined,
     });
 
     for (const sub of subscriptions) {
@@ -3796,6 +3822,11 @@ export class WebServer extends EventEmitter {
               // tile header keeps naming it until the next report; an idle claude
               // session re-renders its statusline only on its next turn.
               displayModel: savedState?.displayModel,
+              // The last prompt-cache report, restored for the same reason: an idle claude
+              // session re-renders its statusline only on its next turn, so without this the
+              // Session Options readout would read "not reported yet" after every restart. The
+              // readout is time-aware, so a value past its expiry shows as cold, not stale-warm.
+              promptCache: savedState?.promptCache,
               // A record rebuilt from the socket has no provenance, so its
               // apparent locality is a guess (see `MuxSession.discovered`).
               discoveredMuxSession: muxSession.discovered,
@@ -3908,6 +3939,17 @@ export class WebServer extends EventEmitter {
               // Flicker filter (frontend-applied but persisted)
               if (savedState.flickerFilterEnabled !== undefined) {
                 session.flickerFilterEnabled = savedState.flickerFilterEnabled;
+              }
+              // Tab colour, pin and the image watcher are user-set and persisted like the settings
+              // above, but this path never read them back: after a restart every surviving pane came
+              // back uncoloured and unpinned with its image watcher off, and the next persist
+              // overwrote the saved values. `reapplyPersistedSessionState()` (the reboot-restore
+              // path) already restores all three. The watcher flag has to be set before
+              // `setupSessionListeners()` below, which reads it to decide whether to start one.
+              if (savedState.color) session.setColor(savedState.color);
+              if (savedState.pinned) session.restorePin(true, savedState.pinnedAt);
+              if (savedState.imageWatcherEnabled !== undefined) {
+                session.imageWatcherEnabled = savedState.imageWatcherEnabled;
               }
               // Respawn controller (not supported for external-CLI sessions)
               if (!isExternalCliMode(session.mode) && savedState.respawnEnabled && savedState.respawnConfig) {

@@ -43,8 +43,9 @@ payload return `{ "success": true, "data": {} }`.
 
 > Non-JSON endpoints are exempt from the envelope: `GET /api/sessions/:id/file-raw`,
 > `GET /api/sessions/:id/tail-file` (SSE), `GET /api/download`,
-> `GET /api/screenshots/:name`, `GET /q/:code` (QR redirect), and the
-> `GET /ws/sessions/:id/terminal` WebSocket upgrade.
+> `GET /api/screenshots/:name`, `GET /q/:code` (QR redirect),
+> `GET /html-view/:cap/*` (a [rendered HTML file](#rendered-html-files) and its
+> assets), and the `GET /ws/sessions/:id/terminal` WebSocket upgrade.
 >
 > **Deprecated:** `POST /api/screenshots`, `GET /api/screenshots` and
 > `GET /api/screenshots/:name` keep working but log a one-time warning on first
@@ -86,6 +87,93 @@ the HTTP status.
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
 
 Adding a new error code is non-breaking; removing or renaming one is a major change.
+
+## Cron jobs
+
+Saved jobs and their launch history are separate from the legacy `/api/scheduled`
+duration-bounded loops. Use `/api/v1/cron/...` in external clients; `/api/cron/...`
+is the unversioned alias. These routes use the response envelope above; the table
+lists the value inside `data` on success.
+
+| Method | Path | Request body | Response `data` |
+| --- | --- | --- | --- |
+| GET | `/api/v1/cron/jobs` | None | `CronJob[]` |
+| POST | `/api/v1/cron/jobs` | Full job definition below | `{ job: CronJob }` |
+| GET | `/api/v1/cron/jobs/:id` | None | `CronJob` |
+| PUT | `/api/v1/cron/jobs/:id` | Partial job definition | `{ job: CronJob }` |
+| DELETE | `/api/v1/cron/jobs/:id` | None | `{}` |
+| PUT | `/api/v1/cron/jobs/:id/enabled` | `{ enabled: boolean }` | `{ job: CronJob }` |
+| POST | `/api/v1/cron/jobs/:id/run` | None | `{ run: CronJobRun, activeAgents: number }` |
+| GET | `/api/v1/cron/jobs/:id/runs` | None | `CronJobRun[]` |
+| GET | `/api/v1/cron/runs` | None | `CronJobRun[]` |
+
+### Job request fields
+
+The create body requires `name`, `agentType`, `workingDir`, `promptMode`,
+`inputMode`, `scheduleType`, `enabled`, and `concurrencyPolicy`. Additional fields
+are required according to the selected prompt and schedule:
+
+| Field | Type / validation |
+| --- | --- |
+| `name` | String, 1–200 characters |
+| `agentType` | A supported session mode (including `shell`) |
+| `workingDir` | Existing, allowed working-directory path |
+| `launchCommand` | Optional single-line string, at most 2000 characters; for shell jobs |
+| `promptMode` | `inline_text` or `prompt_file_path` |
+| `promptText` | Required for `inline_text`; nonempty single-line string, at most 100000 characters |
+| `promptFilePath` | Required for `prompt_file_path`; absolute path inside `workingDir` to a regular file, at most 1 MiB, read when the job fires |
+| `inputMode` | `paste` or `typed` |
+| `scheduleType` | `once`, `interval`, `daily`, or `weekly` |
+| `runAt` | Required for `once`; positive integer Unix timestamp in milliseconds |
+| `intervalMinutes` | Required for `interval`; integer from 1 to 525600 |
+| `dailyTime` | Required for `daily`; `HH:MM` in server-local time |
+| `weeklyDays` | Required for `weekly`; 1–7 weekday integers, 0 (Sunday) through 6 (Saturday) |
+| `weeklyTime` | Required for `weekly`; `HH:MM` in server-local time |
+| `enabled` | Boolean |
+| `concurrencyPolicy` | `warn_only` or `skip_if_same_agent_running`; scheduled runs only |
+| `autoClosePreviousSession` | Optional boolean, default `true`; ignored for `once` |
+| `notes` | Optional string, at most 2000 characters |
+
+`PUT /jobs/:id` accepts any subset of these fields, then validates the merged job.
+When changing `promptMode` or `scheduleType`, supply the fields the new mode needs.
+`Run Now` works even when the job is disabled, bypasses the scheduled concurrency
+policy, and does not change the schedule. `activeAgents` counts live sessions of
+the same agent type, excluding sessions created by this job.
+For recurring jobs with `autoClosePreviousSession` enabled (the default), `Run Now`
+also closes the previous run's session before launching, even if it is still working.
+
+### Job and run response fields
+
+`CronJob` contains the request fields plus server-maintained `id`, optional
+`owner` (multi-user mode), `createdAt`, `updatedAt`, `lastRunAt`, `nextRunAt`,
+`lastStatus`, `lastDueKey`, and optional `completedOnce`. Times are Unix
+milliseconds; `lastRunAt`, `nextRunAt`, `lastStatus`, and `lastDueKey` can be `null`.
+`lastDueKey` is an opaque internal duplicate-launch guard, not a stable API format.
+
+`CronJobRun` contains `id`, `cronJobId`, nullable `sessionId` and `sessionName`,
+`startedAt`, nullable `finishedAt`, `status`, optional `errorMessage`,
+`triggerType` (`scheduled` or `manual_run_now`), and nullable `createdSessionUrl`.
+Run times are also Unix milliseconds. Status is one of `created`,
+`session_started`, `prompt_sent`, `failed`, or `skipped`.
+
+Prompt delivery continues asynchronously after session launch, so `Run Now` can
+return `session_started` before the prompt is sent. Read run history for subsequent
+updates, but do not assume a terminal status will follow: if the session is closed
+during the readiness wait or the server restarts before delivery, the run can remain
+`session_started` indefinitely with `finishedAt: null`.
+`finishedAt` refers to the launch/prompt-delivery attempt, **not completion
+of the agent's task**; `prompt_sent` does not prove that the task succeeded.
+
+In multi-user mode, list/history endpoints filter to accessible jobs. An unknown
+or inaccessible job returns `NOT_FOUND`. Job creation and updates can return
+`403 FORBIDDEN` for a working directory outside the owner's workspace or a shell /
+launch-command job without the required privilege grant. Invalid definitions or
+working directories return `INVALID_INPUT`; launch/delivery failures are recorded
+on the run, so inspect its `status` and `errorMessage` even after an HTTP success.
+
+See [Cron Jobs](wiki/Cron-Jobs.md) for the UI, scheduling, and prompt-file rules.
+See the [complete cron guide](cron-guide.md) for the `cron:runCreated` and
+`cron:runUpdated` SSE events.
 
 ## Long-polling (agent wait)
 
@@ -456,19 +544,30 @@ client that opens many concurrent waits against one session will still hit the c
 
 What a session's terminal shows, for a client to replay: `data.terminalBuffer`,
 with `source` (`mux-visible`, `mux-full-history` or `history`), `truncated`,
-`truncationReason`, `fullSize`, and `captureCols`/`captureRows` when the pane's
-geometry was read. The capture runs synchronous tmux calls on the server; the
+`truncationReason`, `fullSize`, `historyLinesCut` (a `lines=` bound left older
+lines in tmux, so the remainder is more than `fullSize - retainedBytes`), and
+`captureCols`/`captureRows` when the pane's geometry was read. `paneHistoryLines`
+(present when the body is a pane capture whose geometry was read, like
+`captureCols`/`captureRows`, and absent for a remote SSH session, whose local pane
+cannot see the remote history) is the number of scrollback rows tmux holds above the
+visible frame, which is the most a `full=1` request can add. `truncated` describes
+the byte stream instead: for a pane with `paneHistoryLines: 0` (a fullscreen CLI in
+the alternate screen) the bytes a `tail` cut dropped are earlier repaints that no
+request returns. The capture runs synchronous tmux calls on the server; the
 `Server-Timing` header reports `capture`, `prepare` and `total`.
 
 | Query | Meaning |
 |---|---|
 | `full=1` | tmux's scrollback, not only the visible frame (`source: 'mux-full-history'`), ending with a relative cursor move back to the pane's caret. |
 | `tail=<bytes>` | Keep the newest `<bytes>` of the result (`truncationReason: 'tail'` when it cut). |
-| `lines=<n>` | With `full=1` only: read at most `<n>` lines of tmux history above the visible frame. An integer of at least 1, clamped to the configured history limit; absent or malformed, the whole limit (100,000 lines by default), as before. `truncated` and `truncationReason` describe byte cuts only, not this bound. Without it a full capture reads all of that history before `tail` cuts it, so a client that keeps a fixed number of lines (the tile grid sends its xterm's scrollback plus its rows) should send it. |
+| `lines=<n>` | With `full=1` only: read at most `<n>` lines of tmux history above the visible frame. An integer of at least 1, clamped to the configured history limit; absent or malformed, the whole limit (100,000 lines by default), as before. When a bound below the configured limit left older lines in tmux (its `history_size` is deeper), `truncated` is true with `truncationReason: 'tail'`; a byte cap still reports `'capped'`. Without it a full capture reads all of that history before `tail` cuts it, so a client that keeps a fixed number of lines (the tile grid sends its xterm's scrollback plus its rows) should send it. |
+| `alt=recording` | With `full=1` only: if the pane is in the alternate screen (a nested tmux, where tmux keeps no history, or any full-screen app such as vim or less while it is open), answer with the visible frame over the byte recording instead (`source: 'mux-visible'`, `tail` applied as without `full=1`). Shells' automatic loads send it. |
 
 ## The `codeman agent` CLI (client over these endpoints)
 
-`codeman agent ls|spawn|send|wait|read|interrupt|rm` (`src/cli-agent.ts`) is the command-line client for the endpoints above, for agents in modes that never receive the claude-only skill preamble. It adds no route: `spawn` is `POST /api/v1/quick-start` (+ `wait-output` on the mode's `capabilities.composerReadyMark` from the CLI registry, where it declares one), `send` is `POST …/input` with `clientId`+`seq` (and `wait`/`waitTimeout` for `--wait` / `--until <signals>`; `delivered:false` without `duplicate` and `wait.ended` both exit 3 — the CLI never reports a dead worker as done), `wait` is `GET …/wait` (`--until`) or `GET …/wait-output` (`--match`, `from=buffer` by default), `read` is `GET …/last-response` or `GET …/terminal?tail=`, `interrupt` is `POST …/input` with a bare `\u001b`, `rm` is `DELETE …/sessions/:id`. `spawn --env` fills quick-start's `envOverrides` (allowlisted prefixes only), `--permission allow|ask` sets `OPENCODE_PERMISSION` (granular bash+edit), `--resume <id>` fills the mode's config resume field (`openCodeConfig.continueSession`, `codexConfig.resumeSessionId`, …; claude refused — quick-start has no resume field for it); `ls --alive` and `restore` probe with `GET …/wait?until=exit&timeout=1000` (an immediate `exit` is the only truthful death check), and `restore` then delegates to the host-local `codeman-restore-session` tool — a live worker is refused. A fire-and-forget `send` to a sleeping wake-on-LAN host reads the route's `buffered` (own line, exit 0) and `dropped` (exit 1: the chunk is gone). An id may be the 8-character form `ls` prints, resolved through `GET /api/v1/sessions`; anything shorter refuses before any request, the same floor as `PARENT_SESSION_ID_MIN_PREFIX`. Every call carries `X-Codeman-Parent-Session`; only `spawn`'s quick-start carries `X-Codeman-Agent-Origin: codeman-agent-cli` (the agent-scratch label must never reach a request that cannot create the case directory). Basic auth comes from `CODEMAN_PASSWORD` or the data dir's `.env`. Server-side error codes are shown verbatim (`INVALID_INPUT: until=stop …` on a hook-less mode is not hidden); exit codes are `0` ok, `1` error, `2` timeout, `3` the session exited, `4` refused by a client-side guard. See the README section "`codeman agent`" for the guards and `test/cli-agent.test.ts` for the pinned behaviour.
+`codeman agent ls|spawn|send|wait|read|interrupt|rm` (`src/cli-agent.ts`) is the command-line client for the endpoints above, for agents the skill does not reach (a pi or shell session, a machine without `jq`). It adds no route: `spawn` is `POST /api/v1/quick-start` (+ `wait-output` on the mode's `capabilities.composerReadyMark` from the CLI registry, where it declares one), `send` is `POST …/input` with `clientId`+`seq` (and `wait`/`waitTimeout` for `--wait` / `--until <signals>`; `delivered:false` without `duplicate` and `wait.ended` both exit 3 — the CLI never reports a dead worker as done), `wait` is `GET …/wait` (`--until`) or `GET …/wait-output` (`--match`, `from=buffer` by default), `read` is `GET …/last-response` or `GET …/terminal?tail=`, `interrupt` is `POST …/input` with a bare `\u001b`, `rm` is `DELETE …/sessions/:id`. `spawn --env` fills quick-start's `envOverrides` (allowlisted prefixes only), `--permission allow|ask` sets `OPENCODE_PERMISSION` (granular bash+edit), `--resume <id>` fills the mode's config resume field (`openCodeConfig.continueSession`, `codexConfig.resumeSessionId`, …; claude refused — quick-start has no resume field for it); `ls --alive` and `restore` probe with `GET …/wait?until=exit&timeout=1000` (an immediate `exit` is the only truthful death check), and `restore` then delegates to the host-local `codeman-restore-session` tool — a live worker is refused. A fire-and-forget `send` to a sleeping wake-on-LAN host reads the route's `buffered` (own line, exit 0) and `dropped` (exit 1: the chunk is gone). An id may be the 8-character form `ls` prints, resolved through `GET /api/v1/sessions`; anything shorter refuses before any request, the same floor as `PARENT_SESSION_ID_MIN_PREFIX`. Every call carries `X-Codeman-Parent-Session`; only `spawn`'s quick-start carries `X-Codeman-Agent-Origin: codeman-agent-cli` (the agent-scratch label must never reach a request that cannot create the case directory). Basic auth comes from `CODEMAN_PASSWORD` or the data dir's `.env`. Server-side error codes are shown verbatim (`INVALID_INPUT: until=stop …` on a hook-less mode is not hidden); exit codes are `0` ok, `1` error, `2` timeout, `3` the session exited, `4` refused by a client-side guard. See the README section "`codeman agent`" for the guards and `test/cli-agent.test.ts` for the pinned behaviour.
+
+`codeman mcp` (`src/mcp-server.ts`) is a Model Context Protocol server on stdio over the same endpoints, for MCP clients: `list_sessions` (`GET /api/v1/sessions`), `start_session` (`POST /api/v1/quick-start` with `X-Codeman-Agent-Origin: codeman-mcp`, then `wait-output` on the mode's ready mark), `send_prompt` (`POST …/input` with `wait`/`waitTimeout`), `wait_for_session` (`GET …/wait` or `…/wait-output`), `read_output` (`GET …/last-response` or `…/terminal?tail=`), `interrupt_session` and `delete_session`. It adds no route. The URL comes from `CODEMAN_API_URL` or `--url`, never a guess; prompting, interrupting and deleting are limited to sessions the process started (or the calling session's own children) unless it runs with `--allow-any-session`. See the README section "MCP server" and `test/mcp-server.test.ts`.
 
 ## Agent inbox (`/api/sessions/:id/inbox`)
 
@@ -502,6 +601,64 @@ Codeman host under a path the remote agent cannot read. A Docker session of an
 owned case is fine, its workspace is bind-mounted at the same absolute path; an
 adopted container (`owned: false`) mounts nothing, so its agent can open the file
 only if the container itself exposes that host path.
+
+The optional query flag `?kind=video` selects a second path for a camera-roll
+video: the file streams to disk instead of being buffered, under a far larger
+per-file cap (`MAX_PASTE_VIDEO_BYTES`, 1 GB by default, env
+`CODEMAN_MAX_PASTE_VIDEO_BYTES`), and only video container types are accepted
+(mp4, webm, mov, m4v, ogv, single-sourced from the file viewer's playable set).
+The container is checked from the first bytes as
+the body arrives; a file whose bytes do not match its declared type is unlinked
+and answered 415, one over the cap is unlinked and answered 413, and a transfer
+that dies midway leaves nothing behind. Because one video can be 1 GB,
+`?kind=video` draws on its own rate limit, 3 uploads per minute per (IP, session),
+beside the 30 per minute the image path keeps; without the flag the route is
+byte-identical to the image-only version, same 50 MB image cap and same 30/min
+bucket. The response shape is unchanged (`path`, `filename`).
+
+## Rendered HTML files
+
+An `.html`/`.htm` file renders as a page in a sandbox, in two steps
+(`src/web/routes/html-view-routes.ts`).
+
+**`POST /api/v1/sessions/:id/html-view`** with `{ "path": "<file>" }` (absolute,
+relative to the session's workspace, or `~/` for this host's home, which a Docker
+case refuses with `400` since its `~` is the container's; a non-empty string of at most 4096 characters
+without NUL or line breaks, and no other keys) answers `data: { url }`, a
+`/html-view/<cap>/<file>` URL. The capability grants GET access to the files under
+that file's own folder, so a page's relative CSS, scripts, images and data files
+resolve. It is held in memory only (a restart invalidates it), has a rolling TTL
+(`CODEMAN_WEBVIEW_CAPABILITY_TTL_MS`, default 12 h), is reused for the same folder,
+and is revoked on logout, admin logout and user deletion. Refusals:
+
+- `400`: an invalid body, a remote (SSH) session, or a file that is not HTML (the
+  symlink-resolved name counts too);
+- `404`: no such file;
+- `403`: a file outside the workspace that the attachment guard blocks (a blocked
+  tree, or `attachmentConfineToWorkspace` on), a file in a hidden directory (inside
+  the workspace, one below the workspace root), or a file directly in a folder too
+  broad to serve recursively: `/`, the home folder, `/tmp`, `/var/tmp`, `$TMPDIR`,
+  the cases and user-space roots, a drive's mount point (`/mnt/d`), or any folder
+  above one of those (`/home`, `/Users`).
+
+**`GET /html-view/:cap/*`** serves the page and its assets. It needs no cookie: the
+capability in the path is the credential, because the page runs in an opaque origin
+that never sends one. It is not under `/api`, so it has no `/api/v1` alias and no
+envelope. `GET` and `HEAD` only; a CORS preflight on a live capability is answered
+with `Access-Control-Allow-Methods: GET, HEAD`. What it serves: files under the
+capability's folder whose path (requested and symlink-resolved) has no dot segment
+and whose extension is on an asset allowlist (html, css, js/mjs, json, map, txt,
+csv, md, svg and common image, font, wasm, audio, video and PDF types), never
+outside the folder, never a blocked tree, and, for a folder outside the workspace,
+not while `attachmentConfineToWorkspace` is on. Every response carries
+`Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads`
+as its whole policy (never `allow-same-origin`, so the page cannot read Codeman's
+document, cookies or API, even opened as a top-level tab; and no fetch directive, so
+by the owner's decision the page may load from and send requests to any host), `Cache-Control: no-store`,
+`Referrer-Policy: no-referrer` and `Access-Control-Allow-Origin: *`. A `Range`
+request is answered with `206` + `Content-Range` (`416` past the end), like
+`file-raw`. Every refusal is a plain-text `404 Not found`; with a password set, an
+unknown or revoked capability is the auth hook's `401` instead.
 
 ## Session lineage (`parentSessionId`)
 
@@ -553,6 +710,52 @@ is display text from a pane or a CLI report: control characters are stripped and
 most 64 characters, but treat it as untrusted text. A `statusline` or `screen` value is
 persisted and restored after a server restart until the next report replaces it; a
 `config` value is read again at every pane start, attach and relaunch instead.
+
+## Prompt cache (`promptCache`)
+
+Claude-mode session state (`GET /api/v1/sessions`) carries the main conversation's
+prompt-cache state as Claude Code last reported it on the statusline (v2.1.251+), with a
+change-only `session:promptCache` event (`{ sessionId, ...promptCache }`):
+
+```json
+"promptCache": { "warm": true, "ttl": "1h", "expiresAt": 1791653039000, "recacheTokensIfCold": 45000, "misses": 2, "expectedRebuilds": 1, "hitRatio": 0.91, "lastMissCauses": ["ttl_expired_1h"], "compactedAt": 1791649439872 }
+```
+
+| Field                 | Meaning                                                                                                   |
+| --------------------- | --------------------------------------------------------------------------------------------------------- |
+| `warm`                | Whether the cached prefix is still within its TTL. The only field always present.                         |
+| `ttl`                 | `5m` or `1h`; absent when Claude reported neither.                                                         |
+| `expiresAt`           | Epoch MILLISECONDS when the prefix goes cold (the statusline reports seconds). Absent once cold.           |
+| `recacheTokensIfCold` | Tokens the next request re-writes if the cache has gone cold. Absent right after a compaction.             |
+| `misses`              | Requests that re-processed content the cache already held.                                                |
+| `expectedRebuilds`    | Cache rebuilds that followed a compaction or a clearing of old tool results.                               |
+| `hitRatio`            | Cache read tokens as a fraction of all input tokens this session, 0 to 1.                                  |
+| `lastMissCauses`      | Claude Code's diagnosis of the last miss (e.g. `ttl_expired_1h`, `tools_changed`); untrusted text.         |
+| `compactedAt`         | Epoch MILLISECONDS when the context was compacted or its old tool results cleared: the first warm report without `recacheTokensIfCold` after one that had it. Derived, not reported; dropped at the next request. |
+
+The whole object is absent until the first report, and restored after a server restart
+(so the readout is not blank until the pane's next render) rather than recomputed; a value
+whose `expiresAt` has passed reads as cold. The statusline re-runs when a warm cache hits
+`expiresAt`, so the cold flip arrives on its own. A post-`/clear` conversation switch drops
+it. Shown in Session Options → Respawn and, for sessions without a statusline of their own,
+as a `cache:until HH:MM` / `cache:cold` group in the terminal footer.
+
+Beside it, `statusLineExporter` says whether this launch carries the statusline exporter
+that sends the report, decided when the pane starts: `injected` (it does), `collection-off`
+(Plan Usage was off at launch), `workspace-statusline` (the workspace's
+`.claude/settings.local.json` sets its own `statusLine`, which Codeman never replaces) or
+`remote` (remote and Docker sessions). Absent when unknown.
+
+## Placing a new session in a tab group (`tabGroupId`)
+
+`POST /api/v1/sessions` and `POST /api/v1/quick-start` accept an optional
+`tabGroupId` (1 to 100 characters): the id of a group in the caller's tab layout
+(`GET /api/v1/tab-layout`). The session is created as usual and placed at the end
+of that group in the same layout write; the response then also carries the
+committed layout as `tabLayout`. An id the caller's layout does not contain (a
+deleted group, another user's group) is ignored and the session lands where it
+otherwise would, never a `400`. A malformed value (`null`, an empty string, a
+non-string) is a `400 INVALID_INPUT`. Requests without the field are unchanged.
 
 ## Approvals Inbox
 

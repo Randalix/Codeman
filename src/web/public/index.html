@@ -625,6 +625,7 @@
             <button class="btn-icon-sm" id="filePreviewNextBtn" onclick="app.stepFolderPreview(1)" title="Next file in folder (→)" aria-label="Next file in folder" hidden>&rsaquo;</button>
             <button class="btn-icon-sm" id="filePreviewFolderBtn" onclick="app.openFolderOfPreview()" title="Show folder" aria-label="Show folder" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></button>
             <button class="btn-icon-sm file-preview-pill" id="filePreviewMdBtn" onclick="app.toggleFilePreviewMd()" title="Rendered markdown" aria-label="Rendered markdown" aria-pressed="true" hidden>MD</button>
+            <button class="btn-icon-sm file-preview-pill" id="filePreviewPageBtn" onclick="app.toggleFilePreviewPage()" title="Rendered page" aria-label="Rendered page" aria-pressed="true" hidden>Page</button>
             <button class="btn-icon-sm" id="filePreviewLinesBtn" onclick="app.toggleFilePreviewLines()" title="Line numbers" aria-label="Line numbers" aria-pressed="false" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="10" y1="6" x2="21" y2="6"/><line x1="10" y1="12" x2="21" y2="12"/><line x1="10" y1="18" x2="21" y2="18"/><path d="M4 6h1v4"/><path d="M4 10h2"/><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"/></svg></button>
             <button class="btn-icon-sm" id="filePreviewWrapBtn" onclick="app.toggleFilePreviewWrap()" title="Wrap lines" aria-label="Wrap lines" aria-pressed="true" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="3" y1="6" x2="21" y2="6"/><path d="M3 12h15a3 3 0 1 1 0 6h-4"/><polyline points="16 16 14 18 16 20"/><line x1="3" y1="18" x2="10" y2="18"/></svg></button>
             <button class="btn-icon-sm file-preview-edit-btn" id="filePreviewEditBtn" onclick="app.enterFilePreviewEdit()" title="Edit file" aria-label="Edit file" hidden><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5z"/></svg></button>
@@ -783,6 +784,21 @@
             </div>
           </div>
           <!-- Mobile-only case button + gear -->
+          <!-- Phone-only Attach (wired in image-input.js): the button opens its own file input,
+               which sits invisibly over the button so iOS anchors the picker popover to it. The
+               Compose dialog is deliberately not involved: it focuses its textarea, which raises
+               the keyboard under the picker sheet. Sits BEFORE the mic so the two share order: 5
+               and source order keeps Attach on the left. -->
+          <span class="btn-attach-mobile-wrap">
+            <button type="button" class="btn-attach-mobile" id="attachBtnMobile" title="Attach" aria-label="Attach">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="2"/>
+                <circle cx="8.5" cy="8.5" r="1.5"/>
+                <path d="m21 15-5-5L5 21"/>
+              </svg>
+            </button>
+            <input type="file" class="btn-attach-mobile-input" id="attachFileInput" accept="image/*,video/*" multiple tabindex="-1" aria-hidden="true">
+          </span>
           <button class="btn-voice-mobile" id="voiceInputBtnMobile" onclick="VoiceInput.toggle()"
                   title="Voice input" aria-label="Start voice input" aria-pressed="false">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -895,6 +911,7 @@
               <div><kbd>Alt/Option</kbd>+<kbd>Shift</kbd>+<kbd>Arrows</kbd></div><div>Focus Tile Left / Right / Up / Down</div>
               <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Arrows</kbd></div><div>Move Tile Left / Right / Up / Down</div>
               <div><kbd>Drag</kbd> a tile's header</div><div>Move the Tile (onto Another: Swap)</div>
+              <div><kbd>Drag</kbd> a tile's header out of the window</div><div>Open the Tile in Its Own Window (Detach Tiles)</div>
               <div><kbd>Alt/Option</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd></div><div>Zoom Focused Tile</div>
               <div><kbd>Ctrl/Cmd</kbd>+<kbd>Click</kbd> a tab</div><div>Add the Session to the Tile Grid</div>
               <div><kbd>Right-click</kbd> the Tiles button</div><div>Choose How Many Tiles (2, 4 or 6)</div>
@@ -1321,6 +1338,22 @@
               <!-- Hidden wholesale for non-claude sessions and for a session with
                    no live process (session-ui.js: openSessionOptions). -->
               <div id="sessionRespawnSection">
+                <!-- Claude Code (v2.1.251+) reports the main conversation's prompt-cache
+                     state on the statusline; the exporter keeps it per session and this
+                     row shows it live (session-ui.js: updatePromptCacheStatus). -->
+                <div class="set-group">
+                  <div class="set-group-head"><h4>Prompt cache</h4></div>
+                  <p class="set-group-hint">While the cached conversation is warm, a turn re-reads it at the cheap cached rate. Once it sits idle past the cache lifetime, the next turn re-processes the whole context at the cache-write rate.</p>
+                  <div class="set-group-body">
+                    <div class="set-row">
+                      <div class="set-row-text">
+                        <span class="set-row-label">Status</span>
+                        <span class="set-row-desc" id="promptCacheStatus" data-i18n-skip>Not reported yet.</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
                 <div class="set-group">
                   <div class="set-group-head"><h4>Loop control</h4></div>
                   <div class="set-group-body">
@@ -1440,6 +1473,16 @@
                     <div class="set-row-actions">
                       <span id="modalSessionPrefix" class="set-static" style="display: none; white-space: nowrap;"></span>
                       <input type="text" id="modalSessionName" class="set-input" maxlength="128" placeholder="Auto (directory name)" onblur="app.saveSessionName()">
+                    </div>
+                  </div>
+                  <div class="set-row set-row-block">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Working folder</span>
+                      <span class="set-row-desc" id="modalSessionPathDesc">Where this session's CLI runs, on the machine hosting Codeman.</span>
+                    </div>
+                    <div class="set-row-actions">
+                      <code id="modalSessionPath" class="set-static mono" style="flex: 1; min-width: 0; word-break: break-all; user-select: all;"></code>
+                      <button type="button" class="btn-toolbar btn-sm" id="modalSessionPathCopy" onclick="app.copySessionPath()">Copy</button>
                     </div>
                   </div>
                   <div class="set-row set-row-block">
@@ -2268,6 +2311,13 @@
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsShowTabDetachButton"><span class="slider"></span></label>
                   </div>
+                  <div class="set-row" id="appSettingsTileDetachItem" data-search="detach tiles tile pop out window drag move another window">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Detach Tiles <span class="set-tag">desktop</span> <span class="set-tag set-tag-beta">beta</span></span>
+                      <span class="set-row-desc">Drag a tile's header out of the browser to open it in its own window, or onto another Codeman window's tiles to move it there. A popped-out window's title drags back onto tiles.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsTileDetach"><span class="slider"></span></label>
+                  </div>
                   <div class="set-row" id="appSettingsLineageLinesItem" data-search="lineage lines spawned worker parent connection">
                     <div class="set-row-text">
                       <span class="set-row-label">Spawn Lineage Lines <span class="set-tag">desktop</span></span>
@@ -2281,6 +2331,13 @@
                       <span class="set-row-desc">Title a new tab after its first prompt, keeping the case prefix. Renamed tabs are never touched.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsAutoNameSessions"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" id="appSettingsSpawnedTabsFollowParentItem" data-search="spawned child session follow parent tab group lineage move">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Spawned Tabs Follow Their Parent <span class="set-tag">synced</span></span>
+                      <span class="set-row-desc">A session started by another one keeps following its parent's tab into its group and moves with it, until you move it by hand. Off: it starts next to its parent and stays where it is.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsSpawnedTabsFollowParent"><span class="slider"></span></label>
                   </div>
                   <div class="set-row" id="appSettingsMobileOverviewItem" data-search="overview home screen phone logo">
                     <div class="set-row-text">
@@ -2632,6 +2689,19 @@
                 </div>
               </div>
 
+              <div class="set-group" id="agentSkillGroup">
+                <div class="set-group-head"><h4>All agent CLIs</h4><span class="set-scope">synced</span></div>
+                <div class="set-group-body">
+                  <div class="set-row" data-search="agent skill codeman api workers codex gemini opencode pi grok deepseek omp antigravity">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Codeman Agent Skill</span>
+                      <span class="set-row-desc">Write Codeman's agent skill into each new session's folder, where that CLI looks for skills, so the agent in it can start workers in any installed CLI, send them prompts and wait for results. Every CLI except Pi and a plain shell.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentSkill"><span class="slider"></span></label>
+                  </div>
+                </div>
+              </div>
+
               <div class="set-group">
                 <div class="set-group-head"><h4>Claude</h4><span class="set-scope">synced</span></div>
                 <div class="set-group-body">
@@ -2667,13 +2737,6 @@
                       <span class="set-row-desc">Experimental multi-agent teams for all new Claude sessions.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentTeams"><span class="slider"></span></label>
-                  </div>
-                  <div class="set-row" data-search="agent skill codeman api workers">
-                    <div class="set-row-text">
-                      <span class="set-row-label">Codeman Agent Skill</span>
-                      <span class="set-row-desc">Let new sessions start workers, send prompts and wait for results over the API.</span>
-                    </div>
-                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentSkill"><span class="slider"></span></label>
                   </div>
                   <div class="set-row" data-search="workspace hooks alerts approvals notifications settings.local.json">
                     <div class="set-row-text">
