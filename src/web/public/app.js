@@ -285,6 +285,9 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.IMAGE_DETECTED, '_onImageDetected'],
   [SSE_EVENTS.ATTACHMENT_DETECTED, '_onAttachmentDetected'],
 
+  // Edit history (edit-history-ui.js)
+  [SSE_EVENTS.EDIT_HISTORY_UPDATED, '_onEditHistoryUpdated'],
+
   // Tunnel
   [SSE_EVENTS.TUNNEL_STARTED, '_onTunnelStarted'],
   [SSE_EVENTS.TUNNEL_STOPPED, '_onTunnelStopped'],
@@ -9553,6 +9556,8 @@ class CodemanApp {
     // Remote-host reachability banner: only meaningful for a remote session, so this
     // also clears it when the newly active tab is local.
     this.refreshHostWakeBanner?.(sessionId);
+    // An open Edit history panel follows the active session (edit-history-ui.js; no poll).
+    this.onEditHistoryActiveSession?.(sessionId);
 
     // Restore flushed offset AND text IMMEDIATELY so backspace/typing work during
     // the async buffer load.  Without this, the offset is 0 during the

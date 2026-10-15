@@ -91,6 +91,8 @@ interface SessionListenerDeps {
   updateSessionName(sessionId: string, name: string): boolean;
   /** The synced `autoNameSessions` setting, read fresh so a flip applies to the next prompt. */
   isAutoNameEnabled(): Promise<boolean>;
+  /** A remote claude's edit history, read when a turn ends (no hooks reach back from a remote host). */
+  refreshEditHistory(session: Session): void;
 }
 
 /**
@@ -257,6 +259,10 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
     idle: () => {
       sessionWaits.notifySignal(session.id, 'idle');
       deps.broadcast(SseEvent.SessionIdle, { id: session.id });
+      // A remote host sends no hooks, so a turn end is when its edit history is read (the
+      // server ignores local sessions here). `idle` also fires once when a pane becomes ready;
+      // that read is harmless, and like every edit history read it never wakes a host.
+      deps.refreshEditHistory(session);
       deps.broadcastSessionStateDebounced(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
       if (tracker) {

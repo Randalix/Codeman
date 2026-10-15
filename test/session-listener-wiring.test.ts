@@ -62,6 +62,24 @@ describe('session listener wiring', () => {
     expect(session.listenerCount('displayModelChanged')).toBe(0);
   });
 
+  it("reads a remote claude's edit history when its pane goes idle (no hooks reach back from a remote host)", () => {
+    const session = new Session({ id: 'wiring-idle-edit-history', workingDir: '/tmp', mode: 'claude' });
+    const refreshEditHistory = vi.fn();
+    const deps = {
+      refreshEditHistory,
+      broadcast: vi.fn(),
+      broadcastSessionStateDebounced: vi.fn(),
+      getRunSummaryTracker: () => undefined,
+    } as unknown as Parameters<typeof createSessionListeners>[1];
+
+    const refs = createSessionListeners(session, deps);
+    attachSessionListeners(session, refs);
+    session.emit('idle');
+
+    expect(refreshEditHistory).toHaveBeenCalledWith(session);
+    detachSessionListeners(session, refs);
+  });
+
   /** The listener reads the setting asynchronously; let its promise chain settle. */
   const flush = () => new Promise((resolve) => setTimeout(resolve, 5));
 

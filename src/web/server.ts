@@ -112,6 +112,11 @@ import { sessionWaits } from './session-wait-registry.js';
 import { intentStore } from '../intent-store.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
+import { remoteProbePaths, remoteReadClaudeEditSources } from '../remote-files.js';
+import { EditHistorySync } from './edit-history-sync.js';
+import { EditHistoryStore } from '../edit-history-store.js';
+import { probeLocalPaths, readLocalClaudeEditSources } from '../edit-history-local-source.js';
+import { remoteTmuxLocation } from '../tmux-manager.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -188,6 +193,7 @@ import {
   registerRebootRestoreRoutes,
   registerReadMyMindRoutes,
   registerGitStatusRoutes,
+  registerEditHistoryRoutes,
   registerStatusTelemetryRoutes,
   registerSystemRoutes,
   registerCaseRoutes,
@@ -234,6 +240,9 @@ const CUSTOM_MODEL_REDISCOVER_INTERVAL_MS = 5 * 60_000;
 // minutes. Cheap either way — one /running GET per distinct endpoint with at least
 // one live custom-model session, not per session.
 const CUSTOM_MODEL_SWAP_CHECK_INTERVAL_MS = 20_000;
+/** Tools whose end can mean changed files for the edit history (Agent: a subagent's edits). */
+const EDIT_HISTORY_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash', 'Agent']);
+const EDIT_HISTORY_DEBOUNCE_MS = 500;
 
 function escapeHtmlText(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -304,6 +313,21 @@ function getOrCreateSelfSignedCert(): { key: string; cert: string } {
 export class WebServer extends EventEmitter {
   private app: FastifyInstance;
   private sessions: Map<string, Session> = new Map();
+  /**
+   * The edit history panel's reader (edit-history-sync.ts). Runs on occasions only: a local
+   * session's Edit/Write/Bash/Agent tool end, a remote one going `idle`, a panel request.
+   */
+  private readonly editHistorySync = new EditHistorySync({
+    readLocal: (ids, requests, budget) => readLocalClaudeEditSources(ids, requests, budget),
+    readRemote: (remote, ids, requests, budget, sessionId) =>
+      remoteReadClaudeEditSources(remote, ids, requests, budget, remoteTmuxLocation(remote, sessionId)),
+    probeLocal: probeLocalPaths,
+    probeRemote: remoteProbePaths,
+    loadStore: (sessionId) => EditHistoryStore.load(sessionId),
+    onUpdated: (sessionId, added) => this.broadcast(SseEvent.EditHistoryUpdated, { sessionId, added }),
+  });
+  /** Debounces a local session's edit-history sync after a burst of tool ends. */
+  private editHistoryTimers = new Map<string, NodeJS.Timeout>();
   private respawnControllers: Map<string, RespawnController> = new Map();
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
   private runSummaryTrackers: Map<string, RunSummaryTracker> = new Map();
@@ -1150,6 +1174,7 @@ export class WebServer extends EventEmitter {
     registerRebootRestoreRoutes(this.app, ctx);
     registerReadMyMindRoutes(this.app, ctx);
     registerGitStatusRoutes(this.app, ctx);
+    registerEditHistoryRoutes(this.app, ctx, this.editHistorySync);
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx);
@@ -1226,6 +1251,7 @@ export class WebServer extends EventEmitter {
           isError,
           timestamp: Date.now(),
         });
+        this.noteEditHistoryTool(sessionId, toolName);
       });
 
       watcher.on('transcript:error', (error: Error) => {
@@ -1262,6 +1288,24 @@ export class WebServer extends EventEmitter {
     } catch (err) {
       console.warn(`[IntentStore] Capture failed for session ${sessionId}:`, err);
     }
+  }
+
+  /**
+   * A local session's tool ended: if it can have changed files (an edit, a Bash call that may
+   * have rendered an image, a subagent run), read its edit history after a short quiet spell.
+   * Remote sessions have no transcript watcher; they sync when they go `idle` instead.
+   */
+  private noteEditHistoryTool(sessionId: string, toolName: string): void {
+    if (!EDIT_HISTORY_TOOLS.has(toolName)) return;
+    clearTimeout(this.editHistoryTimers.get(sessionId));
+    this.editHistoryTimers.set(
+      sessionId,
+      setTimeout(() => {
+        this.editHistoryTimers.delete(sessionId);
+        const session = this.sessions.get(sessionId);
+        if (session && !session.remote) void this.editHistorySync.sync(session);
+      }, EDIT_HISTORY_DEBOUNCE_MS)
+    );
   }
 
   /**
@@ -1469,6 +1513,15 @@ export class WebServer extends EventEmitter {
 
     // Stop transcript watcher
     this.stopTranscriptWatcher(sessionId);
+
+    // Edit history: forget the pending sync; a killed session takes its history with it
+    clearTimeout(this.editHistoryTimers.get(sessionId));
+    this.editHistoryTimers.delete(sessionId);
+    if (killMux) {
+      void this.editHistorySync.remove(sessionId).catch((err) => {
+        console.warn(`[EditHistory] Removing history of ${sessionId} failed:`, getErrorMessage(err));
+      });
+    }
 
     // Stop and remove run summary tracker
     const summaryTracker = this.runSummaryTrackers.get(sessionId);
@@ -1952,6 +2005,9 @@ export class WebServer extends EventEmitter {
       // Opt-in: the first prompt lands in the tab name, mux-sessions.json, every
       // session:updated broadcast and /api/search, so it is a choice, not a default.
       isAutoNameEnabled: async () => (await this.readSettings()).autoNameSessions === true,
+      refreshEditHistory: (session: Session) => {
+        if (session.remote) void this.editHistorySync.sync(session);
+      },
     };
   }
 
@@ -4154,6 +4210,11 @@ export class WebServer extends EventEmitter {
     this.respawnTimers.clear();
     this.runSummaryTrackers.clear();
     this.transcriptWatchers.clear();
+    for (const timer of this.editHistoryTimers.values()) clearTimeout(timer);
+    this.editHistoryTimers.clear();
+    await this.editHistorySync.flushAll().catch((err) => {
+      console.warn('[EditHistory] Saving on shutdown failed:', getErrorMessage(err));
+    });
     this.sessionListenerRefs.clear();
     this.scheduledRuns.clear();
     // Dispose StaleExpirationMaps (stops internal cleanup timers)
