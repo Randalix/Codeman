@@ -27,6 +27,9 @@ import {
   buildRemoteClaudeTranscriptTailCommand,
   parseRemoteClaudeTranscriptTail,
   remoteReadClaudeTranscriptTail,
+  buildRemoteClaudeEditSourcesCommand,
+  parseRemoteClaudeEditSources,
+  remoteReadClaudeEditSources,
   parseRemoteProbeRecord,
   parseRemoteProbeOutput,
   remoteProbePaths,
@@ -494,5 +497,230 @@ describe('parseRemoteClaudeTranscriptTail', () => {
   it('is null when the protocol markers are missing', () => {
     expect(parseRemoteClaudeTranscriptTail('Welcome to host')).toBeNull();
     expect(parseRemoteClaudeTranscriptTail('\0id-without-terminator')).toBeNull();
+  });
+});
+
+/** One edit-source record in the script's wire format. */
+function editRecord(relPath: string, size: number, start: number, body: Buffer | string): Buffer {
+  const bytes = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  return Buffer.concat([Buffer.from(`${relPath}\0${size}\0${start}\0${bytes.length}\0`), bytes]);
+}
+
+describe('buildRemoteClaudeEditSourcesCommand', () => {
+  it('runs under an explicit sh and never calls ls', () => {
+    const command = buildRemoteClaudeEditSourcesCommand(['conv-1'], [], 1024);
+    expect(command).toMatch(/^sh -c '/);
+    expect(command).not.toMatch(/(^|[\s;|(])ls\s/m);
+  });
+
+  it('drops ids that are not plain tokens (exit 3 when none is left)', () => {
+    expect(buildRemoteClaudeEditSourcesCommand(['$(touch pwned)', "a'b", '../../x'], [], 10)).toBe('exit 3');
+    const command = buildRemoteClaudeEditSourcesCommand(['$(touch pwned)', 'conv-1'], [], 10);
+    expect(command).toContain('conv-1');
+    expect(command).not.toContain('pwned');
+  });
+
+  it('ignores invalid relPaths, offsets and lengths', () => {
+    const command = buildRemoteClaudeEditSourcesCommand(
+      ['conv-1'],
+      [
+        { relPath: '../../etc/passwd', offset: 0 },
+        { relPath: "subagents/agent-a';touch x;'.jsonl", offset: 0 },
+        { relPath: 'subagents/agent-neg.jsonl', offset: -1 },
+        { relPath: 'subagents/agent-frac.jsonl', offset: 1.5 },
+        { relPath: 'subagents/agent-nan.jsonl', offset: Number.NaN },
+        { relPath: 'subagents/agent-badlen.jsonl', offset: 0, len: -5 },
+        { relPath: 'subagents/agent-ok.jsonl', offset: 7, len: 3 },
+        { relPath: 'subagents/agent-ok.jsonl', offset: 99 },
+      ],
+      100
+    );
+    expect(command).not.toMatch(/passwd|touch|agent-neg|agent-frac|agent-nan|agent-badlen/);
+    // First request per relPath wins.
+    expect(command).toContain('agent-ok.jsonl');
+    expect(command).toContain('r 7 3');
+    expect(command).not.toContain('r 99');
+  });
+});
+
+describe('parseRemoteClaudeEditSources', () => {
+  it('splits several records byte-exactly and keeps a UTF-8 sequence cut at a chunk edge intact as bytes', () => {
+    const euro = Buffer.from('a€', 'utf8'); // 61 e2 82 ac
+    const stdout = Buffer.concat([
+      Buffer.from('banner from .zshrc\n\0conv-1\0'),
+      editRecord('main', 10, 6, euro.subarray(0, 3)), // ends mid-€
+      editRecord('subagents/agent-x1.jsonl', 4, 0, '{}\n\0'),
+      editRecord('subagents/agent-x1.meta.json', 23, 0, '{"agentType":"Explore"}'),
+    ]);
+    const parsed = parseRemoteClaudeEditSources(stdout);
+    expect(parsed?.transcriptId).toBe('conv-1');
+    expect(parsed?.files).toHaveLength(2);
+    expect(parsed?.files[0]).toMatchObject({ relPath: 'main', size: 10, startOffset: 6 });
+    expect(parsed?.files[0].chunk.equals(euro.subarray(0, 3))).toBe(true);
+    expect(parsed?.files[1].chunk.equals(Buffer.from('{}\n\0'))).toBe(true);
+    expect(parsed?.metas).toEqual({ x1: '{"agentType":"Explore"}' });
+  });
+
+  it('accepts a zero-length record (budget used up) and a header with no records', () => {
+    const parsed = parseRemoteClaudeEditSources(
+      Buffer.concat([Buffer.from('\0conv-1\0'), editRecord('main', 500, 500, '')])
+    );
+    expect(parsed?.files).toEqual([{ relPath: 'main', size: 500, startOffset: 500, chunk: Buffer.alloc(0) }]);
+    expect(parseRemoteClaudeEditSources(Buffer.from('\0conv-1\0'))).toEqual({
+      transcriptId: 'conv-1',
+      files: [],
+      metas: {},
+    });
+  });
+
+  it('is null when the protocol is broken', () => {
+    expect(parseRemoteClaudeEditSources(Buffer.from('no nul at all'))).toBeNull();
+    expect(parseRemoteClaudeEditSources(Buffer.from('\0conv-1'))).toBeNull();
+    expect(parseRemoteClaudeEditSources(Buffer.from('\0bad id\0'))).toBeNull();
+    // Body shorter than declared.
+    expect(parseRemoteClaudeEditSources(Buffer.from('\0conv-1\0main\x0010\x000\x005\x00abc'))).toBeNull();
+    // Truncated header.
+    expect(parseRemoteClaudeEditSources(Buffer.from('\0conv-1\0main\x0010\x00'))).toBeNull();
+    // Non-numeric size, unknown relPath, slice outside the file.
+    expect(parseRemoteClaudeEditSources(Buffer.from('\0conv-1\0main\0x\x000\x000\0'))).toBeNull();
+    expect(
+      parseRemoteClaudeEditSources(Buffer.concat([Buffer.from('\0conv-1\0'), editRecord('../x', 1, 0, 'a')]))
+    ).toBeNull();
+    expect(
+      parseRemoteClaudeEditSources(Buffer.concat([Buffer.from('\0conv-1\0'), editRecord('main', 2, 1, 'ab')]))
+    ).toBeNull();
+  });
+});
+
+describe('the remote claude edit-sources script on a real shell', () => {
+  let home: string;
+  const project = () => join(home, '.claude', 'projects', 'p');
+  const subagents = () => join(project(), 'conv-1', 'subagents');
+
+  beforeAll(() => {
+    // A throwaway HOME: the script only ever sees this directory as $HOME.
+    home = mkdtempSync(join(tmpdir(), 'codeman-remote-edit-sources-'));
+    mkdirSync(project(), { recursive: true });
+    writeFileSync(join(project(), 'conv-1.jsonl'), 'main-0123456789\n');
+    writeFileSync(join(project(), 'solo.jsonl'), 'solo €uro\n');
+  });
+  afterAll(() => rmSync(home, { recursive: true, force: true }));
+
+  const run = (ids: string[], requests: Parameters<typeof buildRemoteClaudeEditSourcesCommand>[1], budget: number) => {
+    expect(home.startsWith(tmpdir())).toBe(true);
+    const env = { ...process.env, HOME: home };
+    try {
+      return {
+        code: 0,
+        stdout: execFileSync('sh', ['-c', buildRemoteClaudeEditSourcesCommand(ids, requests, budget)], { env }),
+      };
+    } catch (err) {
+      const e = err as { status: number; stdout: Buffer };
+      return { code: e.status, stdout: e.stdout };
+    }
+  };
+  const text = (chunk: Buffer | undefined) => chunk?.toString('utf8');
+
+  it('reads a transcript that has no subagents folder (tail of the file, budget-capped)', () => {
+    const { code, stdout } = run(['missing', 'solo'], [], 6);
+    expect(code).toBe(0);
+    const parsed = parseRemoteClaudeEditSources(stdout);
+    const size = Buffer.byteLength('solo €uro\n');
+    expect(parsed?.transcriptId).toBe('solo');
+    expect(parsed?.files).toHaveLength(1);
+    expect(parsed?.files[0]).toMatchObject({ relPath: 'main', size, startOffset: size - 6 });
+    expect(parsed?.files[0].chunk.equals(Buffer.from('solo €uro\n').subarray(size - 6))).toBe(true);
+    expect(parsed?.metas).toEqual({});
+  });
+
+  it('exits 3 when no id has a transcript', () => {
+    expect(run(['nope'], [], 100).code).toBe(3);
+  });
+
+  describe('with subagents', () => {
+    beforeAll(() => {
+      mkdirSync(subagents(), { recursive: true });
+      writeFileSync(join(subagents(), 'agent-a1.jsonl'), 'AAAAAAAAAA');
+      writeFileSync(join(subagents(), 'agent-a1.meta.json'), '{"agentType":"Explore"}');
+      writeFileSync(join(subagents(), 'agent-b2.jsonl'), 'BBBBB');
+      writeFileSync(join(subagents(), 'agent-bad name.jsonl'), 'never read');
+    });
+
+    it('continues from the stored offsets and reads new subagents with their meta', () => {
+      const parsed = parseRemoteClaudeEditSources(
+        run(
+          ['conv-1'],
+          [
+            { relPath: 'main', offset: 5 },
+            { relPath: 'subagents/agent-b2.jsonl', offset: 2, len: 2 },
+          ],
+          1000
+        ).stdout
+      );
+      expect(parsed?.files.map((file) => [file.relPath, file.size, file.startOffset, text(file.chunk)])).toEqual([
+        ['main', 16, 5, '0123456789\n'],
+        ['subagents/agent-a1.jsonl', 10, 0, 'AAAAAAAAAA'],
+        ['subagents/agent-b2.jsonl', 5, 2, 'BB'],
+      ]);
+      // b2 had a request, so it is not new: only a1's meta is sent.
+      expect(parsed?.metas).toEqual({ a1: '{"agentType":"Explore"}' });
+    });
+
+    it('reads nothing past the end and clamps an offset beyond a truncated file', () => {
+      const parsed = parseRemoteClaudeEditSources(
+        run(
+          ['conv-1'],
+          [
+            { relPath: 'main', offset: 16 },
+            { relPath: 'subagents/agent-a1.jsonl', offset: 10 },
+            { relPath: 'subagents/agent-b2.jsonl', offset: 50 },
+          ],
+          1000
+        ).stdout
+      );
+      expect(parsed?.files.map((file) => [file.relPath, file.size, file.startOffset, file.chunk.length])).toEqual([
+        ['main', 16, 16, 0],
+        ['subagents/agent-a1.jsonl', 10, 10, 0],
+        ['subagents/agent-b2.jsonl', 5, 5, 0],
+      ]);
+      expect(parsed?.metas).toEqual({});
+    });
+
+    it('shares one budget across files and still reports the size of files it could not read', () => {
+      const parsed = parseRemoteClaudeEditSources(run(['conv-1'], [{ relPath: 'main', offset: 0 }], 20).stdout);
+      expect(parsed?.files.map((file) => [file.relPath, file.size, file.startOffset, text(file.chunk)])).toEqual([
+        ['main', 16, 0, 'main-0123456789\n'],
+        // 4 bytes left: the newest 4 of a1.
+        ['subagents/agent-a1.jsonl', 10, 6, 'AAAA'],
+        // Budget exhausted: a zero-length record carrying the size.
+        ['subagents/agent-b2.jsonl', 5, 5, ''],
+      ]);
+      // Metas sit outside the budget.
+      expect(Object.keys(parsed?.metas ?? {}).sort()).toEqual(['a1']);
+    });
+
+    it('treats a hostile request as data: it never reaches the shell', () => {
+      const marker = join(home, 'pwned');
+      const parsed = parseRemoteClaudeEditSources(
+        run(['conv-1'], [{ relPath: `subagents/agent-x.jsonl'; touch ${marker}; '`, offset: 0 }], 1000).stdout
+      );
+      expect(existsSync(marker)).toBe(false);
+      expect(parsed?.files.map((file) => file.relPath)).toEqual([
+        'main',
+        'subagents/agent-a1.jsonl',
+        'subagents/agent-b2.jsonl',
+      ]);
+    });
+  });
+
+  it('refuses to open a connection under test', async () => {
+    await expect(
+      remoteReadClaudeEditSources(
+        { hostId: 'h', label: 'h', host: '192.0.2.1', username: 'j', remotePath: '/' },
+        ['a'],
+        [],
+        10
+      )
+    ).rejects.toBeInstanceOf(RemoteFileAccessError);
   });
 });
