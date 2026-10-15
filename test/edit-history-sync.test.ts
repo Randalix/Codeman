@@ -243,6 +243,25 @@ describe('EditHistorySync', () => {
     expect(host.calls).toHaveLength(2); // the first run + one folded follow-up
   });
 
+  it('drops the queued run after an unreachable host: callers wait one timeout, not two', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let calls = 0;
+    const { sync } = setup({
+      readRemote: async () => {
+        calls++;
+        await gate;
+        throw new RemoteFileAccessError('ssh: connect to host huff port 22: Connection timed out');
+      },
+    });
+    const runs = [sync.sync(remote), sync.sync(remote)];
+    release();
+    const [a, b] = await Promise.all(runs);
+    expect(calls).toBe(1);
+    expect(a.state).toBe('unavailable');
+    expect(b.state).toBe('unavailable');
+  });
+
   it('loads older blocks on request', async () => {
     const { host, sync } = setup({ budget: 400 });
     for (let i = 0; i < 4; i++) host.append('main', editLine(`t${i}`, T0 + i, `/w/${i}.ts`));

@@ -196,6 +196,9 @@ export class EditHistorySync {
     let next: boolean | null = older;
     while (next !== null) {
       await this.runOnce(session, next);
+      // An unreachable host is not back a moment later: a queued run would only wait out
+      // another connect timeout (and keep its callers waiting for it).
+      if (slot.status.state === 'unavailable') slot.again = undefined;
       next = slot.again ? slot.again.older : null;
       slot.again = undefined;
     }
