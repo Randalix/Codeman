@@ -637,6 +637,52 @@ describe('the remote claude edit-sources script on a real shell', () => {
     expect(run(['nope'], [], 100).code).toBe(3);
   });
 
+  describe('after a /clear: the conversation the pane’s claude writes now', () => {
+    // Fake tmux (pane pid 100) and ps (100 → 200 wrapper → 300 claude); claude's own
+    // ~/.claude/sessions/<pid>.json names the current conversation.
+    let bin: string;
+    const pane = { socket: 'codeman-remote', sessionName: 'codeman-ssh-conv1abc' };
+    beforeAll(() => {
+      bin = mkdtempSync(join(tmpdir(), 'codeman-fake-tmux-'));
+      writeFileSync(
+        join(bin, 'tmux'),
+        '#!/bin/sh\ncase "$*" in *"=codeman-ssh-conv1abc"*) echo 100 ;; *) echo "no such session" >&2; exit 1 ;; esac\n'
+      );
+      writeFileSync(join(bin, 'ps'), '#!/bin/sh\nprintf "  1     0\\n100     1\\n200   100\\n300   200\\n"\n');
+      chmodSync(join(bin, 'tmux'), 0o755);
+      chmodSync(join(bin, 'ps'), 0o755);
+      mkdirSync(join(home, '.claude', 'sessions'), { recursive: true });
+    });
+    afterAll(() => rmSync(bin, { recursive: true, force: true }));
+    const runIn = (p: typeof pane | undefined, ids = ['conv-1']) => {
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+      const out = execFileSync('sh', ['-c', buildRemoteClaudeEditSourcesCommand(ids, [], 100, p)], { env, cwd: bin });
+      return parseRemoteClaudeEditSources(out)?.transcriptId;
+    };
+    const session = (body: string) => writeFileSync(join(home, '.claude', 'sessions', '300.json'), body);
+
+    it('reads the live conversation of a grandchild claude before the stored ids', () => {
+      session('{"pid":300,"sessionId":"solo","cwd":"/w","kind":"interactive"}');
+      expect(runIn(pane)).toBe('solo');
+    });
+
+    it('falls back to the stored ids without a pane, for an unknown session, or a live id with no transcript', () => {
+      session('{"pid":300,"sessionId":"solo"}');
+      expect(runIn(undefined)).toBe('conv-1');
+      expect(runIn({ ...pane, sessionName: 'codeman-ssh-other' })).toBe('conv-1');
+      session('{"pid":300,"sessionId":"gone"}');
+      expect(runIn(pane)).toBe('conv-1');
+    });
+
+    it('takes only an id-shaped value from the sessions file, and only plain socket/session names', () => {
+      session('{"pid":300,"sessionId":"x$(touch pwned)"}');
+      expect(runIn(pane)).toBe('conv-1');
+      expect(existsSync(join(bin, 'pwned'))).toBe(false);
+      const command = buildRemoteClaudeEditSourcesCommand(['conv-1'], [], 10, { socket: "a';x", sessionName: 's' });
+      expect(command).not.toContain('list-panes');
+    });
+  });
+
   describe('with subagents', () => {
     beforeAll(() => {
       mkdirSync(subagents(), { recursive: true });

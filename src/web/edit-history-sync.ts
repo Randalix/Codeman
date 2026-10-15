@@ -60,11 +60,13 @@ export interface EditHistorySyncDeps {
     requests: readonly EditSourceRequest[],
     budget: number
   ): Promise<RemoteClaudeEditSources | null>;
+  /** `sessionId` is the Codeman session's: the reader finds the claude it runs (after a `/clear`). */
   readRemote(
     remote: SessionRemote,
     ids: readonly string[],
     requests: readonly EditSourceRequest[],
-    budget: number
+    budget: number,
+    sessionId: string
   ): Promise<RemoteClaudeEditSources | null>;
   /** Probe local paths (`~/` already expanded by the caller's choice); null = missing. */
   probeLocal(paths: readonly string[]): Promise<Array<RemoteProbe | null>>;
@@ -228,7 +230,7 @@ export class EditHistorySync {
 
   private read(session: EditHistorySession, ids: readonly string[], requests: EditSourceRequest[]) {
     return session.remote
-      ? this.deps.readRemote(session.remote, ids, requests, this.budget)
+      ? this.deps.readRemote(session.remote, ids, requests, this.budget, session.id)
       : this.deps.readLocal(ids, requests, this.budget);
   }
 

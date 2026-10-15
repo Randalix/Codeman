@@ -123,6 +123,7 @@ import { EditHistoryStore } from '../edit-history-store.js';
 import { probeLocalPaths, readLocalClaudeEditSources } from '../edit-history-local-source.js';
 import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
+import { remoteTmuxLocation } from '../tmux-manager.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -359,7 +360,8 @@ export class WebServer extends EventEmitter {
    */
   private readonly editHistorySync = new EditHistorySync({
     readLocal: (ids, requests, budget) => readLocalClaudeEditSources(ids, requests, budget),
-    readRemote: remoteReadClaudeEditSources,
+    readRemote: (remote, ids, requests, budget, sessionId) =>
+      remoteReadClaudeEditSources(remote, ids, requests, budget, remoteTmuxLocation(remote, sessionId)),
     probeLocal: probeLocalPaths,
     probeRemote: remoteProbePaths,
     loadStore: (sessionId) => EditHistoryStore.load(sessionId),

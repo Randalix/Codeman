@@ -243,6 +243,19 @@ describe('EditHistorySync', () => {
     expect(host.calls).toHaveLength(2); // the first run + one folded follow-up
   });
 
+  it('hands the remote reader the Codeman session id (it finds the live claude by it)', async () => {
+    const seen: string[] = [];
+    const { host, sync } = setup({
+      readRemote: (_remote, ids, req, budget, sessionId) => {
+        seen.push(sessionId);
+        return host.read(ids, req, budget);
+      },
+    });
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    await sync.sync(remote);
+    expect(seen).toEqual(['s2']);
+  });
+
   it('drops the queued run after an unreachable host: callers wait one timeout, not two', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));

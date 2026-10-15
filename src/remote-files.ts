@@ -432,11 +432,12 @@ function safeClaudeTranscriptIds(ids: readonly string[]): string[] {
  * No `ls` and an `[ -f ]` guard on the glob, for the login-shell reasons noted at
  * {@link buildRemoteClaudeTranscriptTailCommand}.
  */
-function claudeTranscriptFinderLines(ids: readonly string[]): string[] {
+function claudeTranscriptFinderLines(ids: readonly string[], liveIdLines: readonly string[] = []): string[] {
   return [
     'best=',
     'bestid=',
-    `for id in ${ids.map((id) => shellescape(id)).join(' ')}; do`,
+    ...liveIdLines,
+    `for id in ${liveIdLines.length ? '$live ' : ''}${ids.map((id) => shellescape(id)).join(' ')}; do`,
     '  for f in "$HOME"/.claude/projects/*/"$id".jsonl; do',
     '    [ -f "$f" ] || continue',
     '    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best=$f; bestid=$id; fi',
@@ -593,10 +594,49 @@ function isByteCount(value: unknown): value is number {
  * lengths as plain digits; anything invalid is dropped. A subagent file whose name the
  * pattern would reject is skipped on the remote side too.
  */
+/** Where a remote session's agent runs: the remote tmux socket and session (`remoteTmuxLocation`). */
+export interface RemoteClaudePane {
+  socket: string;
+  sessionName: string;
+}
+
+const TMUX_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Shell lines that set `live` to the conversation the claude in `pane` is writing NOW,
+ * or leave it empty. Codeman launches a remote claude with `--session-id <id>`, but a
+ * `/clear` (or a resume picked inside claude) starts a new conversation, and with no
+ * hooks from a remote host Codeman never hears of it. claude itself keeps
+ * `~/.claude/sessions/<pid>.json` with the current `sessionId`, so: the pane's pid, its
+ * children and grandchildren (a wrapper shell may sit in between), the first of those
+ * with such a file. Only `[A-Za-z0-9._-]` survives the `sed`, the id pattern, so `$live`
+ * is safe unquoted. `ps -A -o pid= -o ppid=` is POSIX (no GNU `--ppid`).
+ */
+function liveClaudeIdLines(pane: RemoteClaudePane | undefined): string[] {
+  if (!pane || !TMUX_NAME_PATTERN.test(pane.socket) || !TMUX_NAME_PATTERN.test(pane.sessionName)) return [];
+  return [
+    'live=',
+    `pp=$(tmux -L ${shellescape(pane.socket)} list-panes -t ${shellescape(`=${pane.sessionName}`)} -F '#{pane_pid}' 2>/dev/null | head -n 1)`,
+    "case $pp in ''|*[!0-9]*) pp= ;; esac",
+    'if [ -n "$pp" ]; then',
+    '  tree=$(ps -A -o pid= -o ppid= 2>/dev/null)',
+    '  kids=$(printf \'%s\\n\' "$tree" | awk -v p="$pp" \'$2 == p { print $1 }\')',
+    '  grand=$(for k in $kids; do printf \'%s\\n\' "$tree" | awk -v p="$k" \'$2 == p { print $1 }\'; done)',
+    '  for c in $pp $kids $grand; do',
+    '    f="$HOME/.claude/sessions/$c.json"',
+    '    [ -f "$f" ] || continue',
+    '    live=$(sed -n \'s/.*"sessionId":"\\([A-Za-z0-9._-]*\\)".*/\\1/p\' "$f" | head -n 1)',
+    '    [ -n "$live" ] && break',
+    '  done',
+    'fi',
+  ];
+}
+
 export function buildRemoteClaudeEditSourcesCommand(
   ids: readonly string[],
   requests: readonly EditSourceRequest[],
-  budgetBytes: number
+  budgetBytes: number,
+  pane?: RemoteClaudePane
 ): string {
   const safeIds = safeClaudeTranscriptIds(ids);
   if (safeIds.length === 0) return `exit ${TRANSCRIPT_NOT_FOUND_EXIT}`;
@@ -623,7 +663,7 @@ export function buildRemoteClaudeEditSourcesCommand(
     });
 
   const script = [
-    ...claudeTranscriptFinderLines(safeIds),
+    ...claudeTranscriptFinderLines(safeIds, liveClaudeIdLines(pane)),
     'printf \'\\0%s\\0\' "$bestid"',
     `budget=${budget}`,
     // Size via `wc -c <` (POSIX; BSD pads it with spaces, hence the tr).
@@ -741,11 +781,12 @@ export async function remoteReadClaudeEditSources(
   remote: SessionRemote,
   ids: readonly string[],
   requests: readonly EditSourceRequest[],
-  budgetBytes: number
+  budgetBytes: number,
+  pane?: RemoteClaudePane
 ): Promise<RemoteClaudeEditSources | null> {
   assertNotUnderTest();
   const budget = Number.isFinite(budgetBytes) ? Math.max(0, Math.floor(budgetBytes)) : 0;
-  const command = buildRemoteFileCommand(remote, buildRemoteClaudeEditSourcesCommand(ids, requests, budget));
+  const command = buildRemoteFileCommand(remote, buildRemoteClaudeEditSourcesCommand(ids, requests, budget, pane));
   let stdout: Buffer;
   try {
     const result = await runWithRemoteSshLimit(() =>
