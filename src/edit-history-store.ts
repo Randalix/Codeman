@@ -235,6 +235,11 @@ export class EditHistoryStore {
     return { offset, len: cursor.floor - offset };
   }
 
+  /** Every source with a cursor in the current conversation. */
+  knownSources(): string[] {
+    return [...this.cursors.keys()];
+  }
+
   /** Sources with older lines left. */
   sourcesWithOlder(): string[] {
     return [...this.cursors.entries()].filter(([, c]) => c.floor > 0).map(([s]) => s);
