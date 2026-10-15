@@ -63,7 +63,7 @@ describe('Edit history panel in a real browser', () => {
   const setSetting = async (on: boolean) => {
     await page.evaluate(() => (window as any).app.openAppSettings());
     if ((await page.isChecked('#appSettingsShowEditHistory')) !== on)
-      await page.click('label.switch:has(#appSettingsShowEditHistory)');
+      await page.click('label.set-chip:has(#appSettingsShowEditHistory)');
     await page.evaluate(() => (window as any).app.saveAppSettings());
     await page.waitForTimeout(300);
     await page.evaluate(() => (window as any).app.closeAppSettings());
@@ -172,7 +172,9 @@ describe('Edit history panel in a real browser', () => {
     expect(settingsPutStatuses.length).toBeGreaterThan(0);
     expect(settingsPutStatuses.every((s) => s === 200)).toBe(true);
     expect(await buttonVisible()).toBe(true);
-    expect(await page.evaluate(() => !!document.querySelector('.toolbar-right #editHistoryBtn'))).toBe(true);
+    // In the header next to Attachments, where the panel opens; no longer in the bottom bar.
+    expect(await page.evaluate(() => !!document.querySelector('#headerRight #editHistoryBtn'))).toBe(true);
+    expect(await page.evaluate(() => !!document.querySelector('.toolbar #editHistoryBtn'))).toBe(false);
     expect(calls).toEqual([]); // no poll: nothing is read until the panel opens
   });
 
@@ -297,6 +299,52 @@ describe('Edit history panel in a real browser', () => {
     );
     await page.waitForTimeout(600);
     expect(reads()).toBe(before + 1);
+  });
+
+  it('while the panel is closed, updates count on the badge without reading; opening clears it', async () => {
+    const reads = () => calls.filter((c) => c === `GET /api/sessions/${sessionA}/edits?sync=1`).length;
+    const badge = () =>
+      page.evaluate(() => {
+        const b = document.getElementById('editHistoryUnread')!;
+        return b.hidden ? null : b.textContent;
+      });
+    await page.click('#editHistoryBtn');
+    await page.waitForSelector('#editHistoryPanel:not(.visible)', { state: 'attached' });
+    const before = reads();
+    const broadcast = (data: unknown) => (server as any).broadcast('edit-history:updated', data);
+    broadcast({ sessionId: 'someone-else', added: 5 });
+    broadcast({ sessionId: sessionA, added: 2 });
+    broadcast({ sessionId: sessionA, added: 1 });
+    await page.waitForFunction(() => document.getElementById('editHistoryUnread')!.textContent === '3');
+    expect(await badge()).toBe('3');
+    await page.waitForTimeout(600);
+    expect(reads()).toBe(before);
+    await page.click('#editHistoryBtn');
+    await page.waitForSelector('#editHistoryPanel.visible');
+    expect(await badge()).toBeNull();
+  });
+
+  it('a long path outside the workspace keeps its file name readable, the folder is cut at the start', async () => {
+    const s = state.get(sessionA)!;
+    const long =
+      '/tmp/claude-1000/-mnt-caches-ComfyUI/07e259af-d4d2-4ac3-8a7e-95972e3547df/scratchpad/icons/bremse_alt1_pedal.png';
+    state.set(sessionA, {
+      ...s,
+      entries: [
+        entry({ id: 'long', relPath: long, kind: 'image', tool: 'sent', added: 0, removed: 0 }),
+        ...(s.entries as Entry[]),
+      ],
+    });
+    await reload();
+    const row = rows().nth(0);
+    await row.waitFor();
+    expect(await row.locator('.edit-history-path').textContent()).toBe(long);
+    const name = row.locator('.edit-history-path-name');
+    expect(await name.textContent()).toBe('bremse_alt1_pedal.png');
+    // The name is shown whole; only the folder part is shortened.
+    expect(await name.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+    expect(await row.locator('.edit-history-path-dir').evaluate((el) => el.scrollWidth > el.clientWidth)).toBe(true);
+    state.set(sessionA, s);
   });
 
   it('renders a hostile path as text, never as markup', async () => {

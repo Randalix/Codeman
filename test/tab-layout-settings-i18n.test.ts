@@ -137,12 +137,11 @@ function bottomBarStrings(doc: Document): Map<string, string> {
 describe('the Bottom bar settings group in zh-CN', () => {
   const englishGroup = bottomBarStrings(source.window.document);
   const chineseGroup = bottomBarStrings(dom.window.document);
-  /** What may stay Latin here: the git and Docker names, and the product names. */
-  const left = (text: string) => text.replace(/\b(Git|git|Docker|Codeman|Claude)\b/g, '').match(/[A-Za-z]+/g) ?? [];
+  /** What may stay Latin here: the git and Docker names, and the product name. */
+  const left = (text: string) => text.replace(/\b(Git|git|Docker|Codeman)\b/g, '').match(/[A-Za-z]+/g) ?? [];
 
-  it("finds the heading, the four Git status rows (#543's two included) and the edit history row (the check is not vacuous)", () => {
-    expect(englishGroup.size).toBe(11);
-    expect(englishGroup.get('appSettingsShowEditHistory label')).toBe('Edit history');
+  it("finds the heading and the four Git status rows, #543's two included (the check is not vacuous)", () => {
+    expect(englishGroup.size).toBe(9);
     expect(englishGroup.get('heading')).toBe('Bottom bar');
     expect(englishGroup.get('appSettingsGitStatusMaxRepos label')).toBe('Git status: max repositories');
     expect(englishGroup.get('appSettingsGitStatusTimeout label')).toBe('Git status: git timeout');

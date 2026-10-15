@@ -21746,22 +21746,39 @@ html .toolbar .btn-git-status[aria-expanded='true'] {
   font-size: 0.68rem;
 }
 
-/* ── Edit history: bottom-bar button + panel (edit-history-ui.js) ───────────── */
+/* ── Edit history: header button + panel (edit-history-ui.js) ───────────────── */
 
-/* .btn-toolbar sets display:flex, which beats the [hidden] attribute's UA display:none. */
-.btn-edit-history[hidden] {
+/* .btn-icon-header sets a display, which beats the [hidden] attribute's UA display:none. */
+.btn-edit-history[hidden],
+.edit-history-unread[hidden] {
   display: none;
 }
 
+/* Positioning context for the unread badge (same frame as the Attachments badge). */
 .btn-edit-history {
-  gap: 0.35rem;
-  font-size: 0.68rem;
-  padding: 0.2rem 0.55rem;
-  white-space: nowrap;
+  position: relative;
 }
 
-html .toolbar .btn-edit-history[aria-expanded='true'] {
+.btn-edit-history[aria-expanded='true'] {
   background: color-mix(in srgb, currentColor 16%, transparent);
+}
+
+.edit-history-unread {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.6rem;
+  font-weight: 700;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
 }
 
 /* Same frame as the Git and Files windows: draggable by the header, resizable at the corner. */
@@ -21918,11 +21935,12 @@ html .toolbar .btn-edit-history[aria-expanded='true'] {
 }
 
 /* Only the name itself opens the preview: the rest of the row (the spacer) toggles the diff. */
+/* The folder part gives way first, so the file name stays readable (…/icons/bremse_alt1.png). */
 .edit-history-path {
+  display: inline-flex;
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
   padding: 0;
   border: 0;
@@ -21932,6 +21950,25 @@ html .toolbar .btn-edit-history[aria-expanded='true'] {
   font-family: 'SF Mono', Monaco, monospace;
   font-size: 0.7rem;
   cursor: pointer;
+}
+
+.edit-history-path-dir {
+  /* Shrinks long before the name does; the name only gives way once the folder is at min-width. */
+  flex: 0 10000 auto;
+  min-width: 1.2em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Ellipsis at the START of the folder (rtl); the inner <bdi dir="ltr"> keeps its text in order. */
+  direction: rtl;
+  text-align: left;
+  opacity: 0.7;
+}
+
+.edit-history-path-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .edit-history-path:hover,

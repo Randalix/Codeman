@@ -477,13 +477,11 @@
       '单条 git 命令可运行的秒数，超时后该仓库会被报告为无法读取（5 到 120，默认 30）。仓库位于较慢的网络共享上时请调高此值。',
     'Refresh git status': '刷新 Git 状态',
     'Close git status': '关闭 Git 状态',
-    // Edit history (edit-history-ui.js): settings row, bottom-bar button and panel.
+    // Edit history (edit-history-ui.js): settings chip, header button and panel.
     // The two row badges use scoped keys: a bare "new"/"edit" key would also
     // translate unrelated words elsewhere (the lookup is case-insensitive).
     'Edit history': '编辑历史',
-    Edits: '编辑',
-    "Shows an Edits button at the right of the bottom bar. It opens a list of every file the active session's agent and its subagents changed, newest first, with each change's diff. Claude sessions only. Off by default.":
-      '在底部栏右侧显示“编辑”按钮。它会打开一个列表，按时间倒序列出当前会话的智能体及其子智能体更改过的每个文件，并附带每次更改的差异。仅限 Claude 会话。默认关闭。',
+    'Open edit history': '打开编辑历史',
     'Refresh edit history': '刷新编辑历史',
     'Close edit history': '关闭编辑历史',
     'Group by file': '按文件分组',

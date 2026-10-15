@@ -1,11 +1,14 @@
 /**
- * @fileoverview Edit history: a bottom-bar button and the floating panel it opens, listing every file
- * edit the ACTIVE session's agent (and its subagents) made, newest first.
+ * @fileoverview Edit history: a header button (next to Attachments) and the floating panel it opens
+ * right below, listing every file edit the ACTIVE session's agent (and its subagents) made, newest
+ * first.
  *
- * OPTIONAL and per-device: `showEditHistory` (App Settings → Header & Panels → Bottom bar), default
+ * OPTIONAL and per-device: `showEditHistory` (App Settings → Header & Panels → Header), default
  * OFF. While it is off the button never shows and nothing is requested. There is NO poll: the panel
  * reads `GET /api/sessions/:id/edits?sync=1` when it opens and when the active session changes, and
  * re-reads (debounced) when the server sends `edit-history:updated` for the session on screen.
+ * While the panel is closed, those events only count up the button's badge (entries added in the
+ * active session since the panel was last open); opening the panel or switching sessions clears it.
  *
  * - A code entry opens its diff inline (`GET /api/sessions/:id/edits/:entryId`), drawn with the Git
  *   panel's diff classes (`git-diff`, `git-diff-line--hunk|add|del`).
@@ -57,6 +60,7 @@ Object.assign(CodemanApp.prototype, {
     const btn = this.$('editHistoryBtn');
     if (btn) btn.hidden = !on;
     if (!on) {
+      this._setEditHistoryUnread(0);
       this.closeEditHistoryPanel();
       this._editHistory = null;
       this._editHistoryEpoch = (this._editHistoryEpoch || 0) + 1; // an in-flight read must not repaint
@@ -162,10 +166,27 @@ Object.assign(CodemanApp.prototype, {
     return this.refreshEditHistory({ older: true });
   },
 
-  /** SSE `edit-history:updated` ({ sessionId, added }): re-read, debounced, only while it is on screen. */
+  /** The button's badge: entries added in the active session while the panel was closed. */
+  _setEditHistoryUnread(n, sessionId = this.activeSessionId) {
+    this._editHistoryUnread = n;
+    this._editHistoryUnreadSid = n > 0 ? sessionId : null;
+    const badge = this.$('editHistoryUnread');
+    if (!badge) return;
+    badge.hidden = n <= 0;
+    badge.textContent = n > 99 ? '99+' : String(n);
+  },
+
+  /**
+   * SSE `edit-history:updated` ({ sessionId, added }) for the session on screen: re-read, debounced,
+   * while the panel is open; otherwise count the new entries on the badge.
+   */
   _onEditHistoryUpdated(data) {
-    if (!data || data.sessionId !== this.activeSessionId) return;
-    if (!this.isEditHistoryEnabled() || !this._isEditHistoryPanelOpen()) return;
+    if (!data || data.sessionId !== this.activeSessionId || !this.isEditHistoryEnabled()) return;
+    if (!this._isEditHistoryPanelOpen()) {
+      const added = Number(data.added);
+      if (added > 0) this._setEditHistoryUnread((this._editHistoryUnread || 0) + added);
+      return;
+    }
     clearTimeout(this._editHistoryDebounce);
     this._editHistoryDebounce = setTimeout(() => {
       this._editHistoryDebounce = null;
@@ -175,6 +196,7 @@ Object.assign(CodemanApp.prototype, {
 
   /** Called by selectSession(): the open panel follows the active session. */
   onEditHistoryActiveSession(sessionId) {
+    if (this._editHistoryUnreadSid && this._editHistoryUnreadSid !== sessionId) this._setEditHistoryUnread(0);
     if (!this.isEditHistoryEnabled() || !this._isEditHistoryPanelOpen()) return;
     if (this._editHistory?.sessionId === sessionId) return;
     this.refreshEditHistory();
@@ -195,6 +217,7 @@ Object.assign(CodemanApp.prototype, {
     if (!panel) return;
     panel.classList.add('visible');
     this.$('editHistoryBtn')?.setAttribute('aria-expanded', 'true');
+    this._setEditHistoryUnread(0);
     const group = this.$('editHistoryGroupToggle');
     if (group) group.checked = this.isEditHistoryGrouped();
     const main = this.$('editHistoryMainOnlyToggle');
@@ -388,8 +411,22 @@ Object.assign(CodemanApp.prototype, {
     return group;
   },
 
+  /**
+   * The path as folder + file name: the folder is cut from its start when the row is narrow, so a
+   * long absolute path (an image in claude's scratchpad) still shows which file it is.
+   */
   _editHistoryPathButton(e) {
-    const btn = this._ehEl('button', 'edit-history-path', e.relPath || e.path);
+    const shown = e.relPath || e.path || '';
+    const btn = this._ehEl('button', 'edit-history-path');
+    const cut = shown.lastIndexOf('/') + 1;
+    if (cut > 0) {
+      const dir = this._ehEl('span', 'edit-history-path-dir');
+      const bdi = this._ehEl('bdi', null, shown.slice(0, cut));
+      bdi.dir = 'ltr';
+      dir.append(bdi);
+      btn.append(dir);
+    }
+    btn.append(this._ehEl('span', 'edit-history-path-name', shown.slice(cut)));
     btn.type = 'button';
     btn.title = e.path || e.relPath || '';
     btn.addEventListener('click', (ev) => {
