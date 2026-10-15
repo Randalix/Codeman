@@ -1825,6 +1825,9 @@ const SSE_EVENTS = {
   IMAGE_DETECTED: 'image:detected',
   ATTACHMENT_DETECTED: 'attachment:detected',
 
+  // Edit history (`{ sessionId, added }`)
+  EDIT_HISTORY_UPDATED: 'edit-history:updated',
+
   // Tunnel
   TUNNEL_STARTED: 'tunnel:started',
   TUNNEL_STOPPED: 'tunnel:stopped',

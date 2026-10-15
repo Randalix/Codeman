@@ -117,7 +117,10 @@ import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
 import { CoordinatorReports, type MuteSnapshot } from './coordinator-reports.js';
 import { RemoteModelRefresher } from './remote-model-refresher.js';
-import { remoteReadClaudeTranscriptTail } from '../remote-files.js';
+import { remoteProbePaths, remoteReadClaudeEditSources, remoteReadClaudeTranscriptTail } from '../remote-files.js';
+import { EditHistorySync } from './edit-history-sync.js';
+import { EditHistoryStore } from '../edit-history-store.js';
+import { probeLocalPaths, readLocalClaudeEditSources } from '../edit-history-local-source.js';
 import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
@@ -198,6 +201,7 @@ import {
   registerAgentWatchRoutes,
   registerReadMyMindRoutes,
   registerGitStatusRoutes,
+  registerEditHistoryRoutes,
   registerStatusTelemetryRoutes,
   registerSystemRoutes,
   registerCaseRoutes,
@@ -244,6 +248,9 @@ const CUSTOM_MODEL_REDISCOVER_INTERVAL_MS = 5 * 60_000;
 // minutes. Cheap either way — one /running GET per distinct endpoint with at least
 // one live custom-model session, not per session.
 const CUSTOM_MODEL_SWAP_CHECK_INTERVAL_MS = 20_000;
+/** Tools whose end can mean changed files for the edit history (Agent: a subagent's edits). */
+const EDIT_HISTORY_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash', 'Agent']);
+const EDIT_HISTORY_DEBOUNCE_MS = 500;
 
 function escapeHtmlText(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -346,6 +353,20 @@ export class WebServer extends EventEmitter {
   private readonly remoteModelRefresher = new RemoteModelRefresher({
     readTail: remoteReadClaudeTranscriptTail,
   });
+  /**
+   * The edit history panel's reader (edit-history-sync.ts). Runs on occasions only: a local
+   * session's Edit/Write/Bash/Agent tool end, a remote one's turn end, a panel request.
+   */
+  private readonly editHistorySync = new EditHistorySync({
+    readLocal: (ids, requests, budget) => readLocalClaudeEditSources(ids, requests, budget),
+    readRemote: remoteReadClaudeEditSources,
+    probeLocal: probeLocalPaths,
+    probeRemote: remoteProbePaths,
+    loadStore: (sessionId) => EditHistoryStore.load(sessionId),
+    onUpdated: (sessionId, added) => this.broadcast(SseEvent.EditHistoryUpdated, { sessionId, added }),
+  });
+  /** Debounces a local session's edit-history sync after a burst of tool ends. */
+  private editHistoryTimers = new Map<string, NodeJS.Timeout>();
   /**
    * Posts a worker's turn end / dialog / exit into its parent session's mailbox (the
    * push side of `agent watch`). Same nudge path as a post; no wake registry.
@@ -1230,6 +1251,7 @@ export class WebServer extends EventEmitter {
     registerAgentWatchRoutes(this.app, ctx, { reports: this.coordinatorReports });
     registerReadMyMindRoutes(this.app, ctx);
     registerGitStatusRoutes(this.app, ctx);
+    registerEditHistoryRoutes(this.app, ctx, this.editHistorySync);
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     // The registry's lifetime is the server's: it drops per-session wake state on every
@@ -1307,6 +1329,7 @@ export class WebServer extends EventEmitter {
           isError,
           timestamp: Date.now(),
         });
+        this.noteEditHistoryTool(sessionId, toolName);
       });
 
       watcher.on('transcript:error', (error: Error) => {
@@ -1343,6 +1366,24 @@ export class WebServer extends EventEmitter {
     } catch (err) {
       console.warn(`[IntentStore] Capture failed for session ${sessionId}:`, err);
     }
+  }
+
+  /**
+   * A local session's tool ended: if it can have changed files (an edit, a Bash call that may
+   * have rendered an image, a subagent run), read its edit history after a short quiet spell.
+   * Remote sessions have no transcript watcher; they sync at turn end instead.
+   */
+  private noteEditHistoryTool(sessionId: string, toolName: string): void {
+    if (!EDIT_HISTORY_TOOLS.has(toolName)) return;
+    clearTimeout(this.editHistoryTimers.get(sessionId));
+    this.editHistoryTimers.set(
+      sessionId,
+      setTimeout(() => {
+        this.editHistoryTimers.delete(sessionId);
+        const session = this.sessions.get(sessionId);
+        if (session && !session.remote) void this.editHistorySync.sync(session);
+      }, EDIT_HISTORY_DEBOUNCE_MS)
+    );
   }
 
   /**
@@ -1562,6 +1603,15 @@ export class WebServer extends EventEmitter {
 
     // Stop transcript watcher
     this.stopTranscriptWatcher(sessionId);
+
+    // Edit history: forget the pending sync; a killed session takes its history with it
+    clearTimeout(this.editHistoryTimers.get(sessionId));
+    this.editHistoryTimers.delete(sessionId);
+    if (killMux) {
+      void this.editHistorySync.remove(sessionId).catch((err) => {
+        console.warn(`[EditHistory] Removing history of ${sessionId} failed:`, getErrorMessage(err));
+      });
+    }
 
     // Stop and remove run summary tracker
     const summaryTracker = this.runSummaryTrackers.get(sessionId);
@@ -2053,6 +2103,9 @@ export class WebServer extends EventEmitter {
       isAutoNameEnabled: async () => (await this.readSettings()).autoNameSessions === true,
       refreshRemoteModel: (session: Session) => {
         void this.remoteModelRefresher.refresh(session);
+      },
+      refreshEditHistory: (session: Session) => {
+        if (session.remote) void this.editHistorySync.sync(session);
       },
     };
   }
@@ -4386,6 +4439,8 @@ export class WebServer extends EventEmitter {
     this.respawnTimers.clear();
     this.runSummaryTrackers.clear();
     this.transcriptWatchers.clear();
+    for (const timer of this.editHistoryTimers.values()) clearTimeout(timer);
+    this.editHistoryTimers.clear();
     this.sessionListenerRefs.clear();
     this.scheduledRuns.clear();
     // Dispose StaleExpirationMaps (stops internal cleanup timers)

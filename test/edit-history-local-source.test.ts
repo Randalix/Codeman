@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readLocalClaudeEditSources } from '../src/edit-history-local-source.js';
+import { probeLocalPaths, readLocalClaudeEditSources } from '../src/edit-history-local-source.js';
 
 let root: string;
 const opts = () => ({ projectsDir: root });
@@ -94,5 +94,16 @@ describe('readLocalClaudeEditSources', () => {
     put('p/sid.jsonl', Buffer.from('äöü\n', 'utf8'));
     const res = await readLocalClaudeEditSources(['sid'], [{ relPath: 'main', offset: 2 }], 100, opts());
     expect(res?.files[0].chunk).toEqual(Buffer.from('äöü\n', 'utf8').subarray(2));
+  });
+});
+
+describe('probeLocalPaths', () => {
+  it('reports kind, size and mtime, expands ~/ against home, null for missing', async () => {
+    put('home/img.png', 'PNG!', 1_700_000_000);
+    mkdirSync(join(root, 'dir'));
+    const res = await probeLocalPaths(['~/img.png', join(root, 'dir'), join(root, 'nope.png')], join(root, 'home'));
+    expect(res[0]).toEqual({ realPath: join(root, 'home/img.png'), kind: 'file', size: 4, mtimeMs: 1_700_000_000_000 });
+    expect(res[1]).toMatchObject({ kind: 'directory', size: 0 });
+    expect(res[2]).toBeNull();
   });
 });

@@ -18,10 +18,15 @@
  * @module edit-history-local-source
  */
 
-import { open, readdir, stat } from 'node:fs/promises';
+import { open, readdir, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { EditSourceRequest, RemoteClaudeEditSources, RemoteClaudeEditSourceFile } from './remote-files.js';
+import type {
+  EditSourceRequest,
+  RemoteClaudeEditSources,
+  RemoteClaudeEditSourceFile,
+  RemoteProbe,
+} from './remote-files.js';
 
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const REL_PATH_PATTERN = /^(main|subagents\/agent-[A-Za-z0-9_-]+\.jsonl)$/;
@@ -141,4 +146,31 @@ export async function readLocalClaudeEditSources(
     }
   }
   return { transcriptId: main.id, files, metas };
+}
+
+/**
+ * The local twin of `remoteProbePaths`: per path its resolved path, kind, size and mtime, or
+ * null when it does not exist. A leading `~/` means this user's home, like the remote probe.
+ */
+export async function probeLocalPaths(
+  paths: readonly string[],
+  home: string = homedir()
+): Promise<Array<RemoteProbe | null>> {
+  return Promise.all(
+    paths.map(async (p) => {
+      const path = p.startsWith('~/') ? join(home, p.slice(2)) : p;
+      try {
+        const real = await realpath(path);
+        const s = await stat(real);
+        return {
+          realPath: real,
+          kind: s.isFile() ? 'file' : s.isDirectory() ? 'directory' : 'other',
+          size: s.isFile() ? s.size : 0,
+          mtimeMs: Math.floor(s.mtimeMs),
+        } satisfies RemoteProbe;
+      } catch {
+        return null;
+      }
+    })
+  );
 }

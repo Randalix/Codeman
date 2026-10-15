@@ -67,13 +67,16 @@ describe('session listener wiring', () => {
     // the only way an in-session /model reaches `agent ls` and the header.
     const session = new Session({ id: 'wiring-turn-end-model', workingDir: '/tmp', mode: 'claude' });
     const refreshRemoteModel = vi.fn();
-    const deps = { refreshRemoteModel } as unknown as Parameters<typeof createSessionListeners>[1];
+    const refreshEditHistory = vi.fn();
+    const deps = { refreshRemoteModel, refreshEditHistory } as unknown as Parameters<typeof createSessionListeners>[1];
 
     const refs = createSessionListeners(session, deps);
     attachSessionListeners(session, refs);
     session.emit('turnEnded', 'heuristic');
 
     expect(refreshRemoteModel).toHaveBeenCalledWith(session);
+    // Same occasion for the edit history: a remote host sends no hooks, the turn end is its trigger.
+    expect(refreshEditHistory).toHaveBeenCalledWith(session);
     detachSessionListeners(session, refs);
   });
 
