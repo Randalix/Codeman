@@ -281,6 +281,31 @@ describe('confirmImages', () => {
     );
     expect(out).toEqual([]);
   });
+
+  it('skips a file version already recorded: the ls right after the render, a listing after a Write', () => {
+    const png = { realPath: '/w/p.png', kind: 'file' as const, size: 9, mtimeMs: T0 + 900 };
+    const render = { toolUseId: 'r', start: T0, end: T0 + 1000, paths: ['/w/p.png'] };
+    const ls = { toolUseId: 'l', start: T0 + 1500, end: T0 + 1600, paths: ['/w/p.png'] };
+    expect(confirmImages([ls, render], () => png).map((i) => i.toolUseId)).toEqual(['r']);
+    // A Write entry for the same path at T0 + 950 already covers it.
+    expect(
+      confirmImages(
+        [ls],
+        () => png,
+        () => T0 + 950
+      )
+    ).toEqual([]);
+    // A later re-render (newer mtime, outside the slack) is a new version.
+    const again = { toolUseId: 'r2', start: T0 + 10_000, end: T0 + 11_000, paths: ['/w/p.png'] };
+    const newer = { ...png, mtimeMs: T0 + 10_500 };
+    expect(
+      confirmImages(
+        [again],
+        () => newer,
+        () => T0 + 1000
+      ).map((i) => i.toolUseId)
+    ).toEqual(['r2']);
+  });
 });
 
 describe('wake invariant (wiring guard)', () => {

@@ -102,9 +102,28 @@ describe('parseClaudeEditLines: edits', () => {
     });
     const { records } = parseClaudeEditLines([create, update].join('\n'));
     expect(records.map((r) => [r.tool, r.created, r.added, r.removed])).toEqual([
-      ['Write', true, 0, 0],
+      ['Write', true, 2, 0],
       ['Write', false, 1, 2],
     ]);
+    expect(records[0].hunks).toEqual([
+      { oldStart: 0, oldLines: 0, newStart: 1, newLines: 2, lines: ['+hello', '+world'] },
+    ]);
+  });
+
+  it('a created file’s diff drops the trailing newline and is capped like any hunk', () => {
+    const big = 'x'.repeat(1000) + '\n';
+    const line = toolResultLine('toolu_big', '2026-10-15T19:03:30.000Z', {
+      type: 'create',
+      filePath: '/work/repo/big.txt',
+      content: big.repeat(100),
+      structuredPatch: [],
+      originalFile: null,
+    });
+    const [rec] = parseClaudeEditLines(line).records;
+    expect(rec.added).toBe(100);
+    expect(rec.truncated).toBe(true);
+    expect(rec.hunks[0].lines.length).toBeLessThan(100);
+    expect(rec.hunks[0].lines.every((l) => l === '+' + 'x'.repeat(1000))).toBe(true);
   });
 
   it('classifies an image written by Write as an image', () => {

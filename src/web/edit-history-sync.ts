@@ -86,22 +86,30 @@ export function unsupportedReason(session: EditHistorySession): string | undefin
   return undefined;
 }
 
-/** Bash candidates whose probed file is a regular file with an mtime inside the call's window. */
+/**
+ * Bash candidates whose probed file is a regular file with an mtime inside the call's window.
+ * A candidate whose file version is already recorded is skipped: `known(path)` is the newest
+ * entry time for that path, and an entry at or after `mtime − slack` saw this version — the
+ * `ls *.png` right after the render, or a Write followed by a listing. Candidates are taken
+ * in call order so a batch dedupes itself the same way.
+ */
 export function confirmImages(
   candidates: readonly ImageCandidate[],
-  probe: (path: string) => RemoteProbe | null | undefined
+  probe: (path: string) => RemoteProbe | null | undefined,
+  known: (path: string) => number | undefined = () => undefined
 ): ConfirmedImage[] {
   const out: ConfirmedImage[] = [];
-  for (const c of candidates) {
+  const seen = new Map<string, number>();
+  for (const c of [...candidates].sort((a, b) => a.end - b.end)) {
     for (const path of c.paths) {
       const p = probe(path);
       if (!p || p.kind !== 'file' || !p.mtimeMs) continue;
       if (p.mtimeMs < c.start - IMAGE_MTIME_SLACK_MS || p.mtimeMs > c.end + IMAGE_MTIME_SLACK_MS) continue;
-      const img: ConfirmedImage = {
-        toolUseId: c.toolUseId,
-        path: path.startsWith('~/') ? p.realPath : path,
-        ts: c.end,
-      };
+      const entryPath = path.startsWith('~/') ? p.realPath : path;
+      const last = Math.max(seen.get(entryPath) ?? -Infinity, known(entryPath) ?? -Infinity);
+      if (last >= p.mtimeMs - IMAGE_MTIME_SLACK_MS) continue;
+      seen.set(entryPath, c.end);
+      const img: ConfirmedImage = { toolUseId: c.toolUseId, path: entryPath, ts: c.end };
       if (c.agentId) img.agentId = c.agentId;
       out.push(img);
     }
@@ -312,6 +320,14 @@ export class EditHistorySync {
       return 0;
     }
     const byPath = new Map(paths.map((p, i) => [p, probes[i]]));
-    return store.addImageEntries(confirmImages(candidates, (p) => byPath.get(p)));
+    const newest = new Map<string, number>();
+    for (const e of store.list()) newest.set(e.path, Math.max(newest.get(e.path) ?? -Infinity, e.ts));
+    return store.addImageEntries(
+      confirmImages(
+        candidates,
+        (p) => byPath.get(p),
+        (p) => newest.get(p)
+      )
+    );
   }
 }

@@ -174,17 +174,30 @@ function toHunks(patch: unknown[]): { hunks: EditHunk[]; added: number; removed:
   return { hunks, added, removed, truncated };
 }
 
+/** A new file's content as one all-added hunk, in `structuredPatch` form. */
+function createdFileHunk(content: string): Record<string, unknown> {
+  const lines = content.split('\n');
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop();
+  return { oldStart: 0, oldLines: 0, newStart: 1, newLines: lines.length, lines: lines.map((l) => `+${l}`) };
+}
+
 function toEditRecord(id: string, ts: number, result: unknown, agentId: string | undefined): EditRecord | null {
   if (!isRecord(result)) return null;
   const { filePath, structuredPatch } = result;
   if (typeof filePath !== 'string' || !filePath || !Array.isArray(structuredPatch)) return null;
   const tool: EditTool = typeof result.type === 'string' ? 'Write' : 'oldString' in result ? 'Edit' : 'edit';
-  const { hunks, added, removed, truncated } = toHunks(structuredPatch);
+  const kind = classifyEditPath(filePath);
+  // A Write that created a file reports an empty patch; its diff is the whole content.
+  const patch =
+    result.type === 'create' && structuredPatch.length === 0 && kind !== 'image' && typeof result.content === 'string'
+      ? [createdFileHunk(result.content)]
+      : structuredPatch;
+  const { hunks, added, removed, truncated } = toHunks(patch);
   const record: EditRecord = {
     id,
     ts,
     path: filePath,
-    kind: classifyEditPath(filePath),
+    kind,
     tool,
     created: result.type === 'create',
     added,
