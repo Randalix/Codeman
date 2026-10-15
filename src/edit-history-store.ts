@@ -44,7 +44,9 @@ export const MAX_ENTRIES = 500;
 export const READ_BUDGET_BYTES = 8 * 1024 * 1024;
 export const MAIN_SOURCE = 'main';
 const SAVE_DEBOUNCE_MS = 1000;
-const FILE_VERSION = 1;
+const FILE_VERSION = 2;
+/** Files of these versions keep their entries but are read again (v1 missed SendUserFile images). */
+const RESCAN_VERSIONS: readonly unknown[] = [1];
 const NL = 0x0a;
 
 /** `bash`: an image a Bash call wrote; `sent`: an image claude delivered to the user. */
@@ -161,13 +163,18 @@ export class EditHistoryStore {
     } catch {
       return store;
     }
-    if (!isObj(data) || data.version !== FILE_VERSION) return store;
+    if (!isObj(data)) return store;
+    const rescan = RESCAN_VERSIONS.includes(data.version);
+    if (data.version !== FILE_VERSION && !rescan) return store;
     const f = data as unknown as StoreFile;
-    store.transcriptId = typeof f.transcriptId === 'string' ? f.transcriptId : null;
-    for (const [k, c] of Object.entries(isObj(f.cursors) ? f.cursors : {})) {
-      if (isObj(c) && typeof c.offset === 'number' && typeof c.floor === 'number') store.cursors.set(k, c);
+    if (!rescan) {
+      // Without transcript and cursors the next sync starts over like a new conversation.
+      store.transcriptId = typeof f.transcriptId === 'string' ? f.transcriptId : null;
+      for (const [k, c] of Object.entries(isObj(f.cursors) ? f.cursors : {})) {
+        if (isObj(c) && typeof c.offset === 'number' && typeof c.floor === 'number') store.cursors.set(k, c);
+      }
+      if (Array.isArray(f.pendingBash)) store.pendingBash = f.pendingBash;
     }
-    if (Array.isArray(f.pendingBash)) store.pendingBash = f.pendingBash;
     for (const [k, a] of Object.entries(isObj(f.agents) ? f.agents : {})) store.agents.set(k, a);
     if (Array.isArray(f.entries))
       for (const e of f.entries) if (isObj(e) && typeof e.id === 'string') store.entries.set(e.id, e);

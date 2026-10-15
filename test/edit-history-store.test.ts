@@ -329,6 +329,31 @@ describe('EditHistoryStore: persistence', () => {
     expect(syncForward(loaded, done)?.candidates[0]?.paths).toEqual(['/work/a.png']);
   });
 
+  it('a version 1 file keeps its entries and agents but is read again from the end', async () => {
+    const store = new EditHistoryStore('s1', { dir, debounceMs: 60_000 });
+    const file = jsonl([editLine('e1', 1), editLine('e2', 2)]);
+    syncForward(store, file);
+    store.setAgentMeta('a1', '{"description":"d","agentType":"coding"}');
+    await store.flush();
+    const path = join(dir, 's1.json');
+    const v1 = { ...JSON.parse(readFileSync(path, 'utf-8')), version: 1 };
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(path, JSON.stringify(v1));
+    const loaded = await EditHistoryStore.load('s1', { dir });
+    expect(ids(loaded)).toEqual(['e2', 'e1']);
+    expect(loaded.getAgents()).toEqual({ a1: { description: 'd', agentType: 'coding' } });
+    expect(loaded.getCursor(MAIN_SOURCE)).toBeUndefined();
+    expect(loaded.getTranscriptId()).toBeNull();
+    expect(syncForward(loaded, file)?.added).toBe(0);
+    expect(loaded.getCursor(MAIN_SOURCE)).toEqual(store.getCursor(MAIN_SOURCE));
+  });
+
+  it('ignores a file of an unknown version', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'v9.json'), JSON.stringify({ version: 9, entries: [{ id: 'x' }] }));
+    expect((await EditHistoryStore.load('v9', { dir })).list()).toEqual([]);
+  });
+
   it('writes debounced', async () => {
     const store = new EditHistoryStore('s1', { dir, debounceMs: 20 });
     syncForward(store, jsonl([editLine('e1', 1)]));
