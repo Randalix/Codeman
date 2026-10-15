@@ -2270,6 +2270,19 @@ html.mobile-init .file-browser-panel {
     bottom: calc(44px + 2rem + var(--safe-area-bottom));
   }
 
+  /* Edit history panel - same compact frame as the file browser: at most half the screen, above the toolbar */
+  .edit-history-panel {
+    top: auto;
+    right: 8px;
+    left: 8px;
+    width: auto;
+    max-width: 100%;
+    height: 50vh;
+    max-height: 50vh;
+    min-height: 0;
+    bottom: calc(44px + 2rem + var(--safe-area-bottom));
+  }
+
   /* File preview window: full screen on phones. --app-height tracks the visual
      viewport (KeyboardHandler), so the edit textarea + Save bar stay above the
      OS keyboard instead of hiding behind it. Footer/edit bar pad for the home

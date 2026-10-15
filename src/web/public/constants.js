@@ -10,7 +10,7 @@
  * @globals {function} scheduleBackground - scheduler.postTask wrapper (background priority)
  * @globals {function} getEventCoords - Unified mouse/touch coordinate extractor
  * @globals {function} escapeHtml - XSS-safe HTML escaping
- * @globals {object} SSE_EVENTS - Centralized SSE event type constants (157 event types; must match backend src/web/sse-events.ts)
+ * @globals {object} SSE_EVENTS - Centralized SSE event type constants (165 event types; must match backend src/web/sse-events.ts)
  * @globals {Array} BUILTIN_RESPAWN_PRESETS - Built-in respawn configuration presets
  *
  * @dependency None (first in load order)
@@ -1824,6 +1824,9 @@ const SSE_EVENTS = {
   // Images
   IMAGE_DETECTED: 'image:detected',
   ATTACHMENT_DETECTED: 'attachment:detected',
+
+  // Edit history (`{ sessionId, added }`)
+  EDIT_HISTORY_UPDATED: 'edit-history:updated',
 
   // Tunnel
   TUNNEL_STARTED: 'tunnel:started',
