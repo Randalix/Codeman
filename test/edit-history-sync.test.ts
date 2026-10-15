@@ -254,6 +254,15 @@ describe('EditHistorySync', () => {
     expect(store.list().length).toBeGreaterThan(before);
   });
 
+  it('flushAll writes pending saves (shutdown) so a reload keeps the entries', async () => {
+    const { host, sync } = setup({ loadStore: (id) => EditHistoryStore.load(id, { dir, debounceMs: 60_000 }) });
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    await sync.sync(local);
+    await sync.flushAll();
+    const reloaded = await EditHistoryStore.load('s1', { dir });
+    expect(reloaded.list().map((e) => e.id)).toEqual(['t1']);
+  });
+
   it('remove deletes the stored history', async () => {
     const { host, sync } = setup();
     host.append('main', editLine('t1', T0, '/w/a.ts'));

@@ -162,6 +162,11 @@ export class EditHistorySync {
     return this.getStatus(session.id);
   }
 
+  /** Write every loaded store's pending changes (server shutdown). */
+  async flushAll(): Promise<void> {
+    await Promise.all([...this.slots.values()].map((slot) => slot.store?.flush()));
+  }
+
   /** Drop a deleted session: forget it and delete its stored history. */
   async remove(sessionId: string): Promise<void> {
     const store = await this.getStore(sessionId);

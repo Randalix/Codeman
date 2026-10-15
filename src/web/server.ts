@@ -4441,6 +4441,9 @@ export class WebServer extends EventEmitter {
     this.transcriptWatchers.clear();
     for (const timer of this.editHistoryTimers.values()) clearTimeout(timer);
     this.editHistoryTimers.clear();
+    await this.editHistorySync.flushAll().catch((err) => {
+      console.warn('[EditHistory] Saving on shutdown failed:', getErrorMessage(err));
+    });
     this.sessionListenerRefs.clear();
     this.scheduledRuns.clear();
     // Dispose StaleExpirationMaps (stops internal cleanup timers)
