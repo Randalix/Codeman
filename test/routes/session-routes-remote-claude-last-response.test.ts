@@ -105,6 +105,33 @@ describe('GET /api/sessions/:id/last-response — remote claude session', () => 
     expect(maxBytes).toBeGreaterThan(0);
   });
 
+  it("asks for the session's remote pane and keeps a known conversation", async () => {
+    mockedReadTail.mockResolvedValue({ sessionId: CONVERSATION_ID, content: jsonl([user('q')]) });
+
+    await get();
+
+    expect(mockedReadTail.mock.calls[0][3]).toEqual({
+      socket: 'codeman-remote',
+      sessionName: `codeman-ssh-${harness.ctx._sessionId.slice(0, 8)}`,
+    });
+    expect(harness.ctx._session.claudeSessionId).toBe(CONVERSATION_ID);
+    expect(harness.ctx.persistSessionState).not.toHaveBeenCalled();
+  });
+
+  it('adopts the conversation the remote claude writes now (after a /clear) and persists it', async () => {
+    const cleared = '07e259af-d4d2-4ac3-8a7e-95972e3547df';
+    mockedReadTail.mockResolvedValue({
+      sessionId: cleared,
+      content: jsonl([user('after clear'), assistant('NEW ONE', '2026-10-11T15:00:05Z')]),
+    });
+
+    const { data } = await get();
+
+    expect(data.text).toBe('NEW ONE');
+    expect(harness.ctx._session.claudeSessionId).toBe(cleared);
+    expect(harness.ctx.persistSessionState).toHaveBeenCalledWith(harness.ctx._session);
+  });
+
   it('a tail cut mid-line skips the broken first row instead of failing', async () => {
     mockedReadTail.mockResolvedValue({
       sessionId: CONVERSATION_ID,

@@ -193,6 +193,7 @@ import {
 } from '../response-viewer-transcript.js';
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
 import { RemoteFileAccessError, remoteReadClaudeTranscriptTail } from '../../remote-files.js';
+import { remoteTmuxLocation } from '../../tmux-manager.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { DEFAULT_SCREEN_TAIL_BYTES, MAX_SCREEN_HISTORY_LINES, screenTail } from '../../utils/screen-text.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
@@ -2759,11 +2760,13 @@ export function registerSessionRoutes(
       const wantsRemoteMessages = remoteQuery.context === 'full' || remoteQuery.context === 'turn';
       const empty = wantsRemoteMessages ? { text: '', timestamp: '', messages: [] } : { text: '', timestamp: '' };
       let remoteTranscript: { sessionId: string; content: string } | null;
+      const remoteIds = [session.claudeSessionId || session.id, session.id];
       try {
         remoteTranscript = await remoteReadClaudeTranscriptTail(
           session.remote,
-          [session.claudeSessionId || session.id, session.id],
-          REMOTE_CLAUDE_TRANSCRIPT_TAIL_BYTES
+          remoteIds,
+          REMOTE_CLAUDE_TRANSCRIPT_TAIL_BYTES,
+          remoteTmuxLocation(session.remote, session.id)
         );
       } catch (err) {
         // Say WHY instead of an empty answer an agent reads as "not answered yet".
@@ -2771,6 +2774,12 @@ export function registerSessionRoutes(
         throw err;
       }
       if (!remoteTranscript) return empty;
+      // An id we did not ask for is the conversation the pane's claude writes now (after a
+      // `/clear`, which no remote hook reports): adopt it like the local branch below does.
+      if (!remoteIds.includes(remoteTranscript.sessionId)) {
+        session.adoptClaudeSessionId(remoteTranscript.sessionId);
+        ctx.persistSessionState(session);
+      }
       const parsed = parseClaudeResponseTranscript(remoteTranscript.content, wantsRemoteMessages);
       if (remoteQuery.context === 'turn') {
         return {

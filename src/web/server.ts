@@ -352,7 +352,12 @@ export class WebServer extends EventEmitter {
   });
   /** Reads a remote claude's model off its transcript at each turn end (no exporter there). */
   private readonly remoteModelRefresher = new RemoteModelRefresher({
-    readTail: remoteReadClaudeTranscriptTail,
+    readTail: (remote, ids, maxBytes, sessionId) =>
+      remoteReadClaudeTranscriptTail(remote, ids, maxBytes, remoteTmuxLocation(remote, sessionId)),
+    persist: (sessionId) => {
+      const session = this.sessions.get(sessionId);
+      if (session) this.persistSessionState(session);
+    },
   });
   /**
    * The edit history panel's reader (edit-history-sync.ts). Runs on occasions only: a local

@@ -452,6 +452,9 @@ function claudeTranscriptFinderLines(ids: readonly string[], liveIdLines: readon
  * Script that prints the END of a claude transcript in the remote user's
  * `~/.claude/projects/*\/<id>.jsonl`, trying each id in order.
  *
+ * With `pane`, the conversation the claude there is writing now is tried first
+ * ({@link liveClaudeIdLines}); a returned id that is none of `ids` is that one.
+ *
  * Output: a lone NUL (rc-file chatter before it is discarded), the id that matched,
  * a NUL, then the last `maxBytes` bytes of the file (the newest one when the id
  * exists under several project dirs). Exit 3 = no transcript under
@@ -461,12 +464,16 @@ function claudeTranscriptFinderLines(ids: readonly string[], liveIdLines: readon
  * remote user's home, which the server cannot know. Ids are validated and each one
  * is a single shellescaped token.
  */
-export function buildRemoteClaudeTranscriptTailCommand(ids: readonly string[], maxBytes: number): string {
+export function buildRemoteClaudeTranscriptTailCommand(
+  ids: readonly string[],
+  maxBytes: number,
+  pane?: RemoteClaudePane
+): string {
   const safeIds = safeClaudeTranscriptIds(ids);
   if (safeIds.length === 0) return `exit ${TRANSCRIPT_NOT_FOUND_EXIT}`;
   const script = [
     "printf '\\0'",
-    ...claudeTranscriptFinderLines(safeIds),
+    ...claudeTranscriptFinderLines(safeIds, liveClaudeIdLines(pane)),
     'printf \'%s\\0\' "$bestid"',
     `tail -c ${Math.max(1, Math.floor(maxBytes))} "$best"`,
   ].join('\n');
@@ -497,10 +504,11 @@ export function parseRemoteClaudeTranscriptTail(stdout: string): { sessionId: st
 export async function remoteReadClaudeTranscriptTail(
   remote: SessionRemote,
   ids: readonly string[],
-  maxBytes: number
+  maxBytes: number,
+  pane?: RemoteClaudePane
 ): Promise<{ sessionId: string; content: string } | null> {
   assertNotUnderTest();
-  const command = buildRemoteFileCommand(remote, buildRemoteClaudeTranscriptTailCommand(ids, maxBytes));
+  const command = buildRemoteFileCommand(remote, buildRemoteClaudeTranscriptTailCommand(ids, maxBytes, pane));
   let stdout: Buffer;
   try {
     const result = await runWithRemoteSshLimit(() =>

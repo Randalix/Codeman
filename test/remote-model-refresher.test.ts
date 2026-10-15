@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { RemoteModelRefresherDeps } from '../src/web/remote-model-refresher.js';
 import {
   REMOTE_MODEL_TAIL_BYTES,
   RemoteModelRefresher,
@@ -19,32 +20,56 @@ function fakeSession(over: Partial<RemoteModelSession> = {}): RemoteModelSession
     remote,
     claudeSessionId: 'conv-1',
     noteReportedModel: vi.fn(() => true),
+    adoptClaudeSessionId: vi.fn(),
     ...over,
   };
 }
 
+const persist = vi.fn();
+const deps = (readTail: unknown) => ({ readTail, persist }) as unknown as RemoteModelRefresherDeps;
+
 describe('RemoteModelRefresher', () => {
+  it('adopts the conversation the pane writes now (after a /clear) and persists the session', async () => {
+    persist.mockClear();
+    const readTail = vi.fn(async () => ({ ...tailOf('claude-opus-5-5'), sessionId: 'conv-2' }));
+    const session = fakeSession();
+    await new RemoteModelRefresher(deps(readTail)).refresh(session);
+
+    expect(session.adoptClaudeSessionId).toHaveBeenCalledWith('conv-2');
+    expect(persist).toHaveBeenCalledWith('sess-1');
+    expect(session.noteReportedModel).toHaveBeenCalledWith('transcript', 'Opus 5.5');
+  });
+
+  it('keeps the conversation when the read found one it asked for', async () => {
+    persist.mockClear();
+    const session = fakeSession();
+    await new RemoteModelRefresher(deps(vi.fn(async () => tailOf('claude-sonnet-5')))).refresh(session);
+
+    expect(session.adoptClaudeSessionId).not.toHaveBeenCalled();
+    expect(persist).not.toHaveBeenCalled();
+  });
+
   it("records a remote claude's newest model as a transcript report", async () => {
     const readTail = vi.fn(async () => tailOf('claude-sonnet-5'));
     const session = fakeSession();
-    await new RemoteModelRefresher({ readTail }).refresh(session);
+    await new RemoteModelRefresher(deps(readTail)).refresh(session);
 
-    expect(readTail).toHaveBeenCalledWith(remote, ['conv-1', 'sess-1'], REMOTE_MODEL_TAIL_BYTES);
+    expect(readTail).toHaveBeenCalledWith(remote, ['conv-1', 'sess-1'], REMOTE_MODEL_TAIL_BYTES, 'sess-1');
     expect(session.noteReportedModel).toHaveBeenCalledWith('transcript', 'Sonnet 5');
   });
 
   it('falls back to the session id before claude has named its conversation', async () => {
     const readTail = vi.fn(async () => null);
     const session = fakeSession({ claudeSessionId: null });
-    await new RemoteModelRefresher({ readTail }).refresh(session);
+    await new RemoteModelRefresher(deps(readTail)).refresh(session);
 
-    expect(readTail).toHaveBeenCalledWith(remote, ['sess-1', 'sess-1'], REMOTE_MODEL_TAIL_BYTES);
+    expect(readTail).toHaveBeenCalledWith(remote, ['sess-1', 'sess-1'], REMOTE_MODEL_TAIL_BYTES, 'sess-1');
     expect(session.noteReportedModel).not.toHaveBeenCalled();
   });
 
   it('never reads for a local session or another CLI', async () => {
     const readTail = vi.fn(async () => tailOf('claude-sonnet-5'));
-    const refresher = new RemoteModelRefresher({ readTail });
+    const refresher = new RemoteModelRefresher(deps(readTail));
     await refresher.refresh(fakeSession({ remote: undefined }));
     await refresher.refresh(fakeSession({ mode: 'opencode' }));
     expect(readTail).not.toHaveBeenCalled();
@@ -59,7 +84,7 @@ describe('RemoteModelRefresher', () => {
         })
     );
     const session = fakeSession();
-    const refresher = new RemoteModelRefresher({ readTail });
+    const refresher = new RemoteModelRefresher(deps(readTail));
 
     const first = refresher.refresh(session);
     await refresher.refresh(session);

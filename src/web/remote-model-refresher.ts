@@ -12,6 +12,11 @@
  * wake invariant: reads never wake). At most one read per session is in flight; a turn
  * end during a read is skipped, the next one catches up. A failed read changes nothing.
  *
+ * The same read follows a `/clear`: the remote claude then writes a new conversation and
+ * no hook reports it, so the read tries the one the pane's claude is writing now first.
+ * When that is what it found, the session adopts it (as the local `last-response` does)
+ * and is persisted, so the response viewer and the edit history read it too.
+ *
  * Tests: `test/remote-model-refresher.test.ts`.
  *
  * @module web/remote-model-refresher
@@ -31,15 +36,22 @@ export interface RemoteModelSession {
   remote: SessionRemote | undefined;
   claudeSessionId: string | null;
   noteReportedModel(source: 'transcript', raw: unknown): boolean;
+  adoptClaudeSessionId(newId: string): void;
 }
 
 export interface RemoteModelRefresherDeps {
-  /** `remoteReadClaudeTranscriptTail`: the tail of the first transcript found, or null. */
+  /**
+   * `remoteReadClaudeTranscriptTail` with the session's remote pane: the tail of the live
+   * conversation, else of the first of `ids` found, or null.
+   */
   readTail(
     remote: SessionRemote,
     ids: readonly string[],
-    maxBytes: number
+    maxBytes: number,
+    sessionId: string
   ): Promise<{ sessionId: string; content: string } | null>;
+  /** Save the session after it adopted a new conversation. */
+  persist(sessionId: string): void;
 }
 
 export class RemoteModelRefresher {
@@ -58,7 +70,11 @@ export class RemoteModelRefresher {
     this.inFlight.add(session.id);
     try {
       const ids = [session.claudeSessionId || session.id, session.id];
-      const tail = await this.deps.readTail(remote, ids, REMOTE_MODEL_TAIL_BYTES);
+      const tail = await this.deps.readTail(remote, ids, REMOTE_MODEL_TAIL_BYTES, session.id);
+      if (tail && !ids.includes(tail.sessionId)) {
+        session.adoptClaudeSessionId(tail.sessionId);
+        this.deps.persist(session.id);
+      }
       const model = tail ? lastAssistantModel(tail.content) : undefined;
       if (model) session.noteReportedModel('transcript', friendlyClaudeModel(model));
     } catch {

@@ -666,6 +666,20 @@ describe('the remote claude edit-sources script on a real shell', () => {
       expect(runIn(pane)).toBe('solo');
     });
 
+    it('the transcript tail read tries the live conversation first too', () => {
+      session('{"pid":300,"sessionId":"solo"}');
+      const env = { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` };
+      const tail = (p: typeof pane | undefined) =>
+        parseRemoteClaudeTranscriptTail(
+          execFileSync('sh', ['-c', buildRemoteClaudeTranscriptTailCommand(['conv-1'], 1024, p)], {
+            env,
+            cwd: bin,
+          }).toString()
+        )?.sessionId;
+      expect(tail(pane)).toBe('solo');
+      expect(tail(undefined)).toBe('conv-1');
+    });
+
     it('falls back to the stored ids without a pane, for an unknown session, or a live id with no transcript', () => {
       session('{"pid":300,"sessionId":"solo"}');
       expect(runIn(undefined)).toBe('conv-1');
