@@ -279,6 +279,7 @@ export class EditHistorySync {
     store: EditHistoryStore,
     ids: readonly string[]
   ): Promise<number> {
+    if (!store.backfillTruncated) return 0;
     const requests: EditSourceRequest[] = [];
     for (const relPath of store.sourcesWithOlder()) {
       const range = store.olderRange(relPath, this.budget);

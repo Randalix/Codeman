@@ -300,6 +300,17 @@ describe('EditHistoryStore: cap', () => {
     // Older than everything kept: counts as nothing added.
     expect(store.addImageEntries([{ toolUseId: 'old', path: '/a.png', ts: T0 - 1000 }])).toBe(0);
   });
+
+  it('offers no older block once the cap is full (it would be dropped on read)', () => {
+    const store = new EditHistoryStore('s1', { dir });
+    const lines = Array.from({ length: MAX_ENTRIES + 20 }, (_, i) => editLine(`e${i}`, i));
+    const file = jsonl(lines);
+    const tail = jsonl(lines.slice(-MAX_ENTRIES)).length;
+    syncForward(store, file, tail + 10);
+    expect(store.list()).toHaveLength(MAX_ENTRIES);
+    expect(store.getCursor(MAIN_SOURCE)!.floor).toBeGreaterThan(0);
+    expect(store.backfillTruncated).toBe(false);
+  });
 });
 
 describe('EditHistoryStore: persistence', () => {

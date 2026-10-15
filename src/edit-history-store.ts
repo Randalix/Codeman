@@ -181,8 +181,12 @@ export class EditHistoryStore {
     return c ? { ...c } : undefined;
   }
 
-  /** True while any source has unread older lines. */
+  /**
+   * True while any source has unread older lines that could still be shown. At the entry cap
+   * an older edit would be dropped the moment it is read, so there is nothing more to load.
+   */
   get backfillTruncated(): boolean {
+    if (this.entries.size >= MAX_ENTRIES) return false;
     for (const c of this.cursors.values()) if (c.floor > 0) return true;
     return false;
   }

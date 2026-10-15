@@ -326,11 +326,6 @@ export const TranscriptToolStart = 'transcript:tool_start' as const;
 /** Tool invocation ended in transcript. */
 export const TranscriptToolEnd = 'transcript:tool_end' as const;
 
-// ─── Edit History ────────────────────────────────────────────────────────────
-
-/** A session's edit history gained entries (`{ sessionId, added }`). */
-export const EditHistoryUpdated = 'edit-history:updated' as const;
-
 // ─── Plan Orchestration ──────────────────────────────────────────────────────
 
 /** Plan generation started. */
@@ -650,9 +645,6 @@ export const SseEvent = {
   TranscriptPlanMode,
   TranscriptToolStart,
   TranscriptToolEnd,
-
-  // Edit history
-  EditHistoryUpdated,
 
   // Plan orchestration
   PlanStarted,
