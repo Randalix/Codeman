@@ -1,0 +1,368 @@
+/**
+ * @fileoverview Edit history button and panel, end to end in a real browser: real server, real
+ * Chromium. The edits API is mocked with `page.route` (the UI is built against its contract); the
+ * thumbnail and the SSE update go through the real server.
+ */
+import { homedir } from 'node:os';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { chromium, type Browser, type Page, type Route } from 'playwright';
+import { WebServer } from '../src/web/server.js';
+
+/** A 2×2 red PNG, so the thumbnail has real pixels to decode. */
+const PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP4z8AARAwQCgAf7gP9i18U1AAAAABJRU5ErkJggg==',
+  'base64'
+);
+
+type Entry = {
+  id: string;
+  ts: number;
+  path: string;
+  relPath: string;
+  kind: 'code' | 'image';
+  tool: string;
+  created: boolean;
+  added: number;
+  removed: number;
+  agentId?: string;
+};
+
+describe('Edit history panel in a real browser', () => {
+  let server: WebServer;
+  let browser: Browser;
+  let page: Page;
+  let root: string;
+  let sessionA: string;
+  let sessionB: string;
+  const settingsPutStatuses: number[] = [];
+  /** Every request to the mocked API: `METHOD url`. */
+  const calls: string[] = [];
+  /** The mocked server state per session id. */
+  const state = new Map<string, Record<string, unknown>>();
+  let diffs: Record<string, { diff: string; truncated: boolean }> = {};
+  let olderEntries: Entry[] = [];
+
+  const entry = (over: Partial<Entry> & { id: string; relPath: string }): Entry => ({
+    ts: Date.now(),
+    path: join(root, over.relPath),
+    kind: 'code',
+    tool: 'Edit',
+    created: false,
+    added: 1,
+    removed: 1,
+    ...over,
+  });
+
+  const json = (route: Route, data: unknown) =>
+    route.fulfill({ contentType: 'application/json', body: JSON.stringify({ success: true, data }) });
+
+  const buttonVisible = () => page.evaluate(() => !document.getElementById('editHistoryBtn')!.hidden);
+  const bodyText = async () => (await page.textContent('#editHistoryBody')) ?? '';
+  const setSetting = async (on: boolean) => {
+    await page.evaluate(() => (window as any).app.openAppSettings());
+    if ((await page.isChecked('#appSettingsShowEditHistory')) !== on)
+      await page.click('label.switch:has(#appSettingsShowEditHistory)');
+    await page.evaluate(() => (window as any).app.saveAppSettings());
+    await page.waitForTimeout(300);
+    await page.evaluate(() => (window as any).app.closeAppSettings());
+  };
+  const createSession = (dir: string) =>
+    page.evaluate(async (workingDir) => {
+      const res = await fetch('/api/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workingDir, mode: 'shell' }),
+      });
+      const id = (await res.json()).data.session.id;
+      await fetch(`/api/sessions/${id}/shell`, { method: 'POST' });
+      return id as string;
+    }, dir);
+  const select = (id: string) =>
+    page.evaluate(async (sid) => {
+      const app = (window as any).app;
+      for (let i = 0; i < 100 && !app.sessions.has(sid); i++) await new Promise((r) => setTimeout(r, 100));
+      await app.selectSession(sid);
+    }, id);
+  const reload = () => page.evaluate(() => (window as any).app.refreshEditHistory());
+  const rows = () => page.locator('#editHistoryBody .edit-history-entry');
+
+  beforeAll(async () => {
+    root = mkdtempSync(join(homedir(), 'edit-history-ui-'));
+    writeFileSync(join(root, 'shot.png'), PNG);
+
+    server = new WebServer(0, false, true);
+    await server.start();
+    browser = await chromium.launch({ headless: true });
+    page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
+    page.on('response', (r) => {
+      if (r.request().method() === 'PUT' && r.url().endsWith('/api/settings')) settingsPutStatuses.push(r.status());
+    });
+    await page.route('**/api/sessions/*/edits**', async (route) => {
+      const req = route.request();
+      const url = new URL(req.url());
+      calls.push(`${req.method()} ${url.pathname}${url.search}`);
+      const m = url.pathname.match(/\/api\/sessions\/([^/]+)\/edits(?:\/(.+))?$/)!;
+      const sid = decodeURIComponent(m[1]);
+      const rest = m[2] ? decodeURIComponent(m[2]) : '';
+      const s = state.get(sid) ?? { state: 'unsupported', backfillTruncated: false, agents: {}, entries: [] };
+      if (req.method() === 'POST' && rest === 'older') {
+        const entries = [...(s.entries as Entry[]), ...olderEntries];
+        state.set(sid, { ...s, entries, backfillTruncated: false });
+        return json(route, state.get(sid));
+      }
+      if (req.method() === 'GET' && rest) {
+        const d = diffs[rest];
+        if (!d) return route.fulfill({ status: 404, contentType: 'application/json', body: '{"success":false}' });
+        return json(route, d);
+      }
+      return json(route, s);
+    });
+    await page.goto(`http://localhost:${server.boundPort}`, { waitUntil: 'domcontentloaded' });
+    await page.waitForFunction(() => (window as any).app?.terminal, null, { timeout: 30000 });
+    sessionA = await createSession(root);
+    sessionB = await createSession(root);
+    await select(sessionA);
+
+    const t0 = Date.now();
+    state.set(sessionA, {
+      state: 'ok',
+      backfillTruncated: true,
+      agents: {
+        agent1: { description: 'Refactor the parser', agentType: 'general-purpose', worktreeBranch: 'wt/parser' },
+      },
+      entries: [
+        entry({ id: 'e4', ts: t0, relPath: 'src/a.ts', added: 3, removed: 1 }),
+        entry({ id: 'e3', ts: t0 - 1000, relPath: 'shot.png', kind: 'image', tool: 'bash', created: true }),
+        entry({
+          id: 'e2',
+          ts: t0 - 2000,
+          relPath: 'src/b.ts',
+          created: true,
+          tool: 'Write',
+          added: 10,
+          removed: 0,
+          agentId: 'agent1',
+        }),
+        entry({ id: 'e1', ts: t0 - 3000, relPath: 'src/a.ts', added: 2, removed: 2 }),
+      ],
+    });
+    diffs = {
+      e4: { diff: '@@ -1,3 +1,3 @@\n context\n-old line\n+new line\n+another\n', truncated: true },
+      e1: { diff: '@@ -5 +5 @@\n-x\n+y\n', truncated: false },
+    };
+    olderEntries = [entry({ id: 'e0', ts: t0 - 86_400_000, relPath: 'src/old.ts', added: 7, removed: 0 })];
+  }, 120000);
+
+  afterAll(async () => {
+    if (browser) await browser.close();
+    if (server) await server.stop();
+    rmSync(root, { recursive: true, force: true });
+  }, 60000);
+
+  it('is off by default: no button, and nothing asks the edits API', async () => {
+    await page.waitForTimeout(1000);
+    expect(await buttonVisible()).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it('turning it on through Settings shows the button and saves cleanly (the key never reaches the strict PUT)', async () => {
+    await setSetting(true);
+    expect(settingsPutStatuses.length).toBeGreaterThan(0);
+    expect(settingsPutStatuses.every((s) => s === 200)).toBe(true);
+    expect(await buttonVisible()).toBe(true);
+    expect(await page.evaluate(() => !!document.querySelector('.toolbar-right #editHistoryBtn'))).toBe(true);
+    expect(calls).toEqual([]); // no poll: nothing is read until the panel opens
+  });
+
+  it('opens a panel listing the entries newest first, with the subagent chip and an image thumbnail', async () => {
+    await page.click('#editHistoryBtn');
+    await page.waitForSelector('#editHistoryPanel.visible');
+    await page.waitForSelector('#editHistoryBody .edit-history-entry');
+    expect(calls[0]).toBe(`GET /api/sessions/${sessionA}/edits?sync=1`);
+    expect(await page.getAttribute('#editHistoryBtn', 'aria-expanded')).toBe('true');
+    expect(await rows().count()).toBe(4);
+    const paths = await page.locator('#editHistoryBody .edit-history-path').allTextContents();
+    expect(paths).toEqual(['src/a.ts', 'shot.png', 'src/b.ts', 'src/a.ts']);
+    expect(await rows().nth(0).locator('.edit-history-badge').textContent()).toBe('edit');
+    expect(await rows().nth(2).locator('.edit-history-badge').textContent()).toBe('new');
+    expect(await rows().nth(0).locator('.edit-history-stats').textContent()).toBe('+3−1');
+    // The image row: a symbol instead of a word, no +/− counts.
+    expect(await rows().nth(1).locator('.edit-history-badge--image svg').count()).toBe(1);
+    expect(await rows().nth(1).locator('.edit-history-stats').count()).toBe(0);
+    // The subagent chip: its description, and type + branch on hover.
+    const chip = rows().nth(2).locator('.edit-history-agent');
+    expect(await chip.textContent()).toBe('Refactor the parser');
+    expect(await chip.getAttribute('title')).toBe('general-purpose · wt/parser');
+    expect(await page.locator('#editHistoryBody .edit-history-agent').count()).toBe(1);
+    // The thumbnail is served by the real file-raw route and decodes.
+    const thumb = page.locator('#editHistoryBody img.edit-history-thumb');
+    expect(await thumb.count()).toBe(1);
+    expect(await thumb.getAttribute('src')).toBe(
+      `/api/sessions/${sessionA}/file-raw?path=${encodeURIComponent(join(root, 'shot.png'))}`
+    );
+    await page.waitForFunction(
+      () => (document.querySelector('img.edit-history-thumb') as HTMLImageElement)?.naturalWidth === 2
+    );
+    expect(await page.textContent('#editHistoryCount')).toBe('4');
+  });
+
+  it('a code entry opens its diff inline with the Git panel line classes, and closes again', async () => {
+    await rows().nth(0).locator('.edit-history-spacer').click();
+    await page.waitForSelector('#editHistoryBody .edit-history-diff pre.git-diff');
+    expect(calls).toContain(`GET /api/sessions/${sessionA}/edits/e4`);
+    const lines = await page.$$eval('#editHistoryBody pre.git-diff .git-diff-line', (els) =>
+      els.map((e) => [e.className.replace('git-diff-line', '').trim(), e.textContent])
+    );
+    expect(lines).toEqual([
+      ['git-diff-line--hunk', '@@ -1,3 +1,3 @@\n'],
+      ['', ' context\n'],
+      ['git-diff-line--del', '-old line\n'],
+      ['git-diff-line--add', '+new line\n'],
+      ['git-diff-line--add', '+another\n'],
+    ]);
+    expect(await page.textContent('#editHistoryBody .edit-history-diff')).toContain('Diff cut short');
+    expect(await rows().nth(0).getAttribute('aria-expanded')).toBe('true');
+    // A re-read (what an SSE update does) keeps the open diff without fetching it again.
+    const before = calls.filter((c) => c.endsWith('/edits/e4')).length;
+    await reload();
+    expect(await page.locator('#editHistoryBody pre.git-diff').count()).toBe(1);
+    expect(calls.filter((c) => c.endsWith('/edits/e4')).length).toBe(before);
+    await rows().nth(0).locator('.edit-history-spacer').click();
+    expect(await page.locator('#editHistoryBody pre.git-diff').count()).toBe(0);
+  });
+
+  it('a path and an image open the shared file preview with the absolute path', async () => {
+    await page.evaluate(() => {
+      (window as any).__previewed = [];
+      (window as any).app.openFilePreview = (p: string, sid: string) => (window as any).__previewed.push([p, sid]);
+    });
+    await rows().nth(2).locator('.edit-history-path').click();
+    await page.locator('#editHistoryBody img.edit-history-thumb').click();
+    expect(await page.evaluate(() => (window as any).__previewed)).toEqual([
+      [join(root, 'src/b.ts'), sessionA],
+      [join(root, 'shot.png'), sessionA],
+    ]);
+    // Clicking the path never toggles the row's diff.
+    expect(await page.locator('#editHistoryBody .edit-history-diff').count()).toBe(0);
+  });
+
+  it('"Main agent only" hides the subagent edits; "Group by file" puts edits under their file', async () => {
+    await page.check('#editHistoryMainOnlyToggle');
+    expect(await rows().count()).toBe(3);
+    expect(await page.locator('#editHistoryBody .edit-history-agent').count()).toBe(0);
+    expect(await bodyText()).not.toContain('src/b.ts');
+    await page.uncheck('#editHistoryMainOnlyToggle');
+    expect(await rows().count()).toBe(4);
+
+    await page.check('#editHistoryGroupToggle');
+    const groups = page.locator('#editHistoryBody .edit-history-group');
+    expect(await groups.count()).toBe(3);
+    expect(await groups.nth(0).locator('.edit-history-group-head .edit-history-path').textContent()).toBe('src/a.ts');
+    expect(await groups.nth(0).locator('.edit-history-entry').count()).toBe(2);
+    expect(await groups.nth(0).locator('.edit-history-group-head .edit-history-stats').textContent()).toBe('+5−3');
+    await groups.nth(0).locator('.edit-history-entry').nth(1).locator('.edit-history-spacer').click();
+    await page.waitForSelector('#editHistoryBody .git-diff-line--add');
+    expect(await page.textContent('#editHistoryBody .git-diff-line--add')).toBe('+y\n');
+    await page.uncheck('#editHistoryGroupToggle');
+  });
+
+  it('"Load older" asks the server with a POST and shows what it returns', async () => {
+    const older = page.locator('#editHistoryBody button.edit-history-older');
+    expect(await older.count()).toBe(1);
+    await older.click();
+    await page.waitForFunction(() =>
+      /src\/old\.ts/.test(document.getElementById('editHistoryBody')!.textContent ?? '')
+    );
+    expect(calls).toContain(`POST /api/sessions/${sessionA}/edits/older`);
+    expect(await rows().count()).toBe(5);
+    expect(await page.locator('#editHistoryBody button.edit-history-older').count()).toBe(0);
+  });
+
+  it('an edit-history:updated SSE event for the active session re-reads (debounced); one for another session does not', async () => {
+    const reads = () => calls.filter((c) => c === `GET /api/sessions/${sessionA}/edits?sync=1`).length;
+    const before = reads();
+    const s = state.get(sessionA)!;
+    state.set(sessionA, {
+      ...s,
+      entries: [entry({ id: 'e5', relPath: 'src/fresh.ts', added: 4, removed: 0 }), ...(s.entries as Entry[])],
+    });
+    const broadcast = (data: unknown) => (server as any).broadcast('edit-history:updated', data);
+    broadcast({ sessionId: 'someone-else', added: 1 });
+    broadcast({ sessionId: sessionA, added: 1 });
+    broadcast({ sessionId: sessionA, added: 1 });
+    await page.waitForFunction(() =>
+      /src\/fresh\.ts/.test(document.getElementById('editHistoryBody')!.textContent ?? '')
+    );
+    await page.waitForTimeout(600);
+    expect(reads()).toBe(before + 1);
+  });
+
+  it('renders a hostile path as text, never as markup', async () => {
+    const s = state.get(sessionA)!;
+    const evil = '<script>window.__pwned=1</script><img src=x onerror="window.__pwned=2">.ts';
+    state.set(sessionA, {
+      ...s,
+      agents: { agent1: { description: '<b>bold</b>', agentType: 'x', worktreeBranch: '' } },
+      entries: [entry({ id: 'evil', relPath: evil, agentId: 'agent1' }), ...(s.entries as Entry[])],
+    });
+    await reload();
+    await page.waitForFunction(() => /__pwned/.test(document.getElementById('editHistoryBody')!.textContent ?? ''));
+    expect(await rows().nth(0).locator('.edit-history-path').textContent()).toBe(evil);
+    expect(await rows().nth(0).locator('.edit-history-agent').textContent()).toBe('<b>bold</b>');
+    expect(await page.$('#editHistoryBody script')).toBeNull();
+    expect(await page.$('#editHistoryBody b')).toBeNull();
+    expect(
+      await page.$$eval(
+        '#editHistoryBody img',
+        (els) => els.filter((e) => !e.classList.contains('edit-history-thumb')).length
+      )
+    ).toBe(0);
+    expect(await page.evaluate(() => (window as any).__pwned)).toBeUndefined();
+  });
+
+  it('unavailable: the saved entries stay, with the reason on top', async () => {
+    const s = state.get(sessionA)!;
+    state.set(sessionA, { ...s, state: 'unavailable', reason: 'Host hufflepuff is asleep' });
+    await reload();
+    await page.waitForSelector('#editHistoryBody .edit-history-note--warn');
+    expect(await page.textContent('#editHistoryBody .edit-history-note--warn')).toBe(
+      'Showing saved entries only: Host hufflepuff is asleep'
+    );
+    expect(await rows().count()).toBeGreaterThan(0);
+    state.set(sessionA, { ...s, state: 'ok' });
+  });
+
+  it('follows the active session, and says when a session is not a Claude session', async () => {
+    await select(sessionB);
+    await page.waitForFunction(() =>
+      /only available for Claude sessions/.test(document.getElementById('editHistoryBody')!.textContent ?? '')
+    );
+    expect(calls).toContain(`GET /api/sessions/${sessionB}/edits?sync=1`);
+    expect(await rows().count()).toBe(0);
+    await select(sessionA);
+    await page.waitForSelector('#editHistoryBody .edit-history-entry');
+  });
+
+  it('drags by the header', async () => {
+    const before = await page.evaluate(() => document.getElementById('editHistoryPanel')!.getBoundingClientRect().left);
+    const box = (await page.locator('.edit-history-header').boundingBox())!;
+    await page.mouse.move(box.x + 40, box.y + 10);
+    await page.mouse.down();
+    await page.mouse.move(box.x - 140, box.y + 70, { steps: 5 });
+    await page.mouse.up();
+    const after = await page.evaluate(() => document.getElementById('editHistoryPanel')!.getBoundingClientRect().left);
+    expect(after).toBeLessThan(before - 100);
+  });
+
+  it('turning the setting off hides the button and closes the panel; SSE then reads nothing', async () => {
+    await setSetting(false);
+    expect(await buttonVisible()).toBe(false);
+    expect(await page.isVisible('#editHistoryPanel')).toBe(false);
+    const before = calls.length;
+    (server as any).broadcast('edit-history:updated', { sessionId: sessionA, added: 1 });
+    await page.waitForTimeout(800);
+    expect(calls.length).toBe(before);
+  });
+});

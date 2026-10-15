@@ -615,6 +615,22 @@
       <div class="git-status-footer" id="gitStatusFooter" data-i18n-skip></div>
     </div>
 
+    <!-- Edit history panel (edit-history-ui.js): every file edit the active session's agents made. -->
+    <div class="edit-history-panel" id="editHistoryPanel" role="dialog" aria-label="Edit history">
+      <div class="edit-history-header">
+        <span class="edit-history-title">Edit history <span class="edit-history-count" id="editHistoryCount" data-i18n-skip></span></span>
+        <div class="edit-history-actions">
+          <button class="btn-icon-sm" onclick="app.refreshEditHistory()" title="Refresh" aria-label="Refresh edit history">&#x21BB;</button>
+          <button class="btn-icon-sm" onclick="app.closeEditHistoryPanel()" title="Close" aria-label="Close edit history">&times;</button>
+        </div>
+      </div>
+      <div class="edit-history-controls">
+        <label class="edit-history-toggle"><input type="checkbox" id="editHistoryGroupToggle" onchange="app.setEditHistoryGrouped(this.checked)"><span>Group by file</span></label>
+        <label class="edit-history-toggle"><input type="checkbox" id="editHistoryMainOnlyToggle" onchange="app.setEditHistoryMainOnly(this.checked)"><span>Main agent only</span></label>
+      </div>
+      <div class="edit-history-body" id="editHistoryBody" data-i18n-skip></div>
+    </div>
+
     <!-- File Preview Overlay -->
     <div class="file-preview-overlay" id="filePreviewOverlay">
       <div class="file-preview-window">
@@ -868,6 +884,12 @@
         <button type="button" class="btn-toolbar btn-sm btn-git-status" id="gitStatusBtn" hidden aria-expanded="false" aria-controls="gitStatusPanel" onclick="app.toggleGitStatusPanel()">
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="8" r="2.5"/><path d="M6 8.5v7"/><path d="M18 10.5c0 4-6 3-11 6"/></svg>
           <span class="git-status-label" data-i18n-skip></span>
+        </button>
+        <!-- Edit history of the active session (edit-history-ui.js). Optional and per-device
+             (App Settings → Header & Panels → Bottom bar, default OFF). -->
+        <button type="button" class="btn-toolbar btn-sm btn-edit-history" id="editHistoryBtn" hidden aria-expanded="false" aria-controls="editHistoryPanel" title="Edit history" onclick="app.toggleEditHistoryPanel()">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+          <span>Edits</span>
         </button>
         <span class="version-display" id="versionDisplay" title="Codeman version">v0.0.0</span>
       </div>
@@ -2118,6 +2140,13 @@
                       <span class="set-row-desc">Seconds one git command may run before that repository is reported as unreadable (5 to 120, default 30). Raise it for repositories on a slow network share.</span>
                     </div>
                     <input type="number" id="appSettingsGitStatusTimeout" class="set-num" value="30" min="5" max="120" step="1">
+                  </div>
+                  <div class="set-row" data-search="edit history edits changes diff files agent subagent bottom bar toolbar">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Edit history <span class="set-scope">device</span></span>
+                      <span class="set-row-desc">Shows an Edits button at the right of the bottom bar. It opens a list of every file the active session's agent and its subagents changed, newest first, with each change's diff. Claude sessions only. Off by default.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsShowEditHistory"><span class="slider"></span></label>
                   </div>
                 </div>
               </div>
@@ -4225,6 +4254,7 @@
   <script defer src="mobile-overview.js"></script>
   <script defer src="home-sessions.js"></script>
   <script defer src="git-status-ui.js"></script>
+  <script defer src="edit-history-ui.js"></script>
   <script defer src="entrance-animations.js"></script>
   <script defer src="ralph-wizard.js"></script>
   <script defer src="api-client.js"></script>
