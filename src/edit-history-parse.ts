@@ -75,6 +75,11 @@ export interface ImageCandidate {
   end: number;
   paths: string[];
   agentId?: string;
+  /**
+   * Files claude handed to the user (`SendUserFile`): shown on purpose, so no mtime window
+   * applies; the file must still exist, and a version already listed is not listed again.
+   */
+  sent?: boolean;
 }
 
 export interface EditParseResult {
@@ -209,6 +214,20 @@ function toEditRecord(id: string, ts: number, result: unknown, agentId: string |
   return record;
 }
 
+/**
+ * Image paths of a `SendUserFile` result (`{ caption, attachments: [{ path }] }`): the
+ * files claude delivered to the user, which is how a session shows generated images.
+ */
+function sentImagePaths(result: unknown): string[] {
+  if (!isRecord(result) || !Array.isArray(result.attachments)) return [];
+  const out: string[] = [];
+  for (const a of result.attachments) {
+    if (!isRecord(a) || typeof a.path !== 'string' || !a.path.startsWith('/')) continue;
+    if (IMAGE_PATH_RE.test(a.path) && !out.includes(a.path)) out.push(a.path);
+  }
+  return out;
+}
+
 /** The text of a `tool_result` block's content (a string or a list of text blocks). */
 function blockText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -275,6 +294,12 @@ export function parseClaudeEditLines(text: string, pending: readonly PendingBash
       if (single) {
         const edit = toEditRecord(id, ts, rec.toolUseResult, agentId);
         if (edit) records.push(edit);
+      }
+      const sent = single ? sentImagePaths(rec.toolUseResult) : [];
+      if (sent.length > 0) {
+        const candidate: ImageCandidate = { toolUseId: id, start: ts, end: ts, paths: sent, sent: true };
+        if (agentId) candidate.agentId = agentId;
+        candidates.push(candidate);
       }
       const call = open.get(id);
       if (!call) continue;

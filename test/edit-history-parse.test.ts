@@ -255,6 +255,39 @@ describe('parseClaudeEditLines: Bash image candidates', () => {
   });
 });
 
+describe('parseClaudeEditLines: images sent to the user', () => {
+  it('takes the image attachments of a SendUserFile result, absolute paths only, without a window', () => {
+    const line = toolResultLine(
+      'toolu_send',
+      '2026-10-15T20:50:12.538Z',
+      {
+        caption: 'Vier Alternativen',
+        attachments: [
+          { path: '/tmp/s/icons/bremse_alt1_pedal.png', file_uuid: 'x' },
+          { path: '/tmp/s/icons/bremse_alt1_pedal.png' },
+          { path: '/tmp/s/report.pdf' },
+          { path: 'relative.png' },
+          { nope: 1 },
+        ],
+      },
+      { agentId: 'a1' }
+    );
+    const { candidates, records } = parseClaudeEditLines(line);
+    expect(records).toEqual([]);
+    const at = Date.parse('2026-10-15T20:50:12.538Z');
+    expect(candidates).toEqual([
+      {
+        toolUseId: 'toolu_send',
+        start: at,
+        end: at,
+        paths: ['/tmp/s/icons/bremse_alt1_pedal.png'],
+        sent: true,
+        agentId: 'a1',
+      },
+    ]);
+  });
+});
+
 describe('extractImagePathCandidates', () => {
   it('resolves relative paths against cwd and keeps ~/ paths literal', () => {
     expect(extractImagePathCandidates('cp a.png ../b.jpeg ~/shots/c.gif', '', '', CWD)).toEqual([

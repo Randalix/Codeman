@@ -47,7 +47,8 @@ const SAVE_DEBOUNCE_MS = 1000;
 const FILE_VERSION = 1;
 const NL = 0x0a;
 
-export type EditHistoryTool = EditTool | 'bash';
+/** `bash`: an image a Bash call wrote; `sent`: an image claude delivered to the user. */
+export type EditHistoryTool = EditTool | 'bash' | 'sent';
 
 export interface EditHistoryEntry extends Omit<EditRecord, 'tool'> {
   tool: EditHistoryTool;
@@ -92,6 +93,7 @@ export interface ConfirmedImage {
   path: string;
   ts: number;
   agentId?: string;
+  tool?: 'bash' | 'sent';
 }
 
 export interface EditHistoryStoreOptions {
@@ -324,7 +326,7 @@ export class EditHistoryStore {
         ts: img.ts,
         path: img.path,
         kind: 'image',
-        tool: 'bash',
+        tool: img.tool ?? 'bash',
         created: false,
         added: 0,
         removed: 0,

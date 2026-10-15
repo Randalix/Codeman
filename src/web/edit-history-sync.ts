@@ -89,7 +89,8 @@ export function unsupportedReason(session: EditHistorySession): string | undefin
 }
 
 /**
- * Bash candidates whose probed file is a regular file with an mtime inside the call's window.
+ * Bash candidates whose probed file is a regular file with an mtime inside the call's window
+ * (files claude sent to the user skip the window: they exist and were shown on purpose).
  * A candidate whose file version is already recorded is skipped: `known(path)` is the newest
  * entry time for that path, and an entry at or after `mtime − slack` saw this version — the
  * `ls *.png` right after the render, or a Write followed by a listing. Candidates are taken
@@ -106,12 +107,18 @@ export function confirmImages(
     for (const path of c.paths) {
       const p = probe(path);
       if (!p || p.kind !== 'file' || !p.mtimeMs) continue;
-      if (p.mtimeMs < c.start - IMAGE_MTIME_SLACK_MS || p.mtimeMs > c.end + IMAGE_MTIME_SLACK_MS) continue;
+      const inWindow = p.mtimeMs >= c.start - IMAGE_MTIME_SLACK_MS && p.mtimeMs <= c.end + IMAGE_MTIME_SLACK_MS;
+      if (!c.sent && !inWindow) continue;
       const entryPath = path.startsWith('~/') ? p.realPath : path;
       const last = Math.max(seen.get(entryPath) ?? -Infinity, known(entryPath) ?? -Infinity);
       if (last >= p.mtimeMs - IMAGE_MTIME_SLACK_MS) continue;
       seen.set(entryPath, c.end);
-      const img: ConfirmedImage = { toolUseId: c.toolUseId, path: entryPath, ts: c.end };
+      const img: ConfirmedImage = {
+        toolUseId: c.toolUseId,
+        path: entryPath,
+        ts: c.end,
+        tool: c.sent ? 'sent' : 'bash',
+      };
       if (c.agentId) img.agentId = c.agentId;
       out.push(img);
     }

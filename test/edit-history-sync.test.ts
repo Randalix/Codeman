@@ -314,6 +314,23 @@ describe('confirmImages', () => {
     expect(out).toEqual([]);
   });
 
+  it('lists a file sent to the user outside any window, once per file version', () => {
+    const png = { realPath: '/w/p.png', kind: 'file' as const, size: 9, mtimeMs: T0 };
+    const sent = { toolUseId: 's', start: T0 + 9000, end: T0 + 9000, paths: ['/w/p.png'], sent: true };
+    expect(confirmImages([sent], () => png)).toEqual([
+      { toolUseId: 's', path: '/w/p.png', ts: T0 + 9000, tool: 'sent' },
+    ]);
+    // The Bash call that wrote it was already listed: same version, not again.
+    expect(
+      confirmImages(
+        [sent],
+        () => png,
+        () => T0 + 500
+      )
+    ).toEqual([]);
+    expect(confirmImages([sent], () => null)).toEqual([]);
+  });
+
   it('skips a file version already recorded: the ls right after the render, a listing after a Write', () => {
     const png = { realPath: '/w/p.png', kind: 'file' as const, size: 9, mtimeMs: T0 + 900 };
     const render = { toolUseId: 'r', start: T0, end: T0 + 1000, paths: ['/w/p.png'] };
