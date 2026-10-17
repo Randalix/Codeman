@@ -29,10 +29,11 @@
  * - IDLE reports are QUIET mailbox messages (`agent-inbox.ts`): they never end a wait
  *   and draw no nudge, and are read together with the next loud mail or when the
  *   coordinator's wait slice runs out. BLOCKED, EXITED and GONE stay loud.
- * - Except an IDLE whose reason is `done`: nothing left open on the worker's side, so
- *   it is the hand-off the coordinator is waiting for. Quiet, it sat up to a whole wait
- *   slice (10 min) in the mailbox (Joe, 2026-10-17). It goes out loud; a muted worker
- *   still reports no IDLE at all.
+ * - Except an IDLE whose reason is `done` or `api-error` (LOUD_IDLE_REASONS): `done`
+ *   means nothing is left open on the worker's side, the hand-off the coordinator is
+ *   waiting for; `api-error` is a worker that sits until someone acts. Quiet, either sat
+ *   up to a whole wait slice (10 min) in the mailbox (Joe, 2026-10-17). They go out
+ *   loud; a muted worker still reports no IDLE at all.
  * - Every report from a worker replaces that worker's unseen quiet line, so the
  *   mailbox holds one current status per worker, not a backlog.
  * - `waiting-inbox` is not reported at all: the worker is correctly parked on its own
@@ -95,6 +96,12 @@ interface Pending {
   parent: string;
   name: string;
 }
+
+/**
+ * IDLE reasons that wake the coordinator at once instead of waiting in the digest:
+ * `done` is the worker's hand-off, `api-error` a worker that hangs until someone acts.
+ */
+const LOUD_IDLE_REASONS: ReadonlySet<WatchRow['reason']> = new Set(['done', 'api-error']);
 
 /** HH:MM in server-local time, like `agent watch` prints it. */
 function clock(ms: number): string {
@@ -238,8 +245,7 @@ export class CoordinatorReports {
         return 'skipped';
       }
       text = reportText(row);
-      // `done` is the hand-off itself: loud, so it ends the coordinator's wait now.
-      quiet = reportKind(row) === 'IDLE' && row.reason !== 'done';
+      quiet = reportKind(row) === 'IDLE' && !LOUD_IDLE_REASONS.has(row.reason);
     }
     if (!this.deps.post(parent, sessionId, text, { quiet })) {
       this.deps.log(`[CoordinatorReports] ${sessionId.slice(0, 8)} → ${parent.slice(0, 8)}: report not posted`);

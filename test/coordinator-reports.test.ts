@@ -329,6 +329,14 @@ describe('digest (w3c, 2026-10-11: one IDLE post per turn cost the coordinator a
     ]);
   });
 
+  it('an IDLE whose reason is api-error goes out loud too (the worker hangs until someone acts)', async () => {
+    const { posts, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row({ reason: 'api-error' }) });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts.map((p) => [p.text.includes('  api-error  '), p.quiet])).toEqual([[true, false]]);
+  });
+
   it('a muted worker reports no done either', async () => {
     const { posts, reports, add } = setup();
     add(WORKER, { parentSessionId: COORD, row: row({ reason: 'done', openTodos: 0 }) });

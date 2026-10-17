@@ -97,7 +97,7 @@ printed last as `watch digest (N):`, one current line per worker (a newer report
 replaces the unread older one). A worker parked on its own `inbox --wait` is not
 reported at all (`agent ls` shows it under WAIT). BLOCKED, EXITED and GONE still wake
 you at once, and so does an IDLE whose reason is `done` (nothing left open on the
-worker's side: its hand-off). A worker babysitting a long build ends a short turn every
+worker's side: its hand-off) or `api-error` (it hangs until someone acts). A worker babysitting a long build ends a short turn every
 minute; **`codeman agent mute [ids…] --for 30m`** holds its IDLE reports (`90s`, `2h`,
 bare number = minutes, max 24h; no ids = all your workers). BLOCKED and EXITED still
 come, and when the mute ends — or on `codeman agent unmute [ids…]` — its state is
