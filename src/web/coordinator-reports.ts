@@ -29,6 +29,10 @@
  * - IDLE reports are QUIET mailbox messages (`agent-inbox.ts`): they never end a wait
  *   and draw no nudge, and are read together with the next loud mail or when the
  *   coordinator's wait slice runs out. BLOCKED, EXITED and GONE stay loud.
+ * - Except an IDLE whose reason is `done`: nothing left open on the worker's side, so
+ *   it is the hand-off the coordinator is waiting for. Quiet, it sat up to a whole wait
+ *   slice (10 min) in the mailbox (Joe, 2026-10-17). It goes out loud; a muted worker
+ *   still reports no IDLE at all.
  * - Every report from a worker replaces that worker's unseen quiet line, so the
  *   mailbox holds one current status per worker, not a backlog.
  * - `waiting-inbox` is not reported at all: the worker is correctly parked on its own
@@ -234,7 +238,8 @@ export class CoordinatorReports {
         return 'skipped';
       }
       text = reportText(row);
-      quiet = reportKind(row) === 'IDLE';
+      // `done` is the hand-off itself: loud, so it ends the coordinator's wait now.
+      quiet = reportKind(row) === 'IDLE' && row.reason !== 'done';
     }
     if (!this.deps.post(parent, sessionId, text, { quiet })) {
       this.deps.log(`[CoordinatorReports] ${sessionId.slice(0, 8)} → ${parent.slice(0, 8)}: report not posted`);

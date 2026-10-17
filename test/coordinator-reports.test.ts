@@ -294,7 +294,7 @@ describe('mute', () => {
 describe('digest (w3c, 2026-10-11: one IDLE post per turn cost the coordinator a turn each)', () => {
   it('IDLE goes out quiet; BLOCKED, EXITED and GONE stay loud', async () => {
     const { sessions, posts, reports, add } = setup();
-    const w = add(WORKER, { parentSessionId: COORD, row: row({ reason: 'done' }) });
+    const w = add(WORKER, { parentSessionId: COORD, row: row({ reason: 'open-todos' }) });
     reports.notify(WORKER);
     await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
     w.row = row({ reason: 'blocked', turnEndSource: null, turnEndedAt: 2_000 });
@@ -309,6 +309,33 @@ describe('digest (w3c, 2026-10-11: one IDLE post per turn cost the coordinator a
       ['[codeman watch] BLOCKED', false],
       ['[codeman watch] GONE', false],
     ]);
+  });
+
+  it('an IDLE whose reason is done goes out loud (Joe, 2026-10-17: the hand-off sat up to 10 min)', async () => {
+    const { posts, reports, add } = setup();
+    const w = add(WORKER, { parentSessionId: COORD, row: row({ reason: 'inbox-unread', inboxPending: 1 }) });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    w.row = row({ reason: 'done', openTodos: 0, turnEndedAt: 2_000 });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    w.row = row({ reason: 'open-todos', turnEndedAt: 3_000 });
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts.map((p) => [p.text.split('  ')[0], p.text.includes('  done  '), p.quiet])).toEqual([
+      ['[codeman watch] IDLE', false, true],
+      ['[codeman watch] IDLE', true, false],
+      ['[codeman watch] IDLE', false, true],
+    ]);
+  });
+
+  it('a muted worker reports no done either', async () => {
+    const { posts, reports, add } = setup();
+    add(WORKER, { parentSessionId: COORD, row: row({ reason: 'done', openTodos: 0 }) });
+    reports.mute(WORKER, 60_000);
+    reports.notify(WORKER);
+    await vi.advanceTimersByTimeAsync(REPORT_DEBOUNCE_MS);
+    expect(posts).toEqual([]);
   });
 
   it('a worker parked on its own inbox (waiting-inbox) is not reported; its old line is withdrawn', async () => {
