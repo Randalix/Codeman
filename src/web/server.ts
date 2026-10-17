@@ -43,6 +43,7 @@ import { execSync } from 'node:child_process';
 import { hostname as getHostname, uptime as osUptime } from 'node:os';
 import { looksLikeHostReboot, newestPersistedActivity, planRebootRestore } from '../reboot-restore.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
+import { runBootRemoteReattach } from './reboot-remote-reattach.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
 import type { WebhookUrgency } from '../types/push.js';
@@ -3175,6 +3176,11 @@ export class WebServer extends EventEmitter {
     if (!this.testMode) {
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
+
+      // Remote sessions the reboot cut off reattach without a click when their
+      // remote pane survived. Not awaited: one ssh per host must not hold up the
+      // listen, and a sleeping host would cost its whole timeout.
+      void runBootRemoteReattach(this.createRouteContext(), { readHosts: () => readRemoteHosts(getDataDir()) });
 
       // Instance-scoped reaper: after restore, `docker rm -f` managed containers of
       // THIS instance whose case is gone from docker-cases.json (best-effort, never

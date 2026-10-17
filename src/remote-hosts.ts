@@ -447,6 +447,73 @@ export async function remoteTmuxSessionAlive(
   }
 }
 
+/** One pane on a remote host's `-L codeman-remote` server. */
+export interface RemoteCodemanPane {
+  /** The tmux session name, `codeman-ssh-<id8>` for a Codeman launch. */
+  sessionName: string;
+  dead: boolean;
+  /** `#{pane_current_command}`, e.g. `claude` or `bash`. */
+  command: string;
+  /** `#{pane_current_path}` on the remote host. */
+  path: string;
+}
+
+/**
+ * The SSH command that lists every pane on the remote `-L codeman-remote`
+ * server in one round trip. Fields are `|`-separated with the path LAST, so a
+ * path containing `|` still parses. ⚠️ Not tab-separated: tmux 3.6a prints a
+ * tab inside `-F` as `_` (measured on Hufflepuff, 2026-10-17).
+ */
+export function buildRemoteListPanesCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
+): string {
+  const [ssh, ...connectionArgs] = buildSshConnectionArgs(host);
+  const remoteCmd =
+    "tmux -L codeman-remote list-panes -a -F '#{session_name}|#{pane_dead}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null";
+  return [ssh, ...connectionArgs, remoteSshTarget(host), shellescape(remoteCmd)].join(' ');
+}
+
+/** Parse `buildRemoteListPanesCommand` output. Pure; the first pane of a session wins. */
+export function parseRemoteListPanes(stdout: string): Map<string, RemoteCodemanPane> {
+  const panes = new Map<string, RemoteCodemanPane>();
+  for (const line of stdout.split('\n')) {
+    const parts = line.split('|');
+    if (parts.length < 4 || !parts[0]) continue;
+    const [sessionName, dead, command, ...rest] = parts;
+    if (panes.has(sessionName)) continue;
+    panes.set(sessionName, { sessionName, dead: dead === '1', command, path: rest.join('|') });
+  }
+  return panes;
+}
+
+/**
+ * Every pane on the remote host's `-L codeman-remote` server, keyed by tmux
+ * session name, in ONE ssh, for passes that ask about many sessions on a host.
+ * Same tri-state discipline as `remoteTmuxSessionAlive`:
+ *   - a map (possibly empty) → the host answered. tmux exits 1 when no server
+ *     runs on the socket (measured), and 127 when tmux is missing: both mean no
+ *     Codeman session can be there → empty map.
+ *   - `undefined` → ssh failed or timed out; nothing was learned.
+ *
+ * Never wakes a host: plain ssh in BatchMode with the shared ConnectTimeout.
+ * VITEST guard — returns `undefined` under test so a real ssh never runs.
+ */
+export async function listRemoteCodemanPanes(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
+): Promise<Map<string, RemoteCodemanPane> | undefined> {
+  if (process.env.VITEST) return undefined;
+  try {
+    const { stdout } = await execAsync(buildRemoteListPanesCommand(remote), { timeout: 15_000 });
+    return parseRemoteListPanes(stdout);
+  } catch (err) {
+    const e = err as { code?: unknown; killed?: boolean };
+    const code = typeof e.code === 'number' ? e.code : null;
+    // Same exit mapping as the has-session probe: `false` there is "no such
+    // session", which for a listing is an empty server.
+    return classifyRemoteAliveExit(code, e.killed === true) === false ? new Map() : undefined;
+  }
+}
+
 /**
  * Map the `has-session` probe's exit status onto the tri-state the watcher
  * reads. Pure, so the mapping is unit-tested even though the probe itself is
