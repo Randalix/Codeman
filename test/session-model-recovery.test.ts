@@ -67,7 +67,7 @@ describe('the launch model survives recovery', () => {
 
   it('is handed back by both recovery constructors', () => {
     const server = readFileSync(join(SRC, 'web', 'server.ts'), 'utf-8');
-    const reboot = readFileSync(join(SRC, 'web', 'routes', 'reboot-restore-routes.ts'), 'utf-8');
+    const reboot = readFileSync(join(SRC, 'web', 'reboot-restore-rebuild.ts'), 'utf-8');
     expect(server).toMatch(/model:\s*savedState\?\.model,/);
     expect(reboot).toMatch(/model:\s*saved\.model,/);
   });
@@ -202,7 +202,7 @@ describe('a launch model and an advisor survive recovery together', () => {
 
   it('both recovery constructors hand back model, advisorModel and effort', () => {
     const server = readFileSync(join(SRC, 'web', 'server.ts'), 'utf-8');
-    const reboot = readFileSync(join(SRC, 'web', 'routes', 'reboot-restore-routes.ts'), 'utf-8');
+    const reboot = readFileSync(join(SRC, 'web', 'reboot-restore-rebuild.ts'), 'utf-8');
     for (const field of ['effort', 'model', 'advisorModel']) {
       expect(server).toMatch(new RegExp(`\\b${field}:\\s*savedState\\?\\.${field},`));
       expect(reboot).toMatch(new RegExp(`\\b${field}:\\s*saved\\.${field},`));
