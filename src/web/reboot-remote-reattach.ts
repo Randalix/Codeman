@@ -20,6 +20,8 @@
  * - Take-then-build like the banner route, under its own spender key, so a click
  *   while this pass runs cannot receive the same entry.
  * - Builds through `rebuildRebootEntry`, the route's construction path.
+ * - Afterwards the orphan safety net (`web/remote-orphans`) runs on the same
+ *   per-host listings, so each host is asked once per boot.
  *
  * @dependencies reboot-restore-registry, reboot-restore-rebuild, remote-hosts
  * @consumedby web/server (after boot recovery)
@@ -36,6 +38,7 @@ import { STATS_COLLECTION_INTERVAL_MS } from '../config/server-timing.js';
 import { sessionCapacityMessage } from './route-helpers.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
 import { rebuildRebootEntry, type RebootRebuildCtx } from './reboot-restore-rebuild.js';
+import { runRemoteOrphanAdoption } from './remote-orphans.js';
 
 /**
  * The registry's spender for this pass. Not a username: owners are user names
@@ -57,7 +60,7 @@ export interface BootReattachResult {
 }
 
 /** ssh identity of a host; entries sharing it are asked about in one round trip. */
-function hostKey(remote: SessionRemote): string {
+function hostKey(remote: Pick<SessionRemote, 'username' | 'host' | 'port'>): string {
   return `${remote.username}@${remote.host}:${remote.port ?? 22}`;
 }
 
@@ -112,7 +115,11 @@ export async function reattachRemoteRebootEntries(
         continue;
       }
       if (sessionCapacityMessage(ctx.sessions, entry.owner)) continue;
-      const session = await rebuildRebootEntry(ctx, entry, { workspaceHooksEnabled, remoteHostsById });
+      const session = await rebuildRebootEntry(ctx, entry, {
+        workspaceHooksEnabled,
+        remoteHostsById,
+        reason: 'boot_remote_reattach',
+      });
       if (!session) continue;
       unspent.delete(entry);
       result.reattached.push(entry.sessionId);
@@ -127,15 +134,31 @@ export async function reattachRemoteRebootEntries(
   return result;
 }
 
-/** `reattachRemoteRebootEntries` for the boot sequence: logs, never throws. */
+/**
+ * The boot sequence: reattach from the reboot plan, then adopt orphans. Both
+ * share one listing per host, so a host is asked once per boot. Logs, never throws.
+ */
 export async function runBootRemoteReattach(ctx: RebootRebuildCtx, deps: BootReattachDeps): Promise<void> {
+  const listPanes = deps.listPanes ?? listRemoteCodemanPanes;
+  const listings = new Map<string, Promise<Map<string, RemoteCodemanPane> | undefined>>();
+  const sharedListPanes = (remote: Pick<SessionRemote, 'username' | 'host' | 'port'>) => {
+    const key = hostKey(remote);
+    if (!listings.has(key))
+      listings.set(
+        key,
+        listPanes(remote as SessionRemote).catch(() => undefined)
+      );
+    return listings.get(key)!;
+  };
   try {
-    const { reattached, leftOnOffer } = await reattachRemoteRebootEntries(ctx, deps);
-    if (reattached.length + leftOnOffer.length === 0) return;
-    console.log(
-      `[RebootReattach] reattached ${reattached.length} remote session(s); ${leftOnOffer.length} left on the banner`
-    );
+    const { reattached, leftOnOffer } = await reattachRemoteRebootEntries(ctx, { ...deps, listPanes: sharedListPanes });
+    if (reattached.length + leftOnOffer.length > 0) {
+      console.log(
+        `[RebootReattach] reattached ${reattached.length} remote session(s); ${leftOnOffer.length} left on the banner`
+      );
+    }
   } catch (err) {
     console.error(`[RebootReattach] boot pass failed; the banner still offers the rest: ${getErrorMessage(err)}`);
   }
+  await runRemoteOrphanAdoption(ctx, { readHosts: deps.readHosts, listPanes: sharedListPanes });
 }

@@ -144,6 +144,12 @@ export class RebootRestoreRegistry {
     if (added > 0 && this.builtAt === 0) this.builtAt = Date.now();
   }
 
+  /** Whether the plan holds this session, on offer or in a restore's hands. */
+  holds(sessionId: string): boolean {
+    this.dropIfExpired();
+    return this.entries.has(sessionId) || this.parked.has(sessionId);
+  }
+
   /** Drop the entries a viewer can see. Returns how many went. */
   clear(canAccess: (owner: string | undefined) => boolean): number {
     const removable = [...this.entries.values()].filter((entry) => canAccess(entry.owner));

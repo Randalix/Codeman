@@ -159,6 +159,7 @@ import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal
 import { MAX_PASTE_IMAGE_BYTES, MAX_PASTE_VIDEO_BYTES } from '../../config/buffer-limits.js';
 import { VIDEO_ATTACHMENT_EXTENSIONS } from '../../attachment-registry.js';
 import { dataPath, getDataDir } from '../../config/instance.js';
+import { runRemoteOrphanAdoption } from '../remote-orphans.js';
 import {
   checkRemoteTmuxAvailable,
   readRemoteCases,
@@ -957,6 +958,10 @@ export function registerSessionRoutes(
         },
         broadcast: (event, payload) => ctx.broadcast(event, payload),
         log: (message) => console.log(message),
+        // A host a wake just brought back may still run sessions the board lost
+        // while it slept: one read-only listing of that host, never a wake.
+        onHostReady: (remote) =>
+          void runRemoteOrphanAdoption(ctx, { readHosts: () => readRemoteHosts(CODEMAN_CONFIG_DIR) }, [remote.hostId]),
         // The session's `remote` block is a launch-time snapshot, so a wake target
         // configured later (banner's config dialog, or a hand-edited remote-hosts.json)
         // is resolved here — throttled by the registry, and the host config is

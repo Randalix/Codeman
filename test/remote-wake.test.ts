@@ -227,7 +227,12 @@ interface Harness {
 }
 
 function harness(
-  opts: { remote?: WakeableRemote; writesFail?: boolean; resolveRemote?: RemoteWakeDeps['resolveRemote'] } = {}
+  opts: {
+    remote?: WakeableRemote;
+    writesFail?: boolean;
+    resolveRemote?: RemoteWakeDeps['resolveRemote'];
+    onHostReady?: RemoteWakeDeps['onHostReady'];
+  } = {}
 ): Harness {
   const probe = vi.fn(async () => false);
   const wake = vi.fn(async () => true);
@@ -250,6 +255,7 @@ function harness(
     },
     log: () => {},
     ...(opts.resolveRemote ? { resolveRemote: opts.resolveRemote } : {}),
+    ...(opts.onHostReady ? { onHostReady: opts.onHostReady } : {}),
   };
 
   const session: WakeableSession = {
@@ -358,6 +364,35 @@ describe('RemoteWakeRegistry', () => {
     expect(h.probe).toHaveBeenCalledTimes(2);
     expect(h.wake).toHaveBeenCalledTimes(2);
     expect(h.writeViaMux.mock.calls.map((c) => c[0])).toEqual(['a', 'b']);
+  });
+
+  it('tells onHostReady once a wake brought the host back, and not before', async () => {
+    const onHostReady = vi.fn();
+    const h = harness({ onHostReady });
+    h.probe.mockResolvedValue(false);
+    await h.registry.wake(h.session);
+    expect(onHostReady).toHaveBeenCalledTimes(1);
+    expect(onHostReady).toHaveBeenCalledWith(expect.objectContaining({ hostId: remote.hostId }));
+  });
+
+  it('does not call onHostReady when the woken host never came back, or when no wake ran', async () => {
+    const onHostReady = vi.fn();
+    const h = harness({ onHostReady });
+    h.waitUntilReady.mockResolvedValue(false);
+    await h.registry.wake(h.session);
+    h.probe.mockResolvedValue(true);
+    await h.registry.handleInput(h.session, 'a');
+    expect(onHostReady).not.toHaveBeenCalled();
+  });
+
+  it('a throwing onHostReady does not fail the wake', async () => {
+    const h = harness({
+      onHostReady: () => {
+        throw new Error('boom');
+      },
+    });
+    await expect(h.registry.wake(h.session)).resolves.toBe(true);
+    expect(h.reattachRemote).toHaveBeenCalledTimes(1);
   });
 
   it('does not claim reconnected when the pane cannot be reattached', async () => {

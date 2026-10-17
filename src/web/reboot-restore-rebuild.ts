@@ -36,6 +36,8 @@ export interface RebootRebuildOptions {
   workspaceHooksEnabled: boolean;
   /** Host-level fields from remote-hosts.json, refreshed onto the saved `remote`. */
   remoteHostsById: ReadonlyMap<string, RemoteHost>;
+  /** Lifecycle `recovered` reason, so the log tells a click from a boot pass or an adoption. */
+  reason?: string;
 }
 
 /**
@@ -144,7 +146,12 @@ export async function rebuildRebootEntry(
       );
     }
 
-    getLifecycleLog().log({ event: 'recovered', sessionId: session.id, name: session.name });
+    getLifecycleLog().log({
+      event: 'recovered',
+      sessionId: session.id,
+      name: session.name,
+      ...(opts.reason ? { reason: opts.reason } : {}),
+    });
     // Every other open tab and phone needs this; the clicking tab already has
     // the response, and the client's handler is an idempotent upsert.
     ctx.broadcast(SseEvent.SessionCreated, ctx.getSessionStateWithRespawn(session));

@@ -6,6 +6,7 @@
  * - `GET  /api/reboot-restore`: what is on offer, ownership-scoped
  * - `POST /api/reboot-restore/restore`: rebuild some or all of it
  * - `POST /api/reboot-restore/dismiss`: drop the offer
+ * - `POST /api/remote-orphans/adopt`: the orphan safety net on demand (web/remote-orphans)
  *
  * A click, not the heuristic, is what creates panes. The heuristic only decides
  * whether the banner appears, so a wrong yes costs a line of text the user
@@ -40,8 +41,10 @@ import {
   canAccessOwned,
   ownerFor,
   isWorkingDirAllowedForUsername,
+  requireAdmin,
   sessionCapacityMessage,
 } from '../route-helpers.js';
+import { adoptRemoteOrphans, type AdoptOrphansDeps } from '../remote-orphans.js';
 import { rebootRestoreRegistry } from '../reboot-restore-registry.js';
 import {
   rejectAlreadyLive,
@@ -74,6 +77,8 @@ function toBannerItem(entry: RebootRestoreEntry) {
 export interface RebootRestoreRouteOptions {
   /** Whether a remote session's own tmux still exists; `undefined` = host did not answer. Injected by tests. */
   remoteSessionAlive?: (remote: SessionRemote, remoteSessionName: string) => Promise<boolean | undefined>;
+  /** Orphan adoption IO (host listing, lifecycle log). Injected by tests. */
+  orphanDeps?: Partial<AdoptOrphansDeps>;
 }
 
 export function registerRebootRestoreRoutes(
@@ -237,6 +242,18 @@ export function registerRebootRestoreRoutes(
       rebootRestoreRegistry.releaseFlight(owner, [...unspent]);
       rebootRestoreRegistry.endSpending(owner);
     }
+  });
+
+  // ========== Safety net: remote sessions the board lost ==========
+
+  // Admin-only: an adopted session has no owner (the lifecycle log does not
+  // record one), so in multi-user mode only an admin may bring it back.
+  app.post('/api/remote-orphans/adopt', async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    return adoptRemoteOrphans(ctx, {
+      readHosts: () => readRemoteHosts(getDataDir()),
+      ...options.orphanDeps,
+    });
   });
 
   // ========== Drop it ==========

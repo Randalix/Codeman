@@ -270,6 +270,12 @@ export interface RemoteWakeDeps {
   /** Structured diagnostics. */
   log?(message: string): void;
   /**
+   * A wake brought this host back (it accepts ssh again). Fire-and-forget; used
+   * to adopt remote sessions the board lost while the host slept. Read-only on
+   * the far side: it must never wake anything itself.
+   */
+  onHostReady?(remote: WakeableRemote): void;
+  /**
    * Resolve the host's CURRENT wake config for a session whose persisted `remote`
    * snapshot predates it (or was configured after launch). Called at most once per
    * `REMOTE_WAKE_RESOLVE_TTL_MS` per session, and only when the session's own copy
@@ -717,6 +723,11 @@ export class RemoteWakeRegistry {
 
     state.reachable = true;
     state.probedAt = Date.now();
+    try {
+      this.deps.onHostReady?.(remote);
+    } catch (err) {
+      this.deps.log?.(`[RemoteWake] onHostReady failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
     return true;
   }
 
