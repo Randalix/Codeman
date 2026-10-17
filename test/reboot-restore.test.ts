@@ -19,7 +19,7 @@
 import { mkdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
@@ -28,6 +28,7 @@ import {
   looksLikeHostReboot,
   newestPersistedActivity,
   planRebootRestore,
+  remoteRestoreDecision,
   rejectAlreadyLive,
   resolveResumeConversationId,
   type RebootRestoreEntry,
@@ -132,14 +133,34 @@ describe('which dead sessions may be rebuilt', () => {
     expect(planRebootRestore(['crashy'], persisted, () => true).skipped[0].reason).toBe('respawn-blocked');
   });
 
-  it('leaves remote sessions to the COD-108 reconnect watcher', () => {
+  it('offers a remote session without looking for its path on this disk', () => {
+    const remote = { hostId: 'h', label: 'Huff', host: 'example.test', username: 'u', remotePath: '/r/p', owned: true };
     const persisted = {
-      r: persistedSession({
-        id: 'r',
-        remote: { hostId: 'h', host: 'example.test', username: 'u', sessionName: 'n', owned: true },
-      } as Partial<SessionState> & { id: string }),
+      r: persistedSession({ id: 'r', workingDir: '/r/p', remote } as Partial<SessionState> & { id: string }),
     };
-    expect(planRebootRestore(['r'], persisted, () => true).skipped[0].reason).toBe('remote-or-docker');
+    const workspaceExists = vi.fn(() => false);
+    const plan = planRebootRestore(['r'], persisted, workspaceExists);
+    expect(plan.restore.map((s) => s.sessionId)).toEqual(['r']);
+    expect(plan.restore[0].workingDir).toBe('/r/p');
+    expect(workspaceExists).not.toHaveBeenCalled();
+  });
+
+  it('offers a remote session of any mode, and one whose record lost its pid', () => {
+    // The click asks the host whether the pane survived; mode and pid only matter
+    // if it did not (remoteRestoreDecision).
+    const remote = { hostId: 'h', label: 'Huff', host: 'example.test', username: 'u', remotePath: '/r', owned: true };
+    const persisted = {
+      sh: persistedSession({ id: 'sh', mode: 'shell', pid: null, remote } as Partial<SessionState> & { id: string }),
+    };
+    expect(planRebootRestore(['sh'], persisted, () => true).restore.map((s) => s.sessionId)).toEqual(['sh']);
+  });
+
+  it('still refuses a remote session the user ended on purpose', () => {
+    const remote = { hostId: 'h', label: 'Huff', host: 'example.test', username: 'u', remotePath: '/r', owned: true };
+    const persisted = {
+      r: persistedSession({ id: 'r', status: 'stopped', remote } as Partial<SessionState> & { id: string }),
+    };
+    expect(planRebootRestore(['r'], persisted, () => true).skipped[0].reason).toBe('intentionally-ended');
   });
 
   it('leaves docker sessions alone, since the container may not be up', () => {
@@ -154,6 +175,41 @@ describe('which dead sessions may be rebuilt', () => {
   it('skips a CLI whose history the claude transcript reader does not understand', () => {
     const persisted = { c: persistedSession({ id: 'c', mode: 'codex' }) };
     expect(planRebootRestore(['c'], persisted, () => true).skipped[0].reason).toBe('unsupported-mode');
+  });
+});
+
+describe('a remote entry at click time', () => {
+  const entry = (mode: string, pid: number | null = 4242) => ({
+    sessionId: 'r',
+    mode,
+    state: persistedSession({ id: 'r', mode: mode as SessionState['mode'], pid }),
+  });
+
+  it('rebuilds any mode whose remote pane survived, since the launch only attaches', () => {
+    expect(remoteRestoreDecision(entry('shell'), true)).toEqual({ build: true });
+    expect(remoteRestoreDecision(entry('claude', null), true)).toEqual({ build: true });
+  });
+
+  it('keeps the offer when the host did not answer, and never relaunches blind', () => {
+    expect(remoteRestoreDecision(entry('claude'), undefined)).toEqual({
+      build: false,
+      rejection: { sessionId: 'r', reason: 'host-unreachable' },
+      keepOnOffer: true,
+    });
+  });
+
+  it('resumes a claude conversation whose remote pane is gone', () => {
+    expect(remoteRestoreDecision(entry('claude'), false)).toEqual({ build: true });
+  });
+
+  it('spends the offer for a gone pane it cannot resume, or that never ran', () => {
+    for (const e of [entry('shell'), entry('codex'), entry('claude', null)]) {
+      expect(remoteRestoreDecision(e, false)).toEqual({
+        build: false,
+        rejection: { sessionId: 'r', reason: 'remote-session-gone' },
+        keepOnOffer: false,
+      });
+    }
   });
 });
 

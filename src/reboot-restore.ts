@@ -113,10 +113,12 @@ export function resolveResumeConversationId(state: SessionState): string {
 /**
  * Why one session was passed over. Reported for logging and shown to the user.
  *
- * All but the last two are decided before anything is built. `capacity-reached` and
+ * All but the last four are decided before anything is built. `capacity-reached` and
  * `rebuild-failed` can only happen once a click is spending the plan, and they
  * are the two the banner must not confuse with a missing workspace: one means
  * "try again after closing something", the other means the CLI would not start.
+ * `host-unreachable` and `remote-session-gone` come from the click-time probe of
+ * a remote session's own tmux on its host (see {@link remoteRestoreDecision}).
  */
 export interface RebootRestoreRejection {
   sessionId: string;
@@ -133,7 +135,9 @@ export interface RebootRestoreRejection {
     | 'workspace-forbidden'
     | 'already-live'
     | 'capacity-reached'
-    | 'rebuild-failed';
+    | 'rebuild-failed'
+    | 'host-unreachable'
+    | 'remote-session-gone';
 }
 
 /** One restorable session, as the banner shows it and the rebuild replays it. */
@@ -189,7 +193,12 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'intentionally-ended' });
       continue;
     }
-    if (state.pid === null || state.pid === undefined) {
+    if (!state.remote && (state.pid === null || state.pid === undefined)) {
+      // A remote record skips this: its pid is only the local ssh wrapper, and the
+      // click asks the host whether the agent's own tmux is still there, which
+      // answers the question this check guesses at. A remote record without a pid
+      // is still never RELAUNCHED (`remoteRestoreDecision`).
+      //
       // No attach process when the record was last written: the session never
       // started, or its pane died outright rather than its agent exiting inside a
       // surviving pane. Either way there was nothing running to bring back.
@@ -218,17 +227,28 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'respawn-blocked' });
       continue;
     }
-    if (state.remote || state.docker) {
-      // Both need another host or a container to be up, which a just-booted machine
-      // cannot promise. The remote reconnect watcher owns the remote case already.
+    if (state.docker) {
+      // The container's tmux went down with the host, and rebuilding it means
+      // re-creating the container's launch context, which this pass does not do.
       skipped.push({ sessionId, reason: 'remote-or-docker' });
+      continue;
+    }
+    if (state.remote) {
+      // The reboot took only the LOCAL ssh wrapper: the agent keeps running in the
+      // remote host's own tmux (`-L codeman-remote`), and the rebuild's launch is
+      // `new-session -A`, which attaches to it. Nothing here can tell whether that
+      // remote session survived or whether the host is even up, and finding out
+      // means an ssh round trip, which the boot pass must not make. So the mode and
+      // the remote session are judged at the click (`remoteRestoreDecision`), and
+      // the workspace check below is skipped: the path lives on the other host.
+      restore.push(toEntry(sessionId, state, state.remote.remotePath || state.workingDir || ''));
       continue;
     }
     // Capability, not a CLI id: this pass resumes by handing the CLI a conversation
     // id through the top-level `resumeSessionId`, which only a CLI whose history the
     // claude-jsonl reader understands can consume that way. Others carry their thread
     // id in their own `<Mode>Config`, which this pass does not thread through.
-    if (getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
+    if (!resumesByConversationId(state.mode)) {
       skipped.push({ sessionId, reason: 'unsupported-mode' });
       continue;
     }
@@ -240,18 +260,55 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'workspace-missing' });
       continue;
     }
-    restore.push({
-      sessionId,
-      name: state.name,
-      workingDir: state.workingDir,
-      owner: state.owner,
-      mode: state.mode ?? 'claude',
-      resumeConversationId: resolveResumeConversationId(state),
-      state,
-    });
+    restore.push(toEntry(sessionId, state, state.workingDir));
   }
 
   return { restore, skipped };
+}
+
+function toEntry(sessionId: string, state: SessionState, workingDir: string): RebootRestoreEntry {
+  return {
+    sessionId,
+    name: state.name,
+    workingDir,
+    owner: state.owner,
+    mode: state.mode ?? 'claude',
+    resumeConversationId: resolveResumeConversationId(state),
+    state,
+  };
+}
+
+/** Whether a mode's conversation can be resumed by id, which a fresh launch needs. */
+function resumesByConversationId(mode: string | undefined): boolean {
+  return getCli(mode ?? 'claude')?.capabilities.transcript === 'claude-jsonl';
+}
+
+/**
+ * What a click does with a remote entry, given what its host said about the
+ * session's own remote tmux (`remoteTmuxSessionAlive`).
+ *
+ * - alive: rebuild. The launch's `new-session -A` attaches to the running pane and
+ *   ignores its command, so any mode comes back as it was, with its screen.
+ * - gone: the agent ended on the host. Only a CLI that resumes by conversation id
+ *   is relaunched (into that conversation), and only when the record had a running
+ *   process; anything else would start fresh, which is not a restore, so it is
+ *   refused and the offer spent.
+ * - unknown (host asleep or unreachable): refused and LEFT on offer, so the user
+ *   can wake the host and click again. This pass never wakes it.
+ */
+export function remoteRestoreDecision(
+  entry: Pick<RebootRestoreEntry, 'sessionId' | 'mode' | 'state'>,
+  remoteAlive: boolean | undefined
+): { build: true } | { build: false; rejection: RebootRestoreRejection; keepOnOffer: boolean } {
+  if (remoteAlive === true) return { build: true };
+  if (remoteAlive === undefined) {
+    return { build: false, rejection: { sessionId: entry.sessionId, reason: 'host-unreachable' }, keepOnOffer: true };
+  }
+  // A record with no pid never had a running attach process (see the plan's pid
+  // check), so there is nothing to bring back by launching.
+  const hadProcess = entry.state.pid !== null && entry.state.pid !== undefined;
+  if (hadProcess && resumesByConversationId(entry.mode)) return { build: true };
+  return { build: false, rejection: { sessionId: entry.sessionId, reason: 'remote-session-gone' }, keepOnOffer: false };
 }
 
 /**

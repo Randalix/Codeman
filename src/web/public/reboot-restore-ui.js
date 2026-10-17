@@ -42,6 +42,10 @@ function rebootSkipReason(reason) {
       return 'session limit reached';
     case 'rebuild-failed':
       return 'the agent would not start';
+    case 'host-unreachable':
+      return 'remote host did not answer (wake it, then restore again)';
+    case 'remote-session-gone':
+      return 'the session ended on the remote host';
     default:
       return reason;
   }
@@ -75,11 +79,16 @@ Object.assign(CodemanApp.prototype, {
     if (detail) {
       // Names, so the user can tell what they are about to relaunch.
       const names = sessions
-        .map((s) => s.name || s.workingDir?.split('/').pop() || s.id.slice(0, 8))
+        .map((s) => {
+          const label = s.name || s.workingDir?.split('/').pop() || s.id.slice(0, 8);
+          return s.remote ? `${label} (${s.remote})` : label;
+        })
         .slice(0, 4)
         .join(', ');
       detail.textContent = count > 4 ? `${names}, …` : names;
-      detail.title = sessions.map((s) => `${s.name || s.id}\n${s.workingDir}`).join('\n\n');
+      detail.title = sessions
+        .map((s) => `${s.name || s.id}\n${s.remote ? `${s.remote}: ` : ''}${s.workingDir}`)
+        .join('\n\n');
     }
     const accept = this.$('rebootRestoreBannerAccept');
     // The note is hidden at phone width, so the warning travels on the button too.

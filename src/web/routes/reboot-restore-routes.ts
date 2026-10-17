@@ -18,6 +18,13 @@
  * owner's privilege grant, the workspace still being on disk, and the
  * conversation not already being live because the user resumed it by hand.
  *
+ * A remote session is rebuilt only after its host has answered that the agent's
+ * own tmux is still there (or, for claude, that it is gone and can be resumed):
+ * the reboot took only the local ssh wrapper, and the rebuilt launch's
+ * `new-session -A` attaches to the surviving remote pane. The probe is a plain
+ * `has-session` over ssh. This module has no access to the wake registry, so a
+ * sleeping host answers `host-unreachable` and its entries stay on offer.
+ *
  * A rebuilt session comes back attached, idle and disarmed. Respawn controllers
  * and Ralph loops are deliberately not re-armed, and its terminal scrollback is
  * gone, because the pane is new. The banner says so.
@@ -36,7 +43,15 @@ import {
   sessionCapacityMessage,
 } from '../route-helpers.js';
 import { rebootRestoreRegistry } from '../reboot-restore-registry.js';
-import { rejectAlreadyLive, type RebootRestoreEntry, type RebootRestoreRejection } from '../../reboot-restore.js';
+import {
+  rejectAlreadyLive,
+  remoteRestoreDecision,
+  type RebootRestoreEntry,
+  type RebootRestoreRejection,
+} from '../../reboot-restore.js';
+import { readRemoteHosts, rehydrateRemoteHostFields, remoteTmuxSessionAlive } from '../../remote-hosts.js';
+import { remoteTmuxSessionName } from '../../tmux-manager.js';
+import { getDataDir } from '../../config/instance.js';
 import { clampEnvOverridesForOwner } from '../../session-env-clamp.js';
 import { Session } from '../../session.js';
 import { resolveClaudeModeForUsername } from '../../user-store.js';
@@ -45,7 +60,7 @@ import { agentSkillDir, applyWorkspaceHooks, seedAgentSessionPreamble } from '..
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import { STATS_COLLECTION_INTERVAL_MS } from '../../config/server-timing.js';
 import { SseEvent } from '../sse-events.js';
-import type { SessionAttachmentHistoryItem } from '../../types.js';
+import type { SessionAttachmentHistoryItem, SessionRemote } from '../../types.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 type RebootRestoreCtx = SessionPort & EventPort & ConfigPort & InfraPort;
@@ -58,10 +73,22 @@ function toBannerItem(entry: RebootRestoreEntry) {
     workingDir: entry.workingDir,
     mode: entry.mode,
     owner: entry.owner,
+    // The host's label, so the banner can say where a session lives. Absent for local.
+    ...(entry.state.remote ? { remote: entry.state.remote.label || entry.state.remote.hostId } : {}),
   };
 }
 
-export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRestoreCtx): void {
+export interface RebootRestoreRouteOptions {
+  /** Whether a remote session's own tmux still exists; `undefined` = host did not answer. Injected by tests. */
+  remoteSessionAlive?: (remote: SessionRemote, remoteSessionName: string) => Promise<boolean | undefined>;
+}
+
+export function registerRebootRestoreRoutes(
+  app: FastifyInstance,
+  ctx: RebootRestoreCtx,
+  options: RebootRestoreRouteOptions = {}
+): void {
+  const remoteSessionAlive = options.remoteSessionAlive ?? remoteTmuxSessionAlive;
   const accessorFor = (req: Parameters<typeof getAuthUser>[0]) => {
     const user = getAuthUser(req);
     return (owner: string | undefined) => canAccessOwned(user, owner);
@@ -122,6 +149,15 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
       const restored: ReturnType<typeof toBannerItem>[] = [];
       const failures: RebootRestoreRejection[] = [...skipped];
       const workspaceHooksEnabled = await ctx.getWorkspaceHooksEnabled();
+      // Host-level fields live in remote-hosts.json, not in the record, and a host's
+      // wake command or agent URL may have changed since the session was launched.
+      // Same refresh the boot adopt path applies.
+      const remoteHostsById = restore.some((entry) => entry.state.remote)
+        ? new Map((await readRemoteHosts(getDataDir()).catch(() => [])).map((host) => [host.id, host]))
+        : new Map();
+      // A host that did not answer once is not asked again in this click: a sleeping
+      // host would otherwise cost one ssh timeout per session on it.
+      const unreachableHosts = new Set<string>();
 
       for (const entry of restore) {
         // The already-live check, re-run against the board as it is NOW. The pass
@@ -144,8 +180,27 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           failures.push({ sessionId: entry.sessionId, reason: 'capacity-reached' });
           continue;
         }
-        // A repo can be deleted between the boot that planned this and the click.
-        if (!existsSync(entry.workingDir)) {
+        const savedRemote = entry.state.remote;
+        if (savedRemote) {
+          // The workspace and its confinement are the remote host's business: the
+          // path is not on this disk, and the case grant was checked at launch.
+          // What matters here is whether the agent's own tmux survived.
+          const hostKey = `${savedRemote.username}@${savedRemote.host}:${savedRemote.port ?? 22}`;
+          const alive = unreachableHosts.has(hostKey)
+            ? undefined
+            : await remoteSessionAlive(
+                savedRemote,
+                savedRemote.remoteSessionName || remoteTmuxSessionName(entry.sessionId)
+              ).catch(() => undefined);
+          if (alive === undefined) unreachableHosts.add(hostKey);
+          const decision = remoteRestoreDecision(entry, alive);
+          if (!decision.build) {
+            failures.push(decision.rejection);
+            if (!decision.keepOnOffer) unspent.delete(entry);
+            continue;
+          }
+        } else if (!existsSync(entry.workingDir)) {
+          // A repo can be deleted between the boot that planned this and the click.
           failures.push({ sessionId: entry.sessionId, reason: 'workspace-missing' });
           continue;
         }
@@ -157,7 +212,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         // user's confinement, and `isWorkingDirAllowed` would wave an admin
         // through. The same reason the two grant re-checks below read
         // `saved.owner`.
-        if (!(await isWorkingDirAllowedForUsername(entry.owner, entry.workingDir))) {
+        if (!savedRemote && !(await isWorkingDirAllowedForUsername(entry.owner, entry.workingDir))) {
           // Left on offer: a withdrawn grant can be restored, unlike an already-open
           // conversation, so this is not the permanent kind of refusal.
           failures.push({ sessionId: entry.sessionId, reason: 'workspace-forbidden' });
@@ -205,6 +260,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             lastActivityAt: saved.lastActivityAt,
             owner: saved.owner,
             parentSessionId: saved.parentSessionId,
+            // Without it the rebuild would launch the agent LOCALLY in a path that
+            // only exists on the remote host. With it, the launch is the remote
+            // `ssh … new-session -A`, which attaches to the surviving pane.
+            remote: rehydrateRemoteHostFields(saved.remote, remoteHostsById),
           });
 
           await ctx.addSession(session);
@@ -237,17 +296,22 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // blocking dialog. The boot-time sweep finished hours ago, so the click
           // path installs them itself. `hooks: 'always'` is the capability that says
           // this CLI installs Codeman's hooks into the workspace.
-          if (workspaceHooksEnabled && getCli(session.mode)?.capabilities.hooks === 'always') {
+          // Local only: the workspace of a remote session is on the other host.
+          if (!session.remote && workspaceHooksEnabled && getCli(session.mode)?.capabilities.hooks === 'always') {
             await applyWorkspaceHooks(session.workingDir, true).catch((err: unknown) =>
               console.warn(`[reboot-restore] hook install failed for ${session.workingDir}: ${getErrorMessage(err)}`)
             );
           }
 
           // Both create paths seed this; without it a restored claude session's agent
-          // skill falls back to writing out the whole ~150-line §0 preamble. Remote and
-          // docker sessions never reach here (the plan rejects them as
-          // `remote-or-docker`), so the local-only condition is structural.
-          if (agentSkillDir(getCli(session.mode)?.capabilities) && (await ctx.getAgentSkillEnabled())) {
+          // skill falls back to writing out the whole ~150-line §0 preamble. Local only,
+          // like the create paths: a remote agent reads its skill on its own host, and
+          // docker sessions never reach here (the plan rejects them).
+          if (
+            !session.remote &&
+            agentSkillDir(getCli(session.mode)?.capabilities) &&
+            (await ctx.getAgentSkillEnabled())
+          ) {
             await seedAgentSessionPreamble(session.id).catch((err: unknown) =>
               console.warn(`[agent-skill] preamble seed failed for ${session.id}: ${getErrorMessage(err)}`)
             );
