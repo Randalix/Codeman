@@ -354,7 +354,7 @@ The escape hatch is the synced `workspaceHooksEnabled` setting (App Settings →
 
 ### Reboot restore
 
-**Reboot restore** (#411/#442, `src/reboot-restore.ts` pure + `web/reboot-restore-registry.ts` + `routes/reboot-restore-routes.ts` + `reboot-restore-ui.js`): a host reboot takes the tmux server with it, so every pane dies and the board comes up empty with no explanation. At boot Codeman works out which sessions that reboot destroyed, holds the plan IN MEMORY (no new state file, and a server restart simply drops the offer), and the banner asks.
+**Reboot restore** (#411/#442, `src/reboot-restore.ts` pure + `web/reboot-restore-registry.ts` + `web/reboot-restore-rebuild.ts` (the one construction path) + `routes/reboot-restore-routes.ts` + `reboot-restore-ui.js`): a host reboot takes the tmux server with it, so every pane dies and the board comes up empty with no explanation. At boot Codeman works out which sessions that reboot destroyed, holds the plan IN MEMORY (no new state file, and a server restart simply drops the offer), and the banner asks.
 
 ⚠️ **The heuristic decides whether to ASK, never whether to act**: two signals have to agree (the socket holds no panes at all while state still lists sessions, AND the host booted after the newest persisted activity), and a wrong yes costs one dismissable line rather than N CLI processes nobody asked for.
 

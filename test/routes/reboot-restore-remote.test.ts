@@ -193,7 +193,11 @@ describe('remote entries on the reboot banner', () => {
 
 describe('wake invariant (wiring guard)', () => {
   it('the reboot restore path never reaches the wake registry', () => {
-    for (const file of ['src/web/routes/reboot-restore-routes.ts', 'src/reboot-restore.ts']) {
+    for (const file of [
+      'src/web/routes/reboot-restore-routes.ts',
+      'src/web/reboot-restore-rebuild.ts',
+      'src/reboot-restore.ts',
+    ]) {
       const src = readFileSync(join(__dirname, '..', '..', file), 'utf-8');
       expect(src).not.toMatch(/^import .*remote-wake/m);
       expect(src).not.toMatch(/RemoteWakeRegistry|ensureAwake|handleInput/);
