@@ -29,6 +29,13 @@ export const MAX_HUNK_BYTES = 64 * 1024;
 export const MAX_IMAGE_CANDIDATES = 20;
 /** Unanswered Bash calls carried between chunks (an interrupted call never gets a result). */
 export const MAX_PENDING_BASH = 200;
+/**
+ * Command text kept per unanswered Bash call. Pending calls are persisted with the store, so
+ * this bounds it; an image path past this point of a command is still found in the output.
+ */
+export const MAX_PENDING_COMMAND_CHARS = 8192;
+/** Longest id, cwd or agent id of an unanswered Bash call; a call with a longer one is not kept. */
+export const MAX_PENDING_FIELD_CHARS = 4096;
 
 export type EditKind = 'code' | 'image';
 /** `edit` = a result with a path and a patch from a tool other than Edit/Write. */
@@ -144,22 +151,20 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-function toHunks(patch: unknown[]): { hunks: EditHunk[]; added: number; removed: number; truncated: boolean } {
+/**
+ * The hunks of `patch` with their string lines, cut once the lines reach {@link MAX_HUNK_BYTES}
+ * (`truncated`). Also applied to hunks loaded from a store file.
+ */
+export function capHunks(patch: readonly unknown[]): { hunks: EditHunk[]; truncated: boolean } {
   const hunks: EditHunk[] = [];
-  let added = 0;
-  let removed = 0;
   let budget = MAX_HUNK_BYTES;
   let truncated = false;
   for (const h of patch) {
     if (!isRecord(h) || !Array.isArray(h.lines)) continue;
-    const lines = h.lines.filter((l): l is string => typeof l === 'string');
-    for (const l of lines) {
-      if (l.startsWith('+')) added++;
-      else if (l.startsWith('-')) removed++;
-    }
-    if (truncated) continue;
+    if (truncated) break;
     const kept: string[] = [];
-    for (const l of lines) {
+    for (const l of h.lines) {
+      if (typeof l !== 'string') continue;
       const cost = Buffer.byteLength(l) + 3;
       if (cost > budget) {
         truncated = true;
@@ -176,7 +181,21 @@ function toHunks(patch: unknown[]): { hunks: EditHunk[]; added: number; removed:
       lines: kept,
     });
   }
-  return { hunks, added, removed, truncated };
+  return { hunks, truncated };
+}
+
+function toHunks(patch: unknown[]): { hunks: EditHunk[]; added: number; removed: number; truncated: boolean } {
+  let added = 0;
+  let removed = 0;
+  for (const h of patch) {
+    if (!isRecord(h) || !Array.isArray(h.lines)) continue;
+    for (const l of h.lines) {
+      if (typeof l !== 'string') continue;
+      if (l.startsWith('+')) added++;
+      else if (l.startsWith('-')) removed++;
+    }
+  }
+  return { ...capHunks(patch), added, removed };
 }
 
 /** A new file's content as one all-added hunk, in `structuredPatch` form. */
@@ -274,7 +293,8 @@ export function parseClaudeEditLines(text: string, pending: readonly PendingBash
         if (typeof block.id !== 'string' || !isRecord(block.input)) continue;
         const command = block.input.command;
         if (typeof command !== 'string') continue;
-        const entry: PendingBash = { id: block.id, ts, command, cwd };
+        if ([block.id, cwd, agentId ?? ''].some((f) => f.length > MAX_PENDING_FIELD_CHARS)) continue;
+        const entry: PendingBash = { id: block.id, ts, command: command.slice(0, MAX_PENDING_COMMAND_CHARS), cwd };
         if (agentId) entry.agentId = agentId;
         open.delete(block.id);
         open.set(block.id, entry);

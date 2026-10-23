@@ -25,7 +25,6 @@
  * - **Plan orchestration** (5): started, progress, subagent, completed, cancelled
  * - **Tunnel** (7): started, stopped, progress, error, qrRotated, qrRegenerated, qrAuthUsed
  * - **Image / attachments** (2): image:detected, attachment:detected
- * - **Edit history** (1): edit-history:updated (new entries in a session's edit history)
  * - **Hooks** (10): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted
  *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook;
  *   permission_prompt also arrives with `source: 'screen'` for a codex dialog read off its screen)
@@ -366,11 +365,6 @@ export const ImageDetected = 'image:detected' as const;
 /** New document/image attachment detected in a session working directory. */
 export const AttachmentDetected = 'attachment:detected' as const;
 
-// ─── Edit history ────────────────────────────────────────────────────────────
-
-/** New entries in a session's edit history (`{ sessionId, added }`); the open panel re-reads. */
-export const EditHistoryUpdated = 'edit-history:updated' as const;
-
 // ─── Hooks ───────────────────────────────────────────────────────────────────
 
 /** Claude Code hook: session idle, waiting for input. */
@@ -673,9 +667,6 @@ export const SseEvent = {
   // Image
   ImageDetected,
   AttachmentDetected,
-
-  // Edit history
-  EditHistoryUpdated,
 
   // Hooks
   HookIdlePrompt,

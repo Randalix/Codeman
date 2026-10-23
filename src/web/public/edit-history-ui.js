@@ -4,16 +4,23 @@
  * first.
  *
  * OPTIONAL and per-device: `showEditHistory` (App Settings → Header & Panels → Header), default
- * OFF. While it is off the button never shows and nothing is requested. There is NO poll: the panel
- * reads `GET /api/sessions/:id/edits?sync=1` when it opens and when the active session changes, and
- * re-reads (debounced) when the server sends `edit-history:updated` for the session on screen.
- * While the panel is closed, those events only count up the button's badge (entries added in the
- * active session since the panel was last open); opening the panel or switching sessions clears it.
+ * OFF. While it is off the button never shows and nothing is requested. The panel DRIVES the
+ * server's reading, which never runs in the background: it reads
+ * `GET /api/sessions/:id/edits?sync=1` when it opens and when the active session changes, and,
+ * only while it is open, re-reads (debounced) on the active session's `transcript:tool_end` for a
+ * tool that can change files (the existing transcript watcher's event) and on its `session:idle`
+ * (the end of a turn). No poll, and nothing at all while the panel is closed. A remote session has
+ * no transcript watcher (no hooks reach back from its host), so it follows turn ends only.
  *
  * - A code entry opens its diff inline (`GET /api/sessions/:id/edits/:entryId`), drawn with the Git
  *   panel's diff classes (`git-diff`, `git-diff-line--hunk|add|del`).
- * - An image entry shows a thumbnail from the workspace `file-raw` route and opens the shared file
- *   preview (panels-ui.js `openFilePreview`), as does a click on any path.
+ * - An image entry opens the shared file preview (panels-ui.js `openFilePreview`), as does a click
+ *   on any path; inside a local session's workspace it also shows a thumbnail (a remote one would
+ *   stream every listed image over ssh). Both go through the existing file
+ *   routes only: the thumbnail is the confined `file-raw`, and the preview of a file outside the
+ *   workspace registers it on click with `notify: false` (`_registerExternalPreview`, which
+ *   enforces the attachment guard and its extension allowlist). A path from the transcript is
+ *   never served by a route of its own.
  * - `backfillTruncated` offers "Load older" (`POST /api/sessions/:id/edits/older`).
  *
  * Paths, agent descriptions and diffs are untrusted text: they are only ever written with
@@ -28,7 +35,18 @@
  */
 
 /** SSE bursts (one event per tool call) collapse into one read. */
-const EDIT_HISTORY_SSE_DEBOUNCE_MS = 400;
+const EDIT_HISTORY_SSE_DEBOUNCE_MS = 600;
+/** Tools whose end can mean changed files (Agent/Task: a subagent's edits; SendUserFile: an image). */
+const EDIT_HISTORY_FOLLOW_TOOLS = new Set([
+  'Edit',
+  'Write',
+  'MultiEdit',
+  'NotebookEdit',
+  'Bash',
+  'Agent',
+  'Task',
+  'SendUserFile',
+]);
 /** Per-device view toggles (a viewer convenience, so plain localStorage). */
 const EDIT_HISTORY_GROUP_KEY = 'codeman-edit-history-group';
 const EDIT_HISTORY_MAIN_ONLY_KEY = 'codeman-edit-history-main-only';
@@ -57,10 +75,9 @@ Object.assign(CodemanApp.prototype, {
   /** Called from applyHeaderVisibilitySettings() (boot and every settings save). */
   applyEditHistoryVisibility() {
     const on = this.isEditHistoryEnabled();
-    const btn = this.$('editHistoryBtn');
-    if (btn) btn.hidden = !on;
+    // Marker class, not [hidden]: the base rule is display:inline-flex !important (src/web/CLAUDE.md).
+    this.$('editHistoryBtn')?.classList.toggle('btn-edit-history--hidden', !on);
     if (!on) {
-      this._setEditHistoryUnread(0);
       this.closeEditHistoryPanel();
       this._editHistory = null;
       this._editHistoryEpoch = (this._editHistoryEpoch || 0) + 1; // an in-flight read must not repaint
@@ -166,27 +183,16 @@ Object.assign(CodemanApp.prototype, {
     return this.refreshEditHistory({ older: true });
   },
 
-  /** The button's badge: entries added in the active session while the panel was closed. */
-  _setEditHistoryUnread(n, sessionId = this.activeSessionId) {
-    this._editHistoryUnread = n;
-    this._editHistoryUnreadSid = n > 0 ? sessionId : null;
-    const badge = this.$('editHistoryUnread');
-    if (!badge) return;
-    badge.hidden = n <= 0;
-    badge.textContent = n > 99 ? '99+' : String(n);
-  },
-
   /**
-   * SSE `edit-history:updated` ({ sessionId, added }) for the session on screen: re-read, debounced,
-   * while the panel is open; otherwise count the new entries on the badge.
+   * SSE `transcript:tool_end` ({ sessionId, toolName }), and the end of a turn through
+   * `onEditHistorySessionIdle`: while the panel is open on that session, re-read after a tool that
+   * can change files, and when the turn ends (a parallel tool call reports only one tool end; a
+   * background subagent writes after the tool end that started it). Closed: nothing.
    */
-  _onEditHistoryUpdated(data) {
-    if (!data || data.sessionId !== this.activeSessionId || !this.isEditHistoryEnabled()) return;
-    if (!this._isEditHistoryPanelOpen()) {
-      const added = Number(data.added);
-      if (added > 0) this._setEditHistoryUnread((this._editHistoryUnread || 0) + added);
-      return;
-    }
+  _onEditHistoryTranscriptEvent(data) {
+    if (!data || data.sessionId !== this.activeSessionId || !this._isEditHistoryPanelOpen()) return;
+    if (data.toolName !== undefined && !EDIT_HISTORY_FOLLOW_TOOLS.has(data.toolName)) return;
+    if (!this.isEditHistoryEnabled()) return;
     clearTimeout(this._editHistoryDebounce);
     this._editHistoryDebounce = setTimeout(() => {
       this._editHistoryDebounce = null;
@@ -194,9 +200,17 @@ Object.assign(CodemanApp.prototype, {
     }, EDIT_HISTORY_SSE_DEBOUNCE_MS);
   },
 
+  /**
+   * Called by app.js's `session:idle` handler ({ id }): the end of a turn. Claude's interactive
+   * transcript has no `result` line, so the transcript watcher's `transcript:complete` never fires
+   * for these sessions.
+   */
+  onEditHistorySessionIdle(sessionId) {
+    this._onEditHistoryTranscriptEvent({ sessionId });
+  },
+
   /** Called by selectSession(): the open panel follows the active session. */
   onEditHistoryActiveSession(sessionId) {
-    if (this._editHistoryUnreadSid && this._editHistoryUnreadSid !== sessionId) this._setEditHistoryUnread(0);
     if (!this.isEditHistoryEnabled() || !this._isEditHistoryPanelOpen()) return;
     if (this._editHistory?.sessionId === sessionId) return;
     this.refreshEditHistory();
@@ -217,7 +231,6 @@ Object.assign(CodemanApp.prototype, {
     if (!panel) return;
     panel.classList.add('visible');
     this.$('editHistoryBtn')?.setAttribute('aria-expanded', 'true');
-    this._setEditHistoryUnread(0);
     const group = this.$('editHistoryGroupToggle');
     if (group) group.checked = this.isEditHistoryGrouped();
     const main = this.$('editHistoryMainOnlyToggle');
@@ -297,16 +310,23 @@ Object.assign(CodemanApp.prototype, {
     if (sid && path) this.openFilePreview?.(path, sid);
   },
 
-  /**
-   * Thumbnail URL for an image entry: the same workspace-confined `file-raw` route the preview uses
-   * for images. A path outside the workspace (or an SVG, which file-raw serves as a download) gets
-   * no thumbnail; clicking it still opens the preview, which knows how to reach such files.
-   */
-  _editHistoryThumbUrl(path, sid) {
-    if (!path || /\.svg$/i.test(path)) return null;
-    if (this._isExternalPreviewPath?.(path, sid)) return null;
-    const url = `/api/sessions/${encodeURIComponent(sid)}/file-raw?path=${encodeURIComponent(path)}`;
+  _editHistoryUrl(url) {
     return typeof CodemanBase !== 'undefined' && CodemanBase.url ? CodemanBase.url(url) : url;
+  },
+
+  /**
+   * Thumbnail URL for an image entry inside the workspace: the confined `file-raw` route the file
+   * preview uses. An image outside the workspace gets none: showing it needs an attachment id
+   * (`POST …/attachments`, `notify: false`), and minting one per rendered row would push the
+   * session's real attachments out of its capped registry. Clicking it opens the file preview,
+   * which registers it like any other external file. SVGs get none either (`file-raw` serves
+   * them as a download), nor does a remote session's image: its `file-raw` streams over ssh, and
+   * a list of generated images would open one ssh read per row; a click still previews it.
+   */
+  _editHistoryThumbSrc(path, sid) {
+    if (!path || /\.svg$/i.test(path) || this.sessions?.get?.(sid)?.remote) return null;
+    if (this._isExternalPreviewPath?.(path, sid) !== false) return null;
+    return this._editHistoryUrl(`/api/sessions/${encodeURIComponent(sid)}/file-raw?path=${encodeURIComponent(path)}`);
   },
 
   _renderEditHistoryPanel() {
@@ -337,7 +357,9 @@ Object.assign(CodemanApp.prototype, {
     }
     const data = h.data;
     if (data.state === 'unsupported') {
-      body.append(el('div', 'edit-history-empty', t('Edit history is only available for Claude sessions.')));
+      body.append(
+        el('div', 'edit-history-empty', t('Edit history is only available for Claude sessions outside Docker.'))
+      );
       return;
     }
     if (data.state === 'unavailable') {
@@ -345,9 +367,11 @@ Object.assign(CodemanApp.prototype, {
         el(
           'div',
           'edit-history-note edit-history-note--warn',
-          t('Showing saved entries only: {reason}', {
-            reason: data.reason || t('the host is asleep or not reachable'),
-          })
+          data.reason === 'no-transcript'
+            ? t(
+                'No transcript found for this session yet. It is picked up with the next prompt; until then a CLAUDE_CONFIG_DIR set outside Codeman cannot be found.'
+              )
+            : t('Showing saved entries only: {reason}', { reason: data.reason || '' })
         )
       );
     }
@@ -505,17 +529,17 @@ Object.assign(CodemanApp.prototype, {
           open();
         }
       });
-      const src = this._editHistoryThumbUrl(e.path, this.activeSessionId);
+      const src = this._editHistoryThumbSrc(e.path, h.sessionId);
       if (src) {
         const img = el('img', 'edit-history-thumb');
         img.loading = 'lazy';
         img.alt = e.relPath || '';
-        img.src = src;
         img.addEventListener('click', (ev) => {
           ev.stopPropagation();
           open();
         });
         img.addEventListener('error', () => img.remove());
+        img.src = src;
         out.push(img);
       }
       return out;

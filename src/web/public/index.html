@@ -194,11 +194,10 @@
         </button>
         <!-- Edit history of the active session (edit-history-ui.js), next to Attachments: both show
              what the session produced, and the panel opens right below. Optional and per-device
-             (App Settings → Header & Panels → Header, default OFF). The badge counts entries that
-             arrived while the panel was closed. -->
-        <button type="button" class="btn-icon-header btn-edit-history" id="editHistoryBtn" hidden aria-expanded="false" aria-controls="editHistoryPanel" title="Edit history" aria-label="Open edit history" onclick="app.toggleEditHistoryPanel()">
+             (App Settings → Header & Panels → Header, default OFF): hidden by its marker class,
+             never on phones (mobile.css). -->
+        <button type="button" class="btn-icon-header btn-edit-history btn-edit-history--hidden" id="editHistoryBtn" aria-expanded="false" aria-controls="editHistoryPanel" title="Edit history" aria-label="Open edit history" onclick="app.toggleEditHistoryPanel()">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg>
-          <span class="edit-history-unread" id="editHistoryUnread" hidden data-i18n-skip></span>
         </button>
         <button class="btn-icon-header btn-file-viewer" onclick="app.toggleFileBrowserButton()" title="File Viewer" aria-label="Open file viewer" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path class="icon-folder-closed" d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><g class="icon-folder-open"><path d="M3 17V7a2 2 0 0 1 2-2h4l2 2h6a2 2 0 0 1 2 2v1.5"/><path d="M3 17l2.3-5.4A2 2 0 0 1 7.2 10.5H20a1.5 1.5 0 0 1 1.4 2l-1.9 5.2A2 2 0 0 1 17.6 19H5a2 2 0 0 1-2-2z"/></g></svg></button>
         <button class="btn-icon-header btn-multimonitor btn-multimonitor--hidden" onclick="app.launchMultiMonitor()" title="Open Codeman across all displays" aria-label="Open Codeman across all displays"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="4" width="13" height="9" rx="1.5"/><rect x="11" y="9" width="11" height="8" rx="1.5"/></svg></button>

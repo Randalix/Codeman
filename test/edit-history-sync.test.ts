@@ -1,27 +1,38 @@
 /**
- * Edit history sync: readers, store, image confirmation, single-flight, failure states and
- * the wake invariant. Readers and probes are fakes; the store is real (temp dir).
+ * Edit history sync: reader, store, image confirmation, single-flight, failure states and the
+ * "reads only on request" wiring. Reader and probe are fakes; the store is real (temp dir).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EditHistoryStore } from '../src/edit-history-store.js';
-import type { EditSourceRequest, RemoteClaudeEditSources, RemoteProbe } from '../src/remote-files.js';
-import { RemoteFileAccessError } from '../src/remote-files.js';
+import type {
+  EditSourceReadOptions,
+  EditSourceRequest,
+  EditSources,
+  PathProbe,
+} from '../src/edit-history-local-source.js';
 import {
   confirmImages,
   EditHistorySync,
+  MAX_LOADED_STORES,
+  MAX_OLDER_SOURCES,
+  NO_TRANSCRIPT,
+  REMOVED,
   type EditHistorySession,
   type EditHistorySyncDeps,
   unsupportedReason,
 } from '../src/web/edit-history-sync.js';
 
 let dir: string;
+/** Stores the tests opened; removed before the temp dir, so no late save recreates it. */
+const opened: EditHistoryStore[] = [];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'edit-sync-'));
 });
-afterEach(() => {
+afterEach(async () => {
+  await Promise.all(opened.splice(0).map((s) => s.remove()));
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -62,28 +73,40 @@ function bashPair(id: string, start: number, end: number, command: string): stri
   return use + '\n' + res + '\n';
 }
 
-/** An in-memory "host": files by relPath, served with the reader contract. */
+/** An in-memory transcript: files by relPath, served with the reader contract. */
 class FakeHost {
   transcriptId = 'conv1';
   files = new Map<string, Buffer>();
   metas: Record<string, string> = {};
   calls: EditSourceRequest[][] = [];
+  paths: string[] = [];
+  /** What `transcriptPath` answers (the transcript watcher's path); null = none yet. */
+  get path(): string | null {
+    return this.files.size > 0 ? `/p/${this.transcriptId}.jsonl` : null;
+  }
   read = async (
-    _ids: readonly string[],
+    mainPath: string,
     requests: readonly EditSourceRequest[],
-    budget: number
-  ): Promise<RemoteClaudeEditSources | null> => {
+    budget: number,
+    opts: EditSourceReadOptions = {}
+  ): Promise<EditSources | null> => {
     this.calls.push([...requests]);
+    this.paths.push(mainPath);
     if (this.files.size === 0) return null;
     let remaining = budget;
-    const out: RemoteClaudeEditSources = { transcriptId: this.transcriptId, files: [], metas: {} };
+    const out: EditSources = { transcriptId: this.transcriptId, files: [], metas: {} };
     for (const [relPath, buf] of this.files) {
       const req = requests.find((r) => r.relPath === relPath);
+      if (!req && opts.onlyRequested) continue;
       let start: number;
       let len: number;
-      if (req) {
+      if (req?.len !== undefined) {
+        const blockEnd = Math.min(req.offset + req.len, buf.length);
+        len = Math.min(blockEnd - Math.min(req.offset, buf.length), remaining);
+        start = blockEnd - len;
+      } else if (req) {
         start = Math.min(req.offset, buf.length);
-        len = Math.min(req.len ?? remaining, remaining, buf.length - start);
+        len = Math.min(remaining, buf.length - start);
       } else {
         len = Math.min(buf.length, remaining);
         start = buf.length - len;
@@ -102,19 +125,38 @@ class FakeHost {
 
 function setup(over: Partial<EditHistorySyncDeps> = {}) {
   const host = new FakeHost();
-  const probes = new Map<string, RemoteProbe>();
-  const probe = async (paths: readonly string[]) => paths.map((p) => probes.get(p) ?? null);
-  const updated: Array<[string, number]> = [];
+  const probes = new Map<string, PathProbe>();
+  const lookups: string[] = [];
+  /** Session ids in the order their stores were loaded. */
+  const loads: string[] = [];
+  /** The session each read (and, as `probe:<id>`, each probe) was made for. */
+  const readers: string[] = [];
   const deps: EditHistorySyncDeps = {
-    readLocal: (ids, req, budget) => host.read(ids, req, budget),
-    readRemote: (_remote, ids, req, budget) => host.read(ids, req, budget),
-    probeLocal: probe,
-    probeRemote: (_remote, paths) => probe(paths),
+    transcriptPath: async (session) => {
+      lookups.push(session.id);
+      return host.path;
+    },
+    readSources: (session, path, req, budget, opts) => {
+      readers.push(session.id);
+      return host.read(path, req, budget, opts);
+    },
+    probe: async (session, paths) => {
+      readers.push(`probe:${session.id}`);
+      return paths.map((p) => probes.get(p) ?? null);
+    },
     loadStore: (id) => EditHistoryStore.load(id, { dir, debounceMs: 0 }),
-    onUpdated: (id, n) => updated.push([id, n]),
+    deleteStore: (id) => EditHistoryStore.delete(id, { dir }),
+    sweepStores: async () => 0,
     ...over,
   };
-  return { host, probes, updated, deps, sync: new EditHistorySync(deps) };
+  const load = deps.loadStore;
+  deps.loadStore = async (id) => {
+    loads.push(id);
+    const store = await load(id);
+    opened.push(store);
+    return store;
+  };
+  return { host, probes, lookups, loads, readers, deps, sync: new EditHistorySync(deps) };
 }
 
 const local: EditHistorySession = { id: 's1', mode: 'claude', remote: undefined, claudeSessionId: 'conv1' };
@@ -126,16 +168,18 @@ const remote: EditHistorySession = {
 };
 
 describe('unsupportedReason', () => {
-  it('accepts claude, rejects docker and non-claude CLIs', () => {
+  it('accepts a local or remote claude session, rejects docker and non-claude CLIs', () => {
     expect(unsupportedReason(local)).toBeUndefined();
+    expect(unsupportedReason(remote)).toBeUndefined();
+    expect(unsupportedReason({ ...remote, docker: { image: 'x' } })).toBe('docker');
     expect(unsupportedReason({ ...local, docker: { image: 'x' } })).toBe('docker');
     expect(unsupportedReason({ ...local, mode: 'shell' })).toBe('mode');
   });
 });
 
 describe('EditHistorySync', () => {
-  it('reads new edits forward from the stored offset and reports them', async () => {
-    const { host, sync, updated } = setup();
+  it('reads new edits forward from the stored offset', async () => {
+    const { host, sync } = setup();
     host.append('main', editLine('t1', T0, '/w/a.ts'));
     expect(await sync.sync(local)).toEqual({ state: 'ok' });
     host.append('main', editLine('t2', T0 + 1000, '/w/b.ts'));
@@ -144,10 +188,7 @@ describe('EditHistorySync', () => {
     expect(host.calls[1]).toEqual([
       { relPath: 'main', offset: host.files.get('main')!.length - editLine('t2', T0 + 1000, '/w/b.ts').length },
     ]);
-    expect(updated).toEqual([
-      ['s1', 1],
-      ['s1', 1],
-    ]);
+    expect(host.paths).toEqual(['/p/conv1.jsonl', '/p/conv1.jsonl']);
   });
 
   it('reads subagent transcripts and records their meta', async () => {
@@ -155,22 +196,22 @@ describe('EditHistorySync', () => {
     host.append('main', editLine('t1', T0, '/w/a.ts'));
     host.append('subagents/agent-a1.jsonl', editLine('t9', T0 + 5, '/w/sub.ts', { isSidechain: true, agentId: 'a1' }));
     host.metas.a1 = '{"description":"Fix it","agentType":"coding"}';
-    await sync.sync(remote);
-    const store = await sync.getStore('s2');
+    await sync.sync(local);
+    const store = await sync.getStore('s1');
     expect(store.get('t9')?.agentId).toBe('a1');
     expect(store.getAgents().a1).toEqual({ description: 'Fix it', agentType: 'coding' });
   });
 
-  it('re-reads from the end when the answer names a new conversation', async () => {
+  it('reads a new conversation (/clear, resume) from its end, keeping the entries', async () => {
     const { host, sync } = setup();
     host.append('main', editLine('t1', T0, '/w/a.ts'));
-    await sync.sync(remote);
+    await sync.sync(local);
     host.transcriptId = 'conv2';
     host.files.set('main', Buffer.from(editLine('n1', T0 + 9, '/w/n.ts')));
-    await sync.sync(remote);
-    expect(host.calls.at(-2)).toHaveLength(1); // with the old offset
-    expect(host.calls.at(-1)).toEqual([]); // repeated without offsets
-    const store = await sync.getStore('s2');
+    await sync.sync(local);
+    expect(host.paths.at(-1)).toBe('/p/conv2.jsonl');
+    expect(host.calls.at(-1)).toEqual([]); // no offsets of the old file
+    const store = await sync.getStore('s1');
     expect(store.getTranscriptId()).toBe('conv2');
     expect(store.list().map((e) => e.id)).toEqual(['n1', 't1']);
   });
@@ -199,7 +240,7 @@ describe('EditHistorySync', () => {
 
   it('keeps the edits when only the image probe fails', async () => {
     const { host, sync } = setup({
-      probeLocal: async () => {
+      probe: async () => {
         throw new Error('probe failed');
       },
     });
@@ -208,23 +249,69 @@ describe('EditHistorySync', () => {
     expect((await sync.getStore('s1')).list().map((e) => e.id)).toEqual(['t1']);
   });
 
-  it('reports an unreachable host as unavailable and keeps the stored entries', async () => {
+  it('reports a session without a transcript yet, then reads it once there is one', async () => {
+    const { host, sync } = setup();
+    expect(await sync.sync(local)).toEqual({ state: 'unavailable', reason: NO_TRANSCRIPT });
+    expect(host.calls).toEqual([]);
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    expect(await sync.sync(local)).toEqual({ state: 'ok' });
+    expect((await sync.getStore('s1')).list()).toHaveLength(1);
+  });
+
+  it('reports a transcript that vanished (watcher path stale) the same way', async () => {
+    const { host, sync } = setup({ transcriptPath: async () => '/p/gone.jsonl' });
+    expect(await sync.sync(local)).toEqual({ state: 'unavailable', reason: NO_TRANSCRIPT });
+    expect(host.paths).toEqual(['/p/gone.jsonl']);
+  });
+
+  it('reports a read error as unavailable and keeps the stored entries', async () => {
+    const { host, sync, deps } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    await sync.sync(local);
+    deps.readSources = async () => {
+      throw new Error('EACCES: permission denied');
+    };
+    const status = await sync.sync(local);
+    expect(status).toEqual({ state: 'unavailable', reason: 'EACCES: permission denied' });
+    expect((await sync.getStore('s1')).list()).toHaveLength(1);
+  });
+
+  it('marks docker and non-claude sessions unsupported without looking for a transcript', async () => {
+    const { host, lookups, sync } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    expect(await sync.sync({ ...local, mode: 'shell' })).toEqual({ state: 'unsupported', reason: 'mode' });
+    expect(await sync.sync({ ...local, docker: {} })).toEqual({ state: 'unsupported', reason: 'docker' });
+    expect(lookups).toEqual([]);
+    expect(host.calls).toEqual([]);
+  });
+
+  it('reads a remote session through the same deps, each call with that session (ssh is the server’s part)', async () => {
+    const { host, lookups, readers, probes, sync } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts') + bashPair('b1', T0 + 1000, T0 + 3000, 'render out.png'));
+    probes.set('/w/out.png', { realPath: '/w/out.png', kind: 'file', size: 9, mtimeMs: T0 + 2000 });
+    expect(await sync.sync(remote)).toEqual({ state: 'ok' });
+    expect(lookups).toEqual(['s2']);
+    expect(readers).toEqual(['s2', 'probe:s2']);
+    expect((await sync.getStore('s2')).list().map((e) => e.path)).toEqual(['/w/out.png', '/w/a.ts']);
+  });
+
+  it('an unreachable remote host is unavailable with the stored entries kept, and the next sync reads on', async () => {
     const { host, sync, deps } = setup();
     host.append('main', editLine('t1', T0, '/w/a.ts'));
     await sync.sync(remote);
-    deps.readRemote = async () => {
-      throw new RemoteFileAccessError('ssh: connect to host huff port 22: Connection timed out');
+    const transcriptPath = deps.transcriptPath;
+    deps.transcriptPath = async () => {
+      throw new Error('remote host huff unreachable: ssh: connect to host huff port 22: Connection timed out');
     };
-    const status = await sync.sync(remote);
-    expect(status.state).toBe('unavailable');
-    expect(status.reason).toContain('timed out');
+    host.append('main', editLine('t2', T0 + 1000, '/w/b.ts'));
+    expect(await sync.sync(remote)).toEqual({
+      state: 'unavailable',
+      reason: 'remote host huff unreachable: ssh: connect to host huff port 22: Connection timed out',
+    });
     expect((await sync.getStore('s2')).list()).toHaveLength(1);
-  });
-
-  it('marks non-claude sessions unsupported without reading', async () => {
-    const { host, sync } = setup();
-    expect(await sync.sync({ ...local, mode: 'shell' })).toEqual({ state: 'unsupported', reason: 'mode' });
-    expect(host.calls).toEqual([]);
+    deps.transcriptPath = transcriptPath;
+    expect(await sync.sync(remote)).toEqual({ state: 'ok' });
+    expect((await sync.getStore('s2')).list()).toHaveLength(2);
   });
 
   it('runs one sync per session at a time and folds occasions into one more run', async () => {
@@ -241,38 +328,6 @@ describe('EditHistorySync', () => {
     release();
     await Promise.all(runs);
     expect(host.calls).toHaveLength(2); // the first run + one folded follow-up
-  });
-
-  it('hands the remote reader the Codeman session id (it finds the live claude by it)', async () => {
-    const seen: string[] = [];
-    const { host, sync } = setup({
-      readRemote: (_remote, ids, req, budget, sessionId) => {
-        seen.push(sessionId);
-        return host.read(ids, req, budget);
-      },
-    });
-    host.append('main', editLine('t1', T0, '/w/a.ts'));
-    await sync.sync(remote);
-    expect(seen).toEqual(['s2']);
-  });
-
-  it('drops the queued run after an unreachable host: callers wait one timeout, not two', async () => {
-    let release!: () => void;
-    const gate = new Promise<void>((r) => (release = r));
-    let calls = 0;
-    const { sync } = setup({
-      readRemote: async () => {
-        calls++;
-        await gate;
-        throw new RemoteFileAccessError('ssh: connect to host huff port 22: Connection timed out');
-      },
-    });
-    const runs = [sync.sync(remote), sync.sync(remote)];
-    release();
-    const [a, b] = await Promise.all(runs);
-    expect(calls).toBe(1);
-    expect(a.state).toBe('unavailable');
-    expect(b.state).toBe('unavailable');
   });
 
   it('loads older blocks on request', async () => {
@@ -302,6 +357,267 @@ describe('EditHistorySync', () => {
     await (await sync.getStore('s1')).flush();
     await sync.remove('s1');
     expect(() => readFileSync(join(dir, 's1.json'))).toThrow();
+  });
+
+  it('neither a run in flight nor a request during the removal writes the deleted history again', async () => {
+    const { host, sync } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const reading = new Promise<void>((r) => (entered = r));
+    const orig = host.read;
+    host.read = async (...a) => {
+      entered();
+      await gate;
+      return orig(...a);
+    };
+    const runs = [sync.sync(local), sync.sync(local)]; // one running, one queued
+    await reading;
+    const removing = sync.remove('s1');
+    // The removal waits for the read under way; a request meanwhile reads nothing.
+    expect(await sync.sync(local)).toEqual({ state: 'unavailable', reason: REMOVED });
+    release();
+    await Promise.all([...runs, removing]);
+    await new Promise((r) => setTimeout(r, 20)); // past the store's debounce
+    expect(readdirSync(dir)).toEqual([]);
+    expect(host.calls).toHaveLength(1); // the read under way; the queued run never read
+  });
+
+  it('the same conversation under an unnormalized path reads on from its cursors, nothing else', async () => {
+    const path = '/p/./conv1.jsonl';
+    const { host, sync } = setup({ transcriptPath: async () => path });
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    await sync.sync(local);
+    host.append('main', editLine('t2', T0 + 1, '/w/a.ts'));
+    await sync.sync(local);
+    expect(host.paths).toEqual([path, path]);
+    expect(host.calls[1]).toEqual([
+      { relPath: 'main', offset: host.files.get('main')!.length - editLine('t2', T0 + 1, '/w/a.ts').length },
+    ]);
+  });
+
+  it('a session that comes back with the same id (reboot restore) reads its history afresh', async () => {
+    const { host, sync } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    await sync.sync(local);
+    // Boot: the unpinned record is pruned as stale; then "restore" brings the session back.
+    await sync.remove('s1');
+    expect(await sync.sync(local)).toEqual({ state: 'ok' });
+    expect((await sync.getStore('s1')).list().map((e) => e.id)).toEqual(['t1']);
+  });
+
+  it('remove deletes a history it has not loaded without loading it', async () => {
+    const { sync, loads } = setup();
+    const other = new EditHistoryStore('s1', { dir });
+    other.addImageEntries([{ toolUseId: 'b1', path: '/w/a.png', ts: T0 }]);
+    await other.flush();
+    await sync.remove('s1');
+    expect(loads).toEqual([]);
+    expect(existsSync(join(dir, 's1.json'))).toBe(false);
+  });
+
+  it(`keeps at most ${MAX_LOADED_STORES} stores loaded: a dropped one is written and loads again whole`, async () => {
+    const { host, sync, loads } = setup({ loadStore: (id) => EditHistoryStore.load(id, { dir, debounceMs: 60_000 }) });
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    const ids = Array.from({ length: MAX_LOADED_STORES + 2 }, (_, i) => `s${i}`);
+    for (const id of ids) await sync.sync({ ...local, id });
+    expect(loads).toEqual(ids);
+    // The two least recently used went: written (no debounced save ran), not kept in memory.
+    await sync.flushAll();
+    expect(existsSync(join(dir, 's0.json'))).toBe(true);
+    expect((await sync.getStore('s0')).list().map((e) => e.id)).toEqual(['t1']);
+    expect(loads.slice(ids.length)).toEqual(['s0']);
+    // The most recently used ones stay loaded.
+    await sync.getStore(ids[ids.length - 1]);
+    expect(loads.slice(ids.length)).toEqual(['s0']);
+  });
+
+  it('a dropped store that never changed writes nothing (no file for a session without edits)', async () => {
+    const { sync } = setup(); // no transcript: nothing to read
+    for (let i = 0; i <= MAX_LOADED_STORES; i++) await sync.sync({ ...local, id: `s${i}` });
+    await sync.flushAll();
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
+  it('a store whose run is in flight is not dropped, and loads once', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const { host, sync, loads } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    const orig = host.read;
+    let first = true;
+    host.read = async (...a) => {
+      if (first) {
+        first = false;
+        await gate;
+      }
+      return orig(...a);
+    };
+    const slow = sync.sync(local);
+    for (let i = 1; i <= MAX_LOADED_STORES + 1; i++) await sync.sync({ ...local, id: `s1-${i}` });
+    release();
+    expect(await slow).toEqual({ state: 'ok' });
+    expect((await sync.getStore('s1')).list().map((e) => e.id)).toEqual(['t1']);
+    expect(loads.filter((id) => id === 's1')).toEqual(['s1']);
+  });
+
+  it('concurrent first callers share one store', async () => {
+    const { sync } = setup();
+    const [a, b] = await Promise.all([sync.getStore('s1'), sync.getStore('s1')]);
+    expect(a).toBe(b);
+  });
+
+  it('a forward request queued together with an older one still reads forward', async () => {
+    const { host, sync } = setup();
+    host.append('main', editLine('t1', T0, '/w/a.ts'));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const orig = host.read;
+    host.read = async (...a) => {
+      const res = await orig(...a); // the first run's bytes are taken before the append
+      await gate;
+      return res;
+    };
+    const first = sync.sync(local);
+    await new Promise((r) => setTimeout(r, 0));
+    host.append('main', editLine('t2', T0 + 1, '/w/b.ts'));
+    const queued = [sync.sync(local), sync.sync(local, { older: true })];
+    release();
+    await Promise.all([first, ...queued]);
+    expect((await sync.getStore('s1')).get('t2')).toBeDefined();
+  });
+
+  it('load older moves every source back, reading only the blocks it asked for', async () => {
+    const { host, sync } = setup({ budget: 2000 });
+    for (let i = 0; i < 10; i++) host.append('main', editLine(`m${i}`, T0 + i, `/w/m${i}.ts`));
+    for (let i = 0; i < 10; i++) {
+      host.append('subagents/agent-ab.jsonl', editLine(`s${i}`, T0 + 100 + i, `/w/s${i}.ts`, { agentId: 'ab' }));
+    }
+    await sync.sync(local);
+    await sync.sync(local); // the subagent gets its first block once main is up to date
+    const store = await sync.getStore('s1');
+    const floors = () => [store.getCursor('main')!.floor, store.getCursor('subagents/agent-ab.jsonl')!.floor];
+    const [main0, sub0] = floors();
+    expect(main0).toBeGreaterThan(0);
+    expect(sub0).toBeGreaterThan(0);
+    await sync.sync(local, { older: true });
+    const [main1, sub1] = floors();
+    expect(main1).toBeLessThan(main0);
+    expect(sub1).toBeLessThan(sub0);
+    expect(
+      host.calls
+        .at(-1)!
+        .map((r) => r.relPath)
+        .sort()
+    ).toEqual(['main', 'subagents/agent-ab.jsonl']);
+    for (let i = 0; i < 20 && store.backfillTruncated; i++) await sync.sync(local, { older: true });
+    expect(store.list()).toHaveLength(20);
+  });
+
+  it('a file the shared budget cut short is read in the next pass, not skipped as one long line', async () => {
+    const budget = 4000;
+    const { host, sync } = setup({ budget });
+    const sub = 'subagents/agent-a1.jsonl';
+    host.append('main', editLine('m0', T0, '/w/m0.ts'));
+    host.append(sub, editLine('s0', T0 + 1, '/w/s0.ts', { agentId: 'a1' }));
+    await sync.sync(local);
+    // main grows by almost a whole budget, leaving the subagent 50 bytes of this pass
+    const filler = JSON.stringify({ type: 'user', message: { content: '' } });
+    host.append(
+      'main',
+      JSON.stringify({ type: 'user', message: { content: 'z'.repeat(budget - 51 - filler.length) } }) + '\n'
+    );
+    host.append(sub, editLine('s1', T0 + 2, '/w/s1.ts', { agentId: 'a1', pad: 'p'.repeat(100) }));
+    host.append(sub, editLine('s2', T0 + 3, '/w/s2.ts', { agentId: 'a1' }));
+    await sync.sync(local);
+    const store = await sync.getStore('s1');
+    expect(
+      store
+        .list()
+        .map((e) => e.id)
+        .sort()
+    ).toEqual(['m0', 's0', 's1', 's2']);
+    expect(store.getCursor(sub)?.midLine).toBeUndefined();
+  });
+
+  it('a first read reaches the subagents in a further pass when main fills the budget', async () => {
+    const { host, sync } = setup({ budget: 3000 });
+    for (let i = 0; i < 20; i++) host.append('main', editLine(`m${i}`, T0 + i, `/w/m${i}.ts`));
+    host.append('subagents/agent-a1.jsonl', editLine('s0', T0 + 100, '/w/s0.ts', { agentId: 'a1' }));
+    await sync.sync(local);
+    const store = await sync.getStore('s1');
+    expect(store.get('s0')?.agentId).toBe('a1');
+    expect(store.getCursor('subagents/agent-a1.jsonl')).toBeDefined();
+  });
+
+  it('load older reads a full budget per source: a line longer than the budget split over the sources is kept', async () => {
+    const budget = 2000;
+    const { host, sync } = setup({ budget });
+    host.append('main', editLine('m0', T0, '/w/m0.ts'));
+    host.append('main', editLine('big', T0 + 1, '/w/big.ts', { pad: 'p'.repeat(800) })); // > budget / 3
+    for (let i = 2; i < 12; i++) host.append('main', editLine(`m${i}`, T0 + i, `/w/m${i}.ts`));
+    for (const a of ['a1', 'a2']) {
+      for (let i = 0; i < 12; i++) {
+        host.append(
+          `subagents/agent-${a}.jsonl`,
+          editLine(`${a}-${i}`, T0 + 100 + i, `/w/${a}${i}.ts`, { agentId: a })
+        );
+      }
+    }
+    for (let i = 0; i < 3; i++) await sync.sync(local);
+    const store = await sync.getStore('s1');
+    expect(store.sourcesWithOlder()).toHaveLength(3);
+    for (let i = 0; i < 20 && store.backfillTruncated; i++) await sync.sync(local, { older: true });
+    expect(store.get('big')).toBeDefined();
+    expect(store.list()).toHaveLength(36);
+  });
+
+  it(`load older reads at most ${MAX_OLDER_SOURCES} sources per click, taking turns`, async () => {
+    const { host, sync } = setup({ budget: 600 });
+    const subs = ['a1', 'a2', 'a3', 'a4'].map((a) => `subagents/agent-${a}.jsonl`);
+    for (const relPath of ['main', ...subs]) {
+      for (let i = 0; i < 8; i++) host.append(relPath, editLine(`${relPath}-${i}`, T0 + i, `/w/${i}.ts`));
+    }
+    for (let i = 0; i < 3; i++) await sync.sync(local);
+    const store = await sync.getStore('s1');
+    expect(store.sourcesWithOlder()).toHaveLength(5);
+    const olderCall = () => host.calls.at(-1)!.map((r) => r.relPath);
+    await sync.sync(local, { older: true });
+    expect(olderCall()).toEqual(['main', subs[0], subs[1]]);
+    await sync.sync(local, { older: true });
+    expect(olderCall()).toEqual([subs[2], subs[3], 'main']);
+    for (let i = 0; i < 30 && store.backfillTruncated; i++) await sync.sync(local, { older: true });
+    expect(store.list()).toHaveLength(40);
+  });
+
+  it('a subagent transcript that vanished loses its cursor (no endless "Load older"), not its entries', async () => {
+    const { host, sync } = setup({ budget: 600 });
+    const sub = 'subagents/agent-a1.jsonl';
+    host.append('main', editLine('m0', T0, '/w/m0.ts'));
+    for (let i = 0; i < 8; i++) host.append(sub, editLine(`s${i}`, T0 + 10 + i, `/w/s${i}.ts`, { agentId: 'a1' }));
+    for (let i = 0; i < 2; i++) await sync.sync(local);
+    const store = await sync.getStore('s1');
+    expect(store.backfillTruncated).toBe(true);
+    const kept = store.list().length;
+    host.files.delete(sub);
+    await sync.sync(local, { older: true });
+    expect(store.getCursor(sub)).toBeUndefined();
+    expect(store.backfillTruncated).toBe(false);
+    expect(store.list()).toHaveLength(kept);
+  });
+
+  it('sweep keeps the sessions in use here and those that exist', async () => {
+    const asked: Record<string, boolean> = {};
+    const { sync } = setup({
+      sweepStores: async (keep) => {
+        for (const id of ['s1', 'kept', 'gone']) asked[id] = keep(id);
+        return 1;
+      },
+    });
+    await sync.getStore('s1');
+    expect(await sync.sweep((id) => id === 'kept')).toBe(1);
+    expect(asked).toEqual({ s1: true, kept: true, gone: false });
   });
 });
 
@@ -357,17 +673,39 @@ describe('confirmImages', () => {
   });
 });
 
-describe('wake invariant (wiring guard)', () => {
-  it('the edit history modules never reach the wake registry', () => {
+describe('reads only on request (wiring guard)', () => {
+  const read = (file: string) => readFileSync(join(__dirname, '..', file), 'utf-8');
+
+  it('the server never starts a sync itself: it only hands the reader to the routes', () => {
+    const server = read('src/web/server.ts');
+    const uses = [...server.matchAll(/this\.editHistorySync\b(\.\w+)?/g)].map((m) => m[1] ?? '');
+    expect(uses.sort()).toEqual(['', '.flushAll', '.remove', '.sweep']);
+    expect(server).toMatch(/registerEditHistoryRoutes\(this\.app, ctx, this\.editHistorySync\)/);
+  });
+
+  it('no other module holds the reader, and the edit history modules run no timer or watcher', () => {
+    const root = join(__dirname, '..');
+    const holders = readdirSync(join(root, 'src'), { recursive: true, encoding: 'utf-8' })
+      .filter((f) => /\.(ts|js)$/.test(f))
+      .map((f) => join('src', f).split('\\').join('/'))
+      .filter((f) => /EditHistorySync|editHistorySync/.test(read(f)));
+    expect(holders.sort()).toEqual([
+      'src/web/edit-history-sync.ts',
+      'src/web/routes/edit-history-routes.ts',
+      'src/web/server.ts',
+    ]);
     for (const file of [
       'src/web/edit-history-sync.ts',
       'src/edit-history-store.ts',
       'src/edit-history-local-source.ts',
+      'src/edit-history-parse.ts',
+      'src/web/routes/edit-history-routes.ts',
     ]) {
-      const src = readFileSync(join(__dirname, '..', file), 'utf-8');
-      expect(src).not.toMatch(/^import .*remote-wake/m);
-      expect(src).not.toMatch(/RemoteWakeRegistry|ensureAwake|handleInput/);
+      const src = read(file);
+      expect(src, file).not.toMatch(/setInterval|\bwatch\(|chokidar/);
     }
+    // The store's only timer is its debounced save.
+    expect(read('src/web/edit-history-sync.ts')).not.toMatch(/setTimeout/);
   });
 });
 

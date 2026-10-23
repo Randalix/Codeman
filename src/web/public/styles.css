@@ -22369,37 +22369,19 @@ html .toolbar .btn-git-status[aria-expanded='true'] {
 
 /* ── Edit history: header button + panel (edit-history-ui.js) ───────────────── */
 
-/* .btn-icon-header sets a display, which beats the [hidden] attribute's UA display:none. */
-.btn-edit-history[hidden],
-.edit-history-unread[hidden] {
-  display: none;
-}
-
-/* Positioning context for the unread badge (same frame as the Attachments badge). */
+/* "Edit history" header button — opt-in (App Settings → Header & Panels), hidden by default.
+   Same marker pattern as the Attachments button: a base inline-flex !important so an inline
+   style can't override it, and a more-specific marker rule to hide. Phones hide it regardless
+   (mobile.css). */
 .btn-edit-history {
-  position: relative;
+  display: inline-flex !important;
+}
+.btn-edit-history.btn-edit-history--hidden {
+  display: none !important;
 }
 
 .btn-edit-history[aria-expanded='true'] {
   background: color-mix(in srgb, currentColor 16%, transparent);
-}
-
-.edit-history-unread {
-  position: absolute;
-  top: 2px;
-  right: 1px;
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 0.6rem;
-  font-weight: 700;
-  border-radius: 8px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  pointer-events: none;
 }
 
 /* Same frame as the Git and Files windows: draggable by the header, resizable at the corner. */

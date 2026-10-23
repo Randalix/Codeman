@@ -1,42 +1,69 @@
 /**
- * @fileoverview Keeps each claude session's edit history current: reads the new bytes of
- * its transcripts (main + subagents) into its `EditHistoryStore` and confirms the Bash
- * image candidates that came with them.
+ * @fileoverview Reads a claude session's edit history on request: the new bytes of its
+ * transcripts (main + subagents) go into its `EditHistoryStore`, and the Bash image
+ * candidates that came with them are confirmed against the files on disk.
  *
- * WHEN. Only on an occasion, never on a timer: a local session after an Edit/Write/Bash/
- * Agent tool ended (transcript watcher), a remote one at turn end (no hooks reach back
- * from a remote host, so there is no watcher), and either when the panel asks
- * (`GET …/edits?sync=1`, `POST …/edits/older`). One sync per session runs at a time; an
- * occasion during a run is folded into one more run afterwards.
+ * WHEN. Only when the panel asks (`GET …/edits?sync=1` on open and while it follows the
+ * session, `POST …/edits/older`): no timer, no hook, no background read for sessions nobody
+ * looks at. One sync per session runs at a time; requests during a run are folded into one
+ * more forward read and/or one more older read afterwards.
  *
- * NEVER WAKES. A remote read is one ssh round trip (`remoteReadClaudeEditSources`); a
- * sleeping host is a connect timeout, reported as `unavailable` with the stored entries
- * kept. Nothing here reaches the wake registry — a wiring-guard test pins that.
+ * HOW MUCH. A forward read shares one budget over all files, main first. A file whose chunk
+ * the shared budget cut short is not applied (the store would take a chunk with no line end
+ * for a line longer than the budget) but read in the next pass; up to
+ * {@link MAX_FORWARD_PASSES} passes per sync, the rest with the next one.
  *
- * NEW CONVERSATION. A remote read learns the transcript id only from its answer. When it
- * names a conversation other than the stored one (`/clear`, resume), the offsets sent were
- * for the old file, so the read is repeated without them and every file is read from its
- * end like a first read.
+ * NEW CONVERSATION. When the transcript path names another conversation (`/clear`, resume),
+ * the previous transcript (same directory) is first read to its end, so edits it got after
+ * the last read are not lost with its cursors; then the new one is read from its end.
+ * "Load older" reaches back within the current conversation only.
+ *
+ * MEMORY. At most {@link MAX_LOADED_STORES} stores stay loaded; past that the least recently
+ * used one without a run is written (if it changed) and dropped, and loaded again on demand.
+ *
+ * GONE. `remove()` (the session's record is deleted) marks the session gone, deletes the file
+ * and then drops the session's slot: a run in flight stops after its current read and its
+ * store no longer writes; a request during the removal reads nothing (`unavailable`, reason
+ * `removed`). A session that comes back with the same id (reboot restore) starts afresh.
+ * `sweep()` deletes, at startup, the stored history of sessions that no longer exist. A
+ * subagent transcript that vanished loses its cursor (`dropSource`), not its entries.
+ *
+ * OLDER. "Load older" reads a full budget block of up to {@link MAX_OLDER_SOURCES} sources
+ * with older lines per click; with more sources they take turns.
+ *
+ * WHICH SESSIONS. Claude sessions, local and remote. Docker and non-claude sessions answer
+ * `unsupported` and are never read. The deps get the session and read a remote one over ssh
+ * (`remote-files.ts`): one round trip to find its transcript, one per read. A remote read never
+ * wakes its host; a sleeping one is a connect timeout (`unavailable`, stored entries kept).
  *
  * IMAGES. A Bash candidate counts only when the file's mtime lies in the call's window
- * (start − 2 s … end + 2 s), so `ls *.png` lists nothing. Transcript times and mtime come
- * from the same host, so clock skew to this server does not matter.
+ * (start − 2 s … end + 2 s), so `ls *.png` lists nothing. Transcript times and mtimes come
+ * from the same host, so a remote host's clock skew to this server does not matter.
  *
  * Tests: `test/edit-history-sync.test.ts`.
  *
  * @module web/edit-history-sync
  */
 
+import { basename, dirname, join } from 'node:path';
 import type { SessionRemote } from '../types/session.js';
-import type { EditSourceRequest, RemoteClaudeEditSources, RemoteProbe } from '../remote-files.js';
+import type { EditSourceReadOptions, EditSourceRequest, EditSources, PathProbe } from '../edit-history-local-source.js';
 import type { ImageCandidate } from '../edit-history-parse.js';
 import { EditHistoryStore, READ_BUDGET_BYTES, type ConfirmedImage } from '../edit-history-store.js';
 import { getCli } from '../config/cli-registry/registry.js';
 
 /** Slack around a Bash call's window for the image mtime check. */
 export const IMAGE_MTIME_SLACK_MS = 2000;
-/** Forward passes per sync when a file grew by more than one budget. */
+/** Forward passes per sync when files grew by more than one budget. */
 export const MAX_FORWARD_PASSES = 3;
+/** Sources read back per "Load older" click, a full budget each. */
+export const MAX_OLDER_SOURCES = 3;
+/** Stores kept in memory; the least recently used one past this is dropped. */
+export const MAX_LOADED_STORES = 3;
+/** `reason` when the session has no transcript yet (no prompt yet, or not found). */
+export const NO_TRANSCRIPT = 'no-transcript';
+/** `reason` once the session's history was deleted. */
+export const REMOVED = 'removed';
 
 export type EditHistoryState = 'ok' | 'unavailable' | 'unsupported';
 
@@ -52,28 +79,28 @@ export interface EditHistorySession {
   remote: SessionRemote | undefined;
   docker?: unknown;
   claudeSessionId: string | null;
+  /** The session's own `CLAUDE_CONFIG_DIR` (Codeman env override), if it has one. */
+  claudeConfigDir?: string;
 }
 
 export interface EditHistorySyncDeps {
-  readLocal(
-    ids: readonly string[],
-    requests: readonly EditSourceRequest[],
-    budget: number
-  ): Promise<RemoteClaudeEditSources | null>;
-  /** `sessionId` is the Codeman session's: the reader finds the claude it runs (after a `/clear`). */
-  readRemote(
-    remote: SessionRemote,
-    ids: readonly string[],
+  /** The session's main transcript path, or null when it has none yet. */
+  transcriptPath(session: EditHistorySession): Promise<string | null>;
+  /** The session's transcripts (a remote session's on its host). */
+  readSources(
+    session: EditHistorySession,
+    mainPath: string,
     requests: readonly EditSourceRequest[],
     budget: number,
-    sessionId: string
-  ): Promise<RemoteClaudeEditSources | null>;
-  /** Probe local paths (`~/` already expanded by the caller's choice); null = missing. */
-  probeLocal(paths: readonly string[]): Promise<Array<RemoteProbe | null>>;
-  probeRemote(remote: SessionRemote, paths: readonly string[]): Promise<Array<RemoteProbe | null>>;
+    opts?: EditSourceReadOptions
+  ): Promise<EditSources | null>;
+  /** Bash image candidates of the session, on the host it runs on. */
+  probe(session: EditHistorySession, paths: readonly string[]): Promise<Array<PathProbe | null>>;
   loadStore(sessionId: string): Promise<EditHistoryStore>;
-  /** Called after a sync that added entries. */
-  onUpdated(sessionId: string, added: number): void;
+  /** Delete a session's stored history without loading it. */
+  deleteStore(sessionId: string): Promise<void>;
+  /** Delete the stored history of every session `keep` rejects; returns how many. */
+  sweepStores(keep: (sessionId: string) => boolean): Promise<number>;
   budget?: number;
 }
 
@@ -98,7 +125,7 @@ export function unsupportedReason(session: EditHistorySession): string | undefin
  */
 export function confirmImages(
   candidates: readonly ImageCandidate[],
-  probe: (path: string) => RemoteProbe | null | undefined,
+  probe: (path: string) => PathProbe | null | undefined,
   known: (path: string) => number | undefined = () => undefined
 ): ConfirmedImage[] {
   const out: ConfirmedImage[] = [];
@@ -126,26 +153,36 @@ export function confirmImages(
   return out;
 }
 
+interface SyncWant {
+  forward: boolean;
+  older: boolean;
+}
+
 interface SessionSlot {
-  store?: EditHistoryStore;
+  store?: Promise<EditHistoryStore>;
   status: EditHistoryStatus;
   running?: Promise<void>;
-  again?: { older: boolean };
+  again?: SyncWant;
+  /** The history was deleted: nothing reads for this session any more. */
+  gone?: boolean;
+  /** The last source the previous "Load older" read; the next one starts after it. */
+  olderAfter?: string;
 }
 
 export class EditHistorySync {
+  /** By session, least recently used first. */
   private readonly slots = new Map<string, SessionSlot>();
+  /** Writes of dropped stores; loading that session again waits for its write. */
+  private readonly unloading = new Map<string, Promise<void>>();
   private readonly budget: number;
 
   constructor(private readonly deps: EditHistorySyncDeps) {
     this.budget = deps.budget ?? READ_BUDGET_BYTES;
   }
 
-  /** The session's store, loaded from disk on first use. */
-  async getStore(sessionId: string): Promise<EditHistoryStore> {
-    const slot = this.slot(sessionId);
-    if (!slot.store) slot.store = await this.deps.loadStore(sessionId);
-    return slot.store;
+  /** The session's store, loaded from disk on first use (one load for concurrent callers). */
+  getStore(sessionId: string): Promise<EditHistoryStore> {
+    return this.storeOf(sessionId, this.slot(sessionId));
   }
 
   getStatus(sessionId: string): EditHistoryStatus {
@@ -154,123 +191,218 @@ export class EditHistorySync {
 
   /**
    * Read what is new (or, with `older`, the next older block). Resolves when this
-   * occasion's run is done; never rejects. A call during a run queues one more run.
+   * request's run is done; never rejects. A call during a run queues one more run.
    */
   async sync(session: EditHistorySession, opts: SyncOptions = {}): Promise<EditHistoryStatus> {
     const why = unsupportedReason(session);
     const slot = this.slot(session.id);
+    if (slot.gone) return { ...slot.status };
     if (why) {
       slot.status = { state: 'unsupported', reason: why };
-      return this.getStatus(session.id);
+      return { ...slot.status };
     }
+    const want: SyncWant = { forward: !opts.older, older: !!opts.older };
     if (slot.running) {
-      slot.again = { older: (slot.again?.older ?? false) || !!opts.older };
+      slot.again = {
+        forward: (slot.again?.forward ?? false) || want.forward,
+        older: (slot.again?.older ?? false) || want.older,
+      };
       await slot.running;
       // The queued run starts when the current one ends; wait for it too.
       if (slot.running) await slot.running;
-      return this.getStatus(session.id);
+      return { ...slot.status };
     }
-    slot.running = this.runLoop(session, !!opts.older);
+    slot.running = this.runLoop(session, slot, want);
     try {
       await slot.running;
     } finally {
       slot.running = undefined;
+      this.unloadIdle(slot);
     }
-    return this.getStatus(session.id);
+    return { ...slot.status };
   }
 
   /** Write every loaded store's pending changes (server shutdown). */
   async flushAll(): Promise<void> {
-    await Promise.all([...this.slots.values()].map((slot) => slot.store?.flush()));
+    await Promise.all([
+      ...[...this.slots.values()].map(async (slot) => (await slot.store?.catch(() => undefined))?.settle()),
+      ...this.unloading.values(),
+    ]);
   }
 
-  /** Drop a deleted session: forget it and delete its stored history. */
+  /**
+   * Delete a session's stored history (its record is gone). While it runs the session is
+   * marked, so a run in flight or a request meanwhile cannot load and write a new store for
+   * it; then its slot goes, and a session that comes back with this id starts afresh.
+   */
   async remove(sessionId: string): Promise<void> {
-    const store = await this.getStore(sessionId);
-    this.slots.delete(sessionId);
-    await store.remove();
+    const slot = this.slot(sessionId);
+    slot.gone = true;
+    slot.again = undefined;
+    slot.status = { state: 'unavailable', reason: REMOVED };
+    try {
+      const store = await slot.store?.catch(() => undefined);
+      if (store) {
+        await store.remove();
+      } else {
+        await this.unloading.get(sessionId);
+        await this.deps.deleteStore(sessionId);
+      }
+      await slot.running;
+    } finally {
+      if (this.slots.get(sessionId) === slot) this.slots.delete(sessionId);
+    }
   }
 
+  /**
+   * Delete the stored history of sessions that no longer exist (startup: left behind by a
+   * crash during deletion, or by an older build). A session in use here is kept.
+   */
+  sweep(exists: (sessionId: string) => boolean): Promise<number> {
+    return this.deps.sweepStores((id) => this.slots.has(id) || exists(id));
+  }
+
+  /** The session's slot, now the most recently used. */
   private slot(sessionId: string): SessionSlot {
-    let slot = this.slots.get(sessionId);
-    if (!slot) {
-      slot = { status: { state: 'ok' } };
-      this.slots.set(sessionId, slot);
-    }
+    const slot = this.slots.get(sessionId) ?? { status: { state: 'ok' } };
+    this.slots.delete(sessionId);
+    this.slots.set(sessionId, slot);
     return slot;
   }
 
-  private async runLoop(session: EditHistorySession, older: boolean): Promise<void> {
-    const slot = this.slot(session.id);
-    let next: boolean | null = older;
-    while (next !== null) {
-      await this.runOnce(session, next);
-      // An unreachable host is not back a moment later: a queued run would only wait out
-      // another connect timeout (and keep its callers waiting for it).
-      if (slot.status.state === 'unavailable') slot.again = undefined;
-      next = slot.again ? slot.again.older : null;
+  private storeOf(sessionId: string, slot: SessionSlot): Promise<EditHistoryStore> {
+    if (!slot.store) {
+      const loading = (async () => {
+        await this.unloading.get(sessionId);
+        return this.deps.loadStore(sessionId);
+      })();
+      slot.store = loading;
+      loading.catch(() => {
+        if (slot.store === loading) slot.store = undefined;
+      });
+      this.unloadIdle(slot);
+    }
+    return slot.store;
+  }
+
+  /**
+   * Past {@link MAX_LOADED_STORES}, drop the least recently used stores no run uses: each is
+   * written if it changed, and a later request loads it again (after that write).
+   */
+  private unloadIdle(keep?: SessionSlot): void {
+    let loaded = 0;
+    for (const slot of this.slots.values()) if (slot.store) loaded++;
+    for (const [sessionId, slot] of this.slots) {
+      if (loaded <= MAX_LOADED_STORES) break;
+      if (!slot.store || slot.running || slot.gone || slot === keep) continue;
+      this.slots.delete(sessionId);
+      loaded--;
+      const writing: Promise<void> = slot.store
+        .then((store) => store.settle())
+        .catch((err) => {
+          console.warn(`[EditHistory] Saving the history of ${sessionId} failed:`, err);
+        })
+        .finally(() => {
+          if (this.unloading.get(sessionId) === writing) this.unloading.delete(sessionId);
+        });
+      this.unloading.set(sessionId, writing);
+    }
+  }
+
+  private async runLoop(session: EditHistorySession, slot: SessionSlot, want: SyncWant): Promise<void> {
+    let next: SyncWant | undefined = want;
+    while (next && !slot.gone) {
+      if (next.forward) await this.runOnce(session, slot, false);
+      if (next.older && !slot.gone) await this.runOnce(session, slot, true);
+      next = slot.again;
       slot.again = undefined;
     }
   }
 
-  private async runOnce(session: EditHistorySession, older: boolean): Promise<void> {
-    const slot = this.slot(session.id);
-    const store = await this.getStore(session.id);
-    const ids = [session.claudeSessionId || session.id, session.id];
-    let added = 0;
+  private async runOnce(session: EditHistorySession, slot: SessionSlot, older: boolean): Promise<void> {
+    let status: EditHistoryStatus;
     try {
-      if (older) {
-        added += await this.readOlder(session, store, ids);
+      // This slot's store: a run still in flight after `remove()` cannot reach a later one.
+      const store = await this.storeOf(session.id, slot);
+      const path = slot.gone ? null : await this.deps.transcriptPath(session);
+      let found: boolean;
+      if (!path) {
+        found = false;
+      } else if (older) {
+        found = await this.readOlder(session, path, store, slot);
       } else {
-        for (let pass = 0; pass < MAX_FORWARD_PASSES; pass++) {
-          const r = await this.readForward(session, store, ids);
-          added += r.added;
+        found = true;
+        for (let pass = 0; pass < MAX_FORWARD_PASSES && found && !slot.gone; pass++) {
+          const r = await this.readForward(session, path, store);
+          found = r.found;
           if (!r.more) break;
         }
       }
-      slot.status = { state: 'ok' };
+      status = found ? { state: 'ok' } : { state: 'unavailable', reason: NO_TRANSCRIPT };
     } catch (err) {
-      slot.status = { state: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
+      status = { state: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
     }
-    if (added > 0) this.deps.onUpdated(session.id, added);
+    if (!slot.gone) slot.status = status;
   }
 
-  private read(session: EditHistorySession, ids: readonly string[], requests: EditSourceRequest[]) {
-    return session.remote
-      ? this.deps.readRemote(session.remote, ids, requests, this.budget, session.id)
-      : this.deps.readLocal(ids, requests, this.budget);
-  }
-
-  private forwardRequests(store: EditHistoryStore, known: Iterable<string>): EditSourceRequest[] {
+  private forwardRequests(store: EditHistoryStore): EditSourceRequest[] {
     const out: EditSourceRequest[] = [];
-    for (const relPath of known) {
+    for (const relPath of store.knownSources()) {
       const c = store.getCursor(relPath);
       if (c) out.push({ relPath, offset: c.offset });
     }
     return out;
   }
 
-  /** One forward read of all sources. `more` = some file has unread bytes after it. */
+  /**
+   * One forward read of all sources. `more` = some file has unread bytes after it, or was cut
+   * short by the shared budget and left for the next pass. A transcript other than the stored
+   * one (`/clear`, resume) is read like a first read, once the stored one is read to its end.
+   */
   private async readForward(
     session: EditHistorySession,
-    store: EditHistoryStore,
-    ids: readonly string[]
-  ): Promise<{ added: number; more: boolean }> {
-    const knownId = store.getTranscriptId();
-    const requests = knownId ? this.forwardRequests(store, store.knownSources()) : [];
-    let res = await this.read(session, ids, requests);
-    if (!res) return { added: 0, more: false };
-    if (requests.length > 0 && res.transcriptId !== knownId) {
-      res = await this.read(session, ids, []);
-      if (!res) return { added: 0, more: false };
+    path: string,
+    store: EditHistoryStore
+  ): Promise<{ found: boolean; more: boolean }> {
+    const own = this.storedTranscript(path, store);
+    if (own !== path && store.knownSources().length > 0) {
+      const previous = await this.readFrom(session, own, store, this.forwardRequests(store));
+      if (previous.more) return { found: true, more: true };
     }
+    return this.readFrom(session, path, store, own === path ? this.forwardRequests(store) : []);
+  }
+
+  /**
+   * The path of the conversation the store holds cursors for: `path` itself, or the previous
+   * conversation's transcript next to it (`/clear` and resume keep the project directory).
+   */
+  private storedTranscript(path: string, store: EditHistoryStore): string {
+    const known = store.getTranscriptId();
+    return known === null || basename(path) === `${known}.jsonl` ? path : join(dirname(path), `${known}.jsonl`);
+  }
+
+  private async readFrom(
+    session: EditHistorySession,
+    path: string,
+    store: EditHistoryStore,
+    requests: EditSourceRequest[]
+  ): Promise<{ found: boolean; more: boolean }> {
+    const res = await this.deps.readSources(session, path, requests, this.budget);
+    if (!res) return { found: false, more: false };
+    this.dropMissing(store, requests, res);
     for (const [agentId, text] of Object.entries(res.metas)) {
       if (!store.hasAgentMeta(agentId)) store.setAgentMeta(agentId, text);
     }
-    let added = 0;
+    const requested = new Set(requests.map((r) => r.relPath));
     let more = false;
     const candidates: ImageCandidate[] = [];
     for (const f of res.files) {
+      // A requested file reads on from its cursor, a new one its tail.
+      const available = requested.has(f.relPath) ? f.size - f.startOffset : f.size;
+      if (f.chunk.length < Math.min(this.budget, available)) {
+        more = true;
+        continue;
+      }
       const r = store.apply({
         transcriptId: res.transcriptId,
         source: f.relPath,
@@ -278,30 +410,48 @@ export class EditHistorySync {
         chunk: f.chunk,
         size: f.size,
       });
-      added += r.added;
       candidates.push(...r.candidates);
       if (f.startOffset + f.chunk.length < f.size) more = true;
     }
-    added += await this.addImages(session, store, candidates);
-    return { added, more };
+    await this.addImages(session, store, candidates);
+    return { found: true, more };
   }
 
   private async readOlder(
     session: EditHistorySession,
+    path: string,
     store: EditHistoryStore,
-    ids: readonly string[]
-  ): Promise<number> {
-    if (!store.backfillTruncated) return 0;
+    slot: SessionSlot
+  ): Promise<boolean> {
+    if (!store.backfillTruncated) return true;
+    // Older lines belong to the stored conversation, even before a forward read moved on.
+    path = this.storedTranscript(path, store);
+    const sources = store.sourcesWithOlder().sort();
+    if (sources.length === 0) return true;
+    // Take turns: start after the last source the previous click read.
+    const after = slot.olderAfter;
+    const first =
+      after === undefined
+        ? 0
+        : Math.max(
+            0,
+            sources.findIndex((s) => s > after)
+          );
+    const picked = [...sources.slice(first), ...sources.slice(0, first)].slice(0, MAX_OLDER_SOURCES);
     const requests: EditSourceRequest[] = [];
-    for (const relPath of store.sourcesWithOlder()) {
+    for (const relPath of picked) {
       const range = store.olderRange(relPath, this.budget);
       if (range) requests.push({ relPath, offset: range.offset, len: range.len });
     }
-    if (requests.length === 0) return 0;
-    const res = await this.read(session, ids, requests);
-    if (!res || res.transcriptId !== store.getTranscriptId()) return 0;
+    if (requests.length === 0) return true;
+    slot.olderAfter = picked[picked.length - 1];
+    const res = await this.deps.readSources(session, path, requests, this.budget * requests.length, {
+      onlyRequested: true,
+    });
+    if (!res) return false;
+    if (res.transcriptId !== store.getTranscriptId()) return true;
+    this.dropMissing(store, requests, res);
     const wanted = new Set(requests.map((r) => r.relPath));
-    let added = 0;
     const candidates: ImageCandidate[] = [];
     for (const f of res.files) {
       if (!wanted.has(f.relPath)) continue;
@@ -312,30 +462,36 @@ export class EditHistorySync {
         chunk: f.chunk,
         size: f.size,
       });
-      added += r.added;
       candidates.push(...r.candidates);
     }
-    return added + (await this.addImages(session, store, candidates));
+    await this.addImages(session, store, candidates);
+    return true;
+  }
+
+  /** Requested files the reader no longer lists are gone: their cursors go too. */
+  private dropMissing(store: EditHistoryStore, requests: readonly EditSourceRequest[], res: EditSources): void {
+    const listed = new Set(res.files.map((f) => f.relPath));
+    for (const r of requests) if (!listed.has(r.relPath)) store.dropSource(r.relPath);
   }
 
   private async addImages(
     session: EditHistorySession,
     store: EditHistoryStore,
     candidates: readonly ImageCandidate[]
-  ): Promise<number> {
+  ): Promise<void> {
     const paths = [...new Set(candidates.flatMap((c) => c.paths))];
-    if (paths.length === 0) return 0;
-    let probes: Array<RemoteProbe | null>;
+    if (paths.length === 0) return;
+    let probes: Array<PathProbe | null>;
     try {
-      probes = session.remote ? await this.deps.probeRemote(session.remote, paths) : await this.deps.probeLocal(paths);
+      probes = await this.deps.probe(session, paths);
     } catch {
       // The edits of this read are in; only its images are lost. The read itself succeeded.
-      return 0;
+      return;
     }
     const byPath = new Map(paths.map((p, i) => [p, probes[i]]));
     const newest = new Map<string, number>();
     for (const e of store.list()) newest.set(e.path, Math.max(newest.get(e.path) ?? -Infinity, e.ts));
-    return store.addImageEntries(
+    store.addImageEntries(
       confirmImages(
         candidates,
         (p) => byPath.get(p),

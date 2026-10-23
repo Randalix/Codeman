@@ -8,10 +8,9 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRouteTestHarness } from './_route-test-utils.js';
 import { hunksToUnified, registerEditHistoryRoutes, relativeTo } from '../../src/web/routes/edit-history-routes.js';
-import { EditHistorySync, type EditHistorySyncDeps } from '../../src/web/edit-history-sync.js';
+import { EditHistorySync, NO_TRANSCRIPT, type EditHistorySyncDeps } from '../../src/web/edit-history-sync.js';
 import { EditHistoryStore } from '../../src/edit-history-store.js';
-import type { RemoteClaudeEditSources } from '../../src/remote-files.js';
-import { RemoteFileAccessError } from '../../src/remote-files.js';
+import type { EditSources } from '../../src/edit-history-local-source.js';
 
 const T0 = Date.parse('2026-10-15T20:00:00.000Z');
 let dir: string;
@@ -35,7 +34,7 @@ function editLine(id: string, ts: number, path: string, extra: Record<string, un
   );
 }
 
-function sources(main: string, sub?: string): RemoteClaudeEditSources {
+function sources(main: string, sub?: string): EditSources {
   const files = [{ relPath: 'main', size: Buffer.byteLength(main), startOffset: 0, chunk: Buffer.from(main) }];
   const metas: Record<string, string> = {};
   if (sub) {
@@ -61,12 +60,16 @@ async function setup(
 ) {
   const read = vi.fn(async () => sources(editLine('t1', T0, '/w/src/a.ts')));
   const sync = new EditHistorySync({
-    readLocal: read,
-    readRemote: read,
-    probeLocal: async (p) => p.map(() => null),
-    probeRemote: async (_r, p) => p.map(() => null),
-    loadStore: (id) => EditHistoryStore.load(id, { dir, debounceMs: 0 }),
-    onUpdated: () => {},
+    transcriptPath: async () => '/p/conv1.jsonl',
+    readSources: read,
+    probe: async (_session, p) => p.map(() => null),
+    loadStore: async (id) => {
+      const store = await EditHistoryStore.load(id, { dir, debounceMs: 0 });
+      opened.push(store);
+      return store;
+    },
+    deleteStore: (id) => EditHistoryStore.delete(id, { dir }),
+    sweepStores: async () => 0,
     ...deps,
   });
   const h = await createRouteTestHarness((app, ctx) => registerEditHistoryRoutes(app, ctx, sync), {
@@ -79,11 +82,14 @@ async function setup(
   return { ...h, read, sync };
 }
 
+/** Stores the tests opened; removed before the temp dir, so no late save recreates it. */
+const opened: EditHistoryStore[] = [];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'edit-routes-'));
 });
-afterEach(() => {
+afterEach(async () => {
   delete process.env.CODEMAN_MULTIUSER;
+  await Promise.all(opened.splice(0).map((s) => s.remove()));
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -109,6 +115,18 @@ describe('GET /api/sessions/:id/edits', () => {
     expect(data.entries[0]).not.toHaveProperty('hunks');
   });
 
+  it('starts the sync before it loads the store (a deletion right after the session check stops the sync)', async () => {
+    const { app, sync } = await setup();
+    const calls: string[] = [];
+    const syncFn = sync.sync.bind(sync);
+    const getStore = sync.getStore.bind(sync);
+    vi.spyOn(sync, 'sync').mockImplementation((...a) => (calls.push('sync'), syncFn(...a)));
+    vi.spyOn(sync, 'getStore').mockImplementation((...a) => (calls.push('getStore'), getStore(...a)));
+    await app.inject({ method: 'GET', url: `${URL}?sync=1` });
+    await app.inject({ method: 'POST', url: `${URL}/older` });
+    expect(calls).toEqual(['sync', 'getStore', 'sync', 'getStore']);
+  });
+
   it('without sync=1 answers from the store and does not read', async () => {
     const { app, read } = await setup();
     const res = await app.inject({ method: 'GET', url: URL });
@@ -119,7 +137,7 @@ describe('GET /api/sessions/:id/edits', () => {
   it('labels subagent entries and shows their paths relative to the worktree', async () => {
     const sub = editLine('t9', T0 + 5, '/w/.claude/worktrees/agent-a1/lib/x.ts', { isSidechain: true, agentId: 'a1' });
     const read = vi.fn(async () => sources(editLine('t1', T0, '/w/src/a.ts'), sub));
-    const { app } = await setup({ readLocal: read });
+    const { app } = await setup({ readSources: read });
     const data = (await app.inject({ method: 'GET', url: `${URL}?sync=1` })).json().data;
     expect(data.agents).toEqual({
       a1: { description: 'Fix it', agentType: 'coding', worktreeBranch: 'worktree-agent-a1' },
@@ -130,20 +148,38 @@ describe('GET /api/sessions/:id/edits', () => {
     });
   });
 
-  it('a remote session whose host is unreachable answers unavailable with the stored entries', async () => {
+  it('a read error answers unavailable with the stored entries', async () => {
     let fail = false;
     const read = vi.fn(async () => {
-      if (fail) throw new RemoteFileAccessError('ssh: connect to host huff port 22: Connection timed out');
+      if (fail) throw new Error('EACCES: permission denied');
       return sources(editLine('t1', T0, '/w/src/a.ts'));
     });
-    const { app } = await setup({ readRemote: read });
-    session.remote = { host: 'huff' };
+    const { app } = await setup({ readSources: read });
     await app.inject({ method: 'GET', url: `${URL}?sync=1` });
     fail = true;
     const data = (await app.inject({ method: 'GET', url: `${URL}?sync=1` })).json().data;
-    expect(data.state).toBe('unavailable');
-    expect(data.reason).toContain('timed out');
+    expect(data).toMatchObject({ state: 'unavailable', reason: 'EACCES: permission denied' });
     expect(data.entries).toHaveLength(1);
+  });
+
+  it('hands the reader the session ids and its own CLAUDE_CONFIG_DIR', async () => {
+    const seen: unknown[] = [];
+    const { app } = await setup({
+      transcriptPath: async (s) => {
+        seen.push({ id: s.id, claudeSessionId: s.claudeSessionId, claudeConfigDir: s.claudeConfigDir });
+        return '/p/conv1.jsonl';
+      },
+    });
+    session.claudeConfigDirOverride = '/cfg/alt ';
+    await app.inject({ method: 'GET', url: `${URL}?sync=1` });
+    expect(seen).toEqual([{ id: 'test-session-1', claudeSessionId: 'conv1', claudeConfigDir: '/cfg/alt' }]);
+  });
+
+  it('a session without a transcript yet answers unavailable (no-transcript)', async () => {
+    const { app, read } = await setup({ transcriptPath: async () => null });
+    const data = (await app.inject({ method: 'GET', url: `${URL}?sync=1` })).json().data;
+    expect(data).toMatchObject({ state: 'unavailable', reason: NO_TRANSCRIPT, entries: [] });
+    expect(read).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -184,6 +220,14 @@ describe('GET /api/sessions/:id/edits/:entryId', () => {
     const { app } = await setup();
     expect((await app.inject({ method: 'GET', url: `${URL}/missing` })).statusCode).toBe(404);
   });
+
+  it('multi-user: another user’s diff is not found', async () => {
+    process.env.CODEMAN_MULTIUSER = '1';
+    const { app } = await setup({}, { authUser: { username: 'bob', role: 'user' } });
+    await app.inject({ method: 'GET', url: `${URL}?sync=1` });
+    session.owner = 'alice';
+    expect((await app.inject({ method: 'GET', url: `${URL}/t1` })).statusCode).toBe(404);
+  });
 });
 
 describe('POST /api/sessions/:id/edits/older', () => {
@@ -191,9 +235,14 @@ describe('POST /api/sessions/:id/edits/older', () => {
     const lines = [0, 1, 2, 3].map((i) => editLine(`t${i}`, T0 + i, `/w/${i}.ts`)).join('');
     const full = Buffer.from(lines);
     const read = vi.fn(
-      async (_ids: readonly string[], requests: readonly { relPath: string; offset: number; len?: number }[]) => {
+      async (
+        _session: unknown,
+        _path: string,
+        requests: readonly { relPath: string; offset: number; len?: number }[],
+        budget: number
+      ) => {
         const req = requests.find((r) => r.relPath === 'main');
-        const start = req ? req.offset : full.length - 400;
+        const start = req ? req.offset : full.length - budget;
         const len = req?.len ?? full.length - start;
         return {
           transcriptId: 'conv1',
@@ -202,11 +251,20 @@ describe('POST /api/sessions/:id/edits/older', () => {
         };
       }
     );
-    const { app } = await setup({ readLocal: read });
+    const { app } = await setup({ readSources: read, budget: 400 });
     const first = (await app.inject({ method: 'GET', url: `${URL}?sync=1` })).json().data;
     expect(first.backfillTruncated).toBe(true);
     const older = (await app.inject({ method: 'POST', url: `${URL}/older` })).json().data;
     expect(older.entries.length).toBeGreaterThan(first.entries.length);
+  });
+
+  it('reads a remote session, handing the reader that session', async () => {
+    const { app, read } = await setup();
+    session.remote = { host: 'huff' };
+    const data = (await app.inject({ method: 'GET', url: `${URL}?sync=1` })).json().data;
+    expect(data).toMatchObject({ state: 'ok', entries: [{ path: '/w/src/a.ts' }] });
+    expect(read).toHaveBeenCalledTimes(1);
+    expect((read.mock.calls[0] as unknown[])[0]).toMatchObject({ id: session.id, remote: { host: 'huff' } });
   });
 });
 

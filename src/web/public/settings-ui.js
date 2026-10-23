@@ -3239,7 +3239,7 @@ Object.assign(CodemanApp.prototype, {
       gitStatusTree: _gst,
       gitStatusMaxRepos: _gsm,
       gitStatusTimeoutSeconds: _gst2,
-      // Per-device bottom-bar button (edit-history-ui.js), likewise absent from the .strict() schema.
+      // Per-device header button (edit-history-ui.js), likewise absent from the .strict() schema.
       showEditHistory: _seh,
       showTabDetachButton: _tdb,
       // Detach Tiles: what a tile drag does is a property of this device's
@@ -4530,7 +4530,7 @@ Object.assign(CodemanApp.prototype, {
     // Bottom-bar Git indicator (git-status-ui.js): opt-in, per-device. Starts or stops its poll to
     // match the setting, so a live toggle needs no reload.
     this.applyGitStatusVisibility?.();
-    // Bottom-bar Edit history button (edit-history-ui.js): opt-in, per-device.
+    // Header Edit history button (edit-history-ui.js): opt-in, per-device, marker-class hidden.
     this.applyEditHistoryVisibility?.();
 
     // Notification bell is retired (notifications live in Settings → Notifications

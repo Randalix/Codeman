@@ -1,17 +1,21 @@
 /**
- * @fileoverview The local twin of `remoteReadClaudeEditSources` (remote-files.ts): reads a
- * claude session's main transcript and its subagent transcripts from byte offsets, for
- * the edit history of a session that runs on this host.
+ * @fileoverview Reads a local claude session's transcripts for its edit history: the main
+ * transcript and its subagent transcripts, each from a byte offset.
  *
- * Same contract as the remote read, so the sync treats both alike:
- *   - the main transcript is the newest `<projects>/<dir>/<id>.jsonl` of the first id that
- *     has one; subagents live in `<that path without .jsonl>/subagents/agent-<id>.jsonl`;
- *   - a requested file is read from its `offset` (clamped to its size), an unrequested
- *     (new) one from `budget` bytes before its end, and a new subagent's `.meta.json`
- *     (≤ 8 KB) comes along;
- *   - `budgetBytes` is shared by all files, main first; once spent, files still report
- *     their size with an empty chunk.
- * Returns null when no transcript exists under any id.
+ * WHICH FILE (`resolveClaudeTranscript`). The transcript watcher's path, which the session's
+ * hooks report, so a session is read from wherever its claude really writes. Before the first
+ * hook after a server restart the watcher has none, and `findClaudeTranscript` looks for
+ * `<id>.jsonl` under the session's own `CLAUDE_CONFIG_DIR` override, else the server's
+ * (`claudeProjectsDir()`, as the relaunch pin does). A config dir set outside Codeman is not
+ * guessed; it is found with the next hook. Subagents live in
+ * `<main path without .jsonl>/subagents/agent-<id>.jsonl`.
+ *
+ * HOW MUCH. A requested file is read from its `offset` (clamped to its size), an unrequested
+ * (new) one from `budget` bytes before its end, and a new subagent's `.meta.json` (≤ 8 KB)
+ * comes along. `budgetBytes` is shared by all files, main first; once spent, files still
+ * report their size with an empty chunk. A request with `len` is a block that must end at
+ * `offset + len` (an "older" block ends at the floor): short of budget, its end is read.
+ * With `onlyRequested` ("older" reads) unrequested files are left out.
  *
  * Tests: `test/edit-history-local-source.test.ts`.
  *
@@ -20,22 +24,51 @@
 
 import { open, readdir, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import type {
-  EditSourceRequest,
-  RemoteClaudeEditSources,
-  RemoteClaudeEditSourceFile,
-  RemoteProbe,
-} from './remote-files.js';
+import { basename, isAbsolute, join } from 'node:path';
+import { claudeProjectsDir } from './utils/claude-transcript.js';
 
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
 const REL_PATH_PATTERN = /^(main|subagents\/agent-[A-Za-z0-9_-]+\.jsonl)$/;
 const AGENT_FILE_PATTERN = /^agent-([A-Za-z0-9_-]+)\.jsonl$/;
 const META_MAX_BYTES = 8192;
 
-export interface LocalEditSourceOptions {
-  /** Default `~/.claude/projects`. */
-  projectsDir?: string;
+/** One file to read from where the last read stopped (`len` only for an "older" block). */
+export interface EditSourceRequest {
+  /** `main` or `subagents/agent-<id>.jsonl`. */
+  relPath: string;
+  offset: number;
+  len?: number;
+}
+
+export interface EditSourceFile {
+  relPath: string;
+  /** The file's size when it was read. */
+  size: number;
+  startOffset: number;
+  chunk: Buffer;
+}
+
+export interface EditSources {
+  /** The conversation id: the main transcript's file name without `.jsonl`. */
+  transcriptId: string;
+  files: EditSourceFile[];
+  /** `agent-<id>.meta.json` text of each subagent read for the first time, by agent id. */
+  metas: Record<string, string>;
+}
+
+export interface EditSourceReadOptions {
+  /** Read only the requested files; the others are not listed. */
+  onlyRequested?: boolean;
+}
+
+/** What a path turned out to be (for Bash image candidates). */
+export interface PathProbe {
+  /** The path with symlinks resolved. */
+  realPath: string;
+  kind: 'file' | 'directory' | 'other';
+  /** Size in bytes (0 for anything that is not a regular file). */
+  size: number;
+  mtimeMs: number;
 }
 
 async function readRange(path: string, offset: number, len: number): Promise<Buffer> {
@@ -61,11 +94,11 @@ async function fileSize(path: string): Promise<number | null> {
   }
 }
 
-/** The newest `<id>.jsonl` under any project dir, for the first id that has one. */
-async function findMainTranscript(
-  projectsDir: string,
-  ids: readonly string[]
-): Promise<{ id: string; path: string } | null> {
+/** The newest `<id>.jsonl` under any project dir, for the first id that has one; null when none does. */
+export async function findClaudeTranscript(
+  ids: readonly string[],
+  projectsDir: string = claudeProjectsDir()
+): Promise<string | null> {
   let dirs: string[];
   try {
     dirs = await readdir(projectsDir);
@@ -84,20 +117,37 @@ async function findMainTranscript(
         // not in this project dir
       }
     }
-    if (best) return { id, path: best.path };
+    if (best) return best.path;
   }
   return null;
 }
 
-export async function readLocalClaudeEditSources(
+/**
+ * The session's main transcript: the transcript watcher's (hook-reported) path when there is
+ * one, else the newest `<id>.jsonl` under `configDir` (the session's `CLAUDE_CONFIG_DIR`
+ * override; the server's config dir when unset). Null when neither finds one.
+ */
+export async function resolveClaudeTranscript(
+  watcherPath: string | null | undefined,
   ids: readonly string[],
+  configDir?: string
+): Promise<string | null> {
+  return watcherPath || findClaudeTranscript(ids, claudeProjectsDir(configDir));
+}
+
+/**
+ * Read the main transcript at `mainPath` and its subagent transcripts. Null when `mainPath`
+ * is not an absolute `<id>.jsonl` path or the file does not exist.
+ */
+export async function readClaudeEditSources(
+  mainPath: string,
   requests: readonly EditSourceRequest[],
   budgetBytes: number,
-  opts: LocalEditSourceOptions = {}
-): Promise<RemoteClaudeEditSources | null> {
-  const projectsDir = opts.projectsDir ?? join(homedir(), '.claude', 'projects');
-  const main = await findMainTranscript(projectsDir, ids);
-  if (!main) return null;
+  opts: EditSourceReadOptions = {}
+): Promise<EditSources | null> {
+  if (!isAbsolute(mainPath) || !mainPath.endsWith('.jsonl')) return null;
+  const transcriptId = basename(mainPath, '.jsonl');
+  if (!ID_PATTERN.test(transcriptId)) return null;
 
   const byPath = new Map<string, EditSourceRequest>();
   for (const r of requests) {
@@ -107,8 +157,8 @@ export async function readLocalClaudeEditSources(
     byPath.set(r.relPath, r);
   }
 
-  const subDir = join(main.path.slice(0, -'.jsonl'.length), 'subagents');
-  const sources: Array<{ relPath: string; path: string; agentId?: string }> = [{ relPath: 'main', path: main.path }];
+  const subDir = join(mainPath.slice(0, -'.jsonl'.length), 'subagents');
+  const sources: Array<{ relPath: string; path: string; agentId?: string }> = [{ relPath: 'main', path: mainPath }];
   try {
     for (const name of (await readdir(subDir)).sort()) {
       const m = AGENT_FILE_PATTERN.exec(name);
@@ -119,17 +169,26 @@ export async function readLocalClaudeEditSources(
   }
 
   let remaining = Math.max(0, Math.floor(budgetBytes));
-  const files: RemoteClaudeEditSourceFile[] = [];
+  const files: EditSourceFile[] = [];
   const metas: Record<string, string> = {};
   for (const src of sources) {
     const size = await fileSize(src.path);
-    if (size === null) continue;
+    if (size === null) {
+      if (src.relPath === 'main') return null;
+      continue;
+    }
     const req = byPath.get(src.relPath);
+    if (!req && opts.onlyRequested) continue;
     let start: number;
     let len: number;
-    if (req) {
+    if (req?.len !== undefined) {
+      const blockStart = Math.min(req.offset, size);
+      const blockEnd = Math.min(req.offset + req.len, size);
+      len = Math.min(blockEnd - blockStart, remaining);
+      start = blockEnd - len;
+    } else if (req) {
       start = Math.min(req.offset, size);
-      len = Math.min(req.len ?? remaining, remaining, size - start);
+      len = Math.min(remaining, size - start);
     } else {
       len = Math.min(size, remaining);
       start = size - len;
@@ -145,17 +204,14 @@ export async function readLocalClaudeEditSources(
       }
     }
   }
-  return { transcriptId: main.id, files, metas };
+  return { transcriptId, files, metas };
 }
 
-/**
- * The local twin of `remoteProbePaths`: per path its resolved path, kind, size and mtime, or
- * null when it does not exist. A leading `~/` means this user's home, like the remote probe.
- */
+/** Per path its resolved path, kind, size and mtime, or null when it does not exist. `~/` means this user's home. */
 export async function probeLocalPaths(
   paths: readonly string[],
   home: string = homedir()
-): Promise<Array<RemoteProbe | null>> {
+): Promise<Array<PathProbe | null>> {
   return Promise.all(
     paths.map(async (p) => {
       const path = p.startsWith('~/') ? join(home, p.slice(2)) : p;
@@ -167,7 +223,7 @@ export async function probeLocalPaths(
           kind: s.isFile() ? 'file' : s.isDirectory() ? 'directory' : 'other',
           size: s.isFile() ? s.size : 0,
           mtimeMs: Math.floor(s.mtimeMs),
-        } satisfies RemoteProbe;
+        } satisfies PathProbe;
       } catch {
         return null;
       }

@@ -124,10 +124,6 @@ import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
 import { CoordinatorReports, type MuteSnapshot, type SubscriptionSnapshot } from './coordinator-reports.js';
 import { RemoteModelRefresher } from './remote-model-refresher.js';
-import { remoteProbePaths, remoteReadClaudeEditSources, remoteReadClaudeTranscriptTail } from '../remote-files.js';
-import { EditHistorySync } from './edit-history-sync.js';
-import { EditHistoryStore } from '../edit-history-store.js';
-import { probeLocalPaths, readLocalClaudeEditSources } from '../edit-history-local-source.js';
 import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { remoteTmuxLocation } from '../tmux-manager.js';
@@ -135,6 +131,15 @@ import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
 import { composerIsEmpty, plainFrame } from '../session-submit-verifier.js';
 import { detectUsageLimitPause } from '../usage-limit-patterns.js';
+import { EditHistorySync } from './edit-history-sync.js';
+import { EditHistoryStore } from '../edit-history-store.js';
+import { probeLocalPaths, readClaudeEditSources, resolveClaudeTranscript } from '../edit-history-local-source.js';
+import {
+  remoteLocateClaudeTranscript,
+  remoteProbePaths,
+  remoteReadClaudeEditSources,
+  remoteReadClaudeTranscriptTail,
+} from '../remote-files.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -275,9 +280,6 @@ const CUSTOM_MODEL_REDISCOVER_INTERVAL_MS = 5 * 60_000;
 // minutes. Cheap either way — one /running GET per distinct endpoint with at least
 // one live custom-model session, not per session.
 const CUSTOM_MODEL_SWAP_CHECK_INTERVAL_MS = 20_000;
-/** Tools whose end can mean changed files for the edit history (Agent: a subagent's edits). */
-const EDIT_HISTORY_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit', 'Bash', 'Agent']);
-const EDIT_HISTORY_DEBOUNCE_MS = 500;
 
 function escapeHtmlText(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
@@ -386,20 +388,28 @@ export class WebServer extends EventEmitter {
     },
   });
   /**
-   * The edit history panel's reader (edit-history-sync.ts). Runs on occasions only: a local
-   * session's Edit/Write/Bash/Agent tool end, a remote one's turn end, a panel request.
+   * The edit history panel's reader (edit-history-sync.ts). Reads only when the panel asks.
+   * A local session's main transcript is the one the transcript watcher follows (hook-reported
+   * path), or, before the first hook after a restart, a lookup under the session's claude
+   * config dir. A remote session sends no hooks: its host is asked over ssh for the transcript
+   * the pane's claude writes (remote-files.ts), and is never woken for it.
    */
   private readonly editHistorySync = new EditHistorySync({
-    readLocal: (ids, requests, budget) => readLocalClaudeEditSources(ids, requests, budget),
-    readRemote: (remote, ids, requests, budget, sessionId) =>
-      remoteReadClaudeEditSources(remote, ids, requests, budget, remoteTmuxLocation(remote, sessionId)),
-    probeLocal: probeLocalPaths,
-    probeRemote: remoteProbePaths,
+    transcriptPath: (session) => {
+      const ids = [session.claudeSessionId || session.id, session.id];
+      return session.remote
+        ? remoteLocateClaudeTranscript(session.remote, ids, remoteTmuxLocation(session.remote, session.id))
+        : resolveClaudeTranscript(this.transcriptWatchers.get(session.id)?.getPath(), ids, session.claudeConfigDir);
+    },
+    readSources: (session, mainPath, requests, budget, opts) =>
+      session.remote
+        ? remoteReadClaudeEditSources(session.remote, mainPath, requests, budget, opts)
+        : readClaudeEditSources(mainPath, requests, budget, opts),
+    probe: (session, paths) => (session.remote ? remoteProbePaths(session.remote, paths) : probeLocalPaths(paths)),
     loadStore: (sessionId) => EditHistoryStore.load(sessionId),
-    onUpdated: (sessionId, added) => this.broadcast(SseEvent.EditHistoryUpdated, { sessionId, added }),
+    deleteStore: (sessionId) => EditHistoryStore.delete(sessionId),
+    sweepStores: (keep) => EditHistoryStore.sweep(keep),
   });
-  /** Debounces a local session's edit-history sync after a burst of tool ends. */
-  private editHistoryTimers = new Map<string, NodeJS.Timeout>();
   /**
    * Posts a worker's turn end / dialog / exit into the mailbox of each session that
    * subscribed to it (the push side of `agent watch`). Same nudge path as a post; no
@@ -930,6 +940,7 @@ export class WebServer extends EventEmitter {
       addSession: this.registerSessionWithLayout.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
+      forgetEditHistory: this.forgetEditHistory.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),
@@ -1423,7 +1434,6 @@ export class WebServer extends EventEmitter {
           isError,
           timestamp: Date.now(),
         });
-        this.noteEditHistoryTool(sessionId, toolName);
       });
 
       watcher.on('transcript:error', (error: Error) => {
@@ -1460,24 +1470,6 @@ export class WebServer extends EventEmitter {
     } catch (err) {
       console.warn(`[IntentStore] Capture failed for session ${sessionId}:`, err);
     }
-  }
-
-  /**
-   * A local session's tool ended: if it can have changed files (an edit, a Bash call that may
-   * have rendered an image, a subagent run), read its edit history after a short quiet spell.
-   * Remote sessions have no transcript watcher; they sync at turn end instead.
-   */
-  private noteEditHistoryTool(sessionId: string, toolName: string): void {
-    if (!EDIT_HISTORY_TOOLS.has(toolName)) return;
-    clearTimeout(this.editHistoryTimers.get(sessionId));
-    this.editHistoryTimers.set(
-      sessionId,
-      setTimeout(() => {
-        this.editHistoryTimers.delete(sessionId);
-        const session = this.sessions.get(sessionId);
-        if (session && !session.remote) void this.editHistorySync.sync(session);
-      }, EDIT_HISTORY_DEBOUNCE_MS)
-    );
   }
 
   /**
@@ -1699,15 +1691,6 @@ export class WebServer extends EventEmitter {
     // Stop transcript watcher
     this.stopTranscriptWatcher(sessionId);
 
-    // Edit history: forget the pending sync; a killed session takes its history with it
-    clearTimeout(this.editHistoryTimers.get(sessionId));
-    this.editHistoryTimers.delete(sessionId);
-    if (killMux) {
-      void this.editHistorySync.remove(sessionId).catch((err) => {
-        console.warn(`[EditHistory] Removing history of ${sessionId} failed:`, getErrorMessage(err));
-      });
-    }
-
     // Stop and remove run summary tracker
     const summaryTracker = this.runSummaryTrackers.get(sessionId);
     if (summaryTracker) {
@@ -1828,7 +1811,8 @@ export class WebServer extends EventEmitter {
       // Only remove from state.json if we're also killing the mux session.
       // When killMux=false (server shutdown), preserve state for recovery.
       if (killMux) {
-        this.store.demoteOrRemoveSession(sessionId);
+        // The edit history goes with the record; a pinned session's demoted record keeps it.
+        if (this.store.demoteOrRemoveSession(sessionId) !== 'preserved') this.forgetEditHistory(sessionId);
       }
     }
 
@@ -2203,9 +2187,6 @@ export class WebServer extends EventEmitter {
       isAutoNameEnabled: async () => (await this.readSettings()).autoNameSessions === true,
       refreshRemoteModel: (session: Session) => {
         void this.remoteModelRefresher.refresh(session);
-      },
-      refreshEditHistory: (session: Session) => {
-        if (session.remote) void this.editHistorySync.sync(session);
       },
     };
   }
@@ -2647,8 +2628,25 @@ export class WebServer extends EventEmitter {
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
+      this.forgetEditHistory(s.id);
     }
+    // History files no session owns (a crash between removing a record and deleting its file).
+    const exists = (id: string) => this.sessions.has(id) || !!this.store.getSession(id);
+    await this.editHistorySync.sweep(exists).catch((err) => {
+      console.warn('[EditHistory] Sweeping orphaned histories failed:', getErrorMessage(err));
+    });
     return result.count;
+  }
+
+  /**
+   * Delete a session's edit history (diffs can hold secrets) once its record is gone: deleted
+   * live (`cleanupSession`), deleted as a record only (DELETE route), or cleaned as stale
+   * (startup, `POST /api/cleanup-state`).
+   */
+  private forgetEditHistory(sessionId: string): void {
+    void this.editHistorySync.remove(sessionId).catch((err) => {
+      console.warn(`[EditHistory] Removing history of ${sessionId} failed:`, getErrorMessage(err));
+    });
   }
 
   /**
@@ -4642,8 +4640,6 @@ export class WebServer extends EventEmitter {
     this.respawnTimers.clear();
     this.runSummaryTrackers.clear();
     this.transcriptWatchers.clear();
-    for (const timer of this.editHistoryTimers.values()) clearTimeout(timer);
-    this.editHistoryTimers.clear();
     await this.editHistorySync.flushAll().catch((err) => {
       console.warn('[EditHistory] Saving on shutdown failed:', getErrorMessage(err));
     });

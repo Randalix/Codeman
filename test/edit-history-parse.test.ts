@@ -10,6 +10,8 @@ import {
   MAX_HUNK_BYTES,
   MAX_IMAGE_CANDIDATES,
   MAX_PENDING_BASH,
+  MAX_PENDING_COMMAND_CHARS,
+  MAX_PENDING_FIELD_CHARS,
   parseClaudeEditLines,
 } from '../src/edit-history-parse.js';
 
@@ -252,6 +254,23 @@ describe('parseClaudeEditLines: Bash image candidates', () => {
     const { pending } = parseClaudeEditLines(lines);
     expect(pending).toHaveLength(MAX_PENDING_BASH);
     expect(pending[0].id).toBe('toolu_5');
+  });
+
+  it(`keeps no call with an id, cwd or agent id over ${MAX_PENDING_FIELD_CHARS} characters (the store would refuse it on load)`, () => {
+    const long = 'x'.repeat(MAX_PENDING_FIELD_CHARS + 1);
+    const lines = [
+      bashUseLine(long, start, 'render > a.png'),
+      bashUseLine('toolu_cwd', start, 'render > a.png', { cwd: '/' + long }),
+      bashUseLine('toolu_agent', start, 'render > a.png', { agentId: long }),
+      bashUseLine('toolu_ok', start, 'render > a.png', { cwd: '/' + 'x'.repeat(MAX_PENDING_FIELD_CHARS - 1) }),
+    ];
+    expect(parseClaudeEditLines(lines.join('\n')).pending.map((p) => p.id)).toEqual(['toolu_ok']);
+  });
+
+  it('keeps only the head of a long command (the pending list is persisted)', () => {
+    const command = 'render > out.png && ' + 'x'.repeat(MAX_PENDING_COMMAND_CHARS * 2);
+    const { pending } = parseClaudeEditLines(bashUseLine('toolu_long', start, command));
+    expect(pending[0].command).toBe(command.slice(0, MAX_PENDING_COMMAND_CHARS));
   });
 });
 
