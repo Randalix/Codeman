@@ -122,7 +122,7 @@ import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
 import { composerIsEmpty, plainFrame } from '../session-submit-verifier.js';
 import { detectUsageLimitPause } from '../usage-limit-patterns.js';
-import { EditHistorySync } from './edit-history-sync.js';
+import { EditHistorySync, remoteTranscriptIds } from './edit-history-sync.js';
 import { EditHistoryStore } from '../edit-history-store.js';
 import { probeLocalPaths, readClaudeEditSources, resolveClaudeTranscript } from '../edit-history-local-source.js';
 import { remoteLocateClaudeTranscript, remoteProbePaths, remoteReadClaudeEditSources } from '../remote-files.js';
@@ -340,15 +340,22 @@ export class WebServer extends EventEmitter {
    * A local session's main transcript is the one the transcript watcher follows (hook-reported
    * path), or, before the first hook after a restart, a lookup under the session's claude
    * config dir. A remote session sends no hooks: its host is asked over ssh for the transcript
-   * the pane's claude writes (remote-files.ts), and is never woken for it.
+   * the pane's claude writes, else the stored conversation's (`remoteTranscriptIds`), and is
+   * never woken for it (remote-files.ts).
    */
   private readonly editHistorySync = new EditHistorySync({
-    transcriptPath: (session) => {
-      const ids = [session.claudeSessionId || session.id, session.id];
-      return session.remote
-        ? remoteLocateClaudeTranscript(session.remote, ids, remoteTmuxLocation(session.remote, session.id))
-        : resolveClaudeTranscript(this.transcriptWatchers.get(session.id)?.getPath(), ids, session.claudeConfigDir);
-    },
+    transcriptPath: (session, storedTranscriptId) =>
+      session.remote
+        ? remoteLocateClaudeTranscript(
+            session.remote,
+            remoteTranscriptIds(session, storedTranscriptId),
+            remoteTmuxLocation(session.remote, session.id)
+          )
+        : resolveClaudeTranscript(
+            this.transcriptWatchers.get(session.id)?.getPath(),
+            [session.claudeSessionId || session.id, session.id],
+            session.claudeConfigDir
+          ),
     readSources: (session, mainPath, requests, budget, opts) =>
       session.remote
         ? remoteReadClaudeEditSources(session.remote, mainPath, requests, budget, opts)
