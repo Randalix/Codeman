@@ -2040,11 +2040,15 @@ async function setSubscription(
   id: string,
   subscribed: boolean
 ): Promise<SubscriptionAnswer | { error: string }> {
-  const res = await deps.request(deps.ctx, {
-    method: 'POST',
-    path: `/api/v1/sessions/${encodeURIComponent(id)}/report-subscription`,
-    body: { subscriber: deps.ctx.selfId, subscribed },
-  });
+  // A thrown transport error is an answer too: after a spawn the worker exists, and its id must still print.
+  const res = await deps
+    .request(deps.ctx, {
+      method: 'POST',
+      path: `/api/v1/sessions/${encodeURIComponent(id)}/report-subscription`,
+      body: { subscriber: deps.ctx.selfId, subscribed },
+    })
+    .catch((err: unknown) => ({ error: getErrorMessage(err) }));
+  if ('error' in res) return res;
   if (!res.json?.success) return { error: describeFailure(res) };
   const data = res.json.data as Partial<SubscriptionAnswer> | undefined;
   return { subscribers: data?.subscribers ?? [], row: data?.row ?? null };

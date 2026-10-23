@@ -1936,6 +1936,20 @@ describe('agent subscribe / unsubscribe', () => {
     expect(JSON.parse(deps.out.join(''))).toMatchObject({ subscribed: false, subscribeError: expect.any(String) });
   });
 
+  it('a transport error on spawn --subscribe still prints the worker id', async () => {
+    let n = 0;
+    const deps = fakeDeps((o) => {
+      n++;
+      if (o.path.endsWith('/report-subscription')) throw new Error('ECONNRESET');
+      return n === 1 ? ok({ sessionId: OTHER, caseName: 'c' }) : ok({ wait: { matched: true } });
+    });
+    expect(
+      await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000, subscribe: true })
+    ).toBe(EXIT.ok);
+    expect(deps.out).toEqual([OTHER]);
+    expect(deps.err.join('\n')).toMatch(/subscribe failed: ECONNRESET/);
+  });
+
   it('send offers subscribe after a hand-off it would not hear the end of — not with --wait, not when subscribed', async () => {
     const unsubscribed = fakeDeps([ok({ delivered: true }), ok({ [OTHER]: ['someone-else'] })]);
     await agentSend(unsubscribed, { id: OTHER, text: 'do it', enter: true });
