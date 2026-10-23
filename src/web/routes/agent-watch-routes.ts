@@ -28,7 +28,7 @@
 
 import { FastifyInstance, FastifyReply } from 'fastify';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
-import { AgentWatchQuerySchema, ReportMuteSchema } from '../schemas.js';
+import { AgentWatchQuerySchema, ReportMuteSchema, ReportSubscriptionSchema } from '../schemas.js';
 import { canAccessOwned, findSessionOrFail, getAuthUser, parseBody } from '../route-helpers.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
 import { agentInbox, clampWait } from '../agent-inbox.js';
@@ -147,8 +147,50 @@ function abortOnClientHangUp(reply: FastifyReply): AbortController {
 export function registerAgentWatchRoutes(
   app: FastifyInstance,
   ctx: SessionPort,
-  options: { reports?: Pick<CoordinatorReports, 'mute' | 'unmute'> } = {}
+  options: {
+    reports?: Pick<
+      CoordinatorReports,
+      'mute' | 'unmute' | 'subscribe' | 'unsubscribe' | 'subscribers' | 'subscriptions'
+    >;
+  } = {}
 ): void {
+  // Reports are opt-in (`agent subscribe`): `subscriber` gets `:id`'s IDLE/BLOCKED/EXITED
+  // lines in its mailbox, or stops getting them. The answer carries the worker's current
+  // watch row (null while a turn runs), so the subscriber knows where it stands without a
+  // catch-up post.
+  app.post('/api/sessions/:id/report-subscription', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    const body = parseBody(ReportSubscriptionSchema, req.body);
+    if (!options.reports) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Coordinator reports are off');
+    if (body.subscriber === id) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'a session cannot subscribe to its own reports');
+    }
+    if (body.subscribed) {
+      findSessionOrFail(ctx, body.subscriber, req);
+      options.reports.subscribe(id, body.subscriber);
+    } else {
+      // A subscriber that is gone can still be taken off the list.
+      options.reports.unsubscribe(id, body.subscriber);
+    }
+    return { id, subscribers: options.reports.subscribers(id), row: buildWatchRow(session) };
+  });
+
+  // Every subscription, worker → subscribers, for `agent ls` and `unsubscribe` without ids.
+  // Filtered like `GET /api/sessions`: a worker the caller cannot see is absent.
+  app.get('/api/agent-report-subscriptions', async (req) => {
+    if (!options.reports) return {};
+    const user = isMultiUserMode() ? getAuthUser(req) : null;
+    const out: Record<string, string[]> = {};
+    for (const [worker, subscribers] of Object.entries(options.reports.subscriptions())) {
+      const session = ctx.sessions.get(worker);
+      if (!session) continue;
+      if (user && user.role !== 'admin' && !canAccessOwned(user, session.owner)) continue;
+      out[worker] = subscribers;
+    }
+    return out;
+  });
+
   // Hold a worker's IDLE reports to its coordinator for a while (`agent mute`); BLOCKED
   // and EXITED still go out. `forMs: 0` lifts the mute and reports what it held back.
   app.post('/api/sessions/:id/report-mute', async (req) => {

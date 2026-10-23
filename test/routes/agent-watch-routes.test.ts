@@ -10,6 +10,7 @@ import { agentInbox } from '../../src/web/agent-inbox.js';
 import { approvalInbox } from '../../src/web/approval-inbox.js';
 import { classifyWatchReason } from '../../src/web/routes/agent-watch-routes.js';
 import { createMockSession, type MockSession } from '../mocks/index.js';
+import { CoordinatorReports } from '../../src/web/coordinator-reports.js';
 import { vi } from 'vitest';
 
 /** The slice of the real tracker the route reads. */
@@ -158,6 +159,78 @@ describe('POST /api/sessions/:id/report-mute', () => {
     expect((await post(harness.ctx._sessionId, { forMs: 25 * 3_600_000 })).statusCode).toBe(400);
     expect((await post(harness.ctx._sessionId, { forMs: 1, extra: 1 })).statusCode).toBe(400);
     expect(calls).toEqual([]);
+  });
+});
+
+describe('report subscriptions (opt-in reports, Joe 2026-10-23)', () => {
+  let harness: RouteTestHarness;
+  let reports: CoordinatorReports;
+  const post = (id: string, payload: unknown) =>
+    harness.app.inject({ method: 'POST', url: `/api/sessions/${id}/report-subscription`, payload });
+  const list = async () =>
+    JSON.parse((await harness.app.inject({ method: 'GET', url: '/api/agent-report-subscriptions' })).body);
+
+  beforeEach(async () => {
+    turnWatch.resetForTests();
+    agentInbox.resetForTests();
+    harness = await createRouteTestHarness((app, ctx) => {
+      reports = new CoordinatorReports({
+        getSession: (id) => ctx.sessions.get(id),
+        row: () => null,
+        post: () => true,
+        withdraw: () => {},
+        enabled: () => true,
+        log: () => {},
+      });
+      registerAgentWatchRoutes(app, ctx, { reports });
+    });
+    harness.ctx.sessions.set('coord-1', createMockSession('coord-1'));
+    withTodos(harness.ctx._session);
+  });
+  afterEach(async () => {
+    turnWatch.resetForTests();
+    agentInbox.resetForTests();
+    await harness.app.close();
+  });
+
+  it('subscribes, answers with the subscribers and where the worker stands now, and lists it', async () => {
+    const id = harness.ctx._sessionId;
+    harness.ctx._session.markTurnEnded('hook');
+    const on = JSON.parse((await post(id, { subscriber: 'coord-1', subscribed: true })).body);
+    expect(on).toMatchObject({ id, subscribers: ['coord-1'], row: expect.objectContaining({ id, reason: 'done' }) });
+    expect(await list()).toEqual({ [id]: ['coord-1'] });
+    const off = JSON.parse((await post(id, { subscriber: 'coord-1', subscribed: false })).body);
+    expect(off).toMatchObject({ id, subscribers: [] });
+    expect(await list()).toEqual({});
+  });
+
+  it('says null while a turn runs', async () => {
+    harness.ctx._session.turnEndedAt = null;
+    const on = JSON.parse((await post(harness.ctx._sessionId, { subscriber: 'coord-1', subscribed: true })).body);
+    expect(on.row).toBeNull();
+  });
+
+  it('refuses a self-subscription, an unknown worker or subscriber, a bad body', async () => {
+    const id = harness.ctx._sessionId;
+    // This module answers a refusal as {success:false} (like `sessions: no ids given`).
+    expect(JSON.parse((await post(id, { subscriber: id, subscribed: true })).body)).toMatchObject({
+      success: false,
+      error: expect.stringContaining('own reports'),
+    });
+    expect((await post('nope', { subscriber: 'coord-1', subscribed: true })).statusCode).toBe(404);
+    expect((await post(id, { subscriber: 'nope', subscribed: true })).statusCode).toBe(404);
+    expect((await post(id, { subscriber: 'coord-1' })).statusCode).toBe(400);
+    expect((await post(id, { subscriber: 'coord-1', subscribed: true, extra: 1 })).statusCode).toBe(400);
+    expect(await list()).toEqual({});
+  });
+
+  it('a subscriber that is gone can still be taken off; the list hides workers that are gone', async () => {
+    const id = harness.ctx._sessionId;
+    reports.subscribe(id, 'gone-subscriber');
+    reports.subscribe('gone-worker', 'coord-1');
+    expect(await list()).toEqual({ [id]: ['gone-subscriber'] });
+    const off = JSON.parse((await post(id, { subscriber: 'gone-subscriber', subscribed: false })).body);
+    expect(off).toMatchObject({ id, subscribers: [] });
   });
 });
 

@@ -1283,6 +1283,14 @@ export const AgentWatchQuerySchema = z
   })
   .strict();
 
+/** POST /api/sessions/:id/report-subscription — `subscriber` gets (or stops getting) `:id`'s reports. */
+export const ReportSubscriptionSchema = z
+  .object({
+    subscriber: z.string().min(1).max(100),
+    subscribed: z.boolean(),
+  })
+  .strict();
+
 /** POST /api/sessions/:id/report-mute — 0 lifts the mute. */
 export const ReportMuteSchema = z
   .object({

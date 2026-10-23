@@ -116,7 +116,7 @@ import { approvalInbox } from './approval-inbox.js';
 import { agentInbox } from './agent-inbox.js';
 import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
-import { CoordinatorReports, type MuteSnapshot } from './coordinator-reports.js';
+import { CoordinatorReports, type MuteSnapshot, type SubscriptionSnapshot } from './coordinator-reports.js';
 import { RemoteModelRefresher } from './remote-model-refresher.js';
 import { remoteProbePaths, remoteReadClaudeEditSources, remoteReadClaudeTranscriptTail } from '../remote-files.js';
 import { EditHistorySync } from './edit-history-sync.js';
@@ -376,8 +376,9 @@ export class WebServer extends EventEmitter {
   /** Debounces a local session's edit-history sync after a burst of tool ends. */
   private editHistoryTimers = new Map<string, NodeJS.Timeout>();
   /**
-   * Posts a worker's turn end / dialog / exit into its parent session's mailbox (the
-   * push side of `agent watch`). Same nudge path as a post; no wake registry.
+   * Posts a worker's turn end / dialog / exit into the mailbox of each session that
+   * subscribed to it (the push side of `agent watch`). Same nudge path as a post; no
+   * wake registry.
    */
   private readonly coordinatorReports = new CoordinatorReports({
     getSession: (id) => this.sessions.get(id),
@@ -400,6 +401,7 @@ export class WebServer extends EventEmitter {
     enabled: () => process.env.CODEMAN_COORDINATOR_REPORTS !== '0',
     log: (message) => console.log(message),
     saveMutes: (snapshot) => this.persistReportMutes(snapshot),
+    saveSubscriptions: (snapshot) => this.persistReportSubscriptions(snapshot),
   });
   private unsubscribeCoordinatorReports: (() => void) | null = null;
   private respawnControllers: Map<string, RespawnController> = new Map();
@@ -1765,7 +1767,8 @@ export class WebServer extends EventEmitter {
     if (killMux) agentInbox.drop(sessionId);
     else agentInbox.detach(sessionId);
     this.inboxNudger.drop(sessionId);
-    this.coordinatorReports.drop(sessionId);
+    // Like the inbox: a detach keeps the session's subscriptions for when it comes back.
+    this.coordinatorReports.drop(sessionId, { keepSubscriptions: !killMux });
 
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
@@ -2842,6 +2845,45 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  // ========== Coordinator report subscriptions ==========
+
+  /** `worker → [subscriber…]`, rewritten whole and atomically on every change. */
+  private reportSubscriptionsPath(): string {
+    return dataPath('report-subscriptions.json');
+  }
+
+  private persistReportSubscriptions(snapshot: SubscriptionSnapshot): void {
+    if (this.testMode) return;
+    const path = this.reportSubscriptionsPath();
+    try {
+      writeFileSync(`${path}.tmp`, JSON.stringify(snapshot), { mode: 0o600 });
+      renameSync(`${path}.tmp`, path);
+    } catch (err) {
+      console.warn(`[CoordinatorReports] Could not persist subscriptions: ${getErrorMessage(err)}`);
+    }
+  }
+
+  /**
+   * Re-arm the subscriptions of the sessions that came back. No file yet means the
+   * first boot with opt-in reports: every living parent keeps its workers' reports.
+   */
+  private restoreReportSubscriptions(): void {
+    try {
+      const snapshot = JSON.parse(readFileSync(this.reportSubscriptionsPath(), 'utf-8')) as SubscriptionSnapshot;
+      const restored = this.coordinatorReports.restoreSubscriptions(snapshot, (id) => this.sessions.has(id));
+      if (restored > 0) console.log(`[CoordinatorReports] ${restored} report subscription(s) restored`);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(`[CoordinatorReports] Could not restore subscriptions: ${getErrorMessage(err)}`);
+        return;
+      }
+      const adopted = this.coordinatorReports.adoptParents(this.sessions.keys());
+      console.log(
+        `[CoordinatorReports] reports are opt-in now: ${adopted} parent → worker pair(s) kept as subscriptions`
+      );
+    }
+  }
+
   private batchTaskUpdate(sessionId: string, task: BackgroundTask): void {
     this.sse.batchTaskUpdate(sessionId, task);
   }
@@ -3214,8 +3256,9 @@ export class WebServer extends EventEmitter {
         rearmed++;
       }
       if (rearmed > 0) console.log(`[Inbox] will announce restored mail in ${rearmed} session(s)`);
-      // From here on every worker's turn end reaches its coordinator's mailbox — minus
-      // the workers a coordinator muted, which a restart must not unmute.
+      // From here on a worker's turn end reaches the mailboxes that subscribed to it —
+      // minus the workers a coordinator muted, which a restart must not unmute.
+      this.restoreReportSubscriptions();
       this.restoreReportMutes();
       this.unsubscribeCoordinatorReports = turnWatch.subscribe((id) => this.coordinatorReports.notify(id));
     }

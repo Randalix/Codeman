@@ -37,6 +37,7 @@ import {
   agentWait,
   agentWatch,
   agentMute,
+  agentSubscribe,
   parseMuteDuration,
   matchTodoId,
   baseHeaders,
@@ -255,17 +256,18 @@ describe('agent ls', () => {
   ];
 
   const SUMMARY = '/api/v1/agent-inbox/summary';
+  const SUBS = '/api/v1/agent-report-subscriptions';
   const withSummary =
-    (summary: unknown, list: unknown = sessions) =>
+    (summary: unknown, list: unknown = sessions, subs: unknown = {}) =>
     (o: RequestOptions): ApiResponse =>
-      o.path === SUMMARY ? ok(summary) : ok(list);
+      o.path === SUMMARY ? ok(summary) : o.path === SUBS ? ok(subs) : ok(list);
 
   it('marks this session and falls back to workingDir for the name', async () => {
     const deps = fakeDeps(withSummary({}));
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+-\s+local\s+busy\s+0\s+-\s+-\s+-\s+w1-Codeman/);
-    expect(text).toMatch(/94990c6d\s+opencode\s+-\s+local\s+idle\s+0\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
+    expect(text).toMatch(/\*\s+058ee7b5\s+claude\s+-\s+local\s+busy\s+0\s+-\s+-\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/94990c6d\s+opencode\s+-\s+local\s+idle\s+0\s+-\s+-\s+-\s+-\s+\/home\/joe\/wiki/);
   });
 
   it('--json is the envelope data plus a self flag and the mailbox state', async () => {
@@ -309,10 +311,12 @@ describe('agent ls', () => {
   });
 
   it('degrades to "?" columns and no footer on a server without the summary route', async () => {
-    const deps = fakeDeps((o) => (o.path === SUMMARY ? { status: 404, text: 'Route not found' } : ok(sessions)));
+    const deps = fakeDeps((o) =>
+      o.path === SUMMARY || o.path === SUBS ? { status: 404, text: 'Route not found' } : ok(sessions)
+    );
     expect(await agentLs(deps)).toBe(EXIT.ok);
     const text = deps.out.join('\n');
-    expect(text).toMatch(/058ee7b5\s+claude\s+-\s+local\s+busy\s+\?\s+\?\s+-\s+-\s+w1-Codeman/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+-\s+local\s+busy\s+\?\s+\?\s+-\s+-\s+\?\s+w1-Codeman/);
     expect(text).not.toMatch(/owes a post/);
   });
 
@@ -1754,9 +1758,9 @@ describe('agent watch', () => {
     );
     await agentLs(deps);
     const [header, row1, row2] = deps.out[0].split('\n');
-    expect(header).toMatch(/WAIT\s+ENDED\s+TODO\s+NAME/);
-    expect(row1).toMatch(/\d\d:\d\d\s+-\s+w1$/);
-    expect(row2).toMatch(/-\s+2\/5\s+w2$/);
+    expect(header).toMatch(/WAIT\s+ENDED\s+TODO\s+SUB\s+NAME/);
+    expect(row1).toMatch(/\d\d:\d\d\s+-\s+-\s+w1$/);
+    expect(row2).toMatch(/-\s+2\/5\s+-\s+w2$/);
   });
 });
 
@@ -1801,6 +1805,7 @@ describe('agent mute', () => {
     expect(deps.calls.slice(1).map((c) => c.path)).toEqual([
       `/api/v1/sessions/${W1}/report-mute`,
       `/api/v1/sessions/${W2}/report-mute`,
+      '/api/v1/agent-report-subscriptions', // for the hint; unanswered here, so no hint
     ]);
     expect(deps.out).toEqual([expect.stringMatching(/aaaaaaaa unmuted/), expect.stringMatching(/bbbbbbbb unmuted/)]);
   });
@@ -1811,6 +1816,172 @@ describe('agent mute', () => {
     const off = fakeDeps([ok([{ id: W1 }]), apiError(200, 'OPERATION_FAILED', 'Coordinator reports are off')]);
     expect(await agentMute(off, { ids: ['aaaaaaaa'], forMs: 1 })).toBe(EXIT.error);
     expect(off.err[0]).toMatch(/aaaaaaaa: .*Coordinator reports are off/);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// subscribe — reports are opt-in (Joe, 2026-10-23: they spammed sessions that never asked)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('agent subscribe / unsubscribe', () => {
+  const W1 = 'aaaaaaaa-0000-4000-8000-000000000001';
+  const W2 = 'bbbbbbbb-0000-4000-8000-000000000002';
+  const SUBS = '/api/v1/agent-report-subscriptions';
+  const sessions = () =>
+    ok([
+      { id: SELF, parentSessionId: null },
+      { id: W1, parentSessionId: SELF },
+      { id: W2, parentSessionId: SELF },
+    ]);
+  const idleRow = {
+    id: W1,
+    name: 'w1',
+    mode: 'claude',
+    turnEndedAt: new Date(2026, 9, 23, 10, 5).getTime(),
+    turnEndSource: 'hook',
+    reason: 'done',
+    openTodos: 0,
+    totalTodos: 0,
+    inboxPending: 0,
+  };
+
+  it('subscribes this session to the given worker and says where it stands now', async () => {
+    const deps = fakeDeps([ok([{ id: W1 }]), ok({ id: W1, subscribers: [SELF], row: idleRow })]);
+    expect(await agentSubscribe(deps, { ids: ['aaaaaaaa'], subscribed: true })).toBe(EXIT.ok);
+    expect(deps.calls[1]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${W1}/report-subscription`,
+      body: { subscriber: SELF, subscribed: true },
+    });
+    expect(deps.out[0]).toMatch(/subscribed to aaaaaaaa .*stop: `codeman agent unsubscribe aaaaaaaa`/);
+    expect(deps.out[1]).toMatch(/now: IDLE {2}aaaaaaaa {2}claude {2}since 10:05 \(hook\) {2}done/);
+  });
+
+  it('without ids subscribes to every worker it spawned; a running turn reads "a turn runs"', async () => {
+    const deps = fakeDeps([sessions(), ok({ subscribers: [SELF], row: null }), ok({ subscribers: [SELF], row: null })]);
+    expect(await agentSubscribe(deps, { ids: [], subscribed: true })).toBe(EXIT.ok);
+    expect(deps.calls.slice(1).map((c) => c.path)).toEqual([
+      `/api/v1/sessions/${W1}/report-subscription`,
+      `/api/v1/sessions/${W2}/report-subscription`,
+    ]);
+    expect(deps.out.filter((l) => l.includes('now:'))).toEqual([
+      expect.stringContaining('a turn runs'),
+      expect.stringContaining('a turn runs'),
+    ]);
+  });
+
+  it('unsubscribe without ids stops every subscription this session holds, and only those', async () => {
+    const deps = fakeDeps([ok({ [W1]: [SELF, OTHER], [W2]: [OTHER] }), ok({ subscribers: [OTHER], row: null })]);
+    expect(await agentSubscribe(deps, { ids: [], subscribed: false })).toBe(EXIT.ok);
+    expect(deps.calls.map((c) => c.path)).toEqual([SUBS, `/api/v1/sessions/${W1}/report-subscription`]);
+    expect(deps.calls[1].body).toEqual({ subscriber: SELF, subscribed: false });
+    expect(deps.out).toEqual([expect.stringMatching(/unsubscribed from aaaaaaaa — no more reports/)]);
+  });
+
+  it('unsubscribe with nothing subscribed is a calm no-op', async () => {
+    const deps = fakeDeps([ok({ [W2]: [OTHER] })]);
+    expect(await agentSubscribe(deps, { ids: [], subscribed: false })).toBe(EXIT.ok);
+    expect(deps.out).toEqual([expect.stringContaining('subscribed to nobody')]);
+  });
+
+  it('refuses itself, a session with no workers, and surfaces a server refusal', async () => {
+    const self = fakeDeps([]);
+    expect(await agentSubscribe(self, { ids: [SELF.slice(0, 8)], subscribed: true })).toBe(EXIT.refused);
+    expect(self.err[0]).toMatch(/subscribe to your workers, not yourself/);
+    const none = fakeDeps([ok([{ id: SELF }])]);
+    expect(await agentSubscribe(none, { ids: [], subscribed: true })).toBe(EXIT.refused);
+    expect(none.err[0]).toMatch(/no workers to subscribe to/);
+    const off = fakeDeps([ok([{ id: W1 }]), apiError(200, 'OPERATION_FAILED', 'Coordinator reports are off')]);
+    expect(await agentSubscribe(off, { ids: ['aaaaaaaa'], subscribed: true })).toBe(EXIT.error);
+    expect(off.err[0]).toMatch(/aaaaaaaa: .*Coordinator reports are off/);
+  });
+
+  it('spawn --subscribe subscribes before the readiness wait and says how to stop', async () => {
+    const deps = fakeDeps([
+      ok({ sessionId: OTHER, caseName: 'c' }),
+      ok({ subscribers: [SELF], row: null }),
+      ok({ wait: { matched: true } }),
+    ]);
+    expect(
+      await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000, subscribe: true })
+    ).toBe(EXIT.ok);
+    expect(deps.calls.map((c) => c.path)).toEqual([
+      '/api/v1/quick-start',
+      `/api/v1/sessions/${OTHER}/report-subscription`,
+      `/api/v1/sessions/${OTHER}/wait-output`,
+    ]);
+    expect(deps.calls[1].body).toEqual({ subscriber: SELF, subscribed: true });
+    expect(deps.err.join('\n')).toMatch(/subscribed: .*`codeman agent unsubscribe 94990c6d`/);
+  });
+
+  it('spawn without --subscribe sends no subscription and offers it', async () => {
+    const deps = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' }), ok({ wait: { matched: true } })]);
+    await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 });
+    expect(deps.calls).toHaveLength(2);
+    expect(deps.err.join('\n')).toMatch(/no report reaches you .*`codeman agent subscribe 94990c6d`.*--subscribe/);
+  });
+
+  it('a failed subscribe on spawn is a warning, the worker still stands', async () => {
+    const deps = fakeDeps(
+      [
+        ok({ sessionId: OTHER, caseName: 'c' }),
+        apiError(404, 'NOT_FOUND', 'Session not found'),
+        ok({ wait: { matched: true } }),
+      ],
+      true
+    );
+    expect(
+      await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000, subscribe: true })
+    ).toBe(EXIT.ok);
+    expect(JSON.parse(deps.out.join(''))).toMatchObject({ subscribed: false, subscribeError: expect.any(String) });
+  });
+
+  it('send offers subscribe after a hand-off it would not hear the end of — not with --wait, not when subscribed', async () => {
+    const unsubscribed = fakeDeps([ok({ delivered: true }), ok({ [OTHER]: ['someone-else'] })]);
+    await agentSend(unsubscribed, { id: OTHER, text: 'do it', enter: true });
+    expect(unsubscribed.calls[1].path).toBe(SUBS);
+    expect(unsubscribed.err.join('\n')).toMatch(/no report reaches you .*`codeman agent subscribe 94990c6d`/);
+
+    const subscribed = fakeDeps([ok({ delivered: true }), ok({ [OTHER]: [SELF] })]);
+    await agentSend(subscribed, { id: OTHER, text: 'do it', enter: true });
+    expect(subscribed.err.join('\n')).not.toMatch(/subscribe/);
+
+    const waited = fakeDeps([ok({ delivered: true, wait: { signal: 'stop', timedOut: false } })]);
+    await agentSend(waited, { id: OTHER, text: 'do it', enter: true, wait: true });
+    expect(waited.calls).toHaveLength(1);
+  });
+
+  it('mute on a worker this session does not subscribe to says the reports do not reach it anyway', async () => {
+    const until = new Date(2026, 9, 23, 11, 0).getTime();
+    const deps = fakeDeps([ok([{ id: W1 }]), ok({ id: W1, mutedUntil: until }), ok({ [W1]: [OTHER] })]);
+    expect(await agentMute(deps, { ids: ['aaaaaaaa'], forMs: 60_000 })).toBe(EXIT.ok);
+    expect(deps.err.join('\n')).toMatch(/not subscribed to aaaaaaaa.*`codeman agent subscribe aaaaaaaa`/);
+  });
+
+  it('ls shows SUB: me, me+others, others, nobody', async () => {
+    const list = [
+      { id: SELF, mode: 'claude', status: 'busy', name: 'me' },
+      { id: W1, mode: 'claude', status: 'idle', name: 'w1' },
+      { id: W2, mode: 'claude', status: 'idle', name: 'w2' },
+      { id: OTHER, mode: 'claude', status: 'idle', name: 'other' },
+    ];
+    const deps = fakeDeps((o) =>
+      o.path === SUBS
+        ? ok({ [W1]: [SELF], [W2]: [SELF, OTHER], [OTHER]: [W1, W2] })
+        : o.path === '/api/v1/sessions'
+          ? ok(list)
+          : ok({})
+    );
+    await agentLs(deps);
+    const rows = deps.out[0].split('\n');
+    expect(rows[0]).toMatch(/TODO\s+SUB\s+NAME/);
+    expect(rows.slice(1).map((r) => r.trim().split(/\s+/).slice(-2))).toEqual([
+      ['-', 'me'],
+      ['me', 'w1'],
+      ['me+1', 'w2'],
+      ['2', 'other'],
+    ]);
+    expect(deps.out.join('\n')).toMatch(/SUB = who gets its IDLE\/BLOCKED\/EXITED reports/);
   });
 });
 

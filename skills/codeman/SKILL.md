@@ -57,6 +57,8 @@ directory, e.g. a git worktree), and a case name keeps the old quick-start behav
 (claude: `opus`, `sonnet`, `claude-opus-5-5`, … as `claude --model`, nothing written to
 disk; codex/opencode/…: their model id); without it the worker runs the standard model.
 `-m <mode>` picks the CLI, `-n <name>` the tab name; stdout is the new session id alone.
+`--subscribe` puts the worker's turn-end reports into your mailbox (see below; without
+it you hear nothing unless you `wait`, `watch` or subscribe later).
 
 **A worker on another machine:** `codeman agent hosts` lists the configured remote hosts
 and the directories that already have a remote case; `codeman agent spawn --host <id>
@@ -89,9 +91,18 @@ and nothing that ended after the cursor is lost. claude reports through its stop
 (seconds), codex through the idle heuristic (a few seconds more); `agent ls` shows the
 same stamp as `ENDED` (HTTP: `GET /api/v1/agent-watch?sessions=…&since=…&wait=…`).
 
-**The same lines arrive on their own** in your mailbox: every worker you spawned posts
-`[codeman watch] IDLE|BLOCKED|EXITED|GONE …` to its parent when a turn ends (read and
-`ack` them like any post). **IDLE lines are quiet**: they never end your `inbox --wait`
+**The same lines come to your mailbox if you subscribe** — reports are opt-in:
+**`codeman agent subscribe [ids…]`** (no ids = all the sessions you spawned; any
+session can be subscribed to, e.g. workers whose coordinator is gone) or
+`spawn --subscribe`. From then on that worker posts `[codeman watch]
+IDLE|BLOCKED|EXITED|GONE …` to you when a turn ends (read and `ack` them like any
+post); the subscribe answer prints where it stands now. Subscribe when you hand a
+worker a job and want to hear the hand-off; **`codeman agent unsubscribe [ids…]`**
+(no ids = everything you subscribed to) once you are done with it — every report line
+ends with that command, so stop a worker that keeps reporting things you do not need.
+`agent ls` shows the subscribers under `SUB` (`me`, `me+1`, `2`, `-`); `send` and
+`spawn` remind you when nothing would reach you. A deleted session takes its
+subscriptions along. **IDLE lines are quiet**: they never end your `inbox --wait`
 and draw no nudge; they arrive with your next real post, or when the wait runs out,
 printed last as `watch digest (N):`, one current line per worker (a newer report
 replaces the unread older one). A worker parked on its own `inbox --wait` is not
@@ -101,8 +112,9 @@ worker's side: its hand-off) or `api-error` (it hangs until someone acts). A wor
 minute; **`codeman agent mute [ids…] --for 30m`** holds its IDLE reports (`90s`, `2h`,
 bare number = minutes, max 24h; no ids = all your workers). BLOCKED and EXITED still
 come, and when the mute ends — or on `codeman agent unmute [ids…]` — its state is
-reported once if it still stands idle. Mutes survive a server restart
-(HTTP: `POST /api/v1/sessions/:id/report-mute {"forMs": n}`, 0 = unmute).
+reported once if it still stands idle. Mutes and subscriptions survive a server restart
+(HTTP: `POST /api/v1/sessions/:id/report-subscription {"subscriber": "<your id>", "subscribed": true|false}`,
+`GET /api/v1/agent-report-subscriptions`; `POST /api/v1/sessions/:id/report-mute {"forMs": n}`, 0 = unmute).
 
 ## 0. Guard and bootstrap
 

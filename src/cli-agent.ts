@@ -527,14 +527,24 @@ export function stalledPairLines(sessions: SessionRow[], summary: Map<string, In
   return lines.sort((a, b) => a.since - b.since).map((l) => l.text);
 }
 
+/** The SUB column: `me`, `me+2`, `2` (others only), `-` nobody; `?` on a server without subscriptions. */
+function subCell(subs: Map<string, string[]> | null, id: string, selfId: string): string {
+  if (!subs) return '?';
+  const list = subs.get(id) ?? [];
+  const others = list.filter((sub) => sub !== selfId).length;
+  if (list.includes(selfId)) return others > 0 ? `me+${others}` : 'me';
+  return others > 0 ? String(others) : '-';
+}
+
 /** `agent ls` — every session the caller can see, self marked; `--alive` probes each pane. */
 export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}): Promise<number> {
   const res = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const sessions = (res.json.data as SessionRow[] | undefined) ?? [];
   const alive = new Map<string, 'alive' | 'dead' | 'unknown'>();
-  const [summary] = await Promise.all([
+  const [summary, subs] = await Promise.all([
     fetchInboxSummary(deps),
+    fetchSubscriptions(deps),
     // One short probe per session, in parallel: `status` says busy for a corpse.
     options.alive ? Promise.all(sessions.map(async (s) => alive.set(s.id, await probeAlive(deps, s.id)))) : null,
   ]);
@@ -548,6 +558,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
         self: isSelfSession(deps.ctx.selfId, s.id),
         ...(options.alive ? { pane: alive.get(s.id) } : {}),
         inbox: inboxOf(s.id),
+        subscribers: subs ? (subs.get(s.id) ?? []) : null,
       }))
     );
     return EXIT.ok;
@@ -570,6 +581,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       inbox ? (inbox.waitingSince ? `since ${clockTime(inbox.waitingSince)}` : '-') : '?',
       s.turnEndedAt ? clockTime(new Date(s.turnEndedAt).toISOString()) : '-',
       todoCell(s.ralphTodoStats),
+      subCell(subs, s.id, deps.ctx.selfId),
       s.name || s.workingDir || '',
     ];
   });
@@ -585,12 +597,13 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
     'WAIT',
     'ENDED',
     'TODO',
+    'SUB',
     'NAME',
   ];
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(
-      `* = this session (${deps.ctx.selfId.slice(0, 8)}). MODEL = what the CLI reports (follows /model); * = only the start value, nothing reported yet; - = unknown. HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list.`
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). MODEL = what the CLI reports (follows /model); * = only the start value, nothing reported yet; - = unknown. HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list. SUB = who gets its IDLE/BLOCKED/EXITED reports: me (+n others), n others, - nobody (\`agent subscribe <id>\` / \`unsubscribe <id>\`).`
     )
   );
   if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));
@@ -617,6 +630,8 @@ export interface SpawnOptions {
   permission?: string;
   /** Continue an existing CLI conversation (the CLI's own session id, not Codeman's). */
   resume?: string;
+  /** Subscribe this session to the worker's reports right after the spawn (reports are opt-in). */
+  subscribe?: boolean;
 }
 
 /**
@@ -1030,6 +1045,8 @@ async function finishSpawn(
   data: Record<string, unknown>,
   where: string
 ): Promise<number> {
+  // Before the readiness wait, so a startup dialog already reaches the mailbox.
+  const subscription = options.subscribe ? await setSubscription(deps, sid, true) : undefined;
   let ready: boolean | undefined;
   let readinessError: string | undefined;
   let dead = false;
@@ -1053,8 +1070,15 @@ async function finishSpawn(
     }
   }
 
+  const subscribeError = subscription && 'error' in subscription ? subscription.error : undefined;
   if (deps.json) {
-    emitJson(deps, { ...data, ready, readinessError });
+    emitJson(deps, {
+      ...data,
+      ready,
+      readinessError,
+      subscribed: subscription !== undefined && !subscribeError,
+      ...(subscribeError ? { subscribeError } : {}),
+    });
   } else {
     // Human lines go to stderr so `SID=$(codeman agent spawn …)` captures the id alone.
     const say = (line: string) => deps.io.err(line);
@@ -1062,6 +1086,7 @@ async function finishSpawn(
       palette.ok(`${GLYPH.ok} spawned ${sid} (${options.mode}${options.model ? ` ${options.model}` : ''}, ${where})`)
     );
     if (ready === true) say(palette.muted('  composer up: the worker can take a prompt'));
+    say(subscribeLine(sid, subscription));
     if (dead) say(palette.err(`${GLYPH.fail} the worker exited during the readiness wait`));
     if (ready === false && !dead) {
       say(
@@ -1165,6 +1190,10 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
       deps.io.out(palette.ok(`${GLYPH.ok} accepted for ${target.id}${noEnter} (no delivery report without --wait)`));
     }
     if (data?.wait) deps.io.out(describeWait(data.wait));
+    // A prompt without --wait is a hand-off: say whether its end will reach this session.
+    if (options.wait === undefined && !data?.duplicate && (await isSubscribed(deps, target.id)) === false) {
+      deps.io.err(palette.muted(`  ${NOT_SUBSCRIBED_HINT(target.id.slice(0, 8))}`));
+    }
   }
   if (options.wait === undefined) return EXIT.ok;
   return waitExitCode(data?.wait);
@@ -1832,13 +1861,17 @@ interface WatchAnswer {
   timedOut: boolean;
 }
 
-/** The ids to watch: the given ones (resolved like every id), else this session's children. */
-async function watchTargets(deps: AgentDeps, ids: string[]): Promise<{ ids: string[] } | { error: string }> {
+/** The ids to watch (mute, subscribe to): the given ones (resolved like every id), else this session's children. */
+async function watchTargets(
+  deps: AgentDeps,
+  ids: string[],
+  verb = 'watch'
+): Promise<{ ids: string[] } | { error: string }> {
   if (ids.length > 0) {
     const resolved: string[] = [];
     for (const id of ids) {
       if (isSelfSession(deps.ctx.selfId, id))
-        return { error: `refusing: ${id} is me — watch your workers, not yourself` };
+        return { error: `refusing: ${id} is me — ${verb} your workers, not yourself` };
       const target = await resolveSessionId(deps, id);
       if ('error' in target) return target;
       resolved.push(target.id);
@@ -1850,8 +1883,19 @@ async function watchTargets(deps: AgentDeps, ids: string[]): Promise<{ ids: stri
   const children = ((res.json.data as SessionRow[] | undefined) ?? []).filter(
     (s) => s.parentSessionId === deps.ctx.selfId
   );
-  if (children.length === 0) return { error: 'no workers to watch: this session spawned none — pass their ids' };
+  if (children.length === 0) return { error: `no workers to ${verb}: this session spawned none — pass their ids` };
   return { ids: children.map((s) => s.id) };
+}
+
+/** One `agent watch` line: IDLE/BLOCKED/EXITED, id, mode, since, reason and counts, name. */
+function watchLine(s: WatchRow): string {
+  const what =
+    s.reason === 'exited' || s.turnEndSource === 'exit' ? 'EXITED' : s.reason === 'blocked' ? 'BLOCKED' : 'IDLE';
+  const facts =
+    s.reason === undefined
+      ? ''
+      : `  ${s.reason}  todos ${s.openTodos ?? 0}/${s.totalTodos ?? 0}  inbox ${s.inboxPending ?? 0}`;
+  return `${what}  ${s.id.slice(0, 8)}  ${s.mode}  since ${clockTime(new Date(s.turnEndedAt).toISOString())} (${s.turnEndSource ?? 'dialog'})${facts}  ${s.name}`;
 }
 
 /**
@@ -1876,17 +1920,7 @@ export async function agentWatch(deps: AgentDeps, options: WatchOptions): Promis
   if (deps.json) {
     emitJson(deps, data);
   } else {
-    for (const s of data.ended) {
-      const what =
-        s.reason === 'exited' || s.turnEndSource === 'exit' ? 'EXITED' : s.reason === 'blocked' ? 'BLOCKED' : 'IDLE';
-      const facts =
-        s.reason === undefined
-          ? ''
-          : `  ${s.reason}  todos ${s.openTodos ?? 0}/${s.totalTodos ?? 0}  inbox ${s.inboxPending ?? 0}`;
-      deps.io.out(
-        `${what}  ${s.id.slice(0, 8)}  ${s.mode}  since ${clockTime(new Date(s.turnEndedAt).toISOString())} (${s.turnEndSource ?? 'dialog'})${facts}  ${s.name}`
-      );
-    }
+    for (const s of data.ended) deps.io.out(watchLine(s));
     for (const id of data.gone) deps.io.out(`GONE  ${id.slice(0, 8)}`);
     if (data.timedOut) deps.io.err(palette.muted(`(no turn ended within ${options.waitMs} ms)`));
     deps.io.out(`cursor ${data.cursor}`);
@@ -1941,6 +1975,7 @@ export async function agentMute(deps: AgentDeps, options: { ids: string[]; forMs
   }
   if (deps.json) emitJson(deps, { sessions: out });
   else {
+    const subs = await fetchSubscriptions(deps);
     for (const { id, mutedUntil } of out) {
       deps.io.out(
         palette.ok(
@@ -1949,7 +1984,137 @@ export async function agentMute(deps: AgentDeps, options: { ids: string[]; forMs
             : `${GLYPH.ok} ${id.slice(0, 8)} muted until ${clockTime(new Date(mutedUntil).toISOString())} — IDLE reports held; BLOCKED/EXITED still come`
         )
       );
+      // A mute holds reports for every subscriber; to this session it only matters when it subscribes.
+      if (subs && !(subs.get(id) ?? []).includes(deps.ctx.selfId)) {
+        deps.io.err(
+          palette.muted(
+            `  you are not subscribed to ${id.slice(0, 8)}, so its reports do not reach you anyway (to get them: \`codeman agent subscribe ${id.slice(0, 8)}\`)`
+          )
+        );
+      }
     }
+  }
+  return EXIT.ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subscribe — a worker's reports reach your mailbox only when you ask for them
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Reports are opt-in (Joe, 2026-10-23: they spammed sessions that never asked for
+// them). The verbs say so where an agent decides: spawn, send, every report line
+// (`no more reports: …`), mute, and the SUB column of `ls`.
+
+/** The hint where a hand-off happens and this session would not hear its end. */
+const NOT_SUBSCRIBED_HINT = (id8: string) =>
+  `no report reaches you when its turn ends — to get its IDLE/BLOCKED/EXITED in your mailbox: \`codeman agent subscribe ${id8}\` (or wait for it: \`agent watch ${id8}\`)`;
+
+/**
+ * Every subscription (worker → subscribers), or null on a server without the route —
+ * the SUB column then reads `?` and the hints stay silent, never a failure.
+ */
+async function fetchSubscriptions(deps: AgentDeps): Promise<Map<string, string[]> | null> {
+  // Only ever a hint or a column: a failed lookup must not fail the verb that asked.
+  const res = await deps
+    .request(deps.ctx, { method: 'GET', path: '/api/v1/agent-report-subscriptions' })
+    .catch(() => null);
+  if (!res?.json?.success) return null;
+  return new Map(Object.entries((res.json.data as Record<string, string[]> | undefined) ?? {}));
+}
+
+/** Whether this session gets `id`'s reports; null when the server cannot say. */
+async function isSubscribed(deps: AgentDeps, id: string): Promise<boolean | null> {
+  const subs = await fetchSubscriptions(deps);
+  return subs ? (subs.get(id) ?? []).includes(deps.ctx.selfId) : null;
+}
+
+interface SubscriptionAnswer {
+  subscribers: string[];
+  /** The worker's watch row now; null while a turn runs. */
+  row: WatchRow | null;
+}
+
+/** Turn this session's subscription to `id` on or off. */
+async function setSubscription(
+  deps: AgentDeps,
+  id: string,
+  subscribed: boolean
+): Promise<SubscriptionAnswer | { error: string }> {
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(id)}/report-subscription`,
+    body: { subscriber: deps.ctx.selfId, subscribed },
+  });
+  if (!res.json?.success) return { error: describeFailure(res) };
+  const data = res.json.data as Partial<SubscriptionAnswer> | undefined;
+  return { subscribers: data?.subscribers ?? [], row: data?.row ?? null };
+}
+
+/** The spawn report's subscription line: on, failed, or how to turn it on. */
+function subscribeLine(sid: string, subscription: SubscriptionAnswer | { error: string } | undefined): string {
+  const id8 = sid.slice(0, 8);
+  if (subscription === undefined) return palette.muted(`  ${NOT_SUBSCRIBED_HINT(id8)}; or spawn with --subscribe`);
+  if ('error' in subscription) {
+    return palette.warn(
+      `${GLYPH.warn} subscribe failed: ${subscription.error} — retry: \`codeman agent subscribe ${id8}\``
+    );
+  }
+  return palette.muted(
+    `  subscribed: its IDLE/BLOCKED/EXITED lines come to your mailbox — stop: \`codeman agent unsubscribe ${id8}\``
+  );
+}
+
+/**
+ * `agent subscribe [ids…]` / `agent unsubscribe [ids…]` — get a worker's reports
+ * (IDLE/BLOCKED/EXITED/GONE) in this session's mailbox, or stop getting them. Any
+ * session can be subscribed to. No ids: subscribe to the sessions you spawned;
+ * unsubscribe from every session you are subscribed to.
+ */
+export async function agentSubscribe(
+  deps: AgentDeps,
+  options: { ids: string[]; subscribed: boolean }
+): Promise<number> {
+  let ids: string[];
+  if (options.subscribed || options.ids.length > 0) {
+    const targets = await watchTargets(deps, options.ids, options.subscribed ? 'subscribe to' : 'unsubscribe from');
+    if ('error' in targets) return fail(deps, targets.error, EXIT.refused);
+    ids = targets.ids;
+  } else {
+    const subs = await fetchSubscriptions(deps);
+    if (!subs) return fail(deps, 'this server lists no subscriptions (too old?) — pass the ids');
+    ids = [...subs].filter(([, list]) => list.includes(deps.ctx.selfId)).map(([worker]) => worker);
+    if (ids.length === 0) {
+      if (deps.json) emitJson(deps, { sessions: [] });
+      else deps.io.out(palette.muted('(subscribed to nobody — nothing to stop)'));
+      return EXIT.ok;
+    }
+  }
+  const out: Array<{ id: string } & SubscriptionAnswer> = [];
+  for (const id of ids) {
+    const answer = await setSubscription(deps, id, options.subscribed);
+    if ('error' in answer) return fail(deps, `${id.slice(0, 8)}: ${answer.error}`);
+    out.push({ id, ...answer });
+  }
+  if (deps.json) {
+    emitJson(deps, { sessions: out.map((o) => ({ ...o, subscribed: options.subscribed })) });
+    return EXIT.ok;
+  }
+  for (const { id, row } of out) {
+    const id8 = id.slice(0, 8);
+    if (!options.subscribed) {
+      deps.io.out(
+        palette.ok(
+          `${GLYPH.ok} unsubscribed from ${id8} — no more reports from it (\`agent watch ${id8}\` still answers on demand)`
+        )
+      );
+      continue;
+    }
+    deps.io.out(
+      palette.ok(
+        `${GLYPH.ok} subscribed to ${id8} — its IDLE/BLOCKED/EXITED lines come to your mailbox; stop: \`codeman agent unsubscribe ${id8}\``
+      )
+    );
+    deps.io.out(palette.muted(`  now: ${row ? watchLine(row) : 'a turn runs'}`));
   }
   return EXIT.ok;
 }
@@ -2174,7 +2339,7 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description(
-      'Talk to other sessions from inside one (any CLI mode): list, spawn (also on another host), hosts, send, wait, watch, mute, read, interrupt, rm, post, inbox, todo'
+      'Talk to other sessions from inside one (any CLI mode): list, spawn (also on another host), hosts, send, wait, watch, subscribe, mute, read, interrupt, rm, post, inbox, todo'
     );
 
   agent
@@ -2222,6 +2387,10 @@ export function registerAgentCommands(program: Command): Command {
       '--resume <cli-session-id>',
       'Continue that CLI conversation (opencode --session, codex resume, …); claude is not supported here'
     )
+    .option(
+      '--subscribe',
+      "Get the worker's IDLE/BLOCKED/EXITED reports in your mailbox (reports are opt-in; later: agent subscribe/unsubscribe)"
+    )
     .option('--json', 'Machine-readable output')
     .action(
       (
@@ -2237,6 +2406,7 @@ export function registerAgentCommands(program: Command): Command {
           env: string[];
           permission?: string;
           resume?: string;
+          subscribe?: boolean;
           json?: boolean;
         }
       ) =>
@@ -2253,6 +2423,7 @@ export function registerAgentCommands(program: Command): Command {
             env: options.env,
             permission: options.permission,
             resume: options.resume,
+            subscribe: options.subscribe,
           });
         })
     );
@@ -2489,6 +2660,26 @@ export function registerAgentCommands(program: Command): Command {
     .option('--json', 'Machine-readable output')
     .action((ids: string[], options: { for?: string; json?: boolean }) =>
       run(Boolean(options.json), (deps) => agentMute(deps, { ids, forMs: parseMuteDuration(options.for) }))
+    );
+
+  agent
+    .command('subscribe [ids...]')
+    .description(
+      "Get a session's IDLE/BLOCKED/EXITED/GONE reports in your mailbox from now on (default: all the sessions you spawned); reports are opt-in, any session can be subscribed to, and the answer says where it stands now"
+    )
+    .option('--json', 'Machine-readable output')
+    .action((ids: string[], options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentSubscribe(deps, { ids, subscribed: true }))
+    );
+
+  agent
+    .command('unsubscribe [ids...]')
+    .description(
+      'Stop getting those reports (default: every session you are subscribed to); `agent watch` still answers on demand'
+    )
+    .option('--json', 'Machine-readable output')
+    .action((ids: string[], options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentSubscribe(deps, { ids, subscribed: false }))
     );
 
   agent
