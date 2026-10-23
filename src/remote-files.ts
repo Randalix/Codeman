@@ -517,8 +517,9 @@ function liveClaudeIdLines(pane: RemoteClaudePane | undefined): string[] {
 }
 
 /**
- * Shell lines that find the newest `$HOME/.claude/projects/*\/<id>.jsonl` for the
- * first id that has one and set `best` (the path) and `bestid`; exit
+ * Shell lines that find the newest `<config dir>/projects/*\/<id>.jsonl`
+ * ({@link claudeConfigDirLines}) for the first id that has one and set `best` (the
+ * path) and `bestid`; exit
  * {@link TRANSCRIPT_NOT_FOUND_EXIT} when no id has a transcript. `ids` must already be
  * validated ({@link safeClaudeTranscriptIds}); each one goes in as a shellescaped token.
  * No `ls` and an `[ -f ]` guard on the glob, for the login-shell reasons noted at
@@ -528,9 +529,10 @@ function claudeTranscriptFinderLines(ids: readonly string[], liveIdLines: readon
   return [
     'best=',
     'bestid=',
+    ...claudeConfigDirLines(),
     ...liveIdLines,
     `for id in ${liveIdLines.length ? '$live ' : ''}${ids.map((id) => shellescape(id)).join(' ')}; do`,
-    '  for f in "$HOME"/.claude/projects/*/"$id".jsonl; do',
+    '  for f in "$cfg"/projects/*/"$id".jsonl; do',
     '    [ -f "$f" ] || continue',
     '    if [ -z "$best" ] || [ "$f" -nt "$best" ]; then best=$f; bestid=$id; fi',
     '  done',
@@ -542,7 +544,7 @@ function claudeTranscriptFinderLines(ids: readonly string[], liveIdLines: readon
 
 /**
  * Script that prints the END of a claude transcript in the remote user's
- * `~/.claude/projects/*\/<id>.jsonl`, trying each id in order.
+ * `<config dir>/projects/*\/<id>.jsonl`, trying each id in order.
  *
  * With `pane`, the conversation the claude there is writing now is tried first
  * ({@link liveClaudeIdLines}); a returned id that is none of `ids` is that one.
