@@ -79,7 +79,7 @@ repositories on a slow network share.
 
 **Edit history** (per device, off by default, never on phones) adds a header button for the
 active session's edit history: every edit the agent and its subagents made, with its diff, and
-images it produced. Local Claude sessions only. Nothing is read until you open the window, and it
+images it produced. Claude sessions, local and remote (SSH). Nothing is read until you open the window, and it
 stores those diffs (secrets included) under `~/.codeman/edit-history/`; see
 [Working With Files](Working-With-Files#edit-history).
 
