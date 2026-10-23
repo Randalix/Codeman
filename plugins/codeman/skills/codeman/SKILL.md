@@ -146,7 +146,7 @@ later call opens with, and your first REAL call performs them anyway:
 
 ```bash
 . "${XDG_CACHE_HOME:-$HOME/.cache}/codeman-agent-$CODEMAN_SESSION_ID.sh" 2>/dev/null
-[ "${CODEMAN_PREAMBLE:-}" = 1.33.4 ] || { echo "preamble missing or stale; run the full §0 block"; exit 1; }
+[ "${CODEMAN_PREAMBLE:-}" = 1.44.0 ] || { echo "preamble missing or stale; run the full §0 block"; exit 1; }
 ```
 
 ⚠️ **Never spend a Bash call on this check alone.** §1's block opens with this same
@@ -174,8 +174,11 @@ PRE="${XDG_CACHE_HOME:-$HOME/.cache}/codeman-agent-$CODEMAN_SESSION_ID.sh"
 mkdir -p "$(dirname "$PRE")"
 # Rewrite unless the file already ends with THIS version's stamp, so a stale or a
 # half-written file self-heals here instead of costing you a round trip to rm it.
-grep -qs '^CODEMAN_PREAMBLE=1.33.4$' "$PRE" || (umask 077; cat > "$PRE" <<'PREAMBLE'
-# ---- Codeman agent preamble 1.33.4 (seeded by Codeman at session spawn; the SKILL.md §0 bootstrap rewrites it when missing or stale) ----
+grep -qs '^CODEMAN_PREAMBLE=1.44.0$' "$PRE" || (umask 077; cat > "$PRE" <<'PREAMBLE'
+# ---- Codeman agent preamble 1.44.0 (seeded by Codeman at session spawn; the SKILL.md §0 bootstrap rewrites it when missing or stale) ----
+# Positional parameters are always written with braces, ${1} and never a bare dollar-digit: Claude Code
+# replaces a bare one in a skill body with the matching word of the skill's arguments, and §0 is pasted
+# from that body (test/agent-skill.test.ts pins it).
 API="${CODEMAN_API_URL:?CODEMAN_API_URL not set; refusing to guess}"
 SELF="${CODEMAN_SESSION_ID:?CODEMAN_SESSION_ID not set}"
 # Credentials, cheapest first. Your session has usually INHERITED the server's
@@ -184,7 +187,7 @@ SELF="${CODEMAN_SESSION_ID:?CODEMAN_SESSION_ID not set}"
 # reads. The data dir is wherever the hook-secret file lives. Values may be
 # quoted or `export`-prefixed.
 ENV_FILE="${CODEMAN_HOOK_SECRET_FILE:+${CODEMAN_HOOK_SECRET_FILE%hook-secret}.env}"
-envval() { sed -n "s/^\(export \)\{0,1\}$1=//p" "$ENV_FILE" | tail -1 | sed 's/^"\(.*\)"$/\1/; s/^'\''\(.*\)'\''$/\1/'; }
+envval() { sed -n "s/^\(export \)\{0,1\}${1}=//p" "$ENV_FILE" | tail -1 | sed 's/^"\(.*\)"$/\1/; s/^'\''\(.*\)'\''$/\1/'; }
 if [ -z "${CODEMAN_PASSWORD:-}" ] && [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
   CODEMAN_USERNAME=$(envval CODEMAN_USERNAME)
   CODEMAN_PASSWORD=$(envval CODEMAN_PASSWORD)
@@ -219,15 +222,15 @@ delete_session() {
 
 # ---- fast path: the four verbs, already written. §1 composes them. ----
 _composer_up() {   # <sid> <timeoutMs> -> "true"/"false". `shift+tab` is the one token
-  "${CURL[@]}" -G "$API/api/v1/sessions/$1/wait-output" \
+  "${CURL[@]}" -G "$API/api/v1/sessions/${1}/wait-output" \
     --data-urlencode 'match=shift+tab' --data-urlencode 'from=buffer' \
-    --data-urlencode "timeout=$2" | jq -r '.data.wait.matched // false'
+    --data-urlencode "timeout=${2}" | jq -r '.data.wait.matched // false'
 }
 _dsh_up() {        # <sid> <timeoutMs> -> "true"/"false". The DeepSeek Harness TUI's
   # composer glyph. Override with DSH_READY_MARK for a profile that draws another one.
-  "${CURL[@]}" -G "$API/api/v1/sessions/$1/wait-output" \
+  "${CURL[@]}" -G "$API/api/v1/sessions/${1}/wait-output" \
     --data-urlencode "match=${DSH_READY_MARK:-❯}" --data-urlencode 'from=buffer' \
-    --data-urlencode "timeout=$2" | jq -r '.data.wait.matched // false'
+    --data-urlencode "timeout=${2}" | jq -r '.data.wait.matched // false'
 }
 # ---- the workspace-trust dialog: READ the screen, never press Enter blind ----
 # Claude Code 2.1.252 dropped the option numbers, REVERSED them, and highlights
@@ -243,7 +246,7 @@ _trust_key() {     # <sid> -> "confirm" | "move" | "" (nothing safe to press)
   # full=1 returns the RENDERED pane; a claude pane keeps no tmux history, so that
   # is the current frame rather than every repaint since launch. tail -1 anyway,
   # because the freshest marked row is the only one still true.
-  "${CURL[@]}" -G "$API/api/v1/sessions/$1/terminal" --data-urlencode 'full=1' \
+  "${CURL[@]}" -G "$API/api/v1/sessions/${1}/terminal" --data-urlencode 'full=1' \
     | jq -r '.data.terminalBuffer // empty' \
     | sed -e "s/$(printf '\033')\[[0-9;?]*[a-zA-Z]//g" -e "s/$(printf '\033')[()][AB0]//g" \
     | tr -d ' \t' | grep -i '❯[0-9.]*\(yes,itrustthisfolder\|no,exit\)' | tail -1 \
@@ -261,7 +264,7 @@ _composer_text() { # <sid> -> the composer's text with ALL whitespace removed: "
   # the LAST `❯` line: Claude Code echoes a submitted prompt with the same glyph higher
   # up in the transcript, so only the last one says whether the text was taken.
   local t
-  t=$("${CURL[@]}" -G "$API/api/v1/sessions/$1/terminal" --data-urlencode 'full=1' \
+  t=$("${CURL[@]}" -G "$API/api/v1/sessions/${1}/terminal" --data-urlencode 'full=1' \
     | jq -r '.data.terminalBuffer // empty' \
     | sed -e "s/$(printf '\033')\[[0-9;?]*[a-zA-Z]//g" -e "s/$(printf '\033')[()][AB0]//g" \
     | tr -d '\r' | grep -a '^[[:space:]]*❯' | tail -1)
@@ -271,7 +274,7 @@ _composer_text() { # <sid> -> the composer's text with ALL whitespace removed: "
   printf '%s' "$t" | sed 's/^[[:space:]]*❯//' | tr -d '[:space:]' | sed "s/$(printf '\302\240')//g"
 }
 _accept_trust() {  # <sid> -> 0 once it has answered the dialog, 1 if it could not
-  local sid="$1" k i=1
+  local sid="${1}" k i=1
   while [ "$i" -le 6 ]; do
     k=$(_trust_key "$sid")
     [ -n "$k" ] || return 1   # no dialog on screen, or a layout this cannot read
@@ -412,6 +415,16 @@ spawn_workers() {
 # pane clearly finished means that profile, so switch that worker to markers.
 sendwait() {
   local sid="${1:?}" p="${2:?}" seq="${3:-$(date +%s)}" body r c head n=0 tmp bg i
+  # One line, like every other waiting sender (`toSingleLine`, `codeman agent send`,
+  # the TUI): the server pastes a multi-line prompt as one block, and the loop below,
+  # like the server's own submit check, cannot recognise a pasted block that is still
+  # on the composer, so a prompt like `Review this:\n- item 1` would sit unsent for
+  # the whole re-wait. Each line is trimmed, blank lines are dropped, the rest are
+  # joined with a space. For a long multi-line task, write a file and send its path.
+  case "$p" in *$'\n'*|*$'\r'*)
+    p=$(printf '%s\n' "$p" | tr '\r' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' | paste -sd ' ' -) ;;
+  esac
+  [ -n "$p" ] || { echo "sendwait: empty prompt" >&2; return 1; }
   # `wait:"stop,exit"`, never the `wait:true` default set: that set also carries
   # `idle`, which is INFERRED from output stabilization and flaps mid-turn. On a
   # dsh worker whose TUI repaints rarely the session reads `idle` while the model
@@ -472,7 +485,7 @@ sendwait() {
 last_text() {
   local t="" prev="${2:-}"
   for _ in $(seq 1 15); do
-    t=$("${CURL[@]}" "$API/api/v1/sessions/$1/last-response" | jq -r '.data.text // empty')
+    t=$("${CURL[@]}" "$API/api/v1/sessions/${1}/last-response" | jq -r '.data.text // empty')
     [ -n "$t" ] && [ "$t" != "$prev" ] && { printf '%s\n' "$t"; return 0; }
     sleep 1
   done
@@ -483,10 +496,10 @@ last_text() {
 # The stamp is the LAST line on purpose (a truncated write leaves it unset) and is kept
 # bare on purpose: the write condition above anchors on it with $, so an inline comment
 # here would fail that match and rewrite this file on every single bootstrap.
-CODEMAN_PREAMBLE=1.33.4
+CODEMAN_PREAMBLE=1.44.0
 PREAMBLE
 )
-. "$PRE"; [ "${CODEMAN_PREAMBLE:-}" = 1.33.4 ] || { echo "preamble at $PRE is stale or truncated: rm it and re-run this block"; exit 1; }
+. "$PRE"; [ "${CODEMAN_PREAMBLE:-}" = 1.44.0 ] || { echo "preamble at $PRE is stale or truncated: rm it and re-run this block"; exit 1; }
 ```
 
 Every later Bash call that touches the API starts with the same two loader lines from
@@ -537,7 +550,7 @@ and no per-call body to hand-build.
 
 ```bash
 . "${XDG_CACHE_HOME:-$HOME/.cache}/codeman-agent-$CODEMAN_SESSION_ID.sh" 2>/dev/null   # §0 loader
-[ "${CODEMAN_PREAMBLE:-}" = 1.33.4 ] || { echo "preamble missing or stale; run the full §0 block"; exit 1; }
+[ "${CODEMAN_PREAMBLE:-}" = 1.44.0 ] || { echo "preamble missing or stale; run the full §0 block"; exit 1; }
 N=(alpha beta)                    # INVENT one fresh case name per worker; never list cases first
                                   # (a name may carry a mode: `beta:deepseek`, see below)
 T=('reply with one line: the absolute path of your working directory'
@@ -625,8 +638,9 @@ That is true of no other non-claude mode, and it is worth knowing why: the DeepS
 Harness TUI reports `idle`/`working`/`blocked` to Codeman over the supervisor contract it
 implements, so dsh is the one external CLI with definitive `stop`/`blocked` signals
 instead of guessed-from-silence ones — and it writes a structured transcript, which is
-what `last-response` reads for it. `shell`, `opencode`, `codex`, `gemini`, `antigravity`,
-`pi`, `grok` and `omp` have neither and still need markers ([§5.5](reference/verbs.md#55-markers-for-hook-less-workers)).
+what `last-response` reads for it. `shell`, `opencode`, `gemini`, `antigravity`, `pi`,
+`grok`, `omp` and `copilot` have neither, and `codex` has a transcript and a screen-read `blocked` but
+no `stop`, so all of them still need markers ([§5.5](reference/verbs.md#55-markers-for-hook-less-workers)).
 
 Three things to know before you spawn one:
 
@@ -659,7 +673,7 @@ One row per job. Acting on this table alone is correct; the §5 links are the de
 | know if it is stuck | `GET .../active-tools` and `GET .../run-summary` are structured and free; two `terminal?tail=` samples are the crude fallback | [§5.6](reference/verbs.md#56-alive-and-stuck) |
 | make a runaway worker stop | `POST .../input {"input":"\u001b"}` (ESC, **no** `\r`). Deleting the session would destroy the conversation instead | [§5.7](reference/verbs.md#57-interrupt-without-destroying) |
 | resume a worker halted on a usage limit | `POST .../auto-resume {"enabled":true}`. Respawn and Ralph are **not** the remedy: respawn runs `/clear` | [§5.8](reference/verbs.md#58-usage-limits) |
-| give a worker big input | write a file into its workspace with your own tools and send one short line pointing at it. The composer takes 65536 characters, single-line, newlines stripped | [§5.9](reference/verbs.md#59-big-input-via-the-workspace) |
+| give a worker big input | write a file into its workspace with your own tools and send one short line pointing at it. The composer takes 65536 characters, and `send` takes one line | [§5.9](reference/verbs.md#59-big-input-via-the-workspace) |
 | watch N workers at once | one in-flight wait per worker (per-session waiter cap 16); fan-out shapes differ for claude and shell | [§5.10](reference/verbs.md#510-fan-out) |
 | find yourself, list what exists | `GET /api/v1/sessions`, match your `$SELF` by **prefix** | [§5.11](reference/verbs.md#511-list-and-find-yourself) |
 | read or record what the user wants | `GET/PUT .../intent`, and `POST .../readmymind` to predict | [§5.12](reference/verbs.md#512-read-my-mind) |
@@ -738,8 +752,9 @@ You are yourself a session on this server, and the API has **no undo**.
   user's repository state, so say that you did; **removing** one discards any
   uncommitted work inside it, so ask first ([§5.1](reference/verbs.md#51-where-to-spawn)).
 - Never `tmux kill-session`, `pkill tmux`, `pkill claude`. The API is the only interface.
-- Sessions count against a **global cap of 50** (and, in multi-user mode, a per-user
-  cap of 25 that fires the same 409). Case creation is uncapped and writes real
+- Sessions count against a **global cap, 50 by default** (`CODEMAN_MAX_SESSIONS`), and,
+  in multi-user mode, a per-user cap (half the global cap, 25 by default) that fires
+  the same 409. Case creation is uncapped and writes real
   directories. Clean up every session you start, and never retry `quick-start` in a
   loop.
 

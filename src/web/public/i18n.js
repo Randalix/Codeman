@@ -169,8 +169,8 @@
     'Restore the grid': '恢复平铺网格',
     'Remove tile (the session keeps running)': '移除窗格（会话继续运行）',
     'Drop a tab or a tile here': '将标签页或窗格拖放到此处',
-    // A file of an unsupported type dropped on a tile (tile-grid.js); the single
-    // view's drop (image-input.js) uses 'Only image or video files are supported'.
+    // A file of an unsupported type dropped on a tile (tile-grid.js) or the single
+    // view (image-input.js).
     'Unsupported file type': '不支持的文件类型',
     // Redraw (Ctrl+Shift+R, terminal-ui.js restoreTerminalSize) on the main pane, a tile or Pane B.
     'No active session': '没有活动会话',
@@ -255,6 +255,7 @@
     'Run Grok': '运行 Grok',
     'Run DeepSeek': '运行 DeepSeek',
     'Run OMP': '运行 OMP',
+    'Run GitHub Copilot': '运行 GitHub Copilot',
     'Run Shell': '运行 Shell',
     'More tools': '更多工具',
     'Select AI backend': '选择 AI 后端',
@@ -266,6 +267,50 @@
     'New or link a case…': '新建或关联案例…',
     'Case settings…': '案例设置…',
     'No cases match': '没有匹配的案例',
+    // Git worktrees of a case (session-ui.js openWorktreeModal, the case picker row, the
+    // phone case sheet and Close Session's worktree option). Worktree and branch names,
+    // paths and git's own messages are user/git text and pass through untranslated.
+    'Git worktrees…': 'Git 工作树…',
+    'Git worktrees': 'Git 工作树',
+    'Close git worktrees': '关闭 Git 工作树',
+    Worktrees: '工作树',
+    'Worktrees…': '工作树…',
+    "Each worktree is its own checkout of the case's repository, on its own branch, in .claude/worktrees/ of the case. Agents working in parallel then never share one folder.":
+      '每个工作树都是案例仓库的独立检出，有自己的分支，位于案例的 .claude/worktrees/ 中。并行工作的智能体因此不会共用同一个文件夹。',
+    'Start sessions with': '启动会话所用',
+    'New worktree': '新建工作树',
+    Branch: '分支',
+    'Start from': '起点',
+    "New branch worktree-<name> from the case's current commit, unless you pick another below.":
+      '从案例当前提交新建分支 worktree-<name>，除非在下方另行选择。',
+    'Branch and start point': '分支和起点',
+    "A branch, tag or commit. Default: the case's current commit (HEAD).":
+      '分支、标签或提交。默认：案例当前提交（HEAD）。',
+    'Create & start session': '创建并启动会话',
+    'Loading worktrees…': '正在加载工作树…',
+    'No worktrees yet. Create one below.': '还没有工作树。请在下方创建。',
+    'detached HEAD': '游离 HEAD',
+    'main checkout': '主检出',
+    'not created by Codeman': '非 {name} 创建',
+    locked: '已锁定',
+    missing: '已丢失',
+    Open: '打开',
+    'Start a session in this worktree': '在此工作树中启动会话',
+    'Remove…': '移除…',
+    'git worktree remove refuses while the worktree has uncommitted or untracked files. Codeman never forces it.':
+      '工作树中有未提交或未跟踪的文件时，git worktree remove 会拒绝执行。{name} 从不强制移除。',
+    'Its folder is gone. Removing it clears the record git keeps of it, so the name can be used again.':
+      '它的文件夹已不存在。移除它会清除 git 保存的记录，这个名称便可再次使用。',
+    'Remove worktree': '移除工作树',
+    'Kill & remove worktree': '终止并移除工作树',
+    'git refuses while the worktree has uncommitted or untracked files; nothing is forced':
+      '工作树中有未提交或未跟踪的文件时 git 会拒绝；不会强制执行',
+    'Also delete its branch (git branch -d keeps a branch that is not merged)':
+      '同时删除其分支（git branch -d 会保留未合并的分支）',
+    'Name: letters, digits, ".", "_" and "-", starting with a letter or digit, at most 64 characters.':
+      '名称：字母、数字、"."、"_" 和 "-"，以字母或数字开头，最多 64 个字符。',
+    'A launch is already in progress': '已有启动正在进行',
+    'Codeman did not answer.': '{name} 没有响应。',
     'Add Case': '添加案例',
     'Open sessions': '打开会话',
     'Recent Sessions': '最近会话',
@@ -666,7 +711,13 @@
     'Agent Teams': '智能体团队',
     'Claude Model': 'Claude 模型',
     '1M Opus Context': 'Opus 100 万上下文',
+    'Default session group': '默认会话分组',
+    'New sessions for this case land in this group': '此案例的新会话将放入此分组',
+    'Could not save the default session group.': '无法保存默认会话分组。',
     'Remote auto-reconnect': '远程自动重连',
+    'Pin tab names on the CLI': '在 CLI 上固定标签名',
+    "Launch every Claude session with its tab name, so the CLI's prompt label and /resume list match your tabs. Claude then stops generating its own titles for those sessions, and a rename in Codeman holds only until the next turn. Applies from the next session start or respawn, no server restart needed.":
+      '以标签名启动每个 Claude 会话，让 CLI 的提示框标签和 /resume 列表与你的标签一致。Claude 随后不再为这些会话生成自己的标题，在 Codeman 中的重命名也只保留到下一轮。从下一次会话启动或重新生成时生效，无需重启服务器。',
     'Thinking Effort': '思考强度',
     Low: '低',
     Medium: '中',
@@ -724,7 +775,7 @@
     // the DOM translator skips <textarea> subtrees.
     'Compose prompt': '撰写提示词',
     'Open a session to attach a file': '请先打开一个会话再添加附件',
-    'Only image or video files are supported': '仅支持图片或视频文件',
+    '📎 Attach': '📎 添加附件',
     'Compose prompt, draft saved': '撰写提示词，草稿已保存',
     'Resume saved prompt draft': '继续编辑已保存的提示词草稿',
     'Enter adds a new line': '按 Enter 换行',
@@ -831,9 +882,19 @@
 
     // Dynamic common status / toasts
     'Settings saved': '设置已保存',
+    // The once-per-release toast (settings-ui.js checkWhatsNew); its highlights stay English.
+    "See what's new": '查看更新内容',
+    // The security-notice cards' own eyebrow (panels-ui.js showSecurityNotice/showUpdateNotice);
+    // each notice's title, message and link label carry their own zh-CN text and are skipped.
+    'Security notice': '安全提示',
     'Settings applied': '设置已应用',
     'Save and keep Settings open': '保存并保持设置打开',
     'Settings saved locally': '设置已保存到本机',
+    // Multi-user mode, a non-admin (settings-ui.js / session-ui.js): server-wide settings
+    // writes are admin-only there.
+    'Saved on this device. Server-wide settings can only be changed by an admin.':
+      '已保存到本设备。服务器全局设置只能由管理员更改。',
+    'Server-wide settings can only be changed by an admin': '服务器全局设置只能由管理员更改',
     'Tunnel active': '隧道已启用',
     'Tunnel starting — QR code will appear when ready...': '隧道正在启动，准备好后将显示二维码…',
     'Push notifications enabled': '推送通知已启用',
@@ -937,6 +998,19 @@
     'Enable Respawn': '启用重生',
     'Stop Respawn': '停止重生',
     'Auto-resume when usage limit resets': '使用限制重置后自动继续',
+    // Prompt-cache keep-warm (Session Options → Respawn, App Settings → System → Automation, session-ui.js toasts).
+    'Keep the cache warm while idle': '空闲时保持缓存预热',
+    "Sends a one-line keep-alive just before the cache expires, so your next prompt still reads from cache. Runs only while idle, up to the limit in App Settings → System → Automation; switch on before launch to also stop Claude Code's own idle compaction.":
+      '在缓存即将过期前发送一行保活消息，让您的下一条提示仍能从缓存读取。仅在空闲时运行，最长不超过“应用设置 → 系统 → 自动化”中的上限；在启动前开启还会关闭 Claude Code 自带的空闲压缩。',
+    'Keep prompt caches warm': '保持提示缓存预热',
+    "Default for Claude sessions that have not chosen on their Respawn tab (a session an agent started needs its own switch): shortly before an idle session's prompt cache would expire, send a one-line keep-alive turn so the next prompt still reads the conversation from cache instead of re-processing it.":
+      '未在“重生”标签页中单独设置的 Claude 会话的默认值（由智能体启动的会话需单独开启）：在空闲会话的提示缓存即将过期前发送一行保活消息，让下一条提示仍从缓存读取对话，而不必重新处理。',
+    'Keep warm for at most': '最长保持预热',
+    'Hours after your last prompt in a session during which keep-alives are sent; past that the cache is left to expire. A keep-alive costs a small fraction of the re-write it prevents, so a few hours of them pay off, an overnight gap does not.':
+      '会话中最后一条提示之后发送保活消息的小时数；超过之后任由缓存过期。一次保活的开销只是它所避免的重新写入的一小部分，因此几个小时的保活是值得的，整夜的空档则不值得。',
+    hours: '小时',
+    'Prompt-cache keep-warm enabled': '提示缓存预热已开启',
+    'Prompt-cache keep-warm disabled': '提示缓存预热已关闭',
     'Auto-restart sessions when context fills up (usually not needed)': '上下文已满时自动重启会话（通常不需要）',
     'Auto-Compact': '自动压缩',
     'Auto-Clear': '自动清空',
@@ -1014,6 +1088,12 @@
     'Source type filter': '来源类型筛选',
     'Copy content': '复制内容',
     'Edit file': '编辑文件',
+    'Back (Alt+←)': '后退 (Alt+←)',
+    'Forward (Alt+→)': '前进 (Alt+→)',
+    'Back to the previous file': '返回上一个文件',
+    'Forward to the next file': '前进到下一个文件',
+    Expand: '展开',
+    'Drag to resize': '拖动以调整大小',
     'Rendered markdown': '渲染 Markdown',
     'Line numbers': '行号',
     'Wrap lines': '自动换行',
@@ -1210,8 +1290,11 @@
     'Voice input (Ctrl+Shift+V)': '语音输入（Ctrl+Shift+V）',
     'Insert Newline': '插入换行',
     'Close Panels': '关闭面板',
+    'File Viewer Back / Forward': '文件查看器后退 / 前进',
     'Previous / Next Session': '上一个 / 下一个会话',
     'Next Session': '下一个会话',
+    'Previous Session': '上一个会话',
+    'Next Session (alternate)': '下一个会话（备用）',
     'Switch to Tab N': '切换到第 N 个标签页',
     'Move Active Tab Left': '向左移动当前标签页',
     'Move Active Tab Right': '向右移动当前标签页',
@@ -1277,6 +1360,10 @@
       [/^Update to v(.+)$/, (_m, version) => `更新到 v${version}`],
       [/^You're up to date \(v(.+)\)\.$/, (_m, version) => `已是最新版本（v${version}）。`],
       [/^Update available: v(.+)$/, (_m, version) => `有可用更新：v${version}`],
+      [
+        /^Codeman updated to v([^:\s]+): (.+?)(?: \(\+(\d+) more\))?$/,
+        (_m, version, shown, more) => `Codeman 已更新到 v${version}：${shown}${more ? `（另有 ${more} 项）` : ''}`,
+      ],
       [/^Selected: (.+)$/, (_m, value) => `已选择：${value}`],
       [/^Failed to (.+)$/, (_m, action) => `操作失败：${action}`],
       [/^Will create: (.+)$/, (_m, path) => `将创建：${path}`],
@@ -1285,6 +1372,18 @@
       [/^Terminal restored to (\d+)x(\d+)$/, (_m, cols, rows) => `终端已恢复为 ${cols}x${rows}`],
       [/^View truncated to the first (\d+) cells$/, (_m, n) => `视图仅显示前 ${n} 个单元格`],
       [/^(\d+) unsupported number formats$/, (_m, n) => `${n} 种不支持的数字格式`],
+      // Git worktree toasts (session-ui.js): worktree and branch names and git's own
+      // words pass through untranslated.
+      [/^Worktree (\S+) created on branch (\S+)$/, (_m, wt, branch) => `已创建工作树 ${wt}，分支 ${branch}`],
+      [
+        /^Worktree (\S+) removed\. Branch (\S+) kept: ([\s\S]+)$/,
+        (_m, wt, branch, why) => `已移除工作树 ${wt}。保留了分支 ${branch}：${why}`,
+      ],
+      [/^Worktree (\S+) and branch (\S+) removed$/, (_m, wt, branch) => `已移除工作树 ${wt} 和分支 ${branch}`],
+      [/^Worktree (\S+) removed$/, (_m, wt) => `已移除工作树 ${wt}`],
+      [/^Worktree (\S+) was kept: ([\s\S]+)$/, (_m, wt, why) => `工作树 ${wt} 已保留：${why}`],
+      // A pick, drop or paste that mixed admitted files with refused ones (image-input.js).
+      [/^(\d+) files? skipped: unsupported type$/, (_m, n) => `已跳过 ${n} 个不支持类型的文件`],
       // Group names are user text: they pass through untranslated.
       [/^Move to "(.+)"$/, (_m, group) => `移到“${group}”`],
       // Session names are user text too.
@@ -1320,6 +1419,9 @@
         (_m, n) => `窗口太小，容纳不下 ${n} 个窗格：只显示聚焦的窗格`,
       ],
       [/^The agent exited \((-?\d+)\)$/, (_m, code) => `智能体已退出（${code}）`],
+      // A dialog read off a hook-less CLI's screen (src/web/screen-blocked.ts), as the
+      // notification drawer shows it. The CLI's label passes through.
+      [/^(.+) is waiting for your answer in the terminal$/, (_m, cli) => `${cli} 正在终端中等待你的回答`],
       [/^The agent exited \(signal (\d+)\)$/, (_m, signal) => `智能体已退出（信号 ${signal}）`],
       // A session header's harness logo (tile grid, split pane): "<harness> · <model>",
       // and where the model came from when the CLI did not report it. The harness

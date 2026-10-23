@@ -101,8 +101,9 @@ Differences from `quick-start` worth knowing before you debug one:
 - hitting the session cap here is `OPERATION_FAILED`, where `quick-start` returns
   `SESSION_BUSY` for the identical condition.
 
-`quick-start` failure codes are `SESSION_BUSY` (the global 50-session cap, or the
-per-user cap of 25 in multi-user mode), `FORBIDDEN`, `CONFLICT`, `NOT_FOUND` (a
+`quick-start` failure codes are `SESSION_BUSY` (the global session cap, 50 by default via
+`CODEMAN_MAX_SESSIONS`, or the per-user cap in multi-user mode, half the global cap,
+25 by default), `FORBIDDEN`, `CONFLICT`, `NOT_FOUND` (a
 remote or docker host named by the case no longer exists), `OPERATION_FAILED` and
 `INVALID_INPUT`. **None of them are retryable in a loop.** Always branch on
 `.success` before reading `.data.sessionId`: on failure the field is absent, `jq -r`
@@ -303,10 +304,16 @@ duplicate resend costs nothing.
 Codeman types the text and sends Enter **only when the input contains a carriage
 return**; without it your command sits unsubmitted on the worker's prompt and
 everything downstream times out. No response field catches this: `delivered:true`
-means "written to the pane", **not** "submitted". Newlines are stripped, so input is
-single-line by construction. Build the body with `jq -n` for any prompt you did not
-author as a literal, because the inline `-d '{"input":"'"$P"'\r"}'` pattern breaks on
-the first double quote, backslash or `$` in a real prompt:
+means "written to the pane", **not** "submitted". With `useMux`, newlines are kept: the
+text goes in as one paste, and the `\r` submits all of it. **`sendwait` sends one line,
+though:** its Enter loop and the server's submit check cannot reliably recognise a
+multi-line paste, so a multi-line prompt to a freshly spawned worker could sit unsent in
+Claude Code's Enter-ignore window. `sendwait` therefore joins the lines with a space,
+which loses their layout; put long multi-line content in a file
+([§5.9](#59-big-input-via-the-workspace)). Build the body with `jq -n`
+for any prompt you did not author as a literal, because the inline
+`-d '{"input":"'"$P"'\r"}'` pattern breaks on the first double quote, backslash or `$`
+in a real prompt:
 
 ```bash
 BODY=$(jq -n --arg p "$PROMPT" '{input:($p+"\r"),useMux:true,clientId:"agent-1",seq:1,wait:true,waitTimeout:60000}')
@@ -376,8 +383,10 @@ recovered by submitting it with `{"input":"\r"}`.
 only when the workspace actually has them, see [§5.1](#51-where-to-spawn)) **and for
 `deepseek`** — the one external CLI that reports its own lifecycle, so its `stop` is a
 real end-of-turn signal rather than a guess. On
-`shell`/`opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`omp`, requesting them explicitly is a
-400, and lifecycle transitions there are coarse (a short shell command may emit **no**
+`shell`/`opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`omp`/`copilot`, requesting them explicitly is a
+400 (except `blocked` on `codex`, which Codeman reads off its screen when an approval,
+question or trust dialog is up; a wait for it answers at once if one already is), and
+lifecycle transitions there are coarse (a short shell command may emit **no**
 `idle` transition at all, verified live), so synchronize those with markers.
 
 ⚠️ A dsh session can still refuse them for a per-SESSION reason: `statusReporting:
@@ -428,7 +437,7 @@ from the transcript file, which is flushed slightly *after* the `stop` hook fire
 single read taken the instant send-and-wait returns comes back `""` even though the
 turn finished (verified live: empty on the first call, full text seconds later). `text`
 is also `""` before the worker's first completed turn, and always `""` for modes with
-no transcript (`shell`, `opencode`, `gemini`, `antigravity`, `pi`, `grok`, `omp`; the first four
+no transcript (`shell`, `opencode`, `gemini`, `antigravity`, `pi`, `grok`, `omp`, `copilot`; the first four
 verified live, pi from the same source path), which is
 why the loop above is bounded rather than open-ended. A dsh worker lags too, for its own
 reason: the harness finalizes the assistant message just after it reports `idle`. Fall back to the terminal buffer
@@ -514,7 +523,7 @@ turn), and both better than diffing terminal samples:
 ```
 
 ⚠️ `active-tools` is parsed out of Claude's own output format, so it is **empty for
-`opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`deepseek`/`omp`** (those parsers are skipped wholesale) and
+`opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`deepseek`/`omp`/`copilot`** (those parsers are skipped wholesale) and
 in practice empty for `shell`. Source-verified, not measured live.
 
 Only if neither helps: sample `terminal?tail=` twice a few seconds apart. A changing
@@ -585,9 +594,10 @@ allowlist in §4.
 
 ### 5.9 Big input via the workspace
 
-The composer is a single line capped at 65536 characters with newlines stripped, which
-makes it a bad channel for a spec, a diff or a file list. The workspace is the good
-one, and for a local or docker case you are on the same filesystem as the worker.
+The composer is capped at 65536 characters, and a multi-line paste cannot be confirmed
+as submitted, which makes it a bad channel for a spec, a diff or a file list. The
+workspace is the good one, and for a local or docker case you are on the same
+filesystem as the worker.
 
 1. Write `TASK.md` into the worker's workspace with your own file tools. The path is
    `.data.casePath` from `quick-start`, or the `workingDir` you passed to
@@ -597,10 +607,10 @@ one, and for a local or docker case you are on the same filesystem as the worker
 3. Wait on `DONE_<token>` with `wait-output` ([§5.5](#55-markers-for-hook-less-workers)),
    then read `RESULT.json` back with your own tools.
 
-This sidesteps the byte cap, the newline stripping and the quoting hazards in one
-move, and it makes the marker **split by construction**: the token lives in the file,
-never in the line you type, so the echo of your own keystrokes cannot match it. The
-worker also gets to re-read the task instead of holding it in one echoed line.
+This sidesteps the byte cap, the unconfirmed multi-line paste and the quoting hazards
+in one move, and it makes the marker **split by construction**: the token lives in the
+file, never in the line you type, so the echo of your own keystrokes cannot match it.
+The worker also gets to re-read the task instead of holding it in one echoed line.
 
 ⚠️ Two places it does not work: a **remote-SSH case** runs on another host whose
 filesystem you cannot see, and any worker **currently editing** the directory you are
@@ -697,7 +707,7 @@ The shape, each step verified live (probes, failure modes and safety detail in
    column; the row's `name [ref]` is the address. On Codeman 1.16+ with claude
    2.1.224+ a worker's peer name is its Codeman session name, so pass a DESCRIPTIVE
    `sessionName` in quick-start to pick it (a `w<N>-` placeholder-shaped name is not
-   pinned, so it lists derived); older setups list a name derived from the case folder.
+   pinned by default, so it lists derived); older setups list a name derived from the case folder.
    No row = messaging is off for that worker (it is feature-flagged even on matching
    CLI versions, observed live): fall back to the HTTP recipes without complaint.
 3. `SendMessage` the task; first contact must use the `name [ref]` form copied from

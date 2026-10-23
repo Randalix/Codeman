@@ -97,7 +97,13 @@ import { RunSummaryTracker } from '../run-summary.js';
 import { PlanOrchestrator } from '../plan-orchestrator.js';
 import { OrchestratorLoop } from '../orchestrator-loop.js';
 import { getLifecycleLog } from '../session-lifecycle-log.js';
-import { applyWorkspaceHooks, pruneAgentSessionPreambles, removeAgentSessionPreamble } from '../hooks-config.js';
+import {
+  applyWorkspaceHooks,
+  pruneAgentSessionPreambles,
+  readKeepWarmSettingsOrThrow,
+  readPlanUsageTelemetryEnabled,
+  removeAgentSessionPreamble,
+} from '../hooks-config.js';
 import { PushSubscriptionStore } from '../push-store.js';
 import webpush from 'web-push';
 import { SseStreamManager } from './sse-stream-manager.js';
@@ -125,6 +131,10 @@ import { probeLocalPaths, readLocalClaudeEditSources } from '../edit-history-loc
 import { buildWatchRow } from './routes/agent-watch-routes.js';
 import { probeRemoteHostReachable } from '../remote-probe.js';
 import { remoteTmuxLocation } from '../tmux-manager.js';
+import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
+import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
+import { composerIsEmpty, plainFrame } from '../session-submit-verifier.js';
+import { detectUsageLimitPause } from '../usage-limit-patterns.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -174,9 +184,15 @@ import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
 import { MAX_ROUTE_PARAM_LENGTH } from './route-helpers.js';
-import { getLatestPlanUsage, setLatestCodexPlanUsage } from './plan-usage-latest.js';
+import { getLatestPlanUsage, setLatestCodexPlanUsage, setLatestCopilotPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
+import { isCopilotAvailable } from '../utils/copilot-cli-resolver.js';
+import {
+  readCopilotPlanUsage,
+  readCopilotPlanUsageIfEnabled,
+  resolveCopilotToken,
+} from '../utils/copilot-plan-usage.js';
 import type { ScheduledRun } from './ports/index.js';
 import {
   registerAuthMiddleware,
@@ -207,6 +223,7 @@ import {
   registerStatusTelemetryRoutes,
   registerSystemRoutes,
   registerCaseRoutes,
+  registerWorktreeRoutes,
   registerSessionRoutes,
   registerRespawnRoutes,
   registerRalphRoutes,
@@ -222,6 +239,8 @@ import {
   registerWebviewRoutes,
   registerTabLayoutRoutes,
   registerMcpSyncRoutes,
+  registerConfigBackupRoutes,
+  runConfigBackup,
   registerWebhookRoutes,
   registerDoctorRoutes,
   registerCustomModelRoutes,
@@ -243,6 +262,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // while capping growth of `sseClientsById` and blocking pathological inputs.
 const SSE_CLIENT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 const CODEX_USAGE_POLL_INTERVAL_MS = 5 * 60_000;
+// Copilot's quota is read over the network from GitHub, and a monthly figure moves slowly.
+const COPILOT_USAGE_POLL_INTERVAL_MS = 10 * 60_000;
+
+// Config backups: one cheap read-and-hash of a handful of small files; a snapshot is written only when
+// their content changed since the latest one, so this is one entry per real change, not per tick.
+const CONFIG_BACKUP_INTERVAL_MS = 5 * 60_000;
 const CUSTOM_MODEL_REDISCOVER_INTERVAL_MS = 5 * 60_000;
 // Much shorter than the model-LIST refresh above on purpose: this catches an actual
 // eviction (a session's model no longer loaded, silently swapped out by another
@@ -415,6 +440,50 @@ export class WebServer extends EventEmitter {
   private _customModelDisplacedNotified: Set<string> = new Set();
   /** Cron service (assigned in setupRoutes). */
   private cronService!: CronService;
+  // Prompt-cache keep-warm (prompt-cache-keepwarm.ts): the rulebook and timers live in the
+  // service; the server only lends it the facts a decision needs. A field initializer, not a
+  // setupRoutes() step: cleanup and listener wiring reach it on servers that never set up routes
+  // (the pane-exit and discard tests build a bare WebServer), and every port reads `this.*` lazily.
+  private readonly keepWarmService = new PromptCacheKeepWarmService({
+    getSession: (id) => this.sessions.get(id),
+    sessionIds: () => this.sessions.keys(),
+    readSettings: readKeepWarmSettingsOrThrow,
+    isAutomationActive: (id) => {
+      const session = this.sessions.get(id);
+      if (!session) return true;
+      return (
+        (this.respawnControllers.get(id)?.isRunning ?? false) ||
+        session.ralphTracker.loopState.active ||
+        session.currentTaskId !== null ||
+        sessionWaits.signalWaiterCount(id) > 0
+      );
+    },
+    hasPendingApproval: (id) =>
+      approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
+    readPane: (view) => {
+      const session = view as Session;
+      const muxName = session.muxName;
+      // `capture-pane -p -e`: the visible frame with its styles, which is how `composerIsEmpty()`
+      // tells Claude Code's faint prompt suggestion from a typed draft.
+      const text = muxName ? (this.mux.capturePaneText?.(muxName, undefined, { styles: true }) ?? null) : null;
+      if (!text) return { composerEmpty: null, limitShown: false };
+      const limit = detectUsageLimitPause(plainFrame(text));
+      return {
+        composerEmpty: composerIsEmpty(text, getCli(session.mode)?.capabilities.workDetect?.promptGlyph ?? '') ?? null,
+        limitShown: limit !== null && limit.resetAt > Date.now(),
+      };
+    },
+    publish: (id, status) => {
+      const session = this.sessions.get(id);
+      if (!session?.setKeepWarmStatus(status)) return;
+      this.broadcast(SseEvent.SessionKeepWarm, { sessionId: id, ...status });
+      // Change-only, so one line per transition names whichever guard holds it now.
+      if (status.state !== 'off' || status.reason !== 'off') {
+        console.log(`[KeepWarm] ${id.slice(0, 8)}: ${status.state}${status.reason ? ` (${status.reason})` : ''}`);
+      }
+    },
+    log: (message) => console.log(message),
+  });
   /**
    * Wake-on-LAN registry, returned by `registerSessionRoutes`. Held for its LIFETIME
    * only — `drop()` on session cleanup, `stop()` on shutdown. Waking from here would
@@ -452,6 +521,8 @@ export class WebServer extends EventEmitter {
   private lastRecordedTokens: Map<string, { input: number; output: number }> = new Map();
   private codexUsageRefreshInFlight = false;
   private lastCodexUsageSignature: string | null = null;
+  private copilotUsageRefreshInFlight = false;
+  private lastCopilotUsageSignature: string | null = null;
   // Server startup time for respawn grace period calculation
   private readonly serverStartTime: number = Date.now();
   // Pending respawn start timers (for cleanup on shutdown)
@@ -568,6 +639,7 @@ export class WebServer extends EventEmitter {
       // Fresh, not the 2s cache: the settings PUT does not invalidate it, and a
       // flip must apply to the very next spawn.
       childrenFollowParent: async () => (await this.readSettings(true)).spawnedTabsFollowParent === true,
+      caseDefaults: this.store,
     });
     if (this.testMode) this.tabLayouts.markRestorationSkipped();
 
@@ -832,8 +904,8 @@ export class WebServer extends EventEmitter {
   /**
    * Add a tentative session only after its owner layout accepts the creation.
    * The session enters the live map inside the layout service's owner lock, so
-   * the placement it asked for (`tabGroupId`) lands in the same versioned write
-   * that first records it.
+   * the placement it asked for (`tabGroupId`, else its case's default group)
+   * lands in the same versioned write that first records it.
    */
   private async registerSessionWithLayout(session: Session, placement?: SessionPlacementHint): Promise<TabLayout> {
     return this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner), session.id, placement, () => {
@@ -854,6 +926,7 @@ export class WebServer extends EventEmitter {
     return {
       // SessionPort
       sessions: this.sessions as ReadonlyMap<string, Session>,
+      keepWarm: this.keepWarmService,
       addSession: this.registerSessionWithLayout.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
@@ -1071,7 +1144,7 @@ export class WebServer extends EventEmitter {
       // `ServerResponse` to a `FastifyReply`, so it is `reply.header()` here and
       // NOT `res.setHeader()`. A v9-style body throws TypeError on every static
       // request, which is every page load. See the v10.0.0 release notes.
-      setHeaders: (reply) => {
+      setHeaders: (reply, filePath) => {
         // ⚠️ That same change ALSO flipped precedence, and silently. Under v9 this
         // callback wrote to the raw response and Fastify's staged reply headers then
         // overwrote it, so a route that set its own Cache-Control before .sendFile()
@@ -1080,6 +1153,15 @@ export class WebServer extends EventEmitter {
         // no-store` its route asks for — a service worker that can never update.
         // So: a route that already decided keeps its answer.
         if (reply.getHeader('Cache-Control') !== undefined) return;
+        // A JSON file here is DATA the page fetches at runtime (whats-new.json is rewritten every
+        // release, security-notices.json by hand, manifest.json), never content-hashed and never
+        // `?v=`-busted, so it must revalidate. Under `immutable` a browser may keep last release's
+        // copy for a year, and the page's `fetch(..., { cache: 'no-cache' })` is the only thing
+        // asking it not to; the response header is what every browser honours.
+        if (filePath.endsWith('.json')) {
+          reply.header('Cache-Control', 'no-cache');
+          return;
+        }
         reply.header('Cache-Control', 'public, max-age=31536000, immutable');
       },
     });
@@ -1269,6 +1351,7 @@ export class WebServer extends EventEmitter {
     // routes, whose remote-link (a user request) wakes a sleeping host through it.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx, { remoteWake: this.remoteWake });
+    registerWorktreeRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
@@ -1280,6 +1363,7 @@ export class WebServer extends EventEmitter {
     registerWebviewRoutes(this.app, ctx, this.basePath);
     registerTabLayoutRoutes(this.app, ctx);
     registerMcpSyncRoutes(this.app);
+    registerConfigBackupRoutes(this.app);
     registerWebhookRoutes(this.app, {
       notifier: this.webhookNotifier,
       configDir: getDataDir(),
@@ -1536,6 +1620,7 @@ export class WebServer extends EventEmitter {
     coordinateLayout = true
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
+    this.keepWarmService.remove(sessionId);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
@@ -2034,6 +2119,9 @@ export class WebServer extends EventEmitter {
   }
 
   private async setupSessionListeners(session: Session): Promise<void> {
+    // First keep-warm evaluation: publishes the effective opt-in for the Session Options
+    // readout even before any cache report arrives.
+    void this.keepWarmService.schedule(session.id);
     // Idempotent: the wiring exit handler detaches ALL listeners on every PTY exit
     // (removeSessionListenerRefs), so the re-attach routes (/interactive,
     // /interactive-respawn, /shell) call this again to restore observability
@@ -2066,6 +2154,7 @@ export class WebServer extends EventEmitter {
   private buildSessionListenerDeps() {
     return {
       broadcast: this.broadcast.bind(this),
+      keepWarmSchedule: (id: string) => void this.keepWarmService.schedule(id),
       batchTerminalData: this.batchTerminalData.bind(this),
       batchTaskUpdate: this.batchTaskUpdate.bind(this),
       broadcastSessionStateDebounced: this.broadcastSessionStateDebounced.bind(this),
@@ -3135,6 +3224,14 @@ export class WebServer extends EventEmitter {
     } else if (event === SseEvent.HookPermissionPrompt && data.tool_name) {
       body += body ? ' ' : '';
       body += `Tool: ${String(data.tool_name)}`;
+    } else if (event === SseEvent.HookPermissionPrompt && data.source === SCREEN_BLOCKED_SOURCE && data.message) {
+      // A dialog read off a hook-less CLI's screen (web/screen-blocked.ts), whose message
+      // is built from the CLI's label, never from the screen. Keyed on the source so a
+      // Claude hook's own `message` keeps the body it always had; capped like the error
+      // text, since a hook poster holding the secret can claim the source too (as it can
+      // already claim any `tool_name` above).
+      body += body ? ' ' : '';
+      body += String(data.message).slice(0, 200);
     }
     return body;
   }
@@ -3177,6 +3274,34 @@ export class WebServer extends EventEmitter {
       this.broadcast(SseEvent.SessionStatusTelemetry, snapshot);
     } finally {
       this.codexUsageRefreshInFlight = false;
+    }
+  }
+
+  /**
+   * Copilot's monthly premium-request quota for the shared plan-usage chip. Host-scoped and read-only
+   * like the Codex poll, and additionally gated by `readCopilotPlanUsageIfEnabled()`: only while
+   * plan-usage display is on (so turning the chip off also stops the outbound request), only with a
+   * sign-in token and only with the Copilot CLI installed; nothing is sent to GitHub otherwise.
+   */
+  private async refreshCopilotPlanUsage(): Promise<void> {
+    if (this.copilotUsageRefreshInFlight) return;
+    this.copilotUsageRefreshInFlight = true;
+    try {
+      // A null clears the row, so switching the chip off also takes the last quota off the page.
+      const usage = await readCopilotPlanUsageIfEnabled({
+        planUsageEnabled: readPlanUsageTelemetryEnabled,
+        resolveToken: () => resolveCopilotToken(),
+        copilotInstalled: isCopilotAvailable,
+        read: (token) => readCopilotPlanUsage({ token }),
+      });
+      const signature = usage ? telemetrySignature(usage) : '';
+      if (signature === this.lastCopilotUsageSignature) return;
+      this.lastCopilotUsageSignature = signature;
+      const snapshot = setLatestCopilotPlanUsage(usage);
+      this.cachedLightState = null;
+      this.broadcast(SseEvent.SessionStatusTelemetry, snapshot);
+    } finally {
+      this.copilotUsageRefreshInFlight = false;
     }
   }
 
@@ -3374,12 +3499,28 @@ export class WebServer extends EventEmitter {
     // $CODEMAN_HOOK_SECRET_FILE — hook curls cat that path at execution time.
     getHookSecret();
 
+    // Config backups: a snapshot at start (the state the process found) and then on change.
+    if (!this.testMode) {
+      const backup = (reason: string) =>
+        void runConfigBackup(reason).catch((err) =>
+          console.warn('[config-backup] snapshot failed:', err instanceof Error ? err.message : err)
+        );
+      backup('startup');
+      this.cleanup.setInterval(() => backup('auto'), CONFIG_BACKUP_INTERVAL_MS, {
+        description: 'Config backup',
+      });
+    }
+
     // Main Codex subscription limits come from the signed-in local CLI. Keep
     // this read-only and host-scoped; multi-user SSE routing makes it admin-only.
     if (!this.testMode) {
       void this.refreshCodexPlanUsage();
       this.cleanup.setInterval(() => void this.refreshCodexPlanUsage(), CODEX_USAGE_POLL_INTERVAL_MS, {
         description: 'Codex plan-usage refresh',
+      });
+      void this.refreshCopilotPlanUsage();
+      this.cleanup.setInterval(() => void this.refreshCopilotPlanUsage(), COPILOT_USAGE_POLL_INTERVAL_MS, {
+        description: 'Copilot plan-usage refresh',
       });
     }
 
@@ -3906,6 +4047,7 @@ export class WebServer extends EventEmitter {
               antigravityConfig: muxSession.mode === 'antigravity' ? savedState?.antigravityConfig : undefined,
               piConfig: muxSession.mode === 'pi' ? savedState?.piConfig : undefined,
               grokConfig: muxSession.mode === 'grok' ? savedState?.grokConfig : undefined,
+              copilotConfig: muxSession.mode === 'copilot' ? savedState?.copilotConfig : undefined,
               deepSeekConfig: muxSession.mode === 'deepseek' ? savedState?.deepSeekConfig : undefined,
               ompConfig: muxSession.mode === 'omp' ? savedState?.ompConfig : undefined,
               envOverrides: savedEnvOverrides,
@@ -3917,6 +4059,10 @@ export class WebServer extends EventEmitter {
               // the launch conversation until the user types again, even though
               // the re-attached CLI is on a post-`/clear` one.
               lastSubmitAt: savedState?.lastSubmitAt,
+              // The keep-warm choice and its cap's clock; with the restored `promptCache`
+              // below, a future `expiresAt` re-arms the timer once the pane is attached.
+              lastRealPromptAt: savedState?.lastRealPromptAt,
+              keepWarmEnabled: savedState?.keepWarmEnabled,
               // Conversations this pane provably owned, oldest first. Its tail is
               // the conversation the CLI was on when the server stopped, which is
               // what a re-attach must point the viewer at instead of the launch id.
@@ -4377,6 +4523,7 @@ export class WebServer extends EventEmitter {
     // response), so without this a 10-minute wait holds shutdown open.
     sessionWaits.cancelEverything();
     approvalInbox.stop();
+    this.keepWarmService.stop();
     // Same reason as `cancelEverything` above: an in-flight wake is awaited by a request,
     // and `app.close()` (the last line of this method) does not abort in-flight requests —
     // so without this a restart during a wake waits out the readiness poll.

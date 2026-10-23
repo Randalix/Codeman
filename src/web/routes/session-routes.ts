@@ -4,15 +4,16 @@
  * auto-clear, auto-compact, image watcher, flicker filter, and logout.
  */
 
-import { FastifyInstance, type FastifyReply } from 'fastify';
+import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { join, dirname, extname, basename } from 'node:path';
+import { join, dirname, extname, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { finished } from 'node:stream/promises';
 import { randomBytes, randomUUID } from 'node:crypto';
+import { isUtf8 } from 'node:buffer';
 import { performance } from 'node:perf_hooks';
 import {
   ApiErrorCode,
@@ -27,6 +28,7 @@ import {
   type AntigravityConfig,
   type PiConfig,
   type GrokConfig,
+  type CopilotConfig,
   type DeepSeekConfig,
   type OmpConfig,
 } from '../../types.js';
@@ -52,6 +54,7 @@ import {
   AutoClearSchema,
   AutoCompactSchema,
   AutoResumeSchema,
+  KeepWarmSchema,
   PinSessionSchema,
   ImageWatcherSchema,
   FlickerFilterSchema,
@@ -73,7 +76,7 @@ import {
 } from './custom-model-routes.js';
 import { matchesPattern } from '../../config/cli-registry/patterns.js';
 import { ownerLayoutKey } from '../../tab-layout-persistence.js';
-import { TabLayoutValidationError } from '../../tab-layout.js';
+import { TabLayoutValidationError, type TabLayout } from '../../tab-layout.js';
 import {
   sessionWaits,
   resolveWaitSignals,
@@ -104,6 +107,7 @@ import {
   ownerFor,
   parseBody,
   persistAndBroadcastSession,
+  readJsonConfig,
   resolveAgentCaseOrigin,
   resolveCasesDir,
   resolveParentSessionId,
@@ -152,7 +156,15 @@ import {
   setHistoryIndexRefresher,
   setHistorySessionIndex,
 } from '../session-history-index.js';
-import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayoutPort } from '../ports/index.js';
+import type {
+  SessionPort,
+  EventPort,
+  ConfigPort,
+  InfraPort,
+  AuthPort,
+  TabLayoutPort,
+  KeepWarmPort,
+} from '../ports/index.js';
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
@@ -181,12 +193,14 @@ import {
   readDockerHosts,
   toSessionDocker,
 } from '../../docker-hosts.js';
+import { resolveCaseRepository, resolveManagedWorktree } from '../../git-worktrees.js';
 import { LRUMap } from '../../utils/lru-map.js';
 import { describeUnknownPath, probePathKind } from '../../utils/index.js';
 import { findLatestOmpSessionId } from '../../utils/omp-session-resolver.js';
 import { scanOmpSessionsHistory } from '../../omp-transcript.js';
 import { scanCodexSessionsHistory, codexThreadBySessionId, codemanOwnerOfRollout } from '../../codex-transcript.js';
 import {
+  transcriptNeedsScreenCapture,
   getLastTranscriptResponse,
   isExternalCliTranscriptMode,
   parseExternalCliTranscript,
@@ -209,6 +223,42 @@ const CODEMAN_CONFIG_DIR = getDataDir();
  * conversation's `context=full` view starts at the cut instead of at turn 1.
  */
 const REMOTE_CLAUDE_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
+
+const SAFE_CASE_NAME = /^[a-zA-Z0-9_-]+$/;
+
+/** `<repo>/.claude/worktrees/<name>`: the layout Claude Code's own worktree feature creates. */
+const CLAUDE_WORKTREE_PATH = /^(.*)\/\.claude\/worktrees\/([^/]+)\/?$/;
+
+/** Did the committed layout put this session in a named group (not Ungrouped)? */
+function landedInGroup(layout: TabLayout | undefined, sessionId: string): boolean {
+  return !!layout?.groups.some((group) => group.refs.some((ref) => ref.kind === 'session' && ref.id === sessionId));
+}
+
+/**
+ * The case a POST /api/sessions `workingDir` belongs to, for its default session
+ * group: a direct child of the caller's case space, or (admin / single-user, as
+ * GET /api/cases lists them) a linked case's exact path, or a Claude worktree
+ * (`<case>/.claude/worktrees/<name>`) of either. Lexical only: the browser sends
+ * the path the case list gave it, and this must never touch a possibly-dead
+ * mount. Anything else is no case, which keeps today's placement.
+ */
+async function inferLocalCaseName(req: FastifyRequest, workingDir: string): Promise<string | undefined> {
+  // The Git worktrees modal launches Claude through this route in the worktree, and every other CLI
+  // through quick-start with the case name: both are sessions of that case.
+  const resolved = resolvePath(workingDir);
+  const target = CLAUDE_WORKTREE_PATH.exec(resolved)?.[1] || resolved;
+  const user = getAuthUser(req);
+  if (dirname(target) === resolvePath(resolveCasesDir(user))) {
+    const name = basename(target);
+    if (SAFE_CASE_NAME.test(name)) return name;
+  }
+  if (isMultiUserMode() && !isAdmin(req)) return undefined;
+  const linked = await readJsonConfig<Record<string, string>>(LINKED_CASES_FILE, 'linked cases', {});
+  for (const [name, path] of Object.entries(linked)) {
+    if (SAFE_CASE_NAME.test(name) && typeof path === 'string' && resolvePath(path) === target) return name;
+  }
+  return undefined;
+}
 
 // Pre-compiled regex for terminal buffer cleaning (avoids per-request compilation)
 // eslint-disable-next-line no-control-regex
@@ -333,18 +383,53 @@ export function stripInkRedrawBloat(buffer: string): string {
 }
 
 /**
- * Validate image bytes against a declared extension. Sniffs the first ~12 bytes
- * for a known magic-number signature. Defends against polyglots (e.g. HTML or
- * SVG disguised under a `Content-Type: image/png` header) and against simple
- * extension-only spoofing — both the multipart filename and the Content-Type
- * are attacker-controlled, the raw bytes are not.
+ * The text half of the document allowlist: these are judged on their encoding
+ * (valid UTF-8, no NUL byte) rather than on a signature, since plain text has none.
+ */
+const TEXT_UPLOAD_EXTS = new Set(['.txt', '.md', '.csv', '.tsv', '.json', '.log', '.yaml', '.yml', '.xml']);
+
+/**
+ * Documents a user hands an agent to read: the office formats plus the text
+ * family. Curated on purpose, never SUPPORTED_ATTACHMENT_EXTENSIONS or
+ * EDITABLE_EXTENSIONS, which carry sh/py/js/html; a prompt upload is a thing
+ * to read, not a thing to run or serve. Each is judged on its bytes by
+ * imageMagicMatchesExt (signature, or UTF-8 without NUL for text). The browser
+ * keeps its own copies (test/upload-document-list-parity.test.ts pins them).
+ */
+export const ALLOWED_DOCUMENT_EXTS: ReadonlySet<string> = new Set([
+  '.pdf',
+  '.docx',
+  '.pptx',
+  '.xlsx',
+  '.zip',
+  ...TEXT_UPLOAD_EXTS,
+]);
+
+/**
+ * Validate upload bytes against a declared extension. Sniffs the first ~12 bytes
+ * for a known magic-number signature (a text file is instead required to be
+ * UTF-8 without a NUL byte, the one check plain text allows). Defends against
+ * polyglots (e.g. HTML or SVG disguised under a `Content-Type: image/png`
+ * header) and against simple extension-only spoofing — both the multipart
+ * filename and the Content-Type are attacker-controlled, the raw bytes are not.
+ * Fail-closed: an extension this function does not know is never a match.
  *
  * Signatures: https://en.wikipedia.org/wiki/List_of_file_signatures
  */
 export function imageMagicMatchesExt(data: Buffer, ext: string): boolean {
+  if (TEXT_UPLOAD_EXTS.has(ext)) return data.length > 0 && !data.includes(0) && isUtf8(data);
   if (data.length < 12) return false;
   const u32be = (off: number): number => data.readUInt32BE(off);
   switch (ext) {
+    case '.pdf':
+      // "%PDF-"
+      return u32be(0) === 0x25504446 && data[4] === 0x2d;
+    case '.docx':
+    case '.pptx':
+    case '.xlsx':
+    case '.zip':
+      // PK\x03\x04, the local-file header every non-empty zip (OOXML included) opens with
+      return u32be(0) === 0x504b0304;
     case '.png':
       return u32be(0) === 0x89504e47 && u32be(4) === 0x0d0a1a0a;
     case '.jpg':
@@ -438,11 +523,27 @@ async function ensureUploadDir(workingDir: string): Promise<string | null> {
   return uploadDir;
 }
 
+/**
+ * The part of an uploaded document's name that survives into the saved name,
+ * so `Q3 report (final).pdf` is findable as `paste-<ts>-<hex>-Q3-report-final.pdf`.
+ * Only `[A-Za-z0-9._-]` survive, runs of anything else become one `-`, and the
+ * result is capped at 40 chars; nothing in it can be a path separator or a
+ * second extension that matters (the allowlisted extension is appended after).
+ */
+function sanitizeUploadStem(filename: string): string {
+  const stem = basename(filename).replace(/\.[^.]*$/, '');
+  return stem
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '')
+    .slice(0, 40);
+}
+
 /** Open a fresh, uniquely named paste file for writing. */
-async function openPasteFile(imageDir: string, ext: string) {
+async function openPasteFile(imageDir: string, ext: string, stem = '') {
   // Date.now() collides on same-ms uploads from two tabs (last-write wins
   // silently). Append 8 hex chars so concurrent pastes get distinct names.
-  const filename = `paste-${Date.now()}-${randomBytes(4).toString('hex')}${ext}`;
+  // The `paste-` prefix is what the GC (paste-image-gc.ts) matches on.
+  const filename = `paste-${Date.now()}-${randomBytes(4).toString('hex')}${stem ? `-${stem}` : ''}${ext}`;
   const filepath = join(imageDir, filename);
   // O_EXCL: refuse to overwrite (collision is impossible with random suffix,
   // but defends against TOCTOU). O_NOFOLLOW: refuse if filepath is a symlink.
@@ -585,7 +686,8 @@ export async function _clampExternalCliBypassForOwner(
   antigravityConfig?: AntigravityConfig,
   piConfig?: PiConfig,
   grokConfig?: GrokConfig,
-  deepSeekConfig?: DeepSeekConfig
+  deepSeekConfig?: DeepSeekConfig,
+  copilotConfig?: CopilotConfig
 ): Promise<{
   codexConfig: CodexConfig | undefined;
   geminiConfig: GeminiConfig | undefined;
@@ -593,6 +695,7 @@ export async function _clampExternalCliBypassForOwner(
   piConfig: PiConfig | undefined;
   grokConfig: GrokConfig | undefined;
   deepSeekConfig: DeepSeekConfig | undefined;
+  copilotConfig: CopilotConfig | undefined;
 }> {
   const out = await clampExternalCliBypassForOwner(owner, {
     codexConfig,
@@ -601,6 +704,7 @@ export async function _clampExternalCliBypassForOwner(
     piConfig,
     grokConfig,
     deepSeekConfig,
+    copilotConfig,
   });
   return out as {
     codexConfig: CodexConfig | undefined;
@@ -609,6 +713,7 @@ export async function _clampExternalCliBypassForOwner(
     piConfig: PiConfig | undefined;
     grokConfig: GrokConfig | undefined;
     deepSeekConfig: DeepSeekConfig | undefined;
+    copilotConfig: CopilotConfig | undefined;
   };
 }
 
@@ -686,6 +791,27 @@ function waitCapacityResponse(err: WaitCapacityError): ApiResponse<never> {
 function currentSignalFor(session: { pid: number | null; status: SessionStatus }, dead: boolean): WaitSignal | null {
   if (dead || session.pid === null || session.pid === undefined) return 'exit';
   return signalForStatus(session.status);
+}
+
+/**
+ * `currentSignalFor`, answering `blocked` for a session whose pane is showing a dialog
+ * its CLI is blocked on (`Session.screenBlocked`, read off the screen for a CLI with no
+ * hook: codex) when the caller asked for it. A hook-raised `blocked` is an edge with no
+ * history, but this one is a level the server is still looking at, so a caller that
+ * asks after the dialog appeared is answered at once instead of waiting out its timeout
+ * for an edge that already passed. Only when `blocked` was asked for: such a pane is also
+ * `idle`, and a caller that asked for `idle` alone must keep getting `idle`. Used by
+ * `GET .../wait` and by a DUPLICATE send-and-wait, every place a wait answers from the
+ * session's current state.
+ */
+function currentSignalForWait(
+  session: { pid: number | null; status: SessionStatus; screenBlocked?: boolean },
+  dead: boolean,
+  until: readonly WaitSignal[]
+): WaitSignal | null {
+  const signal = currentSignalFor(session, dead);
+  if (signal !== 'exit' && session.screenBlocked && until.includes('blocked')) return 'blocked';
+  return signal;
 }
 
 // ── Worker liveness for tmux-backed sessions ────────────────────────────────
@@ -934,7 +1060,7 @@ function captureHistoryLines(raw: string | undefined, historyLimit: number): num
 
 export function registerSessionRoutes(
   app: FastifyInstance,
-  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort,
+  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort & KeepWarmPort,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): RemoteWakeRegistry {
@@ -1285,6 +1411,7 @@ export function registerSessionRoutes(
       piConfig: gatedPiConfig,
       grokConfig: gatedGrokConfig,
       deepSeekConfig: gatedDeepSeekConfig,
+      copilotConfig: gatedCopilotConfig,
     } = await _clampExternalCliBypassForOwner(
       owner,
       launchBody.codexConfig,
@@ -1292,7 +1419,8 @@ export function registerSessionRoutes(
       launchBody.antigravityConfig,
       launchBody.piConfig,
       launchBody.grokConfig,
-      launchBody.deepSeekConfig
+      launchBody.deepSeekConfig,
+      launchBody.copilotConfig
     );
     const terminalHistoryConfig = await ctx.getTerminalHistoryConfig();
     const session = new Session({
@@ -1311,6 +1439,7 @@ export function registerSessionRoutes(
       antigravityConfig: mode === 'antigravity' ? gatedAntigravityConfig : undefined,
       piConfig: mode === 'pi' ? gatedPiConfig : undefined,
       grokConfig: mode === 'grok' ? gatedGrokConfig : undefined,
+      copilotConfig: mode === 'copilot' ? gatedCopilotConfig : undefined,
       deepSeekConfig: mode === 'deepseek' ? gatedDeepSeekConfig : undefined,
       ompConfig: resolveOmpConfigForCreate(mode, workingDir, launchBody.ompConfig),
       resumeSessionId: validatedResumeId,
@@ -1323,9 +1452,14 @@ export function registerSessionRoutes(
       parentSessionId: resolveParentSessionId(ctx, req, body.parentSessionId, owner),
     });
 
-    const tabLayout = body.tabGroupId
-      ? await ctx.addSession(session, { tabGroupId: body.tabGroupId })
-      : await ctx.addSession(session);
+    // Only a named workingDir: without one the session starts in the server's own cwd, which is no case.
+    const placementCase = remote || !body.workingDir ? undefined : await inferLocalCaseName(req, workingDir);
+    const placement = {
+      ...(body.tabGroupId ? { tabGroupId: body.tabGroupId } : {}),
+      ...(placementCase ? { caseName: placementCase } : {}),
+    };
+    const tabLayout =
+      Object.keys(placement).length > 0 ? await ctx.addSession(session, placement) : await ctx.addSession(session);
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
@@ -1343,9 +1477,13 @@ export function registerSessionRoutes(
     // Avoids serializing 2-3MB of terminal+text buffers per session creation.
     const lightState = ctx.getSessionStateWithRespawn(session);
     ctx.broadcast(SseEvent.SessionCreated, lightState);
-    // A grouped creation also returns the layout that placed it, so the browser
-    // draws the tab inside its group at once instead of after a re-read.
-    return { session: lightState, ...(body.tabGroupId ? { tabLayout } : {}) };
+    // A grouped creation (asked for, or its case's default group) also returns the
+    // layout that placed it, so the browser draws the tab inside its group at once
+    // instead of after a re-read.
+    return {
+      session: lightState,
+      ...(body.tabGroupId || landedInGroup(tabLayout, session.id) ? { tabLayout } : {}),
+    };
   });
 
   // ========== Rename Session ==========
@@ -1437,6 +1575,7 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
     }
     const contextLength = endpoint.modelContextLengths?.[body.modelId];
+    const slotCount = endpoint.modelSlotCounts?.[body.modelId];
 
     // Some CLIs (today: only claude) carry enough of their own fixed system-prompt/tool-
     // schema overhead that a small enough real context guarantees a first-message failure
@@ -1447,12 +1586,13 @@ export function registerSessionRoutes(
     // `confirmed`, which still means both) — NOT by `confirmedSwap`: this warning is
     // about the caller's own session, and the swap warning below is about someone
     // else's, so an answer to one is not consent to the other.
-    if (!(body.confirmed || body.confirmedContext) && exceedsSafeContextFloor(entry, contextLength)) {
+    if (!(body.confirmed || body.confirmedContext) && exceedsSafeContextFloor(entry, contextLength, slotCount)) {
       return {
         requiresContextWarning: true,
         modelId: body.modelId,
         contextLength,
         minSafeContextTokens: CLAUDE_MIN_SAFE_CONTEXT_TOKENS,
+        ...(slotCount && slotCount > 1 ? { slotCount } : {}),
       };
     }
 
@@ -1992,7 +2132,9 @@ export function registerSessionRoutes(
           // A DUPLICATE has no new turn coming, so it answers from the current state
           // instead of blocking for a transition that already happened.
           requireTransition: !duplicate,
-          currentSignal: duplicate ? currentSignalFor(session, workerDead) : undefined,
+          // The `...ForWait` variant, as on GET .../wait: a screen-read dialog the first
+          // delivery raised is a level, and a retry asking for `blocked` must find it.
+          currentSignal: duplicate ? currentSignalForWait(session, workerDead, until) : undefined,
         });
       } catch (err) {
         if (err instanceof WaitCapacityError) {
@@ -2008,7 +2150,7 @@ export function registerSessionRoutes(
     const stopDeathWatch = wantsWait ? watchForDeadWorker(ctx.mux, session, id) : () => {};
 
     // Write input to PTY. Direct write is synchronous; writeViaMux
-    // (tmux send-keys) is fire-and-forget to avoid blocking the HTTP response.
+    // (tmux paste + Enter) is fire-and-forget to avoid blocking the HTTP response.
     // Every write here is `fromUser`: this route carries a person's prompt, or an
     // agent's on their behalf, so it may name the tab (Ralph, respawn, cron and
     // approvals write through the session directly and never say so).
@@ -2031,7 +2173,7 @@ export function registerSessionRoutes(
     // A plain prompt (`<text>\r`) goes through the mux even when the caller did not
     // ask for it: written straight into the pane it arrives as one burst, and Claude
     // Code takes a long burst as a paste whose `\r` becomes a newline, so the prompt
-    // sat unsent (see isPlainPromptInput). The mux path types the text, presses Enter
+    // sat unsent (see isPlainPromptInput). The mux path pastes the text, presses Enter
     // separately and arms the SubmitVerifier. An explicit `useMux: false` keeps the
     // raw write for a caller that really wants it.
     const autoMux = useMux === undefined && isPlainPromptInput(inputStr);
@@ -2176,7 +2318,7 @@ export function registerSessionRoutes(
         abortSignal: abort.signal,
         requireTransition: query.fresh === '1' || query.fresh === 'true',
         // Read BEFORE awaiting: this is the state the caller is asking about.
-        currentSignal: currentSignalFor(session, workerIsDead(ctx.mux, session)),
+        currentSignal: currentSignalForWait(session, workerIsDead(ctx.mux, session), until),
       });
 
       return {
@@ -2745,7 +2887,14 @@ export function registerSessionRoutes(
     // where a real rollout file is the better source.
     if (isExternalCliTranscriptMode(session.mode)) {
       const externalQuery = req.query as { context?: string };
-      const blocks = parseExternalCliTranscript(session.terminalBuffer, session.mode);
+      // A repainting full-screen TUI (copilot) streams absolute cursor moves, not lines, so the
+      // buffer cannot be segmented; read the pane's visible screen instead, and fall back to the
+      // buffer when there is no tmux pane to ask (direct PTY, tests).
+      const screen =
+        transcriptNeedsScreenCapture(session.mode) && session.muxName
+          ? (ctx.mux.capturePaneText?.(session.muxName) ?? null)
+          : null;
+      const blocks = parseExternalCliTranscript(screen ?? session.terminalBuffer, session.mode);
       return {
         text: getLastTranscriptResponse(blocks),
         timestamp: '',
@@ -3536,6 +3685,39 @@ export function registerSessionRoutes(
     };
   });
 
+  // ========== Prompt-cache keep-warm ==========
+
+  // Per-session opt-in for the keep-alive nudge (prompt-cache-keepwarm.ts). `enabled: null`
+  // clears the choice so the app-wide default applies again. Refused for a CLI that reports
+  // no cache telemetry on its statusline: without `expires_at` there is nothing to schedule.
+  app.post('/api/sessions/:id/keep-warm', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parseBody(KeepWarmSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+    if (!getCli(session.mode)?.capabilities.statusLineTelemetry) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'Prompt-cache keep-warm needs the cache telemetry this CLI does not report'
+      );
+    }
+
+    session.setKeepWarmEnabled(body.enabled ?? undefined);
+    // Re-evaluate BEFORE the state broadcast and the response: both carry `keepWarm`, and a
+    // page that received the previous status would overwrite the one the toggle just produced.
+    await ctx.keepWarm.schedule(id);
+    persistAndBroadcastSession(ctx, session);
+
+    return {
+      success: true,
+      data: {
+        keepWarm: {
+          enabled: session.keepWarmEnabled ?? null,
+          status: session.keepWarm,
+        },
+      },
+    };
+  });
+
   // ========== Auto-Resume (usage-limit pause) ==========
 
   app.post('/api/sessions/:id/auto-resume', async (req) => {
@@ -3739,6 +3921,7 @@ export function registerSessionRoutes(
       antigravityConfig,
       piConfig,
       grokConfig,
+      copilotConfig,
       deepSeekConfig,
       ompConfig,
       envOverrides,
@@ -3748,6 +3931,7 @@ export function registerSessionRoutes(
       agentOrigin,
       customModel,
       tabGroupId,
+      worktree,
     } = parseBody(QuickStartSchema, req.body);
     // Same rule as the create path: only claude takes a session `model`; any other CLI
     // would drop it without a word (its model lives in its own config object).
@@ -3789,6 +3973,16 @@ export function registerSessionRoutes(
       : (await readDockerCases(CODEMAN_CONFIG_DIR)).find(
           (item) => item.name === caseName && canAccessOwned(getAuthUser(req), item.owner)
         );
+    // Worktrees are local only (src/git-worktrees.ts): refused BEFORE a remote host is woken or a
+    // container is touched, since neither branch below could honour it.
+    if (worktree && (remoteCase || dockerCase)) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        remoteCase
+          ? 'worktree is not available for remote (SSH) cases: the repository is on another machine'
+          : 'worktree is not available for Docker cases: git would run on this machine over a workspace the container can write'
+      );
+    }
     if (remoteCase) {
       const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === remoteCase.hostId);
       if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
@@ -3818,6 +4012,7 @@ export function registerSessionRoutes(
         antigravityConfig ||
         piConfig ||
         grokConfig ||
+        copilotConfig ||
         deepSeekConfig ||
         ompConfig ||
         openCodeConfig ||
@@ -3889,6 +4084,7 @@ export function registerSessionRoutes(
         antigravityConfig ||
         piConfig ||
         grokConfig ||
+        copilotConfig ||
         deepSeekConfig ||
         ompConfig ||
         openCodeConfig ||
@@ -3989,6 +4185,7 @@ export function registerSessionRoutes(
             antigravityConfig,
             piConfig,
             grokConfig,
+            copilotConfig,
             deepSeekConfig,
           } as unknown as Record<string, unknown>)
         );
@@ -4040,6 +4237,27 @@ export function registerSessionRoutes(
         ApiErrorCode.OPERATION_FAILED,
         describeUnknownPath('Case folder', resolvedCasePath, { pastCap: true })
       );
+    }
+
+    // Where the session runs: the case folder, or one of its git worktrees. A worktree is only
+    // ever USED here (created through POST /api/cases/:name/worktrees), so a case that does not
+    // exist yet is a 404 rather than a scaffold, and the worktree must be a registered, managed
+    // one, every path component a real directory (src/git-worktrees.ts).
+    let workspacePath = resolvedCasePath;
+    if (worktree) {
+      if (localCaseState === 'absent') {
+        return createErrorResponse(ApiErrorCode.NOT_FOUND, `Case "${caseName}" not found`);
+      }
+      if (localCaseState !== 'directory') {
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Case path is not a folder');
+      }
+      const caseRepo = await resolveCaseRepository(resolvedCasePath, {
+        dockerWorkspaces: (await readDockerCases(CODEMAN_CONFIG_DIR)).map((c) => c.hostWorkspacePath).filter(Boolean),
+      });
+      if (!caseRepo.ok) return createErrorResponse(ApiErrorCode[caseRepo.code], caseRepo.message);
+      const managed = await resolveManagedWorktree(caseRepo.repo, worktree);
+      if (!managed.ok) return createErrorResponse(ApiErrorCode[managed.code], managed.message);
+      workspacePath = managed.path;
     }
 
     // Create case folder and CLAUDE.md if it doesn't exist (only for non-linked, non-remote,
@@ -4100,9 +4318,9 @@ export function registerSessionRoutes(
       // of its own. Skipped for remote cases — resolvedCasePath is a REMOTE path that
       // doesn't exist on the local filesystem.
       if (getCli(mode)?.capabilities.hooks === 'always') {
-        await applyWorkspaceHooks(resolvedCasePath, await ctx.getWorkspaceHooksEnabled());
+        await applyWorkspaceHooks(workspacePath, await ctx.getWorkspaceHooksEnabled());
       } else {
-        await refreshStaleCodemanHooks(resolvedCasePath).catch(() => {});
+        await refreshStaleCodemanHooks(workspacePath).catch(() => {});
       }
     }
 
@@ -4114,7 +4332,7 @@ export function registerSessionRoutes(
     // hostWorkspacePath is a real host dir and the skill crosses the bind mount.
     const quickStartSkillDir = agentSkillDir(getCli(mode)?.capabilities);
     if (!remote && quickStartSkillDir && (await ctx.getAgentSkillEnabled())) {
-      await injectAgentSkill(resolvedCasePath, quickStartSkillDir);
+      await injectAgentSkill(workspacePath, quickStartSkillDir);
     }
 
     // Docker cases: the workspace is a REAL host dir bind-mounted into the container.
@@ -4147,14 +4365,14 @@ export function registerSessionRoutes(
     // docker — the docker workspace is a real host dir, so the settings file crosses
     // the bind mount and the in-container claude reads it). Remote was rejected above.
     if (getCli(mode)?.capabilities.model.source === 'claude-settings-file' && modelOverride !== undefined) {
-      await updateCaseModel(resolvedCasePath, modelOverride || null);
+      await updateCaseModel(workspacePath, modelOverride || null);
     }
 
     // Strip stale disk entries for keys this request is actively setting (Claude only —
     // see POST /api/sessions for full rationale).
     // Same chain, same replacement as the create path above: byte-identical, drift-proof.
     if (!isExternalCliMode(mode) && !remote && envOverrides && Object.keys(envOverrides).length > 0) {
-      await stripCaseEnvKeys(resolvedCasePath, Object.keys(envOverrides));
+      await stripCaseEnvKeys(workspacePath, Object.keys(envOverrides));
     }
 
     // Create a new session with the case as working directory
@@ -4170,6 +4388,7 @@ export function registerSessionRoutes(
       antigravityConfig,
       piConfig,
       grokConfig,
+      copilotConfig,
       deepSeekConfig,
       ompConfig,
     };
@@ -4199,6 +4418,7 @@ export function registerSessionRoutes(
       piConfig: qsGatedPiConfig,
       grokConfig: qsGatedGrokConfig,
       deepSeekConfig: qsGatedDeepSeekConfig,
+      copilotConfig: qsGatedCopilotConfig,
     } = await _clampExternalCliBypassForOwner(
       owner,
       qsLaunchConfigs.codexConfig,
@@ -4206,11 +4426,12 @@ export function registerSessionRoutes(
       qsLaunchConfigs.antigravityConfig,
       qsLaunchConfigs.piConfig,
       qsLaunchConfigs.grokConfig,
-      qsLaunchConfigs.deepSeekConfig
+      qsLaunchConfigs.deepSeekConfig,
+      qsLaunchConfigs.copilotConfig
     );
     const qsTerminalHistoryConfig = await ctx.getTerminalHistoryConfig();
     const qsGatedEnvOverrides = await clampEnvOverridesForOwner(owner, envOverrides);
-    const qsResolvedOmpConfig = resolveOmpConfigForCreate(mode, resolvedCasePath, qsLaunchOmpConfig);
+    const qsResolvedOmpConfig = resolveOmpConfigForCreate(mode, workspacePath, qsLaunchOmpConfig);
 
     // Custom Model Endpoint Profiles, applied AT CREATE TIME (docs/custom-model-endpoints-plan.md)
     // rather than via the dedicated restart-in-place route (POST /api/sessions/:id/custom-
@@ -4252,6 +4473,7 @@ export function registerSessionRoutes(
       const cmEndpoint = cmHosts.find((h) => h.id === customModel.endpointId);
       if (!cmEndpoint) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
       const cmContextLength = cmEndpoint.modelContextLengths?.[customModel.modelId];
+      const cmSlotCount = cmEndpoint.modelSlotCounts?.[customModel.modelId];
 
       // See the dedicated route's own comment for the full reasoning: some CLIs' own fixed
       // overhead can exceed a small enough real context on the very first message,
@@ -4261,13 +4483,14 @@ export function registerSessionRoutes(
       // `confirmedSwap`.
       if (
         !(customModel.confirmed || customModel.confirmedContext) &&
-        exceedsSafeContextFloor(cmEntry, cmContextLength)
+        exceedsSafeContextFloor(cmEntry, cmContextLength, cmSlotCount)
       ) {
         return {
           requiresContextWarning: true,
           modelId: customModel.modelId,
           contextLength: cmContextLength,
           minSafeContextTokens: CLAUDE_MIN_SAFE_CONTEXT_TOKENS,
+          ...(cmSlotCount && cmSlotCount > 1 ? { slotCount: cmSlotCount } : {}),
         };
       }
 
@@ -4316,7 +4539,7 @@ export function registerSessionRoutes(
         customModel.modelId,
         qsCustomModelSessionId,
         cmContextLength,
-        resolvedCasePath
+        workspacePath
       );
       if (!cmApplied) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `${mode} has no known custom-model mechanism`);
@@ -4357,7 +4580,7 @@ export function registerSessionRoutes(
 
     const qsSessionOptions: ConstructorParameters<typeof Session>[0] = {
       id: qsCustomModelSessionId,
-      workingDir: resolvedCasePath,
+      workingDir: workspacePath,
       name: sessionName ? sessionName.slice(0, MAX_SESSION_NAME_LENGTH) : '',
       mux: ctx.mux,
       useMux: true,
@@ -4373,6 +4596,7 @@ export function registerSessionRoutes(
       antigravityConfig: mode === 'antigravity' ? qsGatedAntigravityConfig : undefined,
       piConfig: mode === 'pi' ? qsGatedPiConfig : undefined,
       grokConfig: mode === 'grok' ? qsGatedGrokConfig : undefined,
+      copilotConfig: mode === 'copilot' ? qsGatedCopilotConfig : undefined,
       deepSeekConfig: mode === 'deepseek' ? qsGatedDeepSeekConfig : undefined,
       ompConfig: qsResolvedOmpConfig,
       envOverrides: qsCustomModelEnvOverrides,
@@ -4415,14 +4639,14 @@ export function registerSessionRoutes(
     // Auto-detect completion phrase from CLAUDE.md BEFORE broadcasting
     // so the initial state already has the phrase configured (only if globally enabled)
     if (getCli(mode)?.capabilities.ralph && !remote && !docker && ctx.store.getConfig().ralphEnabled) {
-      autoConfigureRalph(session, resolvedCasePath, ctx);
+      autoConfigureRalph(session, workspacePath, ctx);
       if (!session.ralphTracker.enabled) {
         session.ralphTracker.enable();
         session.ralphTracker.enableAutoEnable(); // Allow re-enabling on restart
       }
     }
 
-    const tabLayout = tabGroupId ? await ctx.addSession(session, { tabGroupId }) : await ctx.addSession(session);
+    const tabLayout = await ctx.addSession(session, { caseName, ...(tabGroupId ? { tabGroupId } : {}) });
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
@@ -4479,36 +4703,42 @@ export function registerSessionRoutes(
         ).catch(() => {});
       }
 
-      // Save lastUsedCase to settings for TUI/web sync
-      try {
-        const settingsFilePath = SETTINGS_PATH;
-        let settings: Record<string, unknown> = {};
+      // Save lastUsedCase to settings for TUI/web sync. It is a key of the server-wide
+      // settings.json, readable by every user through GET /api/settings, so a non-admin's
+      // case name is not written there in multi-user mode (writes are admin-only, like
+      // PUT /api/settings). isAdmin is always true in single-user mode.
+      if (isAdmin(req)) {
         try {
-          settings = JSON.parse(await fs.readFile(settingsFilePath, 'utf-8'));
+          const settingsFilePath = SETTINGS_PATH;
+          let settings: Record<string, unknown> = {};
+          try {
+            settings = JSON.parse(await fs.readFile(settingsFilePath, 'utf-8'));
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+          }
+          settings.lastUsedCase = caseName;
+          const dir = dirname(settingsFilePath);
+          if (!existsSync(dir)) {
+            mkdirSync(dir, { recursive: true });
+          }
+          // Use async write to avoid blocking event loop
+          fs.writeFile(settingsFilePath, JSON.stringify(settings, null, 2)).catch((err) => {
+            // Non-critical but log for debugging
+            console.warn('[Server] Failed to save settings (lastUsedCase):', err);
+          });
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-        }
-        settings.lastUsedCase = caseName;
-        const dir = dirname(settingsFilePath);
-        if (!existsSync(dir)) {
-          mkdirSync(dir, { recursive: true });
-        }
-        // Use async write to avoid blocking event loop
-        fs.writeFile(settingsFilePath, JSON.stringify(settings, null, 2)).catch((err) => {
           // Non-critical but log for debugging
-          console.warn('[Server] Failed to save settings (lastUsedCase):', err);
-        });
-      } catch (err) {
-        // Non-critical but log for debugging
-        console.warn('[Server] Failed to prepare settings update:', err);
+          console.warn('[Server] Failed to prepare settings update:', err);
+        }
       }
 
       return {
         sessionId: session.id,
         casePath: resolvedCasePath,
         caseName,
+        ...(worktree ? { worktree, workingDir: workspacePath } : {}),
         ...(customModel ? { modelSwapInProgress: qsCustomModelSwapInProgress } : {}),
-        ...(tabGroupId ? { tabLayout } : {}),
+        ...(tabGroupId || landedInGroup(tabLayout, session.id) ? { tabLayout } : {}),
       };
     } catch (err) {
       // Clean up session on error to prevent orphaned resources
@@ -4638,9 +4868,6 @@ export function registerSessionRoutes(
     /** Main repo root the worktree belongs to. */
     worktreeRepo?: string;
   };
-
-  /** `<repo>/.claude/worktrees/<name>` — the layout Claude Code's own worktree feature creates. */
-  const CLAUDE_WORKTREE_PATH = /^(.*)\/\.claude\/worktrees\/([^/]+)\/?$/;
 
   /**
    * Recover cwd / branch / worktree from a transcript chunk.
@@ -5452,6 +5679,19 @@ export function registerSessionRoutes(
   };
   // The per-file size cap (MAX_PASTE_IMAGE_BYTES) is enforced by @fastify/multipart (registered in server.ts).
 
+  /** Write buffered upload bytes into the session's upload dir. Null: the dir is not a real directory. */
+  async function writeBufferedUpload(workingDir: string, ext: string, bytes: Buffer, stem = '') {
+    const uploadDir = await ensureUploadDir(workingDir);
+    if (!uploadDir) return null;
+    const { filename, filepath, fh } = await openPasteFile(uploadDir, ext, stem);
+    try {
+      await fh.writeFile(bytes);
+    } finally {
+      await fh.close();
+    }
+    return { path: filepath, filename };
+  }
+
   app.post('/api/sessions/:id/paste-image', async (req, reply) => {
     // CSRF defense: state-changing routes must come from same origin.
     // Cookies are SameSite=lax, multipart/form-data is a "simple" CORS request
@@ -5585,13 +5825,13 @@ export function registerSessionRoutes(
           `Unsupported video type. Allowed: ${[...ALLOWED_VIDEO_EXTS].join(', ')}`
         );
       }
-      const imageDir = await ensureUploadDir(session.workingDir);
-      if (!imageDir) {
+      const uploadDir = await ensureUploadDir(session.workingDir);
+      if (!uploadDir) {
         await finished(part.file.resume()).catch(() => {});
         reply.code(403);
         return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
       }
-      const { filename, filepath, fh } = await openPasteFile(imageDir, ext);
+      const { filename, filepath, fh } = await openPasteFile(uploadDir, ext);
       // Written as it arrives: a phone video is far too large to buffer the way an
       // image is. The container is judged on the first 12 bytes as soon as they are
       // in, so a mislabeled upload stops touching disk at its first chunk; the rest
@@ -5650,12 +5890,51 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Empty file');
     }
 
+    // Dispatch mirrors the client's _promptAttachKind: an image MIME type takes
+    // the image path whatever the name says, a document extension (the MIME a
+    // phone gives a .md is anyone's guess) takes the document branch, anything
+    // else the image path exactly as before, HEIC sniff included. See CLAUDE.md.
+    const origExt = part.filename ? extname(part.filename).toLowerCase() : '';
+    const imageMime = /^image\//i.test(part.mimetype || '');
+    if (!imageMime && ALLOWED_DOCUMENT_EXTS.has(origExt)) {
+      if (!imageMagicMatchesExt(imageBytes, origExt)) {
+        // The first bytes of a text file are user content, so for text the log
+        // names the failure and never the bytes; a signature is safe to print.
+        // A text refusal names the encoding, since an Excel or Notepad export
+        // (UTF-16 with a BOM, or Windows-1252) is not a corrupt file.
+        const isText = TEXT_UPLOAD_EXTS.has(origExt);
+        const bom = imageBytes.length >= 2 ? imageBytes.readUInt16BE(0) : 0;
+        const utf16 = bom === 0xfffe || bom === 0xfeff;
+        const detail = isText
+          ? `reason=${utf16 ? 'utf16-bom' : imageBytes.includes(0) ? 'nul-byte' : 'not-utf8'}`
+          : `magic=${imageBytes.subarray(0, 12).toString('hex')}`;
+        console.warn(
+          `[paste-image] document mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${origExt} size=${imageBytes.length} ${detail}`
+        );
+        reply.code(415);
+        return createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          isText
+            ? `This ${origExt} file is ${utf16 ? 'UTF-16 text, not UTF-8' : 'not UTF-8 text'}; save it as UTF-8 and attach it again`
+            : `File bytes do not match declared type ${origExt}`
+        );
+      }
+      const saved = await writeBufferedUpload(
+        session.workingDir,
+        origExt,
+        imageBytes,
+        sanitizeUploadStem(part.filename)
+      );
+      if (!saved) {
+        reply.code(403);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
+      }
+      return saved;
+    }
+
     // Determine extension from filename or Content-Type.
     let ext = '.png';
-    if (part.filename) {
-      const origExt = extname(part.filename).toLowerCase();
-      if (ALLOWED_IMAGE_EXTS.has(origExt)) ext = origExt;
-    }
+    if (ALLOWED_IMAGE_EXTS.has(origExt)) ext = origExt;
     const mimeMatch = (part.mimetype || '').toLowerCase().match(/^image\/(png|jpeg|jpg|webp|gif|bmp|heic|heif)$/);
     if (mimeMatch) {
       const map: Record<string, string> = {
@@ -5696,6 +5975,15 @@ export function registerSessionRoutes(
         return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Could not convert HEIC image to JPEG');
       }
     } else if (!imageMagicMatchesExt(imageBytes, ext)) {
+      // A foreign extension with no image MIME (a script, an HTML page, a video
+      // without its flag) was never going to be an image: say so, rather than
+      // the ".png" the default extension would name. Decided only HERE, after
+      // the sniff, so anything the image path ever accepted by its bytes (a
+      // HEIC under a generic name) still is.
+      if (origExt && !ALLOWED_IMAGE_EXTS.has(origExt) && !imageMime) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unsupported file type: ${origExt}`);
+      }
       // Sniff actual bytes — a polyglot HTML/PNG would otherwise pass and
       // serve back with image/png MIME. Log the real header so format
       // mismatches can be pinned down without a reproduce-and-guess loop. The
@@ -5707,20 +5995,12 @@ export function registerSessionRoutes(
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Image bytes do not match declared type ${ext}`);
     }
 
-    // {workingDir}/.codeman-uploads/, see ensureUploadDir.
-    const imageDir = await ensureUploadDir(session.workingDir);
-    if (!imageDir) {
+    const saved = await writeBufferedUpload(session.workingDir, ext, imageBytes);
+    if (!saved) {
       reply.code(403);
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
     }
-    const { filename, filepath, fh } = await openPasteFile(imageDir, ext);
-    try {
-      await fh.writeFile(imageBytes);
-    } finally {
-      await fh.close();
-    }
-
-    return { path: filepath, filename };
+    return saved;
   });
 
   // Returned so the server can own the registry's LIFETIME (drop state when a session is

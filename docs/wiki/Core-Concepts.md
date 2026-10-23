@@ -13,6 +13,10 @@ Codeman-side configuration:
 
 - Which CLI the Run button should default to.
 - Per-case toggles (Agent Teams, 1M Opus context).
+- A **Default session group** (Case settings…): new sessions of the case land in that tab group of the
+  vertical rail unless you start them from a group's own *New session* or they follow the session that
+  spawned them. *Ungrouped* turns it off. It follows you across devices, never moves existing tabs, and a
+  deleted group simply falls back to Ungrouped.
 - Where it runs, if it is not the local filesystem: see [Location overlays](#location-overlays).
 
 Three ways to get one, all under **New or link a case…** at the bottom of the case picker
@@ -46,7 +50,8 @@ case. Each has a stable id, and that id is what the API, the wait primitives, an
 event use.
 
 Several sessions can share one case. That is the normal way to parallelize: three workers
-in the same repo, three tabs, one case.
+in the same repo, three tabs, one case. They then also share one folder; when the workers
+edit and commit in parallel, give each its own checkout with [Git Worktrees](Git-Worktrees).
 
 A session carries state the case does not:
 
@@ -58,7 +63,7 @@ A session carries state the case does not:
 ## Run mode
 
 The **run mode** is which CLI the session runs: `claude`, `opencode`, `codex`, `gemini`,
-`antigravity`, `pi`, `grok`, `deepseek`, `omp`, or `shell`. It is chosen at start and does not change afterwards; to
+`antigravity`, `pi`, `grok`, `deepseek`, `omp`, `copilot`, or `shell`. It is chosen at start and does not change afterwards; to
 switch, start another session.
 
 Claude is the reference mode. Nine of the ten are not Claude, and a number of Codeman
@@ -77,7 +82,7 @@ Where a case runs is **separate from** which CLI it runs. There are three locati
 | **Remote SSH** | A durable tmux server on the remote host, fronted by a local pane running `ssh`. See [Remote SSH Sessions](Remote-SSH-Sessions). |
 
 This matters because it is a common source of confusion: Docker is **not** an eleventh run
-mode. All ten run modes work in all three locations. A case is docker-backed or
+mode. All eleven run modes work in all three locations. A case is docker-backed or
 ssh-backed; a session is claude or codex or shell.
 
 **Web tabs** are the other thing that is not a session. A saved dashboard URL renders as a
@@ -96,7 +101,10 @@ would. That indirection buys:
 - **Real scrollback.** History is held by tmux, so reconnecting replays what happened while
   you were gone instead of starting from blank.
 - **Attach from anywhere else.** The same session is reachable from a terminal over SSH
-  with `codeman tui`, or plain `tmux -L codeman attach`.
+  with `codeman tui` (F1 detaches), `./scripts/tmux-manager.sh` (likewise F1), or plain
+  `tmux -L codeman attach`. A plain attach has no detach key: Codeman keeps tmux's prefix
+  table on its socket down to `send-prefix`, so `Ctrl+B d` does nothing there; leave it
+  with `tmux -L codeman detach-client` from another shell, or bind a key yourself.
 - **Secrets off the command line.** Environment overrides are injected with socket-scoped
   `tmux setenv` rather than being visible in the spawn command.
 
@@ -134,6 +142,7 @@ Everything Codeman knows lives under `~/.codeman/`:
 | `users.json`                             | Multi-user accounts, mode 0600.                                       |
 | `push-*.json`                            | Web push keys and subscriptions.                                      |
 | `certs/`                                 | Self-signed TLS for `--https`.                                        |
+| `backups/config/`                        | Timestamped copies of the files above that you customized ([Config Backups](Config-Backups)). |
 
 None of it needs root, none of it leaves the machine, and deleting `~/.codeman/` resets
 Codeman to a fresh install without touching your code.
@@ -163,9 +172,11 @@ report events back: a permission prompt appeared, the turn finished, the agent w
 task completed. Those events drive tab alerts, the Approvals Inbox, notifications, and the
 wait primitives.
 
-This is why some features are Claude-only. The one partial exception is DeepSeek Harness,
+This is why some features are Claude-only. One partial exception is DeepSeek Harness,
 whose terminal front door reports idle, working and blocked to Codeman over the harness's
-own supervisor contract, so it gets the hook-driven signals without a hook file. The other
+own supervisor contract, so it gets the hook-driven signals without a hook file. Codex gets
+one of them from its screen: Codeman reads its approval, question and trust dialogs off the
+pane and raises the same red "needs you" alert a `permission_prompt` hook raises. The other
 CLIs have no equivalent, so for them Codeman falls back to watching terminal output, which
 is coarser: it can see that something happened, not what it was.
 
@@ -177,7 +188,7 @@ See [Hooks And Integrations](Hooks-And-Integrations).
 | --------------- | ---------------------------------------------------------------------------- |
 | **Case**        | Named working directory.                                                      |
 | **Session**     | One CLI in one tmux session.                                                  |
-| **Run mode**    | Which CLI: claude, opencode, codex, gemini, antigravity, pi, grok, deepseek, omp, shell. |
+| **Run mode**    | Which CLI: claude, opencode, codex, gemini, antigravity, pi, grok, deepseek, omp, copilot, shell. |
 | **Respawn**     | Restarting the CLI on idle to keep an unattended run going.                   |
 | **Ralph loop**  | An autonomous single-session task loop.                                       |
 | **Orchestrator**| A phased plan driven across multiple agents.                                  |
@@ -188,6 +199,6 @@ See [Hooks And Integrations](Hooks-And-Integrations).
 ## Read next
 
 - [The Dashboard](The-Dashboard) - what the UI is showing you.
-- [Agent CLIs](Agent-CLIs) - the ten run modes in detail.
+- [Agent CLIs](Agent-CLIs) - the eleven run modes in detail.
 - [Keeping Agents Running](Keeping-Agents-Running) - respawn, idle detection, usage limits.
 - [`docs/architecture-invariants.md`](https://github.com/Ark0N/Codeman/blob/master/docs/architecture-invariants.md) - the mechanisms behind all of this, for contributors.

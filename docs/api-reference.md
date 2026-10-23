@@ -78,10 +78,15 @@ the HTTP status.
 |-------------|------|---------|
 | `INVALID_INPUT` | 400 | Malformed request / failed validation |
 | `UNAUTHORIZED` | 401 | Authentication required or failed |
+| `FORBIDDEN` | 403 | Signed in, but not allowed (e.g. a non-admin calling an admin-only route in multi-user mode) |
+| `PASSWORD_CHANGE_REQUIRED` | 403 | Multi-user: the user must change their password before anything else |
 | `NOT_FOUND` | 404 | Resource does not exist |
+| `USER_NOT_FOUND` | 404 | Multi-user: no user with that name |
 | `SESSION_BUSY` | 409 | Session is busy |
 | `CONFLICT` | 409 | Conflicts with current state (e.g. already running) |
 | `ALREADY_EXISTS` | 409 | Resource already exists |
+| `USER_EXISTS` | 409 | Multi-user: a user with that name already exists |
+| `LAST_ADMIN` | 409 | Multi-user: refusing to demote, disable or delete the last enabled admin |
 | `OPERATION_FAILED` | 422 | Well-formed but could not be completed |
 | `RATE_LIMITED` | 429 | Too many requests |
 | `INTERNAL_ERROR` | 500 | Unexpected server error |
@@ -205,15 +210,19 @@ auto-retried by several clients (silently doubling the polling load), `504` is w
 a genuine tunnel failure looks like, and `204` cannot carry `waitedMs` / `status` /
 `limitPaused`. Reserve error handling for the four codes in the table below.
 
-**2. `stop` and `blocked` fire only for `claude` sessions.** Both come from Claude
-Code hooks, and no other mode installs them: `shell` runs no agent, and the external
-CLIs (`opencode`, `codex`, `gemini`, `antigravity`, `pi`) render their own TUIs and post
-no hooks. For every non-`claude` mode only `idle`, `working` and `exit` are
-accepted, and of those only `exit` is dependable: see the caveats under
-[Signals](#signals) before building on `idle`. Requesting `stop` or `blocked`
-**explicitly** on such a session is a
-`400`; omitting `until` never fails, the server just drops them from the default set
-and echoes the narrowed set back as `wait.until`. Three more places hooks can go
+**2. `stop` fires only for `claude` (and `deepseek`) sessions, `blocked` also for
+`codex`.** Both come from Claude Code hooks, and no other mode installs them: `shell`
+runs no agent, and the external CLIs render their own TUIs and post no hooks
+(`deepseek`'s status bridge reports the same two, see its own docs). The one exception
+is `blocked` on `codex`: Codeman reads codex's approval, question and trust dialogs off
+its screen and raises `blocked` for them (see [Signals](#signals)). For every other mode
+only `idle`, `working` and `exit` are accepted. `exit` is dependable everywhere; `idle` and
+`working` are screen-checked for `opencode`, `gemini`, `pi`, `omp` and `antigravity` (as for `claude` and
+`codex`) and not guaranteed elsewhere: see the caveats under [Signals](#signals) before
+building on `idle`.
+Requesting a signal the session can never emit **explicitly** is a `400` (`stop` on
+`codex` included); omitting `until` never fails, the server just drops them from the
+default set and echoes the narrowed set back as `wait.until`. Three more places hooks can go
 missing even in `claude` mode: a **Docker case** needs
 `CODEMAN_DOCKER_BRIDGE_HOOKS=1`, since a container cannot reach a loopback-bound
 Codeman (without it, only `idle` / `working` / `exit` work); a **remote-SSH
@@ -237,10 +246,10 @@ contract is a **marker unique to each call** (`MARK="DONE_$RANDOM"`, send
 
 | Signal | Source | Actually fires for |
 |--------|--------|--------------------|
-| `idle` | the session's own `idle` event | `claude`: yes, on ❯-prompt detection after activity. `shell`: **once only**, ~500 ms after start, and never again. External CLIs: not guaranteed (they render their own TUIs and readiness is output stabilization) |
-| `working` | the session's own `working` event | `claude` only in practice (spinner and work-keyword detection are Claude output formats) |
-| `stop` | the Claude Code `stop` hook, the definitive end-of-turn signal | `claude` only |
-| `blocked` | a `permission_prompt` or `elicitation_dialog` hook | `claude` only, and rarer than it looks: see below |
+| `idle` | the session's own `idle` event | `claude`: yes, on ❯-prompt detection after activity. `codex`, `opencode`, `gemini`, `pi`, `omp`, `antigravity`: yes, the same screen check through the prompt marker and working line each declares (`capabilities.workDetect`); an `antigravity` session waiting on a shell-command approval stays `working` until it is answered. `shell`: **once only**, ~500 ms after start, and never again. Other external CLIs (`grok`, `deepseek`): not guaranteed (they render their own TUIs and readiness is output stabilization) |
+| `working` | the session's own `working` event | `claude`, plus `codex`, `opencode`, `gemini`, `pi`, `omp` and `antigravity` through the working line each declares. Elsewhere not guaranteed: it rests on generic output heuristics such as a braille spinner glyph |
+| `stop` | the Claude Code `stop` hook, the definitive end-of-turn signal | `claude` (and `deepseek`) only |
+| `blocked` | a `permission_prompt` or `elicitation_dialog` hook; on `codex`, a dialog read off its screen | `claude`, `deepseek` and `codex`; on `claude` rarer than it looks: see below |
 | `exit` | no process is behind the session | every mode |
 
 `stop` is the signal to orchestrate on where it exists; `idle` is a heuristic
@@ -250,9 +259,9 @@ the wait promptly instead of burning the caller's whole timeout on something tha
 can no longer happen). On a `claude` worker, prefer an explicit `until=stop,exit`
 once the session is up: the default set's `idle` also resolves on a spinner pause,
 and on a fresh session the **startup** `idle` (emitted when the CLI first comes up)
-can land inside your first wait window and report a turn that never ran. Measured:
-a session parked on the trust dialog emits no *further* `idle`, so it is the
-startup transition, not the dialog, that produces the false success below.
+can land inside your first wait window and report a turn that never ran. That
+startup `idle` is held while Claude's workspace-trust dialog is on screen (inside
+the 90 s startup window), because the dialog's own ❯ is not a composer.
 
 ⚠️ **`exit` means "nothing is running", which includes "not started yet".** The
 server answers from `pid === null` plus a mux-layer pane-death probe, and that
@@ -277,6 +286,17 @@ asking the user a question. So `until=stop,blocked,exit` is a reasonable belt on
 long turn, but a worker that never comes back is far more likely to be working than
 blocked, and polling `blocked` alone will sit at its timeout.
 
+**`blocked` on `codex` is read off the screen**, because codex has no hooks and is
+launched with its approvals on unless `codexConfig.dangerouslyBypassApprovals` is set.
+A codex pane showing a command, edit or network approval, a question (`request_user_input`)
+or the startup trust prompt raises `blocked` (plus the red alert, push and webhook a Claude
+`permission_prompt` raises, alert-only: answer it in the terminal), and the session reads
+`idle` while it is up. Unlike a hook, this is a level the server keeps reading, so a wait
+for `blocked` that arrives while the dialog is already up answers at once
+(`immediate: true`); a wait that did not ask for `blocked` is unaffected. It clears 2 to 4 s
+after the dialog leaves the screen. `stop` stays a `400` on codex: nothing on a screen says a
+turn ended.
+
 ⚠️ **On a `shell` session, only `exit` and marker-matching are dependable.** A shell
 session emits its one `idle` at startup and then stays `status: "idle"` forever,
 whatever the pane is doing, so it never emits a *transition*. Since send-and-wait
@@ -290,11 +310,11 @@ instead. The same caution applies to the external CLIs.
 Nothing here reports "the agent is ready for a prompt", and no combination of
 `until`/`fresh` synthesizes one. A freshly created session reads as `exit` (above),
 and a `claude` worker in a brand-new case comes up on the CLI's **trust dialog**,
-which contains a ❯ prompt of its own. Send-and-wait posted at that moment types the
-prompt into the dialog, where the `\r` never gets past it, while the session's
-startup `idle` lands inside the wait window: the wait resolves on `idle` in a
-couple of seconds with `timedOut: false`, which looks exactly like a completed
-turn.
+which contains a ❯ of its own. A prompt posted at that moment is typed into the
+dialog, and its `\r` confirms the highlighted `No, exit`: the CLI quits and the
+pane dies, so send-and-wait resolves on `exit`. Codeman holds the session's `idle`
+while the dialog is on screen, so waiting for `idle` before prompting no longer
+clears too early, but that still does not make `idle` a readiness signal.
 
 The reliable sequence is: poll `GET /api/v1/sessions/:id` until `.data.pid` is
 non-null, then `wait-output` for the composer's own marker (`bypass`, the status
@@ -414,6 +434,12 @@ about a hundred characters or more is taken as a paste by Claude Code, its `\r`
 becomes a newline, and the prompt stays unsent (measured on 2.1.283). Any other
 input (escape sequences, a bracketed-paste frame, a line feed, a bare `\r`) keeps
 the raw write, and an explicit `"useMux": false` forces it.
+With `"useMux": true`, a line feed is kept: the text goes in as one bracketed paste
+(`\r\n` read as `\n`, leading and trailing line breaks dropped), then Enter if the
+input carried a `\r`; a pane that has not enabled bracketed paste receives each line
+break as a carriage return and runs the lines as they arrive. The check that
+re-presses a stranded Enter cannot reliably recognise a multi-line paste, so a long
+multi-line prompt to a just-started agent is still safer in a file it is told to read.
 
 ```bash
 curl -s -X POST "$API/api/v1/sessions/$SID/input" \
@@ -520,7 +546,7 @@ read the timeout as "the worker is wedged" and kill a session that was working f
 
 | `errorCode` | HTTP | When |
 |-------------|------|------|
-| `INVALID_INPUT` | 400 | unknown `until` / `wait` token; `stop` or `blocked` requested explicitly on a mode that installs no hooks (the message names the mode); `regex=` on `/wait-output`; `match` outside 1 to 200 chars; a non-numeric `timeout` |
+| `INVALID_INPUT` | 400 | unknown `until` / `wait` token; `stop` or `blocked` requested explicitly on a mode that can never emit it (`stop` without hooks, `blocked` without hooks or a screen-read dialog; the message names the mode); `regex=` on `/wait-output`; `match` outside 1 to 200 chars; a non-numeric `timeout` |
 | `NOT_FOUND` | 404 | no such session, or one this caller does not own |
 | `SESSION_BUSY` | 409 | this session's waiter cap is full |
 | `RATE_LIMITED` | 429 | a per-owner or process-wide waiter cap is full. Retry later; the session you named is not the problem |
@@ -615,6 +641,23 @@ that dies midway leaves nothing behind. Because one video can be 1 GB,
 beside the 30 per minute the image path keeps; without the flag the route is
 byte-identical to the image-only version, same 50 MB image cap and same 30/min
 bucket. The response shape is unchanged (`path`, `filename`).
+
+Beyond images, the route also accepts documents a user hands an agent to read,
+admitted by the name's extension (the Content-Type a phone attaches to a `.md`
+or `.csv` is unreliable): the office formats `.pdf`, `.docx`, `.pptx`, `.xlsx`,
+`.zip` and the text family `.txt`, `.md`, `.csv`, `.tsv`, `.json`, `.log`,
+`.yaml`, `.yml`, `.xml`. A document is buffered under the same 50 MB image cap,
+its bytes are checked against the extension (a magic-number signature, or UTF-8
+with no NUL byte for text) and answered 415 on a mismatch (for text, an `error`
+saying the file is not UTF-8 text, or UTF-16 text when it opens with a UTF-16
+byte order mark, and to save it as UTF-8), and it is saved under
+a sanitized stem of its name, so `Q3 report.pdf` is findable as
+`paste-<ms>-<hex>-Q3-report.pdf`. A named type that is neither an image nor a
+document (a script, an HTML page, a `.sh`) is refused 400 `Unsupported file
+type`. That refusal is a scope choice, not a security property: `file-raw`
+already serves non-media text inert (`text/plain`, `nosniff`), so this just
+keeps the server from storing what it would serve or an agent could run, and
+html and svg are the ones deliberately kept out.
 
 ## Rendered HTML files
 
@@ -757,18 +800,43 @@ deleted group, another user's group) is ignored and the session lands where it
 otherwise would, never a `400`. A malformed value (`null`, an empty string, a
 non-string) is a `400 INVALID_INPUT`. Requests without the field are unchanged.
 
+### A case's default session group
+
+- `GET /api/v1/cases/:name/default-group` → `{ caseName, groupId, groups }`: `groupId` is a
+  group id from the caller's own tab layout or `null` (Ungrouped), `groups` the caller's
+  current named groups (`{ id, name }`, in layout order). A stored id whose group was
+  deleted reads back as `null` (the read changes nothing; the next session created for the
+  case forgets it).
+- `PUT /api/v1/cases/:name/default-group` with `{ "groupId": string | null }` saves it. An
+  id not in the caller's layout is a `400 INVALID_INPUT` that leaves the old value in place.
+
+Both answer `404 NOT_FOUND` for a case the caller cannot see (the same rules as
+`GET /api/v1/cases`). The value is stored per owner and case, so in multi-user mode it is
+never shared and needs no admin role. A new session of the case is placed in that group in
+its creating write when nothing stronger applies; the order is: an explicit `tabGroupId`,
+then the session it was spawned from (`parentSessionId`), then the case default, else
+Ungrouped. `POST /api/v1/quick-start` uses its `caseName` (local, linked, remote and Docker
+cases); `POST /api/v1/sessions` uses the case whose folder `workingDir` is (a direct child of
+the caller's case space, a linked case's exact path, or a Claude worktree of either,
+`<case>/.claude/worktrees/<name>`); without a `workingDir` there is no case. When a case default places the
+session, the create response carries `tabLayout` as it does for `tabGroupId`. Deleting the
+case forgets the value; existing sessions never move.
+
 ## Approvals Inbox
 
 Cross-session queue of prompts waiting on a human (permission dialogs,
-AskUserQuestion questions, idle prompts). Claude-mode sessions only; items are
-in-memory (a server restart drops them; the next prompt re-fires the hook).
+AskUserQuestion questions, idle prompts). Answerable items come from Claude-mode
+sessions only; DeepSeek Harness (its status bridge) and Codex (dialogs read off its
+screen) open **alert-only** items with `answerInTerminal: true`. Items are
+in-memory (a server restart drops them; the next prompt re-fires the hook, and a
+codex dialog still on screen is read again after the pane re-attaches).
 Design: [`approvals-inbox-plan.md`](approvals-inbox-plan.md).
 
 - `GET /api/v1/approvals` → `{ approvals: ApprovalItem[] }`, oldest first,
   ownership-scoped in multi-user mode. `ApprovalItem`: `{ id, sessionId,
   sessionName, kind: 'permission'|'question'|'idle', createdAt, toolName?,
   toolSummary?, message?, cwd?, context?, options?: {n, label}[],
-  acknowledgedAt? }`. `context` is the ANSI-stripped visible pane frame;
+  acknowledgedAt?, answerInTerminal? }`. `context` is the ANSI-stripped visible pane frame;
   `options` is present only when the dialog's numbered choices parsed
   confidently; `acknowledgedAt` marks an item a human has already looked at
   (see `/viewed` below) and tells clients not to re-arm its tab alert. Listing
@@ -782,8 +850,9 @@ Design: [`approvals-inbox-plan.md`](approvals-inbox-plan.md).
   (sends the digit; accepted only when `n` is among the item's parsed
   `options`), or `{ action: 'text', text }` (idle prompts only; submits the
   line as a prompt). `404 NOT_FOUND` when the item is no longer pending,
-  `409 CONFLICT` when the dialog left the screen or another actor answered
-  first, `422 OPERATION_FAILED` when the session refused input.
+  `400 INVALID_INPUT` for an `answerInTerminal` item (`<CLI> approvals must be
+  answered in the terminal`), `409 CONFLICT` when the dialog left the screen or
+  another actor answered first, `422 OPERATION_FAILED` when the session refused input.
 - `POST /api/v1/approvals/:id/dismiss` removes the item without keystrokes.
 - `POST /api/v1/approvals/session/:sessionId/viewed` → `{ sessionId,
   acknowledged: itemId | null }`. Marks the session's pending **idle** item as
@@ -965,7 +1034,10 @@ confirmed? } | { clear: true }` applies (or clears) the session's
     just because a swap is needed at all — only when it would disrupt
     someone else.
   - `{requiresContextWarning: true, modelId, contextLength,
-minSafeContextTokens}` — Claude Code's own fixed per-turn overhead
+minSafeContextTokens, slotCount?}` — `slotCount` is present whenever the model runs more than
+    one parallel llama.cpp slot, and the warning also fires when the context
+    divided across those slots is below the floor even though the whole context
+    is not. Claude Code's own fixed per-turn overhead
     (system prompt + tool schemas) can exceed a small model's entire
     discovered context on its own, before any conversation history exists
     to compact, guaranteeing the very first message fails regardless of
@@ -995,7 +1067,7 @@ The target is judged before anything is written:
 
 - It must be absolute with no `..` and none of the shell metacharacters a session working directory is rejected for (spaces are fine). `400 INVALID_INPUT` otherwise.
 - It must not be a system directory (`/etc`, `/usr`, `/proc`, ...), the home folder itself, Codeman's own data folder, or a credential/config tree (`~/.ssh`, `~/.aws`, `~/.claude`, ...). Judged on the path as typed and on its symlink-resolved form, against both the given and the symlink-resolved roots. `400`.
-- It must not be, or be inside, the cases directory (the caller's own and the shared one): a case there is a plain create without `path`. `400`.
+- It must not be the cases directory (the caller's own or the shared one) or a direct child of it, since those are what `GET /api/cases` lists as local cases: a case there is a plain create without `path`. A folder further down is allowed. `400`.
 - Its parent must already exist (one folder is created, never a chain): `404 NOT_FOUND`. A parent that does not answer (an unreachable network mount) or cannot be read is `422 OPERATION_FAILED`, checked through the bounded path probe before anything else touches it.
 - The folder must not exist, or must be an **empty** directory; a folder with contents is Link Existing's job: `409 ALREADY_EXISTS`. A symlink or a plain file at the target is `400`.
 - `409 ALREADY_EXISTS` also for a case name already in use (in the cases dir or the registry) and for a folder that is already a case.
@@ -1027,6 +1099,70 @@ Both routes accept two optional query parameters, which the UI sends from its pe
 
 Lists are capped (300 files and 50 commits per repository) while the counts stay exact. A branch with no upstream reports the commits no remote has (`HEAD --not --remotes`); a repository with no remote reports `unpushedCount: 0`, since there is nothing to push to. Concurrent polls of one folder share a single git invocation; `?fresh=1` (what the panel's Refresh button and opening the panel send) skips the short-lived caches, though it still joins a computation already running.
 
+## Git worktrees of a case
+
+A local case whose folder is the top of a git repository can keep **worktrees** at `<case>/.claude/worktrees/<name>`, each on its own branch, so several agents on one repository never share a checkout. This is the layout Claude Code's own `claude --worktree <name>` uses (branch `worktree-<name>`), so either tool finds the other's worktrees. Remote (SSH) and Docker cases are refused with `400 INVALID_INPUT` before git runs, and so is a local case whose folder is at or inside a Docker case workspace: `git worktree add` runs the repository's post-checkout hook and checkout filters on this machine, and a container can write there. A case folder that is not a repository, is a bare repository, or sits below the repository's top level is `400` too. The case resolves the way quick-start resolves it (a linked case is admin-only in multi-user mode, everything else is the caller's own case space; another user's case is `404`), and a case folder on a mount that does not answer is `422 OPERATION_FAILED`, never `404`.
+
+`GET /api/cases/:name/worktrees` lists `git worktree list` for the case's repository:
+
+```json
+{
+  "caseName": "myrepo",
+  "repoRoot": "/home/me/codeman-cases/myrepo",
+  "worktreesDir": "/home/me/codeman-cases/myrepo/.claude/worktrees",
+  "truncated": false,
+  "worktrees": [
+    { "path": "/home/me/codeman-cases/myrepo", "head": "6910cb15…", "branch": "main", "detached": false, "bare": false,
+      "locked": false, "prunable": false, "main": true, "isCase": true, "managed": false, "sessionCount": 0, "sessions": [] },
+    { "path": "/home/me/codeman-cases/myrepo/.claude/worktrees/fix-login", "branch": "worktree-fix-login",
+      "main": false, "isCase": false, "managed": true, "name": "fix-login",
+      "sessionCount": 1, "sessions": [{ "id": "2a568379-…", "name": "w1-fix-login" }] }
+  ]
+}
+```
+
+`managed` is `true` only for `<repoRoot>/.claude/worktrees/<name>`: those are the ones Codeman starts sessions in and removes; any other worktree of the repository is listed for information. `sessionCount` counts live sessions of every owner running in that worktree (a session belongs to the deepest worktree holding its folder), `sessions` lists the ones the caller may see. `lockReason`/`prunableReason` appear when git reports them.
+
+`POST /api/cases/:name/worktrees` with `{ name, branch?, base? }` creates one (`201`, `{ worktree: { name, path, branch, base, head, excludeAdded, warnings } }`):
+
+- `name`: 1 to 64 characters of `A-Z a-z 0-9 . _ -`, starting with a letter or digit, no `..`, not ending in `.` or `.lock`. `400` otherwise.
+- `branch`: the NEW branch, default `worktree-<name>`. Letters, digits, `.`, `_`, `-`, `/`, then `git check-ref-format --branch` must accept it unchanged. An existing branch is `409 ALREADY_EXISTS` (never reset), and so is a name whose folder already exists.
+- `base`: where the branch starts, default `HEAD` (the case's current commit): a branch, tag or commit, resolved before anything is written (`400` when it is not a commit, which includes an empty repository).
+- `excludeAdded` lists the lines appended to the repository's local `info/exclude` (in the real common git dir, never a tracked `.gitignore`) when git did not already ignore them: `/.claude/worktrees/`, so the main checkout does not show the worktrees as untracked, `/.claude/settings.local.json`, the hooks file Codeman writes for every claude session, which would otherwise make `git worktree remove` refuse, and the agent skill copy (`/.claude/skills/codeman/`, `/.agents/skills/codeman/`: every skills folder the CLI registry names) that sessions get while `agentSkillEnabled` is on, for the same reason.
+- A symlinked `.claude` or `.claude/worktrees` directory is refused (`400`): a repository cannot redirect the worktree outside itself.
+
+`DELETE /api/cases/:name/worktrees/:worktree[?deleteBranch=true]` removes a managed worktree with `git worktree remove` **without `--force`**: git refuses a worktree with modified or untracked files (or a locked one), and that refusal is the answer, `409 CONFLICT` with git's own words in `error`. A live session at or inside the worktree is `409` as well. With `deleteBranch=true` the branch is deleted with `git branch -d`, never `-D`, so an unmerged branch is kept: the response is still `200`, with `branchDeleted: false` and git's reason in `branchError`. Response: `{ removed: { name, path, branch, branchDeleted, branchError? } }`. A folder git does not list as a worktree of this repository, or a symlink in its place, is `404`/`400`. A worktree that is, sits inside, or holds a Docker case workspace is `400` too (git would run inside a folder the container writes, and the removal would delete that workspace under it). A managed worktree whose folder is gone (deleted by hand; the list reports it `prunable`) is still removable: git then only drops its record, which is what frees the name for a new worktree. A session never starts in one.
+
+**Starting a session in a worktree** goes through the normal create paths: `POST /api/quick-start` takes `worktree: "<name>"` next to `caseName` and runs the session (and the hooks, the agent skill and `modelOverride`) in the worktree folder; the response adds `worktree` and `workingDir`. It is refused for remote and Docker cases (`400`), for a worktree that is not a registered, managed one (`404`), and for a case that does not exist (`404`: a worktree launch never scaffolds a case). `POST /api/sessions` takes the worktree path as `workingDir` like any other folder.
+
+## Settings
+
+`~/.codeman/settings.json` is one file for the whole server: the synced App Settings (feature switches, the plan-usage collection switch `showPlanUsageLimits`, `runMode`, `respawnPresets`, `tunnelEnabled`, ...), plus `modelConfig`, `caseOrder` and `lastUsedCase`. Reads are open to every signed-in user; in multi-user mode a non-admin reads it without what is the admin's (`voiceSettings.apiKey`, the Deepgram key an admin saved, and the admin's case names in `caseOrder` and `lastUsedCase`). **In multi-user mode every write is admin only:** for a non-admin the routes below answer `403 FORBIDDEN` before the body is even validated, so nothing is written, no watcher is toggled and no tunnel is started. Single-user mode is unaffected.
+
+| Method | Path                          | Body                                 | Notes |
+| ------ | ----------------------------- | ------------------------------------ | ----- |
+| `GET`  | `/api/settings`               | none                                 | The stored settings object. Never writes. For a non-admin in multi-user mode, without `voiceSettings.apiKey`, `caseOrder` and `lastUsedCase`. |
+| `PUT`  | `/api/settings`               | partial settings (strict schema)     | Merged into the stored file; services (watchers, tunnel, tmux history limit) reconcile to the merged result. `403 FORBIDDEN` for a non-admin in multi-user mode. A tunnel enable without `CODEMAN_PASSWORD` is refused separately (`403 OPERATION_FAILED`, resend with `acknowledgeUnauthTunnel: true`). |
+| `GET`  | `/api/execution/model-config` | none                                 | `modelConfig` (cron's and the plan orchestrator's default model). |
+| `PUT`  | `/api/execution/model-config` | `{ defaultModel?, agentTypeOverrides?, ... }` | Replaces `modelConfig`. `403 FORBIDDEN` for a non-admin in multi-user mode. |
+| `PUT`  | `/api/cases/order`            | `{ order: string[] }`                | The one case order every user's `GET /api/cases` is sorted by. `403 FORBIDDEN` for a non-admin in multi-user mode. |
+| `PUT`  | `/api/config`                 | `{ pollIntervalMs?, defaultTimeoutMs?, maxConcurrentSessions?, respawn? }` (strict) | The process-wide app config in `state.json`. `403 FORBIDDEN` for a non-admin in multi-user mode. |
+
+A non-admin's `POST /api/quick-start` and `POST /api/ralph-loop/start` work as before but do not record their case as `lastUsedCase` (a server-wide key).
+
+### System operations
+
+The same multi-user rule covers the operations that act on the whole server. For a non-admin:
+
+| Method | Path                          | Multi-user non-admin |
+| ------ | ----------------------------- | -------------------- |
+| `POST` | `/api/system/update`          | `403 FORBIDDEN` (the update restarts the server under every user) |
+| `POST` | `/api/system/span-displays`   | `403 FORBIDDEN` (opens a window on the server's desktop) |
+| `POST` | `/api/tunnel/qr/regenerate`   | `403 FORBIDDEN` (it clears every user's outstanding QR login code) |
+| `POST` | `/api/cleanup-state`          | `403 FORBIDDEN` (drops every user's stale session records) |
+| `POST` | `/api/auth/revoke`            | Revokes only the caller's own login sessions: the bare form (`{}`) signs them out everywhere, and a `sessionToken` is revoked only when it is theirs. For an admin, and in single-user mode, the bare form still revokes every login session |
+| `GET`  | `/api/tunnel/info`            | `authSessions` lists only the caller's own logins |
+
 ## CLI management
 
 Read and write the CLI registry (`docs/cli-registry.md`). Every **write** route answers `403 FORBIDDEN` while `cliManagementEnabled` is off (the default), and for a non-admin in multi-user mode. A write that would overwrite a `clis.json` which does not parse, or which has group/world permission bits, is refused with `409 CONFLICT` and a message naming the fix; the file is left untouched.
@@ -1052,7 +1188,7 @@ Copies MCP servers between the agent CLIs' own user-level config files (`docs/cl
 Result (`data`):
 
 - `applied` — `false` for the dry run.
-- `targets[]` — one per enabled CLI that declares an MCP config, plus GitHub Copilot CLI (`id: "copilot"`, a sync-only target that is not a run mode): `id`, `label`, `file`, `status`, `error?`, `servers` (names it already has), `added` (names added, or that would be), `skipped` (names its dialect cannot express, e.g. SSE for Codex and Antigravity).
+- `targets[]` — one per enabled CLI that declares an MCP config, including GitHub Copilot CLI (`id: "copilot"`; it is a run mode that declares its own `mcpConfig`, and a sync-only target takes its place only while that run mode is disabled): `id`, `label`, `file`, `status`, `error?`, `servers` (names it already has), `added` (names added, or that would be), `skipped` (names its dialect cannot express, e.g. SSE for Codex and Antigravity).
   - `status`: `ok`; `absent` (not installed and no config file, so not read or created); `skipped` (the CLI's relocation env var, e.g. `CODEX_HOME`, is set to a relative path in the server's environment, so its file cannot be located safely and is neither read nor written); `unreadable` (the file exists but cannot be parsed safely, so it is not written); `failed` (a read or write error, the file may be unchanged).
   - `error` says why a target is not `ok`. A parse failure is reported by position only (`not valid TOML (line 3, column 21)`, `not valid JSON`), never with text from the file.
   - `file` honours each CLI's own relocation env var as the server process sees it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME`, `GEMINI_CLI_HOME`, and `COPILOT_HOME` for the sync-only Copilot CLI); see `docs/cli-registry.md`.
@@ -1062,6 +1198,31 @@ Result (`data`):
   - Only installed CLIs are listed: one that is not installed is left out, as a supported CLI that is not installed reads `absent`.
 
 The result carries server **names** only, never `env` values, `headers` or file content. Each changed file keeps its previous content as `<file>.codeman-bak` (overwritten by each sync); a file that receives servers carrying `env` or `headers` is left mode `0600`.
+
+## Prompt-cache keep-warm
+
+Claude Code reports the main conversation's prompt-cache state on its statusline (v2.1.251+); the exporter keeps it per session as `promptCache` on `GET /api/sessions` (`{ warm, ttl, expiresAt, recacheTokensIfCold, misses, lastMissCauses }`, epoch ms). The keep-warm sends one keep-alive turn shortly before an idle session's cache would expire; `keepWarmEnabled` (absent = the app-wide `promptCacheKeepWarm` setting applies, which a session spawned by another session does not inherit), the live `keepWarm` status and `lastRealPromptAt` (epoch ms of the last submit that was not a keep-alive, the cap's clock) ride the same session state. A keep-alive is a submit, so it moves `lastSubmitAt` like any prompt. A claude launch with keep-warm on also carries `"idleCompaction": false` in its `--settings` JSON (Claude Code 2.1.290 or newer).
+
+| Method | Path                               | Body                                 | Notes |
+| ------ | ---------------------------------- | ------------------------------------ | ----- |
+| `POST` | `/api/v1/sessions/:id/keep-warm`   | `{ "enabled": true \| false \| null }` | Sets the session's choice; `null` clears it so the app-wide default applies. `200` with `{ keepWarm: { enabled, status } }`. `400 INVALID_INPUT` for a CLI that reports no cache telemetry on its statusline (anything but Claude today). |
+
+`status` is `{ enabled, idleCompactionOff, state, nextCheckAt?, reason?, nudges, lastNudgeAt?, budgetEndsAt? }` (`idleCompactionOff`: whether the session's current launch carries that opt-out; `budgetEndsAt` only while `enabled`) with `state` one of `off`, `armed` (waiting for the due time), `waiting` (due, deferred by a guard named in `reason`), `nudged` (sent, waiting for the next cache report) or `stopped` (`reason` says why). Two SSE events carry changes: `session:promptCache` (`{ sessionId, ...promptCache }`) and `session:keepWarm` (`{ sessionId, ...status }`), both change-only. The keep-alive turn's `hook:stop` and `hook:idle_prompt` broadcasts carry `acknowledgedReason: "cache keep-alive"`, no push is sent for them and the run summary does not record them; an idle approval already pending stays as it was (only a person spends its alert). Its `session:working` and `session:idle` broadcasts carry `keepAlive: true`.
+
+## Config backups
+
+Timestamped snapshots of the files that hold what a user has customized (`src/config-backup.ts`). On by default; a snapshot is taken at startup and whenever the tracked files' content changes (checked every 5 minutes), so there is one entry per real change. All four routes are admin only in multi-user mode (`403`), because the files include credentials. Responses carry file names and sizes; only the diff returns values, and never a credential's.
+
+Tracked files (a fixed list, relative to the data dir): `settings.json`, `clis.json`, `custom-model-hosts.json`, `webhook.json`, `intents.json`, `linked-cases.json`, `remote-hosts.json`, `remote-cases.json`, `docker-hosts.json`, `docker-cases.json`, `webviews.json`, `push-keys.json`, `users.json`, `.env`. Session state (`state.json`, which also holds cron jobs and respawn presets), logs, the hook secret and caches are not.
+
+Settings (synced, in `settings.json`): `configBackupEnabled` (absent = on), `configBackupDir` (absolute path, `~` expanded; empty = `<data dir>/backups/config`), `configBackupKeepCount` (2–500, default 20), `configBackupKeepDays` (0–3650, default 30; `0` = no age limit). A key absent from `settings.json` means the retention the newest backup in the folder recorded, and the default only when none did. Retention only ever deletes snapshot folders Codeman made there, and never the newest one. Each snapshot is a `0700` folder named `cfg-YYYYMMDD-HHMMSS` (server local time; `-2`, `-3`… on a same-second collision) holding the tracked files under their own names plus a `manifest.json` (`id`, `createdAt`, `reason` of `startup`/`auto`/`manual`/`pre-restore`, `appVersion`, the change-check `hash`, an `origin` id, the `keepCount` and `keepDays` in force, and a SHA-256 and size per file), all `0600`. A snapshot is never dated earlier than the instance's newest one, so a clock that read ahead once does not make every later pass write a copy. All four routes answer `503 OPERATION_FAILED` when a custom folder does not respond, and diff and restore answer `409` for a symlinked or group/world-accessible backup as well as a checksum mismatch. Only folders with that name and a valid manifest are listed, restored or pruned. Full guide: `docs/wiki/Config-Backups.md`.
+
+| Method | Path                                 | Body | Notes                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------ | ------------------------------------ | ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/config-backups`                | none | `settings` in effect, `dir`, `defaultDir`, `tracked[]` and `backups[]` (`id`, `createdAt`, `reason`, `appVersion`, `files[]`, `bytes`), newest first.                                                                                                                                                                                                                                                                  |
+| `POST` | `/api/config-backups`                | none | Snapshot now, even if nothing changed (`reason: manual`), then apply retention. `status` is `created` or `empty` (nothing tracked exists yet); `removed[]` lists the ids retention deleted. `503` when a custom folder does not answer.                                                                                                                                                                                                                                                                         |
+| `GET`  | `/api/config-backups/diff?from=&to=` | none | What differs between two states: `from`/`to` are a backup id or `current` (the running config; the default for `to`). `files[]` (`name`, `status` `added`/`removed`/`changed`/`unchanged`, `changes[]` of `path`, `kind`, `before`/`after`, `truncated`, `detail`) and `changed`. Credential values are never returned (`redacted: true`). `400` without `from`; `404` unknown id; `409` if a file fails its checksum. |
+| `POST` | `/api/config-backups/:id/restore`    | none | Put a snapshot's files back, atomically, after a `pre-restore` snapshot of the current ones (none when nothing changed since the newest backup). `404` unknown id; `409 CONFLICT` if a file fails its checksum (nothing changed). Returns `restored[]`, `untouched[]` (tracked files present now that the backup did not hold; left as they are), `safetySnapshot` (the `pre-restore` id, or the newest backup's when nothing had changed since it) and `restartRequired[]` (files the running server only reads at start: `.env`, `push-keys.json`, `settings.json`). A file that cannot be written (a full disk, a directory in its place) does not stop the others: the answer is then `500 OPERATION_FAILED` with the same fields in `data` plus `failed[]` (`name`, `error`); the files listed in `restored[]` are the backup's and are reloaded like a full restore.                                                                                                                                                              |
 
 ## Webhook notifications
 

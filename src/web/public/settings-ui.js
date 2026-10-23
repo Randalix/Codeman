@@ -35,7 +35,11 @@ Object.assign(CodemanApp.prototype, {
       this.setPendingHook(data.sessionId, 'permission_prompt');
     }
     const toolInfo = data.tool ? `${data.tool}${data.command ? ': ' + data.command : data.file ? ': ' + data.file : ''}` : '';
-    this._notifySession(data.sessionId, 'critical', 'hook-permission', 'Permission Required', toolInfo || 'Claude needs tool approval to continue');
+    // A dialog read off a hook-less CLI's screen (codex; `source: 'screen'`, see
+    // src/web/screen-blocked.ts) carries a server-built message naming that CLI, so the
+    // notification does not claim it is Claude asking.
+    const screenMessage = data.source === 'screen' && data.message ? data.message : '';
+    this._notifySession(data.sessionId, 'critical', 'hook-permission', 'Permission Required', toolInfo || screenMessage || 'Claude needs tool approval to continue');
   },
 
   _onHookElicitationDialog(data) {
@@ -68,6 +72,10 @@ Object.assign(CodemanApp.prototype, {
   },
 
   _onHookStop(data) {
+    // The end of Codeman's own keep-alive turn (prompt-cache keep-warm): nothing finished
+    // that a person asked for, and an idle alert still pending is theirs to spend, so this
+    // neither clears it nor raises "Response Complete".
+    if (data.acknowledgedReason) return;
     // Clear all pending hooks when Claude finishes responding
     if (data.sessionId) {
       this.clearPendingHooks(data.sessionId);
@@ -369,6 +377,130 @@ Object.assign(CodemanApp.prototype, {
     return select?.value.trim() || '';
   },
 
+  /**
+   * Announce a new release once per browser: one toast naming its headline changes.
+   * The notes come from /whats-new.json, which `npm run version-packages` regenerates from
+   * CHANGELOG.md for each release. A browser that has never seen any version just records the
+   * current one, so a fresh install is not greeted with "what's new".
+   *
+   * The same pass places the security notices (/security-notices.json, see
+   * _loadSecurityNotices), so a load shows ONE notification per notice:
+   * CodemanSecurityNotices.plan() (constants.js) puts every selected notice INSIDE the update
+   * toast when that toast shows (showUpdateNotice), and gives each its own card otherwise, a
+   * fresh install or a reload on the same version (showSecurityNotice). With no notice
+   * selected the update toast is the plain one it always was. Storage blocked shows neither:
+   * nothing could remember a close.
+   *
+   * ⚠️ A detached session window (/session/:id) is rendered without __codemanCliAvailable, so
+   * it can never select a notice naming a CLI. Were it to take the update toast anyway, it
+   * would record the version and the dashboard would later show that notice as a separate
+   * card, not inside the update toast. So while any notice is pending (_loadSecurityNotices
+   * counts every CLI the file names as installed there), a solo window shows and records
+   * nothing and leaves both to the dashboard; with none pending it shows the plain update
+   * toast as it always did.
+   */
+  async checkWhatsNew(runningVersion) {
+    if (this._whatsNewChecked) return;
+    this._whatsNewChecked = true;
+    const KEY = 'codeman-whats-new-seen';
+    let seen = null;
+    try { seen = localStorage.getItem(KEY); } catch { /* storage blocked: skip the announcement and the notices */ return; }
+    const remember = () => { try { localStorage.setItem(KEY, runningVersion); } catch { /* ignore */ } };
+    const [notes, notices] = await Promise.all([
+      seen && seen !== runningVersion ? this._fetchWhatsNewNotes() : null,
+      this._loadSecurityNotices(),
+    ]);
+    if (this.isSoloWindow && notices.length) return;
+    const plan = window.CodemanSecurityNotices.plan({ seenVersion: seen, runningVersion, notes, notices });
+    if (plan.recordVersion) remember();
+    if (plan.update) {
+      const shown = notes.highlights.slice(0, 3).join(' · ');
+      const more = notes.highlights.length > 3 ? ` (+${notes.highlights.length - 3} more)` : '';
+      const text = `Codeman updated to v${runningVersion}: ${shown}${more}`;
+      const releaseUrl = `https://github.com/Ark0N/Codeman/releases/tag/codeman%40${runningVersion}`;
+      if (plan.updateNotices.length) {
+        this.showUpdateNotice({
+          text,
+          releaseUrl,
+          notices: plan.updateNotices,
+          onNoticeSeen: (id) => this._rememberSecurityNotice(id),
+        });
+      } else {
+        this.showToast(text, 'info', {
+          duration: 20000,
+          action: {
+            label: "See what's new",
+            onClick: () => window.open(releaseUrl, '_blank', 'noopener'),
+          },
+        });
+      }
+    }
+    for (const notice of plan.cards) {
+      this.showSecurityNotice(notice, { onClose: () => this._rememberSecurityNotice(notice.id) });
+    }
+  },
+
+  /** This release's notes, or null (offline or malformed: try again next load). */
+  async _fetchWhatsNewNotes() {
+    try {
+      const res = await fetch('/whats-new.json', { cache: 'no-cache' });
+      return res.ok ? await res.json() : null;
+    } catch {
+      return null;
+    }
+  },
+
+  /**
+   * The security notices this browser should see now, from the HAND-maintained
+   * /security-notices.json (docs/releasing.md says how to add and retire one), selected by
+   * CodemanSecurityNotices.select() in constants.js: dates, the seen list, and for a notice
+   * naming a CLI, `window.__codemanCliAvailable[cli] === true` only (unknown means not
+   * installed). [] on any failure, and when storage is blocked (a close could not be
+   * remembered, so the card would return on every load). In a solo window every CLI the file
+   * names counts as installed: there the answer only decides whether to leave the release to
+   * the dashboard (see checkWhatsNew), and is never shown.
+   */
+  async _loadSecurityNotices() {
+    let seen;
+    try { seen = this._readSecurityNoticesSeen(); } catch { /* storage blocked: show nothing */ return []; }
+    try {
+      const res = await fetch(CodemanBase.url('/security-notices.json'), { cache: 'no-cache' });
+      if (!res.ok) return [];
+      const data = await res.json();
+      const list = Array.isArray(data?.notices) ? data.notices : [];
+      const available = this.isSoloWindow
+        ? Object.fromEntries(list.filter((entry) => typeof entry?.cli === 'string').map((entry) => [entry.cli, true]))
+        : window.__codemanCliAvailable;
+      return window.CodemanSecurityNotices.select(data?.notices, {
+        available,
+        seen,
+        now: Date.now(),
+        lang: window.CodemanI18n?.language || window.__codemanLanguage,
+      });
+    } catch { /* offline or malformed: try again next load */ return []; }
+  },
+
+  /** The ids the user closed or followed (`codeman-security-notices-seen`). Throws when storage is blocked. */
+  _readSecurityNoticesSeen() {
+    const raw = localStorage.getItem('codeman-security-notices-seen');
+    let ids = [];
+    try { ids = raw ? JSON.parse(raw) : []; } catch { /* a corrupt value counts as nothing seen */ }
+    return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string') : [];
+  },
+
+  /**
+   * Record a notice as seen. Only a user action calls this (a close, Dismiss, its link), never
+   * the card appearing, so one shown while nobody was looking comes back on the next load.
+   * Re-reads first: another tab may have recorded a notice since this one loaded.
+   */
+  _rememberSecurityNotice(id) {
+    try {
+      const ids = this._readSecurityNoticesSeen();
+      if (!ids.includes(id)) ids.push(id);
+      localStorage.setItem('codeman-security-notices-seen', JSON.stringify(ids));
+    } catch { /* storage blocked since load: it shows again next load */ }
+  },
+
   openAppSettings() {
     // Load current settings
     const settings = this.loadAppSettingsFromStorage();
@@ -423,6 +555,12 @@ Object.assign(CodemanApp.prototype, {
     this._mcpSyncSavedOn = settings.mcpSyncEnabled === true;
     document.getElementById('appSettingsMcpSync').checked = this._mcpSyncSavedOn;
     this.applyMcpSyncVisibility();
+    // Config backups: absent means ON, 20 copies, 30 days.
+    document.getElementById('appSettingsConfigBackup').checked = settings.configBackupEnabled !== false;
+    document.getElementById('appSettingsConfigBackupDir').value = settings.configBackupDir || '';
+    document.getElementById('appSettingsConfigBackupKeepCount').value = settings.configBackupKeepCount ?? 20;
+    document.getElementById('appSettingsConfigBackupKeepDays').value = settings.configBackupKeepDays ?? 30;
+    this.loadConfigBackups();
     this._applyDoctorAdminGate();
     this.loadWebhook();
     // Read My Mind: synced, default OFF (opt-in; capture + prediction cost real tokens).
@@ -470,6 +608,9 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsSubagentTracking').checked = settings.subagentTrackingEnabled ?? defaults.subagentTrackingEnabled ?? true;
     document.getElementById('appSettingsSubagentActiveTabOnly').checked = settings.subagentActiveTabOnly ?? defaults.subagentActiveTabOnly ?? true;
     document.getElementById('appSettingsImageWatcherEnabled').checked = settings.imageWatcherEnabled ?? defaults.imageWatcherEnabled ?? false;
+    // Prompt-cache keep-warm: synced, default OFF, cap default 2 h (DEFAULT_KEEP_WARM_MAX_HOURS).
+    document.getElementById('appSettingsPromptCacheKeepWarm').checked = settings.promptCacheKeepWarm === true;
+    document.getElementById('appSettingsPromptCacheKeepWarmMaxHours').value = settings.promptCacheKeepWarmMaxHours ?? 2;
     document.getElementById('appSettingsTunnelEnabled').checked = settings.tunnelEnabled ?? false;
     this.loadTunnelStatus();
     document.getElementById('appSettingsLocalEcho').checked = settings.localEchoEnabled ?? MobileDetection.isTouchDevice();
@@ -552,6 +693,7 @@ Object.assign(CodemanApp.prototype, {
     // Default ON: an absent key is a user who has never seen this setting, and OFF
     // for them means no tab alerts in any workspace Codeman did not scaffold.
     document.getElementById('appSettingsWorkspaceHooks').checked = settings.workspaceHooksEnabled !== false;
+    document.getElementById('appSettingsPinCliSessionName').checked = settings.pinCliSessionName === true;
     document.getElementById('appSettingsClaudeModel').value = settings.claudeModel ?? '';
     document.getElementById('appSettingsOpusContext1m').checked = settings.opusContext1mEnabled ?? false;
     document.getElementById('appSettingsRemoteAutoReconnect').checked = settings.remoteAutoReconnect ?? true;
@@ -675,6 +817,10 @@ Object.assign(CodemanApp.prototype, {
     // Activate focus trap
     this.activeFocusTrap = new FocusTrap(modal);
     this.activeFocusTrap.activate();
+
+    // Multi-user non-admin only: remember what the form shows now, so Save can tell a real
+    // change to a server-wide setting from an untouched one (see the method).
+    this._captureSettingsFormBaseline();
   },
 
   /**
@@ -1226,10 +1372,178 @@ Object.assign(CodemanApp.prototype, {
    * wired to `codeman:me` for the same late-resolving role as the groups above.
    */
   _applyDoctorAdminGate() {
-    const group = document.getElementById('doctorGroup');
-    if (!group) return;
     const me = window.__codemanUser || {};
-    group.style.display = me.multiUser && me.role !== 'admin' ? 'none' : '';
+    for (const id of ['doctorGroup', 'configBackupGroup']) {
+      const group = document.getElementById(id);
+      if (group) group.style.display = me.multiUser && me.role !== 'admin' ? 'none' : '';
+    }
+  },
+
+  // ── Config backups ──────────────────────────────────────────────────────────
+  // Server-side files, so these read the SAVED settings: a folder or retention edit applies after Save.
+
+  /**
+   * The retention keys a Save sends: a value only once it was saved before or edited here. After a reset
+   * the form merely DISPLAYS what the passes use (the retention the backups recorded), and writing that back
+   * would replace it with whatever a different folder or an older default says.
+   */
+  _configBackupRetentionPayload(prev) {
+    const count = document.getElementById('appSettingsConfigBackupKeepCount');
+    const days = document.getElementById('appSettingsConfigBackupKeepDays');
+    const out = {};
+    if (prev.configBackupKeepCount !== undefined || count.dataset.touched) {
+      out.configBackupKeepCount = Math.min(500, Math.max(2, parseInt(count.value, 10) || 20));
+    }
+    if (prev.configBackupKeepDays !== undefined || days.dataset.touched) {
+      const n = parseInt(days.value, 10);
+      out.configBackupKeepDays = Math.min(3650, Math.max(0, Number.isNaN(n) ? 30 : n));
+    }
+    return out;
+  },
+
+  /** Fill the backup list, and show the default folder as the input's placeholder. */
+  async loadConfigBackups() {
+    const out = this.$('configBackupList');
+    if (!out) return;
+    const res = await this._api('/api/config-backups');
+    let body = null;
+    try { body = res ? await res.json() : null; } catch { /* fall through */ }
+    if (!res || !res.ok || !body || body.success === false) {
+      out.textContent = body?.error || 'Backups are not available here (admin only in multi-user mode).';
+      return;
+    }
+    const data = body.data;
+    const dirInput = this.$('appSettingsConfigBackupDir') || document.getElementById('appSettingsConfigBackupDir');
+    if (dirInput && data.defaultDir) dirInput.placeholder = `default: ${data.defaultDir}`;
+    // A reset settings.json has none of the four keys, but the passes keep the retention the newest backup
+    // recorded: show that, or a Save would write 20 / 30 over it.
+    const saved = this.loadAppSettingsFromStorage();
+    const countInput = document.getElementById('appSettingsConfigBackupKeepCount');
+    const daysInput = document.getElementById('appSettingsConfigBackupKeepDays');
+    if (countInput && saved.configBackupKeepCount === undefined && data.settings) countInput.value = data.settings.keepCount;
+    if (daysInput && saved.configBackupKeepDays === undefined && data.settings) daysInput.value = data.settings.keepDays;
+    if (!data.backups.length) {
+      out.innerHTML = `No backups yet in <code>${escapeHtml(data.dir)}</code>.`;
+      return;
+    }
+    const kb = (n) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`);
+    this._configBackups = data.backups;
+    const rows = data.backups.map((b, i) => {
+      const when = new Date(b.createdAt).toLocaleString();
+      const names = b.files.map((f) => escapeHtml(f.name)).join(', ');
+      const id = escapeHtml(b.id);
+      // The list is newest first, so the next row is the backup this one followed.
+      const prev = data.backups[i + 1];
+      const vsPrev = prev ? `<button class="btn-toolbar btn-sm" onclick="app.showConfigDiff('${escapeHtml(prev.id)}','${id}')">Changes in this backup</button>` : '';
+      return `<li><b>${escapeHtml(when)}</b> <span class="set-row-desc">(${escapeHtml(b.reason)}, ${kb(b.bytes)})</span>
+        <button class="btn-toolbar btn-sm" onclick="app.restoreConfigBackup('${id}')">Restore</button>
+        <button class="btn-toolbar btn-sm" onclick="app.showConfigDiff('${id}','current')">Compare with current</button>
+        ${vsPrev}
+        <div class="set-row-desc">${names}</div></li>`;
+    });
+    const options = (sel) => [`<option value="current"${sel === 'current' ? ' selected' : ''}>Current config</option>`]
+      .concat(data.backups.map((b) => `<option value="${escapeHtml(b.id)}"${sel === b.id ? ' selected' : ''}>${escapeHtml(new Date(b.createdAt).toLocaleString())} (${escapeHtml(b.reason)})</option>`))
+      .join('');
+    const picker = data.backups.length
+      ? `<div class="set-row-desc">Compare <select id="configDiffFrom">${options(data.backups[0].id)}</select> with <select id="configDiffTo">${options('current')}</select>
+        <button class="btn-toolbar btn-sm" onclick="app.showConfigDiff(app.$('configDiffFrom').value, app.$('configDiffTo').value)">Show changes</button></div>`
+      : '';
+    out.innerHTML = `<div>${data.backups.length} backup${data.backups.length === 1 ? '' : 's'} in <code>${escapeHtml(data.dir)}</code></div>${picker}<ul>${rows.join('')}</ul><div id="configBackupDiff"></div>`;
+  },
+
+  /** What differs between two states of the config files: a backup id or `current` (the running config). */
+  async showConfigDiff(from, to) {
+    const out = this.$('configBackupDiff');
+    if (!out) return;
+    out.textContent = 'Comparing…';
+    const res = await this._api(`/api/config-backups/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`);
+    let body = null;
+    try { body = res ? await res.json() : null; } catch { /* fall through */ }
+    if (!res || !res.ok || !body || body.success === false) {
+      out.textContent = body?.error || 'Could not compare these';
+      return;
+    }
+    const label = (id) => {
+      if (id === 'current') return 'the current config';
+      const b = (this._configBackups || []).find((x) => x.id === id);
+      return b ? new Date(b.createdAt).toLocaleString() : id;
+    };
+    const d = body.data;
+    const verb = { added: 'added', removed: 'removed', changed: 'changed' };
+    const files = d.files.filter((f) => f.status !== 'unchanged').map((f) => {
+      let detail;
+      if (f.detail === 'bytes') {
+        detail = '<div class="set-row-desc">Differs (not a key/value file, so no detail).</div>';
+      } else {
+        const rows = f.changes.map((c) => {
+          const val = (v) => `<code>${escapeHtml(v ?? '')}</code>`;
+          const text = c.redacted ? `${verb[c.kind]} <span class="set-row-desc">(value hidden: credential)</span>`
+            : c.kind === 'added' ? `added ${val(c.after)}`
+            : c.kind === 'removed' ? `removed (was ${val(c.before)})`
+            : `${val(c.before)} → ${val(c.after)}`;
+          return `<li><code>${escapeHtml(c.path)}</code>: ${text}</li>`;
+        });
+        const more = f.truncated ? '<li class="set-row-desc">More changes not shown.</li>' : '';
+        detail = f.changes.length ? `<ul>${rows.join('')}${more}</ul>` : '';
+      }
+      const whole = f.status === 'added' ? ' (new file)' : f.status === 'removed' ? ' (file gone)' : '';
+      return `<div><b>${escapeHtml(f.name)}</b>${whole}${detail}</div>`;
+    });
+    const same = d.files.filter((f) => f.status === 'unchanged').map((f) => escapeHtml(f.name));
+    out.innerHTML = `<div><b>${escapeHtml(label(d.from))}</b> → <b>${escapeHtml(label(d.to))}</b>: ${
+      d.changed ? `${d.changed} file${d.changed === 1 ? '' : 's'} differ` : 'no differences'}</div>${files.join('')}${
+      same.length ? `<div class="set-row-desc">Unchanged: ${same.join(', ')}</div>` : ''}`;
+  },
+
+  async backupConfigNow() {
+    const btn = this.$('configBackupNowBtn');
+    if (btn) btn.disabled = true;
+    try {
+      const res = await this._apiPost('/api/config-backups', {});
+      let body = null;
+      try { body = res ? await res.json() : null; } catch { /* fall through */ }
+      if (!res || !res.ok || !body || body.success === false) {
+        this.showToast(body?.error || 'Backup failed', 'error');
+      } else if (body.data.status === 'empty') {
+        this.showToast('Nothing to back up yet', 'warning');
+      } else {
+        this.showToast(`Backed up ${body.data.files} file${body.data.files === 1 ? '' : 's'}`, 'success');
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+      this.loadConfigBackups();
+    }
+  },
+
+  async restoreConfigBackup(id) {
+    const names = ((this._configBackups || []).find((b) => b.id === id)?.files || []).map((f) => f.name);
+    const secret = names.filter((n) => ['.env', 'users.json', 'push-keys.json', 'custom-model-hosts.json', 'webhook.json'].includes(n));
+    const list = names.length ? `\n\nFiles replaced: ${names.join(', ')}` : '';
+    const warn = secret.length ? `\n\nThis rolls back credentials and accounts (${secret.join(', ')}): passwords, disabled accounts and keys return to how they were then.` : '';
+    if (!confirm(`Restore this backup? Its files replace the current ones (a copy of the current files is made first). Some files only take effect after a restart.${list}${warn}`)) return;
+    const res = await this._apiPost(`/api/config-backups/${encodeURIComponent(id)}/restore`, {});
+    let body = null;
+    try { body = res ? await res.json() : null; } catch { /* fall through */ }
+    const ok = res && res.ok && body && body.success !== false;
+    const d = body?.data;
+    // A restore that failed partway still answers with what it wrote (`restored`, `failed`, `safetySnapshot`):
+    // those files are the backup's now and need the same refill as a full restore.
+    if (!ok && !Array.isArray(d?.restored)) {
+      this.showToast(body?.error || 'Restore failed', 'error');
+      return;
+    }
+    const restart = d.restartRequired?.length ? ` Restart Codeman to apply: ${d.restartRequired.join(', ')}.` : '';
+    // The form still holds the pre-restore values, and Save would PUT them over the restored file.
+    if (d.restored.includes('settings.json')) {
+      await this.loadAppSettingsFromServer();
+      this.openAppSettings();
+    }
+    if (ok) {
+      this.showToast(`Restored ${d.restored.length} file${d.restored.length === 1 ? '' : 's'}.${restart}`, 'success');
+    } else {
+      this.showToast(`${body.error || 'Restore failed partway'}.${restart}`, 'error');
+    }
+    this.loadConfigBackups();
   },
 
   /** Preview (apply=false) or run (apply=true) the MCP server sync across enabled CLIs. */
@@ -1844,8 +2158,12 @@ Object.assign(CodemanApp.prototype, {
           regenBtn.textContent = 'Regenerate QR';
           regenBtn.style.cssText = 'margin-top:8px;padding:4px 12px;background:var(--bg-elevated);border:1px solid var(--border);border-radius:4px;color:var(--text-secondary);cursor:pointer;font-size:11px';
           regenBtn.onclick = () => {
+            // A refusal is not a success: in multi-user mode this is admin-only (403).
             fetch('/api/tunnel/qr/regenerate', { method: 'POST' })
-              .then(() => this.showToast('QR code regenerated', 'success'))
+              .then((res) => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                this.showToast('QR code regenerated', 'success');
+              })
               .catch(() => this.showToast('Failed to regenerate QR', 'error'));
           };
           const card = container.parentElement;
@@ -1940,6 +2258,11 @@ Object.assign(CodemanApp.prototype, {
   async toggleTunnelFromWelcome() {
     const btn = document.getElementById('welcomeTunnelBtn');
     if (!btn) return;
+    // The tunnel is a server-wide setting (PUT /api/settings), admin-only in multi-user mode.
+    if (this._settingsReadOnly()) {
+      this.showToast('Server-wide settings can only be changed by an admin', 'warning');
+      return;
+    }
     const isActive = btn.classList.contains('active');
     btn.disabled = true;
     try {
@@ -2266,11 +2589,21 @@ Object.assign(CodemanApp.prototype, {
   async _handleTunnelEnableRefusal(res) {
     if (!res || res.ok) return false;
     let message = 'Tunnel refused: set CODEMAN_PASSWORD before exposing Codeman publicly.';
+    let errorCode = '';
     try {
       const body = await res.json();
       if (body && body.error) message = body.error;
+      if (body && typeof body.errorCode === 'string') errorCode = body.errorCode;
     } catch {
       /* non-JSON body — use the default message */
+    }
+    // A non-admin in multi-user mode: PUT /api/settings is admin-only there (403 FORBIDDEN).
+    // That is not the no-password refusal below, so no security prompt and no retry. The
+    // callers skip the PUT for a known non-admin; this covers a role that had not resolved yet.
+    if (res.status === 403 && errorCode === 'FORBIDDEN') {
+      this._dismissTunnelConnecting?.();
+      this.showToast('Server-wide settings can only be changed by an admin', 'warning');
+      return true;
     }
     // 403 = the no-password safety refusal (COD-55). Warn loudly and let the
     // operator acknowledge the risk; on confirm, retry with explicit acknowledgment.
@@ -2320,6 +2653,12 @@ Object.assign(CodemanApp.prototype, {
   },
 
   async _tunnelPanelToggle(enable) {
+    // The tunnel is a server-wide setting (PUT /api/settings), admin-only in multi-user mode.
+    if (this._settingsReadOnly()) {
+      this.showToast('Server-wide settings can only be changed by an admin', 'warning');
+      this.closeTunnelPanel();
+      return;
+    }
     try {
       const res = await fetch('/api/settings', {
         method: 'PUT',
@@ -2580,6 +2919,9 @@ Object.assign(CodemanApp.prototype, {
       customModelEndpointsEnabled: document.getElementById('appSettingsCustomModelEndpoints').checked,
       cliManagementEnabled: document.getElementById('appSettingsCliManagement').checked,
       mcpSyncEnabled: document.getElementById('appSettingsMcpSync').checked,
+      configBackupEnabled: document.getElementById('appSettingsConfigBackup').checked,
+      configBackupDir: document.getElementById('appSettingsConfigBackupDir').value.trim(),
+      ...this._configBackupRetentionPayload(_prev),
       readMyMindEnabled: document.getElementById('appSettingsReadMyMind').checked,
       ultracodeFloatingWindows: document.getElementById('appSettingsUltracodeFloatingWindows').checked,
       showMultiMonitorButton: document.getElementById('appSettingsShowMultiMonitorButton').checked,
@@ -2604,6 +2946,10 @@ Object.assign(CodemanApp.prototype, {
       subagentTrackingEnabled: document.getElementById('appSettingsSubagentTracking').checked,
       subagentActiveTabOnly: document.getElementById('appSettingsSubagentActiveTabOnly').checked,
       imageWatcherEnabled: document.getElementById('appSettingsImageWatcherEnabled').checked,
+      promptCacheKeepWarm: document.getElementById('appSettingsPromptCacheKeepWarm').checked,
+      promptCacheKeepWarmMaxHours:
+        // Clamped to the schema's range: one value outside it fails the whole save.
+        Math.min(24, Math.max(0.5, parseFloat(document.getElementById('appSettingsPromptCacheKeepWarmMaxHours').value) || 2)),
       tunnelEnabled: document.getElementById('appSettingsTunnelEnabled').checked,
       localEchoEnabled: document.getElementById('appSettingsLocalEcho').checked,
       autoCopySelection: document.getElementById('appSettingsAutoCopySelection').checked,
@@ -2644,6 +2990,7 @@ Object.assign(CodemanApp.prototype, {
       agentTeamsEnabled: document.getElementById('appSettingsAgentTeams').checked,
       agentSkillEnabled: document.getElementById('appSettingsAgentSkill').checked,
       workspaceHooksEnabled: document.getElementById('appSettingsWorkspaceHooks').checked,
+      pinCliSessionName: document.getElementById('appSettingsPinCliSessionName').checked,
       claudeVoiceEnabled: document.getElementById('appSettingsClaudeVoice').checked,
       claudeModel: document.getElementById('appSettingsClaudeModel').value,
       opusContext1mEnabled: document.getElementById('appSettingsOpusContext1m').checked,
@@ -2656,6 +3003,13 @@ Object.assign(CodemanApp.prototype, {
         niceValue: parseInt(document.getElementById('appSettingsNiceValue').value) || 10,
       },
     };
+
+    // One-shot form read for _captureSettingsFormBaseline(): hand back what the form
+    // shows, before anything below is checked, stored, applied or sent.
+    if (this._readSettingsFormOnce === true) {
+      this._readSettingsFormOnce = false;
+      return settings;
+    }
 
     // SettingsUpdateSchema is .strict() and checks codexModel with this same
     // pattern, so one bad character 400s the WHOLE settings PUT while the toast
@@ -2678,6 +3032,14 @@ Object.assign(CodemanApp.prototype, {
     // Shortcut overrides are edited from the Shortcuts tab (not rebuilt from the
     // general-settings DOM), so the fresh rebuild would drop them on every save.
     if (_prev.shortcutOverrides !== undefined) settings.shortcutOverrides = _prev.shortcutOverrides;
+
+    // Multi-user mode, signed in as a non-admin: settings.json is one file for the whole
+    // server and PUT /api/settings answers 403 (system-routes.ts), so nothing is sent
+    // below. The per-device keys still save here exactly as before; every SYNCED key
+    // keeps the server's value, which the next page load would put back anyway, so this
+    // device never shows a server-wide change that did not happen.
+    const settingsReadOnly = this._settingsReadOnly();
+    const syncedChangeRefused = settingsReadOnly && this._keepServerSyncedSettings(settings, _prev);
 
     // Save to localStorage
     this.saveAppSettingsToStorage(settings);
@@ -2901,18 +3263,31 @@ Object.assign(CodemanApp.prototype, {
     let webhookError = '';
     let serverSaved = false;
     try {
-      const res = await this._apiPut('/api/settings', {
+      // A non-admin's save is not sent at all (see settingsReadOnly above): the server
+      // would refuse it with a 403, the plan-usage collection flip included.
+      const res = settingsReadOnly ? null : await this._apiPut('/api/settings', {
         ...serverSettings,
         ...(_chipFlip !== undefined ? { showPlanUsageLimits: _chipFlip } : {}),
         notificationPreferences: notifPrefsToSave,
         voiceSettings,
       });
 
+      // Multi-user mode, a non-admin whose role was not known when this save started
+      // (/api/me had not answered, or failed and admin-ui.js fell back to a single-user
+      // admin): the server refused the PUT as admin-only. End it the way a known non-admin's save
+      // ends: every synced key back to the server's value on this device, and the one admin
+      // toast below instead of "Settings saved". The page is read-only from here on.
+      const refusedAsNonAdmin = !settingsReadOnly && (await this._noteSettingsWriteRefusal(res));
+      if (refusedAsNonAdmin) {
+        this._keepServerSyncedSettings(settings, _prev);
+        this.saveAppSettingsToStorage(settings);
+      }
+
       // COD-55: the server refuses an unauthenticated public tunnel with a 403 — which
       // rejects the WHOLE settings PUT. Surface the message and revert the tunnel toggle
       // (in the UI + localStorage) so it doesn't look enabled. Other settings persisted
       // to localStorage above still apply locally.
-      if (settings.tunnelEnabled && (await this._handleTunnelEnableRefusal(res))) {
+      if (!refusedAsNonAdmin && settings.tunnelEnabled && (await this._handleTunnelEnableRefusal(res))) {
         settings.tunnelEnabled = false;
         this.saveAppSettingsToStorage(settings);
         const cb = document.getElementById('appSettingsTunnelEnabled');
@@ -2925,8 +3300,9 @@ Object.assign(CodemanApp.prototype, {
       // evidence the server kept the flags the Apply refresh below reads.
       serverSaved = !!res?.ok;
 
-      // Save model configuration separately
-      await this.saveModelConfigFromSettings();
+      // Save model configuration separately. For a non-admin it is not sent either, and the
+      // answer says whether this save would have changed it.
+      const modelConfigRefused = (await this.saveModelConfigFromSettings()) === true;
 
       // The webhook is server state in its own 0600 file (its URL is a secret, kept out of
       // settings.json), so like the model config above it is saved beside the settings PUT, not in
@@ -2935,12 +3311,18 @@ Object.assign(CodemanApp.prototype, {
       webhookError = this._webhookPending() ? await this.saveWebhook() : '';
       if (webhookError) {
         this.showToast(`Settings saved, but not the webhook: ${webhookError}`, 'warning');
+      } else if (syncedChangeRefused || modelConfigRefused || refusedAsNonAdmin) {
+        // ONE toast for the whole save, and only when the user really changed a server-wide
+        // setting: a non-admin saving a font size hears "Settings saved" as everyone does.
+        // A refused PUT always gets it: the server said this user is not an admin.
+        this.showToast('Saved on this device. Server-wide settings can only be changed by an admin.', 'warning');
       } else {
         this.showToast(keepOpen ? 'Settings applied' : 'Settings saved', 'success');
       }
 
-      // Show tunnel-specific feedback if toggled on
-      if (settings.tunnelEnabled) {
+      // Show tunnel-specific feedback if toggled on (never for a non-admin, whose save
+      // starts nothing: the box only shows what the server already has)
+      if (settings.tunnelEnabled && !settingsReadOnly && !refusedAsNonAdmin) {
         this.showToast('Tunnel starting — QR code will appear when ready...', 'info');
       }
     } catch (err) {
@@ -2966,13 +3348,156 @@ Object.assign(CodemanApp.prototype, {
     // gestureControlEnabled from settings.json), so a change only takes effect on
     // reload. Reload when it actually changed — the server PUT above already
     // persisted the new value.
-    if (settings.gestureControlEnabled !== _prevGestureEnabled) {
+    // `?? false`: a non-admin's save puts a synced key the server never stored back to
+    // absent (_keepServerSyncedSettings), and absent means off, as in _prevGestureEnabled.
+    if ((settings.gestureControlEnabled ?? false) !== _prevGestureEnabled) {
       this.showToast(
         settings.gestureControlEnabled ? 'Enabling gesture control — reloading…' : 'Disabling gesture control — reloading…',
         'info'
       );
       setTimeout(() => location.reload(), 400);
     }
+  },
+
+  /**
+   * True only for a signed-in NON-ADMIN in multi-user mode, where every server-wide settings
+   * write is refused with 403 FORBIDDEN (PUT /api/settings, PUT /api/execution/model-config and
+   * PUT /api/cases/order: settings.json is one file for the whole server). Single-user mode and
+   * admins answer false. Read at call time, because `window.__codemanUser` resolves after page
+   * load (admin-ui.js fetches /api/me). Also true once the server has refused one of these
+   * writes as admin-only on this page (_noteSettingsWriteRefusal): before /api/me answers, and
+   * after it failed (admin-ui.js then falls back to a single-user admin), the role alone reads
+   * as writable. Other modules call it as
+   * `this._settingsReadOnly?.()`, so a harness that loads one of them without this file reads
+   * it as writable, which is what an admin gets.
+   */
+  _settingsReadOnly() {
+    if (this._settingsWriteForbidden === true) return true;
+    // typeof guard: the load path calls this, and some vm harnesses define no `window`.
+    const me = (typeof window !== 'undefined' && window.__codemanUser) || {};
+    return !!(me.multiUser && me.role !== 'admin');
+  },
+
+  /**
+   * Whether `res` (a settings write's response) is the multi-user admin-only refusal: 403 with
+   * errorCode FORBIDDEN. The tunnel's no-password refusal is a 403 too, with another code, and
+   * is not this. When it is, the page reads as read-only from now on (_settingsReadOnly), so a
+   * write sent before the role was known is the last one. Reads a clone, so the caller can
+   * still read the body.
+   * @returns {Promise<boolean>}
+   */
+  async _noteSettingsWriteRefusal(res) {
+    if (!res || res.status !== 403) return false;
+    let body = null;
+    try {
+      body = await (typeof res.clone === 'function' ? res.clone() : res).json();
+    } catch {
+      return false;
+    }
+    if (body?.errorCode !== 'FORBIDDEN') return false;
+    this._settingsWriteForbidden = true;
+    return true;
+  },
+
+  /**
+   * Where a non-admin's OWN run mode and respawn presets live (multi-user mode). Both are keys of
+   * the server-wide settings.json, whose PUT is admin-only, so this user's picks are kept on this
+   * device under their name instead (_rememberOwnSetting) and put back over the server's on every
+   * page load (_applyOwnSettings): loadAppSettingsFromServer() writes the server's values into
+   * `codeman_runMode` and `codeman-respawn-presets` each time, which used to drop them on reload.
+   */
+  _ownSettingsKey() {
+    const me = (typeof window !== 'undefined' && window.__codemanUser) || {};
+    return `codeman:own-settings:${me.username || ''}`;
+  },
+
+  _readOwnSettings() {
+    try {
+      const own = JSON.parse(localStorage.getItem(this._ownSettingsKey()) || '{}');
+      return own && typeof own === 'object' && !Array.isArray(own) ? own : {};
+    } catch {
+      return {};
+    }
+  },
+
+  /** Keep a non-admin's own pick of a server-wide `key` on this device (see _ownSettingsKey). */
+  _rememberOwnSetting(key, value) {
+    try {
+      const own = this._readOwnSettings();
+      own[key] = value;
+      localStorage.setItem(this._ownSettingsKey(), JSON.stringify(own));
+    } catch {
+      /* storage unavailable: the pick lasts until the next page load */
+    }
+  },
+
+  /**
+   * A non-admin's own run mode and respawn presets win over the server's (see _ownSettingsKey).
+   * Called after the server's values are applied at load, and again on `codeman:me`, because the
+   * role can resolve either side of that load. A no-op for admins and single-user mode.
+   */
+  _applyOwnSettings() {
+    if (!this._settingsReadOnly()) return;
+    const own = this._readOwnSettings();
+    if (Array.isArray(own.respawnPresets)) {
+      this._serverRespawnPresets = own.respawnPresets;
+      try { localStorage.setItem('codeman-respawn-presets', JSON.stringify(own.respawnPresets)); } catch {}
+    }
+    if (typeof own.runMode === 'string' && own.runMode) {
+      this.runMode = own.runMode;
+      try { localStorage.setItem('codeman_runMode', own.runMode); } catch {}
+      this._applyRunMode?.();
+    }
+  },
+
+  /**
+   * What the App Settings form showed when it opened, read the way saveAppSettings() reads it
+   * (its one-shot `_readSettingsFormOnce` form read), so a non-admin's save can tell whether the
+   * user changed a SYNCED setting. The stored blob cannot answer that: a key no admin has ever
+   * saved is absent from it while the form shows the default, which would read as a change on
+   * every save. Taken only for a non-admin; nobody else's save asks for it.
+   */
+  _captureSettingsFormBaseline() {
+    this._settingsFormBaseline = null;
+    if (!this._settingsReadOnly()) return;
+    this._readSettingsFormOnce = true;
+    let pending;
+    try {
+      pending = this.saveAppSettings();
+    } finally {
+      // Consumed by the read itself; cleared here too in case it threw before reaching it.
+      this._readSettingsFormOnce = false;
+    }
+    Promise.resolve(pending)
+      .then((form) => {
+        this._settingsFormBaseline = form && typeof form === 'object' ? form : null;
+      })
+      .catch(() => {});
+  },
+
+  /**
+   * A non-admin's save in multi-user mode (saveAppSettings): put every SYNCED key of `settings`
+   * back to the value this device last had from the server (`prev`; deleted when it had none),
+   * and answer whether the form changed one since it opened. Synced means outside the per-device
+   * `displayKeys` merge policy of loadAppSettingsFromServer() (_displaySettingKeySet(), the one
+   * list both read): those are the keys the server's settings.json overwrites on every page load.
+   * A per-device key is left exactly as the user set it.
+   * @returns {boolean} true when the user changed at least one synced setting
+   */
+  _keepServerSyncedSettings(settings, prev) {
+    const displayKeys = this._displaySettingKeySet();
+    // Without a baseline (the form was read before the role was known) the stored blob stands
+    // in, and a key it lacks is not counted: no toast is better than one on every save.
+    const baseline = this._settingsFormBaseline || prev || {};
+    let changed = false;
+    for (const key of Object.keys(settings)) {
+      // shortcutOverrides is carried over from `prev` already and never comes from the form.
+      if (displayKeys.has(key) || key === 'shortcutOverrides') continue;
+      if (key in baseline && JSON.stringify(settings[key]) !== JSON.stringify(baseline[key])) changed = true;
+      if (prev && key in prev) settings[key] = prev[key];
+      else delete settings[key];
+    }
+    return changed;
   },
 
   /**
@@ -3025,10 +3550,12 @@ Object.assign(CodemanApp.prototype, {
     } catch (err) {
       console.warn('Failed to load model config:', err);
     }
+    // What the form shows now, so a non-admin's save can tell whether it was changed.
+    this._modelConfigBaseline = JSON.stringify(this._modelConfigFromSettingsForm());
   },
 
-  // Save model configuration from settings modal to server
-  async saveModelConfigFromSettings() {
+  /** The model configuration as the settings modal's form shows it (the PUT body). */
+  _modelConfigFromSettingsForm() {
     const defaultModelEl = document.getElementById('appSettingsDefaultModel');
     const showRecsEl = document.getElementById('appSettingsShowModelRecommendations');
     const exploreEl = document.getElementById('appSettingsModelExplore');
@@ -3042,11 +3569,26 @@ Object.assign(CodemanApp.prototype, {
     if (testEl?.value) agentTypeOverrides.test = testEl.value;
     if (reviewEl?.value) agentTypeOverrides.review = reviewEl.value;
 
-    const config = {
+    return {
       defaultModel: defaultModelEl?.value || '',
       showRecommendations: showRecsEl?.checked ?? true,
       agentTypeOverrides,
     };
+  },
+
+  /**
+   * Save model configuration from settings modal to server.
+   * @returns {Promise<boolean|undefined>} true only when a non-admin in multi-user mode changed it:
+   *   the config is a key of the server-wide settings.json and its PUT is admin-only (403), so it is
+   *   not sent, and saveAppSettings() folds this into its one admin-only toast
+   */
+  async saveModelConfigFromSettings() {
+    const config = this._modelConfigFromSettingsForm();
+
+    if (this._settingsReadOnly()) {
+      const baseline = this._modelConfigBaseline;
+      return typeof baseline === 'string' && JSON.stringify(config) !== baseline;
+    }
 
     try {
       await fetch('/api/execution/model-config', {
@@ -4333,6 +4875,37 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  /**
+   * The per-device DISPLAY keys. They are device-specific (mobile vs desktop) and must not be
+   * synced from the server, to avoid overriding mobile defaults: loadAppSettingsFromServer()
+   * seeds one from the server only when this device has no value for it. A non-admin's save in
+   * multi-user mode reads the same split (_keepServerSyncedSettings()), so the list lives here,
+   * once, and is there even when GET /api/settings failed at load.
+   * NOTE: Feature toggles (subagentTrackingEnabled, imageWatcherEnabled, ralphTrackerEnabled)
+   * are NOT display keys: they control server-side behavior and must sync from server.
+   */
+  _displaySettingKeySet() {
+    const displayKeys = new Set([
+      'showFontControls', 'showSystemStats', 'headerStatsStyle', 'showTokenCount', 'showCost',
+      'showLifecycleLog', 'showResponseViewer', 'showRedrawButton',
+      'showMonitor', 'showProjectInsights', 'showFileBrowser', 'showSubagents',
+      'subagentActiveTabOnly', 'tabTwoRows', 'showTabCliLogos', 'tabOrientation', 'tabRailWidth', 'tabRailDetail', 'tabRailSort', 'tabArrangement', 'tabStateOrder', 'sessionListLayout', 'sessionSidebarFontSize', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',
+      'skin', 'showPlanUsageLimits', 'showAttachmentsButton', 'showFileViewerButton', 'webglRendererEnabled',
+      'terminalFontFamily', 'terminalFontWeight', 'terminalFontWeightBold',
+      'language',
+      'terminalWheelLocalScrollback',
+      'autoCopySelection', 'copyStripMargin',
+      'showSessionButton', 'showAwayDigestButton', 'showCronButton', 'showGitStatus', 'gitStatusTree', 'gitStatusMaxRepos', 'gitStatusTimeoutSeconds', 'showEditHistory',
+      'showTabDetachButton',
+      'mobileOverviewEnabled',
+      'sessionLineageLines',
+      'showSplitButton',
+      'showTileGridButton',
+      'tileDetachEnabled',
+    ]);
+    return displayKeys;
+  },
+
   async loadAppSettingsFromServer(settingsPromise = null) {
     // One-time migration: showPlanUsageLimits became a per-device display setting.
     // Before this, it synced from the server, so the (separate) mobile settings blob
@@ -4358,28 +4931,9 @@ Object.assign(CodemanApp.prototype, {
       if (settings) {
         // Extract notification prefs before merging app settings
         const { notificationPreferences, voiceSettings, respawnPresets, runMode, ...appSettings } = settings;
-        // Filter out display settings — these are device-specific (mobile vs desktop)
-        // and should not be synced from the server to avoid overriding mobile defaults.
-        // NOTE: Feature toggles (subagentTrackingEnabled, imageWatcherEnabled, ralphTrackerEnabled)
-        // are NOT display keys — they control server-side behavior and must sync from server.
-        const displayKeys = new Set([
-          'showFontControls', 'showSystemStats', 'headerStatsStyle', 'showTokenCount', 'showCost',
-          'showLifecycleLog', 'showResponseViewer', 'showRedrawButton',
-          'showMonitor', 'showProjectInsights', 'showFileBrowser', 'showSubagents',
-          'subagentActiveTabOnly', 'tabTwoRows', 'showTabCliLogos', 'tabOrientation', 'tabRailWidth', 'tabRailDetail', 'tabRailSort', 'tabArrangement', 'tabStateOrder', 'sessionListLayout', 'sessionSidebarFontSize', 'localEchoEnabled', 'cjkInputEnabled', 'extendedKeyboardBar',
-          'skin', 'showPlanUsageLimits', 'showAttachmentsButton', 'showFileViewerButton', 'webglRendererEnabled',
-          'terminalFontFamily', 'terminalFontWeight', 'terminalFontWeightBold',
-          'language',
-          'terminalWheelLocalScrollback',
-          'autoCopySelection', 'copyStripMargin',
-          'showSessionButton', 'showAwayDigestButton', 'showCronButton', 'showGitStatus', 'gitStatusTree', 'gitStatusMaxRepos', 'gitStatusTimeoutSeconds', 'showEditHistory',
-          'showTabDetachButton',
-          'mobileOverviewEnabled',
-          'sessionLineageLines',
-          'showSplitButton',
-          'showTileGridButton',
-          'tileDetachEnabled',
-        ]);
+        // Display settings are device-specific (mobile vs desktop) and must not be synced
+        // from the server: see _displaySettingKeySet().
+        const displayKeys = this._displaySettingKeySet();
         // The plan-usage chip is a PER-DEVICE display setting (desktop default ON,
         // handheld default OFF): desktop can show it while mobile stays hidden. Drop
         // the server's stored value here so it is NEVER seeded into a device that
@@ -4430,14 +4984,17 @@ Object.assign(CodemanApp.prototype, {
           this._serverRespawnPresets = respawnPresets;
           // Also update localStorage for offline access
           localStorage.setItem('codeman-respawn-presets', JSON.stringify(respawnPresets));
-        } else {
-          // Migration: push existing localStorage presets to server
+        } else if (!this._settingsReadOnly()) {
+          // Migration: push existing localStorage presets to server. Not for a non-admin in
+          // multi-user mode: the presets are a server-wide setting there (admin-only PUT).
           const localPresets = localStorage.getItem('codeman-respawn-presets');
           if (localPresets) {
             const parsed = JSON.parse(localPresets);
             if (parsed.length > 0) {
               this._serverRespawnPresets = parsed;
-              this._apiPut('/api/settings', { respawnPresets: parsed }).catch(() => {});
+              this._apiPut('/api/settings', { respawnPresets: parsed })
+                .then((res) => this._noteSettingsWriteRefusal(res))
+                .catch(() => {});
             }
           }
         }
@@ -4448,6 +5005,10 @@ Object.assign(CodemanApp.prototype, {
           try { localStorage.setItem('codeman_runMode', runMode); } catch {}
           this._applyRunMode();
         }
+
+        // Multi-user non-admin: their own run mode and presets, kept on this device, win over
+        // the server's just applied (no-op otherwise; `codeman:me` below covers a late role).
+        this._applyOwnSettings();
 
         return merged;
       }
@@ -4725,6 +5286,14 @@ Object.assign(CodemanApp.prototype, {
       this.showToast?.('Shortcut must include Ctrl, Cmd, or Alt', 'error');
       return;
     }
+    // Refuse a chord something else already owns: the registry dispatches the first match,
+    // so a duplicate would silently take over (or lose to) the other action.
+    const taken = this.findShortcutConflict(e, shortcutId);
+    if (taken) {
+      this.renderShortcutSettingsList();
+      this.showToast?.(`${this.describeShortcutEvent(e)} is already used by ${taken}`, 'error');
+      return;
+    }
     const modifiers = [];
     if (e.ctrlKey) modifiers.push('ctrl');
     if (e.metaKey) modifiers.push('meta');
@@ -4741,7 +5310,72 @@ Object.assign(CodemanApp.prototype, {
     this.renderShortcutSettingsList();
   },
 
+  /** Label of the action that already owns the chord in `e`, or '' when it is free. */
+  findShortcutConflict(e, shortcutId) {
+    // Chords the keydown handlers claim before (or outside) the registry: they are fixed, so a
+    // rebind onto one of them would be dead or would hijack it. Alt+1-9 switch tabs by index
+    // (the document handler does not exclude Cmd); Ctrl/Shift+Enter insert a newline and
+    // Ctrl/Cmd+V pastes, and the user-bound gate sits above those branches in the xterm handler.
+    if (e.altKey && !e.ctrlKey && !e.shiftKey && /^Digit[1-9]$/.test(e.code || '')) {
+      return 'Switch to Tab N';
+    }
+    // (Alt+Shift+Enter is the tile grid's Zoom chord, a registry entry, so Alt stays free.
+    // Downstream: so is Ctrl+Shift+Enter, Compose Prompt's default; the xterm handler lets
+    // it through to the registry before its newline branch.)
+    if (e.key === 'Enter' && !e.altKey && e.ctrlKey !== e.shiftKey) return 'Insert Newline';
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && String(e.key).toLowerCase() === 'v') return 'Paste';
+    if (typeof this.getShortcutRegistry !== 'function' || typeof this.matchesShortcutEvent !== 'function') return '';
+    const other = this.getShortcutRegistry().find(
+      (shortcut) =>
+        shortcut.id !== shortcutId && !shortcut.disabled && Array.isArray(shortcut.bindings) && this.matchesShortcutEvent(e, shortcut)
+    );
+    return other ? other.label : '';
+  },
+
+  /**
+   * Label of the action that already owns a chord in `shortcut`'s bindings, or ''. Used when a
+   * binding comes back without a capture (re-enable, Reset), where the chord may have been
+   * given to another action in the meantime.
+   */
+  findShortcutBindingConflict(shortcut) {
+    for (const binding of shortcut?.bindings || []) {
+      const mods = binding.modifiers || [];
+      const taken = this.findShortcutConflict(
+        {
+          ctrlKey: mods.includes('ctrl'),
+          metaKey: mods.includes('meta'),
+          shiftKey: mods.includes('shift'),
+          altKey: mods.includes('alt'),
+          key: binding.key || '',
+          code: binding.code || '',
+        },
+        shortcut.id
+      );
+      if (taken) return taken;
+    }
+    return '';
+  },
+
+  describeShortcutEvent(e) {
+    const parts = [];
+    if (e.ctrlKey) parts.push('Ctrl');
+    if (e.metaKey) parts.push('Meta');
+    if (e.shiftKey) parts.push('Shift');
+    if (e.altKey) parts.push('Alt');
+    parts.push(e.key && e.key.length === 1 ? e.key.toUpperCase() : e.key || e.code);
+    return parts.join('+');
+  },
+
   resetShortcutOverride(shortcutId) {
+    // Reset puts the default chord back (and re-enables the row): refuse when another action
+    // has taken that chord since, instead of leaving two actions on one key.
+    const fallback = typeof DEFAULT_SHORTCUTS !== 'undefined' ? DEFAULT_SHORTCUTS.find((d) => d.id === shortcutId) : null;
+    const taken = fallback ? this.findShortcutBindingConflict(fallback) : '';
+    if (taken) {
+      this.renderShortcutSettingsList();
+      this.showToast?.(`The default chord is already used by ${taken}`, 'error');
+      return;
+    }
     const settings = this.loadAppSettingsFromStorage();
     const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
     delete shortcutOverrides[shortcutId];
@@ -4751,6 +5385,17 @@ Object.assign(CodemanApp.prototype, {
   },
 
   toggleShortcutEnabled(shortcutId, enabled) {
+    if (enabled) {
+      // Re-enabling brings the row's chord back into play: leave it disabled when another action
+      // has been bound to that chord while it was off.
+      const shortcut = this.getShortcutRegistry?.().find((s) => s.id === shortcutId);
+      const taken = this.findShortcutBindingConflict(shortcut);
+      if (taken) {
+        this.renderShortcutSettingsList();
+        this.showToast?.(`Its chord is already used by ${taken}`, 'error');
+        return;
+      }
+    }
     const settings = this.loadAppSettingsFromStorage();
     const shortcutOverrides = { ...(settings.shortcutOverrides || {}) };
     shortcutOverrides[shortcutId] = { ...(shortcutOverrides[shortcutId] || {}), disabled: !enabled };
@@ -4783,6 +5428,9 @@ Object.assign(CodemanApp.prototype, {
 // all, and a module-level statement that throws there fails the whole file's
 // evaluation, not just this feature.
 document.addEventListener?.('codeman:me', () => {
+  // A non-admin's own run mode and respawn presets (multi-user mode) win over the server's,
+  // which the settings load may already have applied before the role was known.
+  window.app?._applyOwnSettings?.();
   window.app?._applyCustomModelAdminGate?.();
   window.app?._applyCliManagementAdminGate?.();
   window.app?._applyMcpSyncAdminGate?.();

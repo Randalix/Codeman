@@ -29,6 +29,7 @@ import { getLifecycleLog } from '../session-lifecycle-log.js';
 import { fileStreamManager } from '../file-stream-manager.js';
 import { sessionWaits } from './session-wait-registry.js';
 import { approvalInbox } from './approval-inbox.js';
+import { raiseScreenBlocked, clearScreenBlocked } from './screen-blocked.js';
 import { composeAutoSessionName, deriveAutoSessionName } from '../session-auto-name.js';
 import { MAX_SESSION_NAME_LENGTH } from '../config/terminal-limits.js';
 import { turnWatch } from './agent-watch.js';
@@ -45,6 +46,7 @@ export interface SessionListenerRefs {
   working: () => void;
   idle: () => void;
   watchingChanged: () => void;
+  blockedChanged: (blocked: boolean, frame: string | null) => void;
   displayModelChanged: () => void;
   turnEnded: () => void;
   taskCreated: (task: BackgroundTask) => void;
@@ -97,6 +99,12 @@ interface SessionListenerDeps {
   refreshRemoteModel(session: Session): void;
   /** A remote claude's edit history, read at each turn end (no hooks reach back from a remote host). */
   refreshEditHistory(session: Session): void;
+  /**
+   * Re-evaluate the prompt-cache keep-warm when the session goes idle: a turn just ended
+   * (its cache report may already be in), and after a restart this is the first moment the
+   * recovered pane is attached, so the restored report can arm its timer.
+   */
+  keepWarmSchedule?(sessionId: string): void;
 }
 
 /**
@@ -104,6 +112,8 @@ interface SessionListenerDeps {
  * Call `attachSessionListeners()` after to wire them to the session.
  */
 export function createSessionListeners(session: Session, deps: SessionListenerDeps): SessionListenerRefs {
+  /** The Approvals Inbox item the session's last screen-read dialog opened (see blockedChanged). */
+  let screenBlockedItemId: string | null = null;
   return {
     // ─── Terminal Output ─────────────────────────────────────
 
@@ -236,7 +246,8 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       // kind: `working` is heuristic and can flap mid-turn, so clearing a
       // pending permission/question dialog on the signal ALONE would
       // false-clear real approvals.
-      approvalInbox.resolveForSession(session.id, 'resolved_in_terminal', ['idle']);
+      // Not for Codeman's own keep-alive turn: only a human spends an idle alert.
+      if (!session.keepAliveTurnActive) approvalInbox.resolveForSession(session.id, 'resolved_in_terminal', ['idle']);
       // A permission/question dialog gets the pane-VERIFIED variant instead:
       // the signal only decides when to look, `verifyStillAnswerable` re-reads
       // the screen and resolves only when the dialog is really gone. Without
@@ -246,7 +257,11 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
       // open. `stop` was the first thing to clear it, which on a long turn is
       // minutes away.
       approvalInbox.resolveIfDialogGone(session.id);
-      deps.broadcast(SseEvent.SessionWorking, { id: session.id });
+      // `keepAlive` tells the page this turn is Codeman's own keep-alive (stuck detection ignores it).
+      deps.broadcast(SseEvent.SessionWorking, {
+        id: session.id,
+        ...(session.keepAliveTurnActive && { keepAlive: true }),
+      });
       // Full state ride-along: the home screens sort the running group on
       // lastSubmitAt, and without this the browser keeps the stamp it loaded
       // with (a turn started after page load ranks by the PREVIOUS turn's
@@ -273,8 +288,9 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
     /** Broadcasts `session:idle` — Claude finished processing, waiting for input */
     idle: () => {
       sessionWaits.notifySignal(session.id, 'idle');
-      deps.broadcast(SseEvent.SessionIdle, { id: session.id });
+      deps.broadcast(SseEvent.SessionIdle, { id: session.id, ...(session.keepAliveTurnActive && { keepAlive: true }) });
       deps.broadcastSessionStateDebounced(session.id);
+      deps.keepWarmSchedule?.(session.id);
       const tracker = deps.getRunSummaryTracker(session.id);
       if (tracker) {
         tracker.recordIdle();
@@ -291,6 +307,21 @@ export function createSessionListeners(session: Session, deps: SessionListenerDe
      */
     watchingChanged: () => {
       deps.broadcastSessionStateDebounced(session.id);
+    },
+
+    /**
+     * The pane started or stopped showing a dialog its CLI is blocked on, read off the
+     * screen for a CLI with no hook to report it (`capabilities.workDetect.blockedLine`:
+     * codex). Raised as a Claude `permission_prompt` hook would be, alert-only, and
+     * cleared by resolving the item it opened; web/screen-blocked.ts has the rules.
+     */
+    blockedChanged: (blocked: boolean, frame: string | null) => {
+      if (blocked) {
+        screenBlockedItemId = raiseScreenBlocked(session, deps, frame);
+      } else {
+        clearScreenBlocked(session.id, screenBlockedItemId);
+        screenBlockedItemId = null;
+      }
     },
 
     /**
@@ -536,6 +567,7 @@ export function attachSessionListeners(session: Session, refs: SessionListenerRe
   session.on('working', refs.working);
   session.on('idle', refs.idle);
   session.on('watchingChanged', refs.watchingChanged);
+  session.on('blockedChanged', refs.blockedChanged);
   session.on('displayModelChanged', refs.displayModelChanged);
   session.on('turnEnded', refs.turnEnded);
   session.on('taskCreated', refs.taskCreated);
@@ -575,6 +607,7 @@ export function detachSessionListeners(session: Session, refs: SessionListenerRe
   session.off('working', refs.working);
   session.off('idle', refs.idle);
   session.off('watchingChanged', refs.watchingChanged);
+  session.off('blockedChanged', refs.blockedChanged);
   session.off('displayModelChanged', refs.displayModelChanged);
   session.off('turnEnded', refs.turnEnded);
   session.off('taskCreated', refs.taskCreated);

@@ -27,6 +27,11 @@ stream rather than server memory). Sensitive paths (`.env`, anything
 matching credentials, `~/.ssh`, AWS credentials) are blocked from download, and SVG and HTML
 are served as downloads rather than rendered, so they cannot execute in the page.
 
+The preview window has **Back** and **Forward** buttons (also `Alt+←` and `Alt+→`) once you
+have opened a second file, so a link into another document is no longer one way. **Expand**
+fills the screen and is remembered per device, and the corner grip resizes the window. On a
+phone the window is always full screen, so Expand and the grip are hidden there.
+
 Closing the preview pauses and unloads any playing media. A video that keeps playing after
 you close the panel means you are on an old version.
 
@@ -84,7 +89,8 @@ File paths in a session are links. That works in two places:
 
 - **In the terminal**, on any absolute path an agent prints.
 - **In the response viewer**, where paths are usually written as prose or in backticks. They
-  render as underlined monospace links.
+  render as underlined monospace links. A Markdown link whose target is a path
+  (`[report](/tmp/run/report.json)`, the way Codex cites files) opens the same way.
 
 Clicking one opens it in the preview: images and PDFs render, video and audio play with a
 working scrub bar, documents convert, text shows inline, Markdown renders and HTML opens as a
@@ -168,17 +174,41 @@ blocks sensitive trees. In multi-user mode a non-admin gets only their own user 
 root, because per-user spaces live inside the home directory and a home-directory root would
 expose everyone.
 
-## Images into a session
+## Files into a session
 
-Paste from the clipboard or drag and drop straight onto the terminal. The image is written
+Paste from the clipboard or drag and drop straight onto the terminal. The file is written
 where the agent can read it and the reference is inserted into your prompt. On a phone, the
-toolbar's Attach button opens the camera or photo library, videos included, and puts the path
-on your prompt, where it behaves like text you typed; the Image button inside the Compose
-editor does the same into the editor. Dropping a video onto the terminal works the same way.
+toolbar's Attach button opens the camera, photo library or files, and puts the path on your
+prompt, where it behaves like text you typed; the Attach button inside the Compose editor
+does the same into the editor. Dropping a video or a document onto the terminal works the
+same way.
 
-HEIC images from an iPhone are converted to JPEG on the way in.
-Videos (mp4, webm, mov, m4v, ogv) are stored as recorded, up to 1 GB each by default
-(`CODEMAN_MAX_PASTE_VIDEO_BYTES`); they stream to disk rather than through server memory.
+Images (png, jpg, gif, webp, bmp, heic) are re-encoded on the device before they go up (a GIF
+goes as is, so it keeps its frames), and HEIC from an iPhone is converted to JPEG. Videos (mp4, webm, mov, m4v, ogv) are stored as recorded,
+up to 1 GB each by default (`CODEMAN_MAX_PASTE_VIDEO_BYTES`); they stream to disk rather than
+through server memory. Documents are the office formats (pdf, docx, pptx, xlsx, zip) and the
+text family (txt, md, csv, tsv, json, log, yaml, yml, xml). Each is checked on the way in,
+against its file signature for the binary formats and against its encoding for text (UTF-8,
+no NUL bytes), so a script renamed to `.pdf` is refused while a `.txt` can hold any text at
+all. A text file in another encoding is refused with a message saying it is not UTF-8 (or that
+it is UTF-16, which Excel's "Unicode Text" and Notepad's "Unicode" produce); save it as UTF-8
+(in Excel, "CSV UTF-8") and attach it again. Files with script or page extensions (sh, py,
+js, html) are not accepted, since a prompt upload is something for the agent to read, not
+something for Codeman to store and serve. A document keeps a trimmed copy of its original
+name, letters, digits, dot, dash and underscore with anything else turned into a dash, so
+`Q3 report.pdf` is findable as `paste-<time>-<id>-Q3-report.pdf`; a name made entirely of
+other characters saves without one. Uploads are refused for remote (SSH) sessions, whose
+working directory is on the other host.
+
+Uploads land in `.codeman-uploads/` inside the case, next to the code the agent is working
+on, because that is the one path a local agent and a Docker case (whose workspace is mounted
+at the same absolute path) both see the same way. The first upload writes a `.gitignore` of `*` into `.codeman-uploads/`, so the
+directory ignores itself and your repository never picks the files up, while your own ignore file is
+left alone; a `.gitignore` you already had there is never overwritten. Files older than seven
+days are swept hourly, and the directory goes when the last session of the case is closed (a
+session that is only detached keeps it). Earlier releases wrote to `.claude-images/`; that
+directory is still swept and cleaned up the same way for one release so a case in use before
+the move is not left with stray files.
 
 ## Generated artifacts
 

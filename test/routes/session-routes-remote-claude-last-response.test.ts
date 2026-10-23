@@ -15,6 +15,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
+import { TEST_HOME_PREFIX } from '../mocks/test-helpers.js';
 import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
 import type { SessionRemote } from '../../src/types/session.js';
 
@@ -54,7 +55,8 @@ describe('GET /api/sessions/:id/last-response — remote claude session', () => 
   let previousHome: string | undefined;
 
   beforeEach(async () => {
-    testHome = mkdtempSync(join(tmpdir(), 'codeman-remote-rv-'));
+    // Named like test/setup.ts's HOME: the shared harness refuses any other (assertSandboxedHome).
+    testHome = mkdtempSync(join(tmpdir(), `${TEST_HOME_PREFIX}remote-rv-`));
     previousHome = process.env.HOME;
     process.env.HOME = testHome;
     harness = await createRouteTestHarness(registerSessionRoutes);

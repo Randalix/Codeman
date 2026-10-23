@@ -8,7 +8,7 @@
  * - SessionConfig — creation-time config (id, workingDir, createdAt)
  * - SessionOutput — captured stdout/stderr/exitCode
  * - SessionStatus — 'idle' | 'busy' | 'stopped' | 'error'
- * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' (which CLI backend)
+ * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot' (which CLI backend)
  * - ClaudeMode — CLI permission mode ('dangerously-skip-permissions' | 'auto' | 'normal' | 'allowedTools')
  * - SessionColor — visual differentiation color
  * - OpenCodeConfig — OpenCode-specific settings (model, autoAllowTools, continueSession)
@@ -17,6 +17,7 @@
  * - AntigravityConfig — Antigravity CLI (agy) settings (model, dangerouslySkipPermissions, resumeConversationId)
  * - PiConfig — Pi CLI (pi.dev) settings (model, provider, thinking, resume/continue, project trust)
  * - GrokConfig — Grok Build CLI (xAI `grok`) settings (model, alwaysApprove, resume/continue)
+ * - CopilotConfig — GitHub Copilot CLI settings (model, allowAll, resume/continue)
  * - DeepSeekConfig — DeepSeek Harness (`dsh`) settings (profile, permissionMode, resume, status bridge)
  *
  * Cross-domain relationships:
@@ -56,7 +57,8 @@ export type SessionMode =
   | 'pi'
   | 'grok'
   | 'deepseek'
-  | 'omp';
+  | 'omp'
+  | 'copilot';
 
 /**
  * Who owns a session's name. `placeholder`: Codeman's own `w<n>-<case>` (or no
@@ -78,7 +80,7 @@ export interface SessionWriteOptions {
 
 export type RemoteCommandMode = Extract<
   SessionMode,
-  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp'
+  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot'
 >;
 
 /**
@@ -222,7 +224,7 @@ export interface RemoteSessionInfo {
 /** Which CLI backends a Docker case can run (same set as remote). */
 export type DockerCommandMode = Extract<
   SessionMode,
-  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp'
+  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot'
 >;
 
 /** Container engine. Docker and Podman differ in the uid/userns + host-gateway alias. */
@@ -535,6 +537,32 @@ export interface GrokConfig {
 }
 
 /**
+ * GitHub Copilot CLI (`copilot`) session configuration.
+ *
+ * Copilot asks before running tools ("Manual Approval") and before touching paths
+ * outside the trusted folder. `--yolo` is its allow-all switch (tools, paths and URLs),
+ * the one the Run button opts into like the other agent CLIs' bypass switches. Verified
+ * against copilot 1.0.94.
+ */
+export interface CopilotConfig {
+  /** Model ID passed via --model (e.g. "claude-sonnet-5.5", or "auto"). */
+  model?: string;
+  /**
+   * Allow every tool, path and URL without asking (passes --yolo). Absent = Copilot's own
+   * Manual Approval mode. Multi-user: forced off for non-granted owners by the only-if-sent
+   * clamp branch, like codex/antigravity/grok.
+   */
+  allowAll?: boolean;
+  /** Resume the most recent session (--continue). Skipped when resumeSessionId is set. */
+  continueSession?: boolean;
+  /**
+   * Resume a specific session (--resume <value>): an id, id prefix or session name, as ONE plain word
+   * starting with a letter or digit (a leading `-` would make the value its own flag).
+   */
+  resumeSessionId?: string;
+}
+
+/**
  * DeepSeek Harness (`dsh`) session configuration.
  *
  * Two things make this config shaped unlike every sibling above it.
@@ -778,6 +806,33 @@ export interface PromptCacheStatus {
  */
 export type StatusLineExporter = 'injected' | 'collection-off' | 'workspace-statusline' | 'remote';
 
+/**
+ * What the prompt-cache keep-warm (`prompt-cache-keepwarm.ts`) is doing for a session, for
+ * the Session Options readout. Ephemeral: published through `toState()` and the
+ * `session:keepWarm` event, never restored.
+ */
+export interface KeepWarmStatus {
+  /** Effective opt-in: the session's own flag, else the app-wide default (see `keepWarmOn`). */
+  enabled: boolean;
+  /**
+   * Whether this launch carries `idleCompaction: false` (`MuxSession.idleCompactionOff`). False
+   * on a session switched on after launch: Claude Code's own idle compaction may still run
+   * until its next launch.
+   */
+  idleCompactionOff: boolean;
+  /** `armed` = waiting for the due time, `waiting` = due but deferred by a guard, `nudged` = sent, waiting for the next cache report. */
+  state: 'off' | 'armed' | 'waiting' | 'nudged' | 'stopped';
+  /** Next evaluation, epoch ms (armed, waiting, nudged). */
+  nextCheckAt?: number;
+  /** Why it is waiting or stopped, in words. */
+  reason?: string;
+  /** Nudges sent this session so far. */
+  nudges: number;
+  lastNudgeAt?: number;
+  /** When the keep-warm window after the last real prompt closes, epoch ms. */
+  budgetEndsAt?: number;
+}
+
 export interface SessionState {
   /** Unique session identifier */
   id: string;
@@ -800,7 +855,9 @@ export interface SessionState {
    *
    * ⚠️ UI DECORATION ONLY — it draws the lineage lines between tabs. It is never an
    * ownership, permission, or lifecycle signal: a child outlives its parent, and an
-   * unresolvable value is dropped rather than failing the spawn.
+   * unresolvable value is dropped rather than failing the spawn. Its one non-visual reader
+   * picks a default, nothing more: a session an agent spawned does not inherit the app-wide
+   * prompt-cache keep-warm default (`keepWarmOn`), though its own switch still works.
    */
   parentSessionId?: string;
   /** ID of currently assigned task, null if none */
@@ -839,6 +896,10 @@ export interface SessionState {
   promptCache?: PromptCacheStatus;
   /** Why a cache report will or will not arrive (see `StatusLineExporter`); absent when unknown. */
   statusLineExporter?: StatusLineExporter;
+  /** Prompt-cache keep-warm opt-in; absent = follow the app-wide `promptCacheKeepWarm` default. */
+  keepWarmEnabled?: boolean;
+  /** What the keep-warm is doing right now; ephemeral, never restored. */
+  keepWarm?: KeepWarmStatus;
   /** Pinned to the top of the session manager list (COD-139) */
   pinned?: boolean;
   /** When the session was pinned (epoch ms) — orders the pinned group, most-recent-first */
@@ -902,6 +963,8 @@ export interface SessionState {
   piConfig?: PiConfig;
   /** Grok-specific configuration (only for mode === 'grok') */
   grokConfig?: GrokConfig;
+  /** GitHub Copilot CLI configuration (only for mode === 'copilot') */
+  copilotConfig?: CopilotConfig;
   /** DeepSeek Harness configuration (only for mode === 'deepseek') */
   deepSeekConfig?: DeepSeekConfig;
   /** OMP-specific configuration (only for mode === 'omp') */
@@ -951,6 +1014,13 @@ export interface SessionState {
    * again until the pane's own Enter is known.
    */
   lastSubmitAt?: number;
+  /**
+   * Wall-clock ms of the last submit that was NOT the prompt-cache keep-alive
+   * (Session.lastRealPromptAt): the keep-warm cap's clock. Persisted so a restart
+   * does not reopen the window, which `lastSubmitAt` cannot do since every nudge
+   * moves it.
+   */
+  lastRealPromptAt?: number;
   /**
    * Claude conversations this pane has been on, oldest first, current last.
    * Written ONLY from a first-hand `UserPromptSubmit`/`Stop` hook payload —

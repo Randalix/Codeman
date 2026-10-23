@@ -29,6 +29,7 @@ import {
   ClonePreflightSchema,
   LinkCaseSchema,
   CaseOrderSchema,
+  CaseDefaultGroupSchema,
   RemoteCaseLinkSchema,
   RemoteHostSchema,
   DockerCaseLinkSchema,
@@ -51,7 +52,7 @@ import {
 import type { GitRemoteProbe, GitUrlParse } from '../../git-clone.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { prepareNewCasePath } from '../case-path.js';
-import { boundedPathExists, describeUnknownPath, probePath } from '../../utils/index.js';
+import { boundedPathExists, describeUnknownPath, probePath, probePathKind } from '../../utils/index.js';
 import { readAgentCaseMarker, type AgentCaseMarker } from '../../agent-case-marker.js';
 import { settingsWriteBlocker, writeHooksConfig } from '../../hooks-config.js';
 import {
@@ -60,6 +61,7 @@ import {
   isAdmin,
   isWorkingDirAllowed,
   ownerFor,
+  requireAdmin,
   resolveCasesDir,
   SETTINGS_PATH,
   validatePathWithinBase,
@@ -69,7 +71,9 @@ import {
 import { isMultiUserMode } from '../../config/multiuser.js';
 import type { AuthUser } from '../../types.js';
 import { SseEvent } from '../sse-events.js';
-import type { EventPort, ConfigPort, SessionPort } from '../ports/index.js';
+import type { EventPort, ConfigPort, SessionPort, TabLayoutPort } from '../ports/index.js';
+import { ownerLayoutKey } from '../../tab-layout-persistence.js';
+import { TabLayoutValidationError } from '../../tab-layout.js';
 import type { FastifyRequest } from 'fastify';
 import { dataPath, getDataDir } from '../../config/instance.js';
 import {
@@ -248,9 +252,32 @@ async function ensureCaseImage(
   return { ok: true, imageBuilding: true };
 }
 
+/**
+ * Is `name` a case the caller can see (the same rules as GET /api/cases and
+ * resolveCasePath): an owned remote or Docker case, a linked case (admin or
+ * single-user only), or a directory in the caller's own case space. Bounded:
+ * a case folder on a mount that stopped answering still counts as there, like
+ * the case list keeps listing it.
+ */
+async function caseVisibleToCaller(name: string, req: FastifyRequest): Promise<boolean> {
+  if (!SAFE_CASE_NAME.test(name)) return false;
+  const user = getAuthUser(req);
+  if ((await readRemoteCases(CODEMAN_CONFIG_DIR)).some((c) => c.name === name && canAccessOwned(user, c.owner))) {
+    return true;
+  }
+  if ((await readDockerCases(CODEMAN_CONFIG_DIR)).some((c) => c.name === name && canAccessOwned(user, c.owner))) {
+    return true;
+  }
+  const linkedCases = await readLinkedCases();
+  if (linkedCases[name] && (!isMultiUserMode() || isAdmin(req)))
+    return (await probePath(linkedCases[name])) !== 'absent';
+  const kind = await probePathKind(join(resolveCasesDir(user), name));
+  return kind === 'directory' || kind === 'unknown';
+}
+
 export function registerCaseRoutes(
   app: FastifyInstance,
-  ctx: EventPort & ConfigPort & SessionPort,
+  ctx: EventPort & ConfigPort & SessionPort & TabLayoutPort,
   /** The server's wake registry (from registerSessionRoutes): linking a case on a sleeping host wakes it. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): void {
@@ -1612,6 +1639,19 @@ export function registerCaseRoutes(
   app.delete('/api/cases/:name', async (req): Promise<ApiResponse<{ name: string }>> => {
     const { name } = req.params as { name: string };
     const user = getAuthUser(req);
+    // The caller's default session group for this case goes with it (best-effort:
+    // a stale value is ignored at creation anyway).
+    // An admin deleting another user's remote/Docker case clears that owner's too.
+    const forgetCaseDefault = async (caseOwner?: string): Promise<void> => {
+      const owners = new Set([ownerLayoutKey(ownerFor(req)), ...(caseOwner ? [ownerLayoutKey(caseOwner)] : [])]);
+      for (const owner of owners) {
+        try {
+          await ctx.tabLayouts.forgetCaseDefaultGroup(owner, name);
+        } catch {
+          /* never blocks the delete */
+        }
+      }
+    };
 
     if (!validatePathWithinBase(name, resolveCasesDir(user))) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Invalid case name');
@@ -1621,12 +1661,14 @@ export function registerCaseRoutes(
     // docker case is skipped so control falls through to the caller's own local delete.
     // canAccessOwned is all-true for admins/single-user, so flag-OFF stays byte-identical.
     const remoteCases = await readRemoteCases(CODEMAN_CONFIG_DIR);
-    if (remoteCases.some((item) => item.name === name && canAccessOwned(user, item.owner))) {
+    const remoteCase = remoteCases.find((item) => item.name === name && canAccessOwned(user, item.owner));
+    if (remoteCase) {
       await writeRemoteCases(
         CODEMAN_CONFIG_DIR,
         remoteCases.filter((item) => !(item.name === name && canAccessOwned(user, item.owner)))
       );
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'remote-unlinked' });
+      await forgetCaseDefault(remoteCase.owner);
       return { success: true, data: { name } };
     }
 
@@ -1659,6 +1701,7 @@ export function registerCaseRoutes(
           .catch(() => {});
       }
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'docker-unlinked' });
+      await forgetCaseDefault(dockerCase.owner);
       return { success: true, data: { name } };
     }
 
@@ -1671,6 +1714,7 @@ export function registerCaseRoutes(
       try {
         await fs.writeFile(LINKED_CASES_FILE, JSON.stringify(linkedCases, null, 2));
         ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'unlinked' });
+        await forgetCaseDefault();
         return { success: true, data: { name } };
       } catch (err) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
@@ -1686,15 +1730,58 @@ export function registerCaseRoutes(
     try {
       await fs.rm(casePath, { recursive: true, force: true });
       ctx.broadcast(SseEvent.CaseDeleted, { name, type: 'deleted' });
+      await forgetCaseDefault();
       return { success: true, data: { name } };
     } catch (err) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, getErrorMessage(err));
     }
   });
 
+  // ========== Default session group ==========
+
+  /**
+   * The tab group new sessions of this case land in when the create request names
+   * no group and no parent places them. Scoped to the caller's own tab layout: the
+   * options are their groups, and a stored id that is no longer one of them reads
+   * as Ungrouped (null); the read writes nothing (the next creation for the case
+   * forgets it). Not admin-gated in multi-user mode: the
+   * value is per owner (like the layout it points into), never server-wide.
+   */
+  app.get('/api/cases/:name/default-group', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    if (!(await caseVisibleToCaller(name, req))) {
+      return reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, `Case "${name}" not found`));
+    }
+    const view = await ctx.tabLayouts.caseDefaultGroup(ownerLayoutKey(ownerFor(req)), name);
+    return { success: true, data: { caseName: name, ...view } };
+  });
+
+  app.put('/api/cases/:name/default-group', async (req, reply) => {
+    const { name } = req.params as { name: string };
+    const { groupId } = parseBody(CaseDefaultGroupSchema, req.body, 'Invalid default group');
+    if (!(await caseVisibleToCaller(name, req))) {
+      return reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, `Case "${name}" not found`));
+    }
+    try {
+      const view = await ctx.tabLayouts.setCaseDefaultGroup(ownerLayoutKey(ownerFor(req)), name, groupId);
+      return { success: true, data: { caseName: name, ...view } };
+    } catch (err) {
+      if (err instanceof TabLayoutValidationError) {
+        return reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'That tab group does not exist'));
+      }
+      throw err;
+    }
+  });
+
   // ========== Reorder Cases ==========
 
-  app.put('/api/cases/order', async (req): Promise<ApiResponse<{ order: string[] }>> => {
+  app.put('/api/cases/order', async (req, reply): Promise<ApiResponse<{ order: string[] }> | undefined> => {
+    // `caseOrder` is ONE list in the server-wide settings.json, read by every user's
+    // GET /api/cases, so a non-admin's reorder would replace everyone's order (and
+    // publish their case names to every user through GET /api/settings). Admin-only in
+    // multi-user mode, like PUT /api/settings; a per-user order would need per-user
+    // storage. No-op in single-user mode.
+    if (isMultiUserMode() && !requireAdmin(req, reply)) return;
     const { order } = parseBody(CaseOrderSchema, req.body, 'Invalid order data');
 
     try {

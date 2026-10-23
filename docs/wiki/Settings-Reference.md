@@ -29,6 +29,10 @@ The practical rule: **appearance and input are per device, behaviour is shared.*
 did not follow you, it is in one of the first two rows, and you change it again on that
 device.
 
+In [Multi-User Mode](Multi-User-Mode) the server's settings are shared by every user, so
+only an **admin** can change them. A regular user's **Save** keeps their per-device settings
+as usual and tells them that server-wide settings can only be changed by an admin.
+
 ## App Settings
 
 ### Updates
@@ -146,7 +150,8 @@ instead of its native cloud backend. See [Custom Model Endpoints](Custom-Model-E
 | Allowed Tools                    | The list used by the explicit mode.                                                            |
 | Ralph / Todo Tracker             | Enables the Ralph loop surfaces.                                                               |
 | Agent Teams                      | Experimental teams. Also needs the CLI's own environment flag.                                 |
-| Codeman Agent Skill              | Under **All agent CLIs**. Injects the agent skill into each new session's case, where that session's CLI looks for skills (every CLI except Pi and a plain shell). Off by default. See [Driving Codeman From An Agent](Driving-Codeman-From-An-Agent). |
+| Pin tab names on the CLI         | Launches every Claude session with `--name` set to its tab name, so Claude Code's prompt label and `/resume` list match your tabs. Claude then stops generating its own titles for those sessions, and a rename in Codeman holds only until the next turn. Synced, off by default; applies from the next session start or respawn. |
+| Codeman Agent Skill              | Under **All agent CLIs**. Injects the agent skill into each new session's case, where that session's CLI looks for skills (every CLI except Pi and a plain shell). Off by default. See [The Codeman Skill](Codeman-Skill). |
 | Remote auto-reconnect            | Reattaches dropped remote SSH sessions. On by default.                                         |
 | Nice priority / value            | Runs agent processes at a lower CPU priority.                                                  |
 | Default Codex model              | Model for new local Codex sessions; empty uses Codex's own config. Letters, digits, `.` `_` `-` `/` only. |
@@ -179,11 +184,19 @@ Rebinding for the shortcut registry. See [Keyboard Shortcuts](Keyboard-Shortcuts
 
 ### System
 
-`CLAUDE.md` template for new cases, default working directory, the image watcher, and
+`CLAUDE.md` template for new cases, default working directory, the image watcher, the prompt-cache keep-warm default (**Keep prompt caches warm**, off) and its cap (**Keep warm for at most**, 2 hours after a session's last prompt; see [Keeping Agents Running](Keeping-Agents-Running)), and
 Cloudflare tunnel controls including the tunnel URL. The **Diagnostics** group runs
 `codeman doctor` on the server and lists the agent CLIs, tmux, Node and the optional office
 tools with their versions and install hints (admin only in multi-user mode). In multi-user
 mode, the **Users** administration entry is injected here.
+
+The **Config backups** group controls timestamped copies of your configuration files: an
+on/off switch (on by default), the backup folder (default `~/.codeman/backups/config`), how
+many backups to keep (2 to 500, default 20) and how many days to keep them (0 to 3650, default
+30; 0 means no age limit). A value that is not saved in `settings.json` (a reset file) is whatever
+the newest backup in that folder recorded, and the default only when none did, plus **Back up now** and a list with **Restore**. These are
+server-side settings, read fresh. Details, naming and restore behaviour are on
+[Config Backups](Config-Backups).
 
 ## Session Options
 
@@ -191,7 +204,7 @@ Per session, from the tab.
 
 | Panel            | Contains                                                                                   |
 | ---------------- | ------------------------------------------------------------------------------------------- |
-| **Respawn**      | Auto-resume on usage limit, the respawn cycle configuration, presets, duration. See [Keeping Agents Running](Keeping-Agents-Running). |
+| **Respawn**      | Auto-resume on usage limit, the prompt cache readout and keep-warm switch, the respawn cycle configuration, presets, duration. See [Keeping Agents Running](Keeping-Agents-Running). |
 | **Session**      | Name, working directory, environment overrides, per-tab pop-out override.                    |
 | **Ralph / Todo** | Loop configuration, iteration and todo caps, circuit breaker reset. See [Autonomous Loops](Autonomous-Loops). |
 | **Summary**      | What this session has done: tokens, activity, run summary.                                   |
@@ -216,8 +229,9 @@ Some things are configured before the server starts, not in the UI:
 | `CODEMAN_FILE_PICKER_ROOTS`         | Extra roots for the path picker.                                        |
 | `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK` | Acknowledges exposing the server with no password.                  |
 | `CODEMAN_BASE_URL`                  | Mounts Codeman under a sub-path behind a reverse proxy that forwards the prefix unchanged. See [Remote Access](Remote-Access). |
+| `CODEMAN_MAX_SESSIONS`              | Cap on concurrent sessions. 50 by default, 1 to 462 (a larger value is clamped to 462, anything that is not a positive integer falls back to 50). Read at startup. The 462 assumes the default `CODEMAN_MAX_WEBVIEWS` and no pinned closed sessions, which share the same 512-entry tab layout. In multi-user mode the per-user cap defaults to half of it unless `CODEMAN_MAX_SESSIONS_PER_USER` is set. |
 | `CODEMAN_MAX_DOWNLOAD_BYTES`        | Cap on raw file bodies and downloads. 2 GB by default, `0` for none.    |
-| `CODEMAN_MAX_PASTE_IMAGE_BYTES`     | Cap on one pasted, dropped or attached image. 50 MB by default.         |
+| `CODEMAN_MAX_PASTE_IMAGE_BYTES`     | Cap on one pasted, dropped or attached image or document. 50 MB by default. |
 | `CODEMAN_MAX_PASTE_VIDEO_BYTES`     | Cap on one attached video (phone Attach, drop). 1 GB by default; videos stream to disk, so this bounds disk use, not memory. |
 | `CODEMAN_MAX_REMOTE_FILE_SSH`       | Concurrent ssh reads for files in remote cases. 4 by default.           |
 | `CODEMAN_PATH_PROBE_TIMEOUT_MS`     | How long a linked case's folder may take to answer before it is shown as unreachable. 1500 ms by default; raise it for a slow but healthy mount. |
@@ -238,3 +252,4 @@ Some things are configured before the server starts, not in the UI:
 - [The Dashboard](The-Dashboard) - what each control does once visible.
 - [Keeping Agents Running](Keeping-Agents-Running) - the Respawn panel in depth.
 - [Agent CLIs](Agent-CLIs) - model, effort, and permission modes.
+- [Config Backups](Config-Backups) - copies of your settings, and how to restore them.

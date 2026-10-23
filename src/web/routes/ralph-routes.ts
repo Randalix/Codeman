@@ -23,6 +23,7 @@ import { SseEvent } from '../sse-events.js';
 import {
   autoConfigureRalph,
   getAuthUser,
+  isAdmin,
   ownerFor,
   resolveCasesDir,
   sessionCapacityMessage,
@@ -470,8 +471,8 @@ export function registerRalphRoutes(
     const promptPath = join(casePath, '@ralph_prompt.md');
     writeFileSync(promptPath, fullPrompt, 'utf-8');
 
-    // Register session
-    await ctx.addSession(session);
+    // Register session (in its case's default session group, if one is set)
+    await ctx.addSession(session, { caseName });
     ctx.store.incrementSessionsCreated();
     ctx.persistSessionState(session);
     await ctx.setupSessionListeners(session);
@@ -521,20 +522,25 @@ export function registerRalphRoutes(
       });
     }
 
-    // Save lastUsedCase
-    try {
-      let settings: Record<string, unknown> = {};
+    // Save lastUsedCase. It is a key of the server-wide settings.json, readable by every
+    // user through GET /api/settings, so a non-admin's case name is not written there in
+    // multi-user mode (writes are admin-only: PUT /api/settings). isAdmin is always true
+    // in single-user mode.
+    if (isAdmin(req)) {
       try {
-        settings = JSON.parse(await fs.readFile(SETTINGS_PATH, 'utf-8'));
+        let settings: Record<string, unknown> = {};
+        try {
+          settings = JSON.parse(await fs.readFile(SETTINGS_PATH, 'utf-8'));
+        } catch {
+          /* ignore */
+        }
+        settings.lastUsedCase = caseName;
+        const dir = dirname(SETTINGS_PATH);
+        if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+        fs.writeFile(SETTINGS_PATH, JSON.stringify(settings, null, 2)).catch(() => {}); // Ignore - persisting lastUsedCase is non-critical
       } catch {
-        /* ignore */
+        /* non-critical */
       }
-      settings.lastUsedCase = caseName;
-      const dir = dirname(SETTINGS_PATH);
-      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-      fs.writeFile(SETTINGS_PATH, JSON.stringify(settings, null, 2)).catch(() => {}); // Ignore - persisting lastUsedCase is non-critical
-    } catch {
-      /* non-critical */
     }
 
     const sessionId = session.id;

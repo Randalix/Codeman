@@ -20,6 +20,7 @@ import type {
   AntigravityConfig,
   PiConfig,
   GrokConfig,
+  CopilotConfig,
   DeepSeekConfig,
   OmpConfig,
   SessionRemote,
@@ -61,8 +62,14 @@ export interface MuxSession {
   /** Whether the current launch carries the statusLine exporter; set on every create and respawn. */
   statusLine?: StatusLineExporter;
   /**
+   * Whether the current launch carries `idleCompaction: false` in its `--settings` JSON (keep-warm
+   * on at launch, the exporter injected, Claude Code new enough); set on every create and respawn.
+   */
+  idleCompactionOff?: boolean;
+  /**
    * This record was rebuilt from the tmux socket rather than from Codeman's own
-   * bookkeeping, so everything on it but the name and the pid is a guess. Its
+   * bookkeeping, so everything on it but the name, the pid and, when tmux
+   * reported a usable one, the directory is a guess. Its
    * synthetic `restored-<fragment>` id cannot find the session's `state.json`
    * entry either, which means a remote or docker session rediscovered this way
    * arrives with no `remote`/`docker` metadata and looks local. Anything that
@@ -97,7 +104,8 @@ export interface CreateSessionOptions {
    * Name pinned on a claude spawn as `--name` (version-gated, sanitized, local only).
    * Deliberately NOT `name`: `--name` owns the prompt-box label, the `/resume` picker
    * entry and the terminal title, and a pinned title stops Claude generating its own,
-   * so only a user-chosen name belongs here (see `Session.cliPinnedName`).
+   * so by default only a user-chosen name belongs here; the opt-in `pinCliSessionName`
+   * setting pins every tab name (see `Session.cliPinnedName`).
    */
   cliName?: string;
   niceConfig?: NiceConfig;
@@ -110,6 +118,7 @@ export interface CreateSessionOptions {
   antigravityConfig?: AntigravityConfig;
   piConfig?: PiConfig;
   grokConfig?: GrokConfig;
+  copilotConfig?: CopilotConfig;
   deepSeekConfig?: DeepSeekConfig;
   ompConfig?: OmpConfig;
   /** When restoring after reboot, resume a previous Claude conversation by its session ID */
@@ -120,6 +129,10 @@ export interface CreateSessionOptions {
   effort?: EffortLevel;
   /** Claude advisor model, merged into the same `--settings` JSON (overridable via /advisor in-session) */
   advisorModel?: string;
+  /** The session's own prompt-cache keep-warm choice (undefined = app default); decides the `idleCompaction` opt-out. */
+  keepWarm?: boolean;
+  /** Spawned by another session: it does not inherit the keep-warm app default (`keepWarmOn`). */
+  spawnedByAgent?: boolean;
   /** tmux history-limit (scrollback lines) allocated when this session is created. */
   historyLimit?: number;
   /** Remote execution metadata for local tmux sessions wrapping SSH */
@@ -141,7 +154,8 @@ export interface RespawnPaneOptions {
    * Name pinned on a respawned claude as `--name` (version-gated, sanitized, local only).
    * Deliberately NOT `name`: `--name` owns the prompt-box label, the `/resume` picker
    * entry and the terminal title, and a pinned title stops Claude generating its own,
-   * so only a user-chosen name belongs here (see `Session.cliPinnedName`).
+   * so by default only a user-chosen name belongs here; the opt-in `pinCliSessionName`
+   * setting pins every tab name (see `Session.cliPinnedName`).
    */
   cliName?: string;
   niceConfig?: NiceConfig;
@@ -154,6 +168,7 @@ export interface RespawnPaneOptions {
   antigravityConfig?: AntigravityConfig;
   piConfig?: PiConfig;
   grokConfig?: GrokConfig;
+  copilotConfig?: CopilotConfig;
   deepSeekConfig?: DeepSeekConfig;
   ompConfig?: OmpConfig;
   /** Resume a previous Claude conversation when respawning */
@@ -171,6 +186,10 @@ export interface RespawnPaneOptions {
   effort?: EffortLevel;
   /** Claude advisor model (preserved across respawns, merged into the same `--settings` JSON) */
   advisorModel?: string;
+  /** The session's own prompt-cache keep-warm choice, re-read at every relaunch (see CreateSessionOptions). */
+  keepWarm?: boolean;
+  /** Spawned by another session (see CreateSessionOptions). */
+  spawnedByAgent?: boolean;
   /** Original tmux history-limit retained for config parity; respawn cannot resize the existing pane. */
   historyLimit?: number;
   /** Remote execution metadata for local tmux sessions wrapping SSH */
@@ -416,12 +435,17 @@ export interface TerminalMultiplexer extends EventEmitter {
   captureActivePaneBuffer?(muxName: string, opts?: PaneCaptureOptions): string | null;
 
   /**
-   * Plain text of the visible frame: no styles, no cursor query, no repaint
-   * reconstruction. Deliberately cheaper than `capturePaneBuffer` because idle
+   * Plain text of the visible frame: no cursor query, no repaint
+   * reconstruction, and no styles unless `styles` asks for them (SGR only, lines
+   * still `\n`-separated). Deliberately cheaper than `capturePaneBuffer` because idle
    * detection calls it on a timer: it only needs to read what the CLI is
    * currently rendering, never to replay it into an xterm. Returns null when the
    * pane cannot be read. `historyLines` adds that much scrollback above the
    * frame, with hard-wrapped rows re-joined.
    */
-  capturePaneText?(muxName: string, paneTarget?: string, opts?: { historyLines?: number }): string | null;
+  capturePaneText?(
+    muxName: string,
+    paneTarget?: string,
+    opts?: { historyLines?: number; styles?: boolean }
+  ): string | null;
 }

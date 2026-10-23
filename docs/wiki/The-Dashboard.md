@@ -148,7 +148,7 @@ The right side of the header. Almost all of these are off until you enable them 
 | CPU / MEM              | On                 | Server resource use. Drawn as a compact pill by default; see Header Stats Style below. |
 | File Viewer            | On                 | Toggles the file browser panel.                                                  |
 | Settings gear          | Always on          | App Settings.                                                                    |
-| Plan usage chip        | On, desktop only   | Live Claude subscription usage. Claude-only, and needs its telemetry exporter, which the same setting installs. |
+| Plan usage chip        | On, desktop only   | Live subscription usage: Claude (needs its telemetry exporter, which the same setting installs), Codex limits and the Copilot monthly quota. |
 | Session Manager        | Off                | The full session list, live and historical.                                      |
 | Approvals bell         | Off                | Cross-session queue of prompts waiting on a human. Appears only when the count is above zero. Never shown on phones. |
 | Read My Mind 🧠        | Off                | Predicts your next prompt for this case. Claude-only.                            |
@@ -202,6 +202,15 @@ Both wait about 2.5 seconds before appearing, so a deploy that restarts the serv
 flash a warning at you every time. If the browser reports itself offline, the grace period
 is skipped.
 
+**The transport readout.** With a session open, the header shows how its terminal is
+connected: `WS` (WebSocket, the normal case), `WS…` (connecting or reconnecting) or `HTTP`
+(the WebSocket is unavailable and input goes over HTTP). If typed or pasted input is backing
+up faster than it is acknowledged, the readout grows a suffix such as `WS · 1.2KB queued`.
+That suffix appears only after the backlog has stayed up for about a second, so a paste or a
+fast burst that clears at once does not make the pill widen and shrink. (It is part of the
+text line, so you see it in the Compact and As before header styles; Tiles hides that line and
+shows `WS live`, and phones hide it too.)
+
 There is also a watchdog for the case where the connection stops delivering without
 erroring. If the server's heartbeat stops arriving, Codeman reconnects on its own rather
 than sitting on a green dot showing frozen data.
@@ -228,10 +237,12 @@ Worth knowing:
 - **Wheel and touch scrolling** are forwarded into Claude's own transcript when a recent
   Claude runs fullscreen (`CLAUDE_CODE_NO_FLICKER=1`, or `"tui": "fullscreen"` in
   `~/.claude/settings.json`), so the wheel scrolls the conversation rather than the terminal.
-  Claude's default inline view keeps its history in the terminal and scrolls locally. `Shift+Wheel` is
+  Codex with mouse tracking on gets the wheel forwarded like fullscreen Claude; otherwise
+  it pages its transcript or scrolls locally. Claude's default inline view keeps its history
+  in the terminal and scrolls locally. `Shift+Wheel` is
   always local scrollback. OpenCode's wheel and swipes page its own conversation
-  (PageUp/PageDown), and so do newer Codex versions, which draw on the alternate screen
-  and leave the terminal no history of its own (an older Codex that draws inline keeps
+  (PageUp/PageDown), as do untracked fullscreen Codex versions that leave the terminal
+  no history of its own (an older Codex that draws inline keeps
   its history in the terminal and scrolls locally). The first small movement of a
   gesture pages at once, then one page per half screen of travel; one finger on the
   screen is one gesture however slowly it moves. In a grid tile or the split view's

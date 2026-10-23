@@ -194,6 +194,7 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.SESSION_CLI_INFO, '_onSessionCliInfo'],
   [SSE_EVENTS.SESSION_STATUS_TELEMETRY, '_onSessionStatusTelemetry'],
   [SSE_EVENTS.SESSION_PROMPT_CACHE, '_onSessionPromptCache'],
+  [SSE_EVENTS.SESSION_KEEP_WARM, '_onSessionKeepWarm'],
 
   // Scheduled runs
   [SSE_EVENTS.SCHEDULED_CREATED, '_onScheduledCreated'],
@@ -546,8 +547,8 @@ const DEFAULT_SHORTCUTS = [
     group: 'Session',
     label: 'Toggle Session Sidebar',
     // Alt+B, not Ctrl+B: Ctrl+B must reach the terminal (tmux prefix,
-    // readline backward-char). The Alt block below claims only Digit1-9 and
-    // the brackets, and the registry claims Alt for KeyK and Slash only.
+    // readline backward-char). The Alt block below claims only Digit1-9; the
+    // brackets are registry entries, and the registry claims Alt for KeyK and Slash only.
     bindings: [{ modifiers: ['alt'], key: 'b', code: 'KeyB' }],
     action: 'toggleSessionSidebar',
   },
@@ -651,11 +652,22 @@ const DEFAULT_SHORTCUTS = [
     bindings: [],
     action: 'removeTile',
   },
+  // Physical key codes, so macOS Option layouts that print "“" for Option+[ still match.
   {
-    id: 'previous-next-session',
+    id: 'previous-session',
     group: 'Session',
-    label: 'Previous / Next Session',
-    displayBindings: ['Alt/Option+[', 'Alt/Option+]'],
+    label: 'Previous Session',
+    displayBindings: ['Alt/Option+['],
+    bindings: [{ modifiers: ['alt'], code: 'BracketLeft' }],
+    action: 'previousSession',
+  },
+  {
+    id: 'next-session-alt',
+    group: 'Session',
+    label: 'Next Session (alternate)',
+    displayBindings: ['Alt/Option+]'],
+    bindings: [{ modifiers: ['alt'], code: 'BracketRight' }],
+    action: 'nextSession',
   },
   {
     id: 'switch-tab-n',
@@ -687,6 +699,14 @@ const DEFAULT_SHORTCUTS = [
     label: 'Close Panels',
     displayBindings: ['Escape'],
   },
+  // Handled by the File Viewer's own capture-phase listener while it is open
+  // (_bindFilePreviewChrome, panels-ui.js), never through the registry.
+  {
+    id: 'file-preview-history',
+    group: 'Panels',
+    label: 'File Viewer Back / Forward',
+    displayBindings: ['Alt/Option+ArrowLeft', 'Alt/Option+ArrowRight'],
+  },
 ];
 
 
@@ -701,6 +721,12 @@ const DEFAULT_SHORTCUTS = [
  * setInterval fire on every frame, and constants.js is cached independently.
  */
 const SIDEBAR_RICH_CLOCK_MS = 20000;
+// Header connection pill: a queue above CONNECTION_BACKLOG_HINT_BYTES is only worth a " · NB queued"
+// suffix once it has STAYED above it for CONNECTION_BACKLOG_HOLD_MS. A paste, an IME commit or a fast
+// word sits above the threshold for a few milliseconds until its ACK lands, and surfacing that made the
+// pill grow to the right and shrink back on every such burst.
+const CONNECTION_BACKLOG_HINT_BYTES = 4;
+const CONNECTION_BACKLOG_HOLD_MS = 1200;
 
 /**
  * How long a `#session=<id>` link waits for the session list to name its id
@@ -1404,20 +1430,7 @@ class CodemanApp {
     // getShortcutRegistry()). The command palette chord is deliberately NOT in
     // this map — shouldOpenCommandPaletteFromShortcut() dispatches it above with
     // focus-target awareness (it must fire from the terminal but not from inputs).
-    const SHORTCUT_ACTIONS = {
-      showShortcutOverlay: () => this.showShortcutOverlay(),
-      killActiveSession: () => this.killActiveSession(),
-      nextSession: () => this.nextSession(),
-      clearTerminal: () => this.clearTerminal(),
-      restoreTerminalSize: () => this.restoreTerminalSize(),
-      increaseFontSize: () => this.increaseFontSize(),
-      decreaseFontSize: () => this.decreaseFontSize(),
-      toggleVoiceInput: () => VoiceInput.toggle(),
-      openComposePrompt: () => KeyboardAccessoryBar.composePrompt(),
-      moveActiveTabLeft: () => this.moveActiveTabLeft(),
-      moveActiveTabRight: () => this.moveActiveTabRight(),
-      toggleSessionSidebar: () => this.toggleSessionSidebar(),
-    };
+    const SHORTCUT_ACTIONS = this._shortcutActions();
 
     // Use capture to handle before terminal
     document.addEventListener('keydown', (e) => {
@@ -1464,6 +1477,7 @@ class CodemanApp {
         this.closeAllPanels();
         this.closeHelp();
         if (this.attachmentHistoryDrawerOpen) this.closeAttachmentHistory();
+        this.closeWorktreeModal?.();
         this.closeSessionManager();
         this.closeCommandPalette?.();
         this.closeShortcutOverlay?.();
@@ -1480,7 +1494,8 @@ class CodemanApp {
       // Option/Alt session navigation uses physical key CODES, not e.key, so macOS
       // keyboard layouts that emit special characters under Option (Option+1 -> ¡,
       // Option+[ -> "“") still switch sessions. e.code is the physical key regardless
-      // of layout. Option+1-9 = switch by index; Option+[ / Option+] = prev / next.
+      // of layout. Option+1-9 = switch by index. Option+[ / ] (prev / next) live in the
+      // shortcut registry, so they can be rebound.
       if (e.altKey && !e.ctrlKey && !e.shiftKey) {
         const code = e.code || '';
         const digitMatch = code.match(/^Digit([1-9])$/);
@@ -1504,16 +1519,6 @@ class CodemanApp {
               this.openWebview(webId);
             }
           }
-          return;
-        }
-        if (e.code === 'BracketLeft') {
-          e.preventDefault();
-          this.prevSession();
-          return;
-        }
-        if (e.code === 'BracketRight') {
-          e.preventDefault();
-          this.nextSession();
           return;
         }
       }
@@ -2980,12 +2985,48 @@ class CodemanApp {
    * output. Subtrees already inside an `<a>` are skipped so an autolinked URL
    * is never re-cut, and the anchor's textContent is the path verbatim, so
    * "copy code" still yields exactly what the agent printed.
+   *
+   * Before that walk it also rewrites an existing anchor whose href is a path
+   * (no scheme, not `//host`, not a bare `#fragment`) into the same `a.rv-path`
+   * shape, on purpose WITHOUT `FILE_PATH_LINK_PATTERN`'s root and extension
+   * filter: the agent chose that href as a link target, and left alone it opens
+   * as a same-origin URL (a 404 page in a new tab).
    */
   _linkifyFilePaths(root) {
     if (!root || typeof document === 'undefined') return;
     // Guarded: a stale cached constants.js must degrade to plain text, not throw
     // out of the middle of rendering a message.
     if (typeof findFilePathLinks !== 'function') return;
+
+    // A markdown link whose destination is a path (`[report](/home/me/run/x.json)`,
+    // Codex's usual way of citing a file) resolved against Codeman's own origin
+    // and opened a 404 in a new tab. Give it the linkified-path shape instead;
+    // links with a scheme or `//host` keep their own behaviour.
+    for (const a of root.querySelectorAll('a[href]')) {
+      // The URL parser drops tabs and newlines, so `http&#9;://` is still http.
+      const href = (a.getAttribute('href') || '').replace(/[\t\n\r]/g, '');
+      if (/^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith('//')) continue;
+      // `#L42`, `?plain=1` and a `:42:7` suffix name a spot in the file, not the
+      // file. The suffix is cut before decoding, so an encoded `%3A` stays a name.
+      let path = href.split('#')[0].split('?')[0].replace(/:\d+(?::\d+)?$/, '');
+      try {
+        path = decodeURIComponent(path);
+      } catch {
+        /* malformed escape: keep the path as written */
+      }
+      // A bare `#fragment` (and every `.rv-path`, whose href is `#`) ends up empty.
+      if (!path) continue;
+      // rv-path-link keeps the label in the prose font (styles.css): it is a label,
+      // not a path, and break-all would split it mid-word on a phone.
+      a.className = 'rv-path rv-path-link';
+      a.dataset.path = path;
+      a.dataset.linkified = '1';
+      if (path.endsWith('/') || findFilePathLinks(path).some((f) => f.folder && f.path === path)) a.dataset.folder = '1';
+      a.title = path;
+      a.setAttribute('href', '#');
+      a.removeAttribute('target');
+      a.removeAttribute('rel');
+    }
 
     // Collect first: replacing a node while the walker is positioned on it
     // invalidates the traversal.
@@ -3036,9 +3077,11 @@ class CodemanApp {
                 ? 'DeepSeek'
                 : mode === 'omp'
                   ? 'OMP'
-                  : mode === 'opencode'
-                    ? 'OpenCode'
-                    : 'Claude';
+                  : mode === 'copilot'
+                    ? 'GitHub Copilot'
+                    : mode === 'opencode'
+                      ? 'OpenCode'
+                      : 'Claude';
   }
 
   async toggleResponseViewer() {
@@ -3500,8 +3543,10 @@ class CodemanApp {
       this.sendPendingCtrlL(data.id);
       if (data.id === this.activeSessionId) this._updateLocalEchoState();
     }
-    // Start stuck detection timer (only if no respawn running)
-    if (!this.respawnStatus[data.id]?.enabled) {
+    // Start stuck detection timer (only if no respawn running). Not at the end of Codeman's
+    // own keep-alive turn (`keepAlive`): the session has been waiting since the last real
+    // turn, whose timer is still running or has already fired.
+    if (!data.keepAlive && !this.respawnStatus[data.id]?.enabled) {
       const threshold = this.notificationManager?.preferences?.stuckThresholdMs || 600000;
       clearTimeout(this.idleTimers.get(data.id));
       this.idleTimers.set(data.id, setTimeout(() => {
@@ -3523,8 +3568,9 @@ class CodemanApp {
       this.sendPendingCtrlL(data.id);
       if (data.id === this.activeSessionId) this._updateLocalEchoState();
     }
-    // Clear stuck detection timer
-    const timer = this.idleTimers.get(data.id);
+    // Clear stuck detection timer, unless this is Codeman's own keep-alive turn, which is
+    // no sign of life from the agent's side.
+    const timer = data.keepAlive ? null : this.idleTimers.get(data.id);
     if (timer) {
       clearTimeout(timer);
       this.idleTimers.delete(data.id);
@@ -3588,7 +3634,7 @@ class CodemanApp {
     }
   }
 
-  // Claude + Codex plan usage limits — account-global, so the latest sample
+  // Claude, Codex and Copilot plan usage limits — account-global, so the latest sample
   // drives the shared header chip.
   _onSessionStatusTelemetry(data) {
     this.updatePlanUsageChip(data);
@@ -3648,19 +3694,27 @@ class CodemanApp {
     };
     // The provider label only earns its space when there is more than one
     // provider to tell apart: a machine with Claude alone shows bare windows.
-    const hasWindows = (usage) => pct(usage?.fiveHour) !== null || pct(usage?.sevenDay) !== null;
-    const labelled = hasWindows(data) && hasWindows(data.codex);
+    const hasWindows = (usage) =>
+      pct(usage?.fiveHour) !== null || pct(usage?.sevenDay) !== null || pct(usage?.monthly) !== null;
+    const labelled = [data, data.codex, data.copilot].filter(hasWindows).length > 1;
     const row = (provider, usage, idle) => {
       // hasWindows() gates the row, so a placeholder can only ever appear
       // ALONGSIDE a real reading — a provider reporting nothing still renders
       // nothing, never a row of em dashes.
       if (!hasWindows(usage)) return '';
-      const windows = [seg('5h', pct(usage?.fiveHour), idle), seg('7d', pct(usage?.sevenDay), idle)].filter(Boolean);
+      // `mo` is Copilot's calendar-month premium-request quota; it is the only window that provider has.
+      const windows = [
+        seg('5h', pct(usage?.fiveHour), idle),
+        seg('7d', pct(usage?.sevenDay), idle),
+        seg('mo', pct(usage?.monthly), false),
+      ].filter(Boolean);
       if (!windows.length) return '';
       const label = labelled ? `<span class="pu-provider">${provider}</span>` : '';
       return `<span class="pu-row">${label}<span class="pu-windows">${windows.join('<span class="pu-sep">·</span>')}</span></span>`;
     };
-    const rows = [row('Claude', data, true), row('Codex', data.codex, false)].filter(Boolean);
+    const rows = [row('Claude', data, true), row('Codex', data.codex, false), row('Copilot', data.copilot, false)].filter(
+      Boolean
+    );
     chip.innerHTML = rows.length ? rows.join('') : '—';
     const resetStr = (w) => (w && w.resetAt ? new Date(w.resetAt).toLocaleString() : '—');
     const details = (provider, usage, idle) => {
@@ -3670,10 +3724,20 @@ class CodemanApp {
       if (five !== null) lines.push(`5-hour limit: ${five}% used (resets ${resetStr(usage.fiveHour)})`);
       else if (idle && seven !== null) lines.push('5-hour limit: no active session window');
       if (seven !== null) lines.push(`Weekly limit: ${seven}% used (resets ${resetStr(usage.sevenDay)})`);
+      const month = pct(usage?.monthly);
+      if (month !== null) {
+        // Counts are coerced finite numbers, so interpolating them stays XSS-safe like the rest.
+        const m = usage.monthly;
+        const counts =
+          Number.isFinite(m.used) && Number.isFinite(m.limit) ? `${Math.round(m.used)} of ${Math.round(m.limit)} requests, ` : '';
+        lines.push(`Premium requests this month: ${month}% used (${counts}resets ${resetStr(m)})`);
+      }
       return lines.length ? `${provider} plan usage\n${lines.join('\n')}` : '';
     };
     chip.title =
-      [details('Claude', data, true), details('Codex', data.codex, false)].filter(Boolean).join('\n\n') ||
+      [details('Claude', data, true), details('Codex', data.codex, false), details('Copilot', data.copilot, false)]
+        .filter(Boolean)
+        .join('\n\n') ||
       'Plan usage limits';
   }
 
@@ -3969,8 +4033,8 @@ class CodemanApp {
     // Both transports refuse a frame over the server's limit (issue #484), and a
     // refused frame used to sit at the head of the durable queue for good. So an
     // oversized paste goes out as several in-limit frames, delivered in seq order
-    // as one contiguous stream. A mux write is line-oriented (it strips newlines
-    // and sends Enter on its own), so it is never split: refuse it instead.
+    // as one contiguous stream. A mux write is one paste that sends Enter on its
+    // own, so it is never split: refuse it instead.
     const limit = window.CodemanInputLimit;
     if (limit && input.length > limit.FRAME_MAX_CHARS) {
       if (useMux || input.length > limit.PASTE_MAX_CHARS) {
@@ -4403,19 +4467,26 @@ class CodemanApp {
     }
   }
 
-  // Pure render of the header connection indicator: reads only `this.*` state,
+  // Pure render of the header connection indicator: reads only `this.*` state (and
+  // the pending totals it is handed, which default to a fresh `_pendingBytes()`),
   // touches NO DOM. Returns the exact { display, dotClass, text, title } tuple the
   // writer applies. When hidden (display:'none') the other three are normalized to
   // '' so the cache compare in _updateConnectionIndicator() is well-defined.
   // Every branch/string here must stay byte-identical to what's rendered today.
-  _computeConnectionDescriptor() {
-    const { bytes: totalBytes, count } = this._pendingBytes();
+  _computeConnectionDescriptor(pending = this._pendingBytes()) {
+    const { bytes: totalBytes, count } = pending;
     const hasQueue = count > 0;
     // Only surface a backlog once it's more than a few bytes. A single keystroke
     // (1B) ACKs in milliseconds, so without this the label flickered "sending 1B"
-    // on every key press. Above this threshold means input is genuinely backing up.
-    const BACKLOG_HINT_BYTES = 4;
-    const showBacklog = totalBytes > BACKLOG_HINT_BYTES;
+    // on every key press. Above this threshold means input is genuinely backing up,
+    // and only once it has stayed there (see CONNECTION_BACKLOG_HOLD_MS): a burst
+    // that drains in a moment must not widen the pill. `_backlogOverSince` is kept
+    // by _updateConnectionIndicator; `undefined` (never tracked, as when this pure
+    // compute is called directly) means no hold.
+    const since = this._backlogOverSince;
+    const heldLongEnough =
+      since === undefined || (since !== null && Date.now() - since >= CONNECTION_BACKLOG_HOLD_MS);
+    const showBacklog = totalBytes > CONNECTION_BACKLOG_HINT_BYTES && heldLongEnough;
     const formatBytes = (b) => (b < 1024 ? `${b}B` : `${(b / 1024).toFixed(1)}KB`);
     const queuedSuffix = showBacklog ? ` · ${formatBytes(totalBytes)} queued` : '';
 
@@ -4531,10 +4602,35 @@ class CodemanApp {
     const text = this.$('connectionText');
     if (!indicator || !dot || !text) return;
 
+    // Track how long the queue has stayed above the hint threshold, and make sure
+    // the pill is re-rendered when the hold elapses even if no keystroke or ACK
+    // arrives to trigger it.
+    // ⚠️ This runs before _drainSession() on every keystroke, so it must never throw: a throw here
+    // once skipped immediate delivery and made typing lag (COD-133; the combinatorial never-throws
+    // test in test/connection-indicator.test.ts pins it). The queue is walked ONCE per call and the
+    // same totals are handed to the compute below, since this is the hot input path.
+    const pending = this._pendingBytes();
+    if (pending.bytes > CONNECTION_BACKLOG_HINT_BYTES) {
+      if (this._backlogOverSince == null) this._backlogOverSince = Date.now();
+      if (!this._backlogHoldTimer && Date.now() - this._backlogOverSince < CONNECTION_BACKLOG_HOLD_MS) {
+        const wait = CONNECTION_BACKLOG_HOLD_MS - (Date.now() - this._backlogOverSince) + 25;
+        this._backlogHoldTimer = setTimeout(() => {
+          this._backlogHoldTimer = null;
+          this._updateConnectionIndicator();
+        }, wait);
+      }
+    } else {
+      this._backlogOverSince = null;
+      if (this._backlogHoldTimer) {
+        clearTimeout(this._backlogHoldTimer);
+        this._backlogHoldTimer = null;
+      }
+    }
+
     // Called on EVERY keystroke (_reliableSend) and EVERY ACK (_ackDelivery).
     // During fast typing the rendered tuple is usually identical, so skip the DOM
     // writes when nothing changed (COD-136) — the compute above is DOM-free.
-    const next = this._computeConnectionDescriptor();
+    const next = this._computeConnectionDescriptor(pending);
     const prev = this._lastIndicatorDescriptor;
     // The tile's value word is written in the UI language, so a language
     // switch counts as a change too.
@@ -4872,6 +4968,8 @@ class CodemanApp {
         headerVersionEl.title = `Codeman v${data.version}`;
       }
     }
+
+    if (data.version) this.checkWhatsNew?.(data.version);
 
     // Stop any active voice recording on reconnect
     VoiceInput.cleanup();
@@ -5708,6 +5806,21 @@ class CodemanApp {
       return false;
     }
     const shortcut = this.getShortcutRegistry().find((s) => s.id === 'toggle-session-sidebar');
+    if (!shortcut || shortcut.disabled) return false;
+    return this.matchesShortcutEvent(e, shortcut);
+  }
+
+  /**
+   * Whether `e` is Compose Prompt's chord (default Ctrl+Shift+Enter). The xterm handler asks
+   * before its Shift/Ctrl+Enter newline branch: the document handler opens the composer, and
+   * without this gate the same keydown also typed a newline into the session.
+   */
+  shouldOpenComposePromptFromShortcut(e) {
+    if (!e || e.key !== 'Enter') return false;
+    if (typeof this.getShortcutRegistry !== 'function' || typeof this.matchesShortcutEvent !== 'function') {
+      return false;
+    }
+    const shortcut = this.getShortcutRegistry().find((s) => s.id === 'compose-prompt');
     if (!shortcut || shortcut.disabled) return false;
     return this.matchesShortcutEvent(e, shortcut);
   }
@@ -7732,6 +7845,8 @@ class CodemanApp {
       this._tabLayoutEditor = null;
     }
     this.tabLayout = next;
+    // An open Case settings popover lists the groups as its Default session group options.
+    this._refreshCaseDefaultGroupOptions?.(next);
     const storage = this._getTabCollapseStorage();
     const collapsed = storage && next
       ? window.CodemanTabLayout.loadCollapsedGroupIds(storage, next.groups.map((group) => group.id))
@@ -10416,9 +10531,10 @@ class CodemanApp {
     delete this.respawnActionLogs[sessionId];
   }
 
+  /** Resolves true once the session is gone from the server, false when it is still there. */
   async closeSession(sessionId, killMux = true) {
     // Already on its way out (a repeated click, the mux panel racing the tab).
-    if (this._closingSessions.has(sessionId)) return;
+    if (this._closingSessions.has(sessionId)) return false;
     // The tab goes FIRST and the server is asked after. The kill takes the server
     // a few hundred ms (SIGTERM grace, the process tree, tmux), and a tab that sat
     // there that long after "Kill" read as a click that did nothing. A refused
@@ -10496,7 +10612,7 @@ class CodemanApp {
       } else {
         this.showToast('Tab hidden, tmux still running', 'info');
       }
-      return;
+      return true;
     }
 
     // Still on the server (or the server is unreachable, in which case the resync
@@ -10511,6 +10627,7 @@ class CodemanApp {
       this.renderSessionTabs();
     }
     this.showToast('Failed to close session', 'error');
+    return false;
   }
 
   // Request confirmation before closing a session
@@ -10524,6 +10641,20 @@ class CodemanApp {
     const name = this.getSessionName(session);
     const sessionNameEl = document.getElementById('closeConfirmSessionName');
     sessionNameEl.textContent = name;
+
+    // A session in a Codeman-managed git worktree also offers to remove the worktree
+    // (git worktree remove, never forced) once the session is gone. Read now, before the
+    // session leaves this.sessions.
+    const worktree = this._managedWorktreeOfSession?.(session) || null;
+    this.pendingCloseWorktree = worktree;
+    const wtOption = document.getElementById('closeConfirmWorktree');
+    if (wtOption) {
+      wtOption.hidden = !worktree;
+      const wtName = document.getElementById('closeConfirmWorktreeName');
+      if (wtName) wtName.textContent = worktree ? worktree.name : '';
+      const wtBranch = document.getElementById('closeConfirmWorktreeBranch');
+      if (wtBranch) wtBranch.checked = false;
+    }
 
     // Update kill button text based on session mode
     const killTitle = document.getElementById('closeConfirmKillTitle');
@@ -10544,7 +10675,9 @@ class CodemanApp {
                     ? 'Kill Tmux & DeepSeek'
                     : session.mode === 'omp'
                       ? 'Kill Tmux & OMP'
-                      : 'Kill Tmux & Claude Code';
+                      : session.mode === 'copilot'
+                        ? 'Kill Tmux & GitHub Copilot'
+                        : 'Kill Tmux & Claude Code';
     }
 
     document.getElementById('closeConfirmModal').classList.add('active');
@@ -10552,15 +10685,24 @@ class CodemanApp {
 
   cancelCloseSession() {
     this.pendingCloseSessionId = null;
+    this.pendingCloseWorktree = null;
     document.getElementById('closeConfirmModal').classList.remove('active');
   }
 
-  async confirmCloseSession(killMux = true) {
+  /**
+   * `removeWorktree`: Close Session's "Kill & remove worktree". The worktree is removed only
+   * after the server confirms the session is gone (a live session inside is refused anyway),
+   * and only ever through `git worktree remove` without --force.
+   */
+  async confirmCloseSession(killMux = true, { removeWorktree = false } = {}) {
     const sessionId = this.pendingCloseSessionId;
+    const worktree = removeWorktree ? this.pendingCloseWorktree : null;
+    const deleteBranch = !!document.getElementById('closeConfirmWorktreeBranch')?.checked;
     this.cancelCloseSession();
 
     if (sessionId) {
-      await this.closeSession(sessionId, killMux);
+      const gone = await this.closeSession(sessionId, killMux);
+      if (gone && worktree) await this._removeWorktreeAfterClose?.(worktree, deleteBranch);
     }
   }
 
@@ -10778,6 +10920,55 @@ class CodemanApp {
   }
 
   // ─── Shortcut Registry ───────────────────────────────────────────────────────
+  /**
+   * Action name -> handler for the shortcut registry entries the document keydown
+   * handler dispatches generically (DEFAULT_SHORTCUTS + the user's rebinds). Entries
+   * absent here (copy selection, the palette, the tile chords) have their own dispatch.
+   */
+  _shortcutActions() {
+    return {
+      showShortcutOverlay: () => this.showShortcutOverlay(),
+      killActiveSession: () => this.killActiveSession(),
+      nextSession: () => this.nextSession(),
+      previousSession: () => this.prevSession(),
+      clearTerminal: () => this.clearTerminal(),
+      restoreTerminalSize: () => this.restoreTerminalSize(),
+      increaseFontSize: () => this.increaseFontSize(),
+      decreaseFontSize: () => this.decreaseFontSize(),
+      toggleVoiceInput: () => VoiceInput.toggle(),
+      openComposePrompt: () => KeyboardAccessoryBar.composePrompt(),
+      moveActiveTabLeft: () => this.moveActiveTabLeft(),
+      moveActiveTabRight: () => this.moveActiveTabRight(),
+      toggleSessionSidebar: () => this.toggleSessionSidebar(),
+    };
+  }
+
+  /**
+   * True when `e` is a chord the USER rebound to a generically dispatched action.
+   * The document handler has already run the action, but its preventDefault() does not
+   * stop xterm, so without this gate a rebind to e.g. Alt+J would also type ESC j into the
+   * session. Defaults are not covered on purpose: several (Ctrl+L) rely on reaching the PTY,
+   * and neither is a chord that matches the entry's own default (a re-capture of it).
+   */
+  isUserBoundShortcutEvent(e) {
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) return false;
+    const overrides = this.loadAppSettingsFromStorage().shortcutOverrides || {};
+    const actions = this._shortcutActions();
+    return this.getShortcutRegistry().some((shortcut) => {
+      if (shortcut.disabled || !Array.isArray(overrides[shortcut.id]?.bindings)) return false;
+      // toggleSessionSidebar has its own gate (shouldToggleSessionSidebarFromShortcut) that
+      // lets the chord through when the sidebar layout is off; swallowing it here would make a
+      // rebound sidebar key dead in the header layout.
+      if (shortcut.action === 'toggleSessionSidebar') return false;
+      if (typeof actions[shortcut.action] !== 'function') return false;
+      if (!this.matchesShortcutEvent(e, shortcut)) return false;
+      // Re-capturing the entry's own default (Ctrl+L for Clear Terminal) must keep reaching the
+      // CLI: clearTerminal() relies on ^L for the redraw.
+      const fallback = DEFAULT_SHORTCUTS.find((d) => d.id === shortcut.id);
+      return !this.matchesShortcutEvent(e, fallback);
+    });
+  }
+
   // Returns the merged shortcut list: DEFAULT_SHORTCUTS with any per-shortcut
   // overrides from settings.shortcutOverrides applied on top.
 

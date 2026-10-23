@@ -58,11 +58,11 @@ another device starts from its own history). The default model keeps its own **D
 in both cases, and nothing is ever auto-chosen: the promoted row is simply the one under your
 thumb.
 
-**For opencode, Codex, Gemini, Pi, Grok, DeepSeek and OMP, picking an entry launches
+**For opencode, Codex, Gemini, Pi, Grok, DeepSeek, OMP and GitHub Copilot, picking an entry launches
 straight onto the endpoint** — no restart, because the endpoint is applied before the
 session's process ever starts. **Claude still restarts the harness's process in place** —
 same tab, same conversation (`--resume`) — after a normal native launch, since that restart
-is far less jarring for Claude than for the other seven, whose own TUI can fully
+is far less jarring for Claude than for the others, whose own TUI can fully
 reinitialize on a restart. Either way, every supported harness reads its endpoint config at
 process start, never per turn, so there is no live hot-swap while a turn is running.
 
@@ -150,10 +150,39 @@ relying on auto-fit (`--fit-ctx`), which sizes the context around fitting the bi
 rather than the biggest context — for example adding `-c 65536` to that model's llama-swap
 entry. "Launch anyway" is still there if you want to try regardless.
 
+**A context that is big enough overall can still be too small once it is split across
+slots.** `llama-server` runs several parallel slots by default (four on the build this was measured on) and,
+unless you say otherwise, they all share one pool of context. Claude Code sends more than one
+request at a time: the main session plus every subagent it runs in parallel, and each of those
+requests carries the roughly 40K tokens of system prompt and tools on its own. Four requests
+of 40K tokens do not fit in a shared 131K pool, so the server refuses them with HTTP 500
+`Context size has been exceeded`, even though any single request would have been fine.
+Discovery therefore also records how many slots each loaded model has. It reads an explicit
+`--parallel` or `-np` from the launch command, and otherwise asks the server for
+`total_slots`, because a server started without the flag chooses the number itself. When the
+context divided by the slot count drops below what Claude Code needs, picking that model shows
+the same in-app dialog, this time explaining the shared slots. The division uses the context
+Codeman read from the launch command (`--fit-ctx` or `-c`), never a larger figure from the
+server's `/props`, which has been measured reporting far more than the server really runs
+with. So a default llama-swap model with auto slots shows the dialog, which names the fix and
+lets you launch anyway. The fix is a single slot:
+
+```yaml
+cmd: >-
+  llama-server -m /models/your-model.gguf --parallel 1 ...
+```
+
+With one slot the active conversation gets the whole context, requests from parallel
+subagents queue behind it instead of failing, and Claude Code's repeated prompt prefix stays
+in the cache instead of being processed again in a different slot each time. The alternative
+is a context large enough that every slot can hold 40K tokens. A slot count Codeman could not
+read is treated as one slot, never guessed.
+
 ## Which harnesses actually work
 
 | Harness                                  | Status                                                                                                                                                                                                               |
 | ---------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GitHub Copilot CLI**                   | Verified at the CLI level (1.0.95) against a local OpenAI-compatible endpoint: it posts to `/v1/chat/completions` with your key and model name and needs no GitHub sign-in. Tool calls through a custom endpoint were not exercised. |
 | **Claude Code, opencode, Pi, Grok, OMP** | Verified end-to-end against a real local server.                                                                                                                                                                     |
 | **Codex**                                | Config is correct, and plain chat can work against a server that speaks the Responses API — but a real tool-call attempt comes back as inert text instead of running, so it's still not usable for real coding work. |
 | **Gemini**                               | Fails with an auth error gemini-cli raises once redirected. Unresolved; don't rely on it yet.                                                                                                                        |

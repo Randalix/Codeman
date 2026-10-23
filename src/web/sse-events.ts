@@ -5,10 +5,10 @@
  * and referenced by the frontend (`SSE_EVENTS` in `constants.js`).
  * Both files MUST be kept in sync.
  *
- * 162 event constants organized by category:
+ * 163 event constants organized by category:
  * - **Core** (1): init
  * - **Transport** (1): sse:heartbeat
- * - **Session lifecycle** (24): created, updated, deleted, terminal, idle, working, ...
+ * - **Session lifecycle** (25): created, updated, deleted, terminal, idle, working, ...
  * - **Session: Ralph** (6): ralphLoopUpdate, todoUpdate, completionDetected, ...
  * - **Session: Bash tools** (3): bashToolStart, bashToolEnd, bashToolsUpdate
  * - **Session: Plan** (4): planTaskUpdate, planCheckpoint, planRollback, planTaskAdded
@@ -27,7 +27,8 @@
  * - **Image / attachments** (2): image:detected, attachment:detected
  * - **Edit history** (1): edit-history:updated (new entries in a session's edit history)
  * - **Hooks** (10): idle_prompt, permission_prompt, elicitation_dialog, elicitation_complete, elicitation_response, stop, agent_working, teammate_idle, task_completed, prompt_submitted
- *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook)
+ *   (agent_working is the odd one out: reported by the DeepSeek Harness status bridge, not by a Claude Code hook;
+ *   permission_prompt also arrives with `source: 'screen'` for a codex dialog read off its screen)
  * - **Approvals** (3): pending, updated, resolved (cross-session Approvals Inbox)
  * - **Custom Model Endpoint Profiles** (1): swapped-out (a session's model got evicted by another session on the same llama-swap endpoint)
  * - **Agent inbox** (1): message (a post to a session's agent mailbox)
@@ -123,6 +124,8 @@ export const SessionRunning = 'session:running' as const;
 export const SessionStatusTelemetry = 'session:statusTelemetry' as const;
 /** Prompt-cache state of one session's main conversation changed (`{ sessionId, ...PromptCacheStatus }`). */
 export const SessionPromptCache = 'session:promptCache' as const;
+/** The prompt-cache keep-warm's status for one session changed (`{ sessionId, ...KeepWarmStatus }`). */
+export const SessionKeepWarm = 'session:keepWarm' as const;
 
 // ─── Session: Ralph ──────────────────────────────────────────────────────────
 
@@ -372,7 +375,11 @@ export const EditHistoryUpdated = 'edit-history:updated' as const;
 
 /** Claude Code hook: session idle, waiting for input. */
 export const HookIdlePrompt = 'hook:idle_prompt' as const;
-/** Claude Code hook: tool requesting permission. */
+/**
+ * Claude Code hook: tool requesting permission. Also raised by the server itself, with
+ * `source: 'screen'`, for a dialog read off a hook-less CLI's screen (codex; see
+ * `web/screen-blocked.ts`), which is cleared by `approval:resolved`.
+ */
 export const HookPermissionPrompt = 'hook:permission_prompt' as const;
 /** Claude Code hook: elicitation dialog (Claude asking a question). */
 export const HookElicitationDialog = 'hook:elicitation_dialog' as const;
@@ -541,6 +548,7 @@ export const SseEvent = {
   SessionRunning,
   SessionStatusTelemetry,
   SessionPromptCache,
+  SessionKeepWarm,
 
   // Session: Ralph
   SessionRalphLoopUpdate,

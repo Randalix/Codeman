@@ -44,8 +44,11 @@ const FILE_PREVIEW_PREF_KEYS = {
   htmlRendered: 'codeman:filePreviewHtmlRendered',
   lineNumbers: 'codeman:filePreviewLineNumbers',
   wrap: 'codeman:filePreviewWrap',
+  expanded: 'codeman:filePreviewExpanded',
 };
-const FILE_PREVIEW_PREF_DEFAULTS = { mdRendered: true, htmlRendered: true, lineNumbers: false, wrap: true };
+const FILE_PREVIEW_PREF_DEFAULTS = { mdRendered: true, htmlRendered: true, lineNumbers: false, wrap: true, expanded: false };
+// Back/forward list of previews opened from one overlay session (links between documents).
+const FILE_PREVIEW_HISTORY_MAX = 50;
 const AWAY_DIGEST_SECTIONS = [
   ['needsAttention', 'Needs Attention'],
   ['completed', 'Completed'],
@@ -544,7 +547,7 @@ Object.assign(CodemanApp.prototype, {
 
   _buildCommandPaletteNewSessionItem(query = '') {
     const mode = this.runMode || this._runMode || 'claude';
-    const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', grok: 'Grok', deepseek: 'DeepSeek', omp: 'OMP' };
+    const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', grok: 'Grok', deepseek: 'DeepSeek', omp: 'OMP', copilot: 'Copilot' };
     const caseName = this._findCommandPaletteCaseMatch(query) || document.getElementById('quickStartCase')?.value || 'testcase';
     return {
       id: 'new-session',
@@ -4119,6 +4122,9 @@ Object.assign(CodemanApp.prototype, {
 
     if (!overlay || !bodyEl) return;
 
+    this._recordFilePreviewHistory(filePath, sessionId, attachmentId, options);
+    this._bindFilePreviewChrome();
+
     // Only the newest load may write: paging ←/→ through a folder starts the next
     // load while the previous one still awaits its fetch, and its late answer would
     // put the previous file's text under the next file's title.
@@ -4144,6 +4150,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Show overlay with loading state
     overlay.classList.add('visible');
+    this._applyFilePreviewExpanded();
     titleEl.textContent = filePath;
     bodyEl.innerHTML = '<div class="binary-message">Loading...</div>';
     footerEl.textContent = '';
@@ -4648,6 +4655,148 @@ Object.assign(CodemanApp.prototype, {
     this._openFolderGridFile(next);
   },
 
+  // ═══════════════════════════════════════════════════════════════
+  // File Viewer window: back/forward between previews, expand, resize
+  // ═══════════════════════════════════════════════════════════════
+
+  /**
+   * Remember a preview in the back/forward list. A navigation that came FROM the
+   * list (stepFilePreviewHistory) is not recorded again, and neither is a reload
+   * of the file already showing (the MD/Page toggles reopen the same file). Opening
+   * something new while standing mid-list drops the forward entries, as a browser does.
+   */
+  _recordFilePreviewHistory(filePath, sessionId, attachmentId, options) {
+    const h = (this.filePreviewHistory = this.filePreviewHistory || { entries: [], index: -1 });
+    if (!this._filePreviewHistoryStepping) {
+      const cur = h.entries[h.index];
+      const same =
+        cur && cur.filePath === filePath && cur.sessionId === sessionId && (cur.attachmentId || null) === (attachmentId || null);
+      if (!same) {
+        h.entries.length = h.index + 1;
+        h.entries.push({ filePath, sessionId, attachmentId: attachmentId || null, options });
+        if (h.entries.length > FILE_PREVIEW_HISTORY_MAX) h.entries.shift();
+        h.index = h.entries.length - 1;
+      }
+    }
+    this._updateFilePreviewHistoryNav();
+  },
+
+  /** Back (-1) / forward (+1) through the previews opened in this overlay session. */
+  stepFilePreviewHistory(delta) {
+    const h = this.filePreviewHistory;
+    if (!h) return;
+    const target = h.index + delta;
+    if (target < 0 || target >= h.entries.length) return;
+    if (this.filePreviewEdit?.dirty && !confirm('Discard unsaved changes?')) return;
+    h.index = target;
+    const e = h.entries[target];
+    // openFilePreview records synchronously, before its first await, so the flag
+    // only needs to cover the call itself.
+    this._filePreviewHistoryStepping = true;
+    try {
+      // A folder-grid page goes through the grid so index, lastIndex and the highlighted
+      // tile follow; otherwise the next ‹ › would continue from the newer file.
+      const folderFile = e.options?.folderFile;
+      if (folderFile && folderFile.folderId === this.folderGrid?.folderId) {
+        const index = this.folderGrid.files.findIndex((f) => f.name === folderFile.name);
+        if (index !== -1) return this._openFolderGridFile(index);
+      }
+      return this.openFilePreview(e.filePath, e.sessionId, e.attachmentId, e.options || {});
+    } finally {
+      this._filePreviewHistoryStepping = false;
+    }
+  },
+
+  /** Buttons show once there is somewhere to go; each is disabled at its end of the list. */
+  _updateFilePreviewHistoryNav() {
+    const h = this.filePreviewHistory;
+    const multi = !!h && h.entries.length > 1;
+    const back = this.$('filePreviewBackBtn');
+    const fwd = this.$('filePreviewForwardBtn');
+    if (back) {
+      back.hidden = !multi;
+      back.disabled = !multi || h.index <= 0;
+    }
+    if (fwd) {
+      fwd.hidden = !multi;
+      fwd.disabled = !multi || h.index >= h.entries.length - 1;
+    }
+  },
+
+  /** Expand button: fill the screen, remembered across opens. */
+  toggleFilePreviewExpanded() {
+    this._setFilePreviewPref('expanded', !this._filePreviewPref('expanded'));
+    this._applyFilePreviewExpanded();
+  },
+
+  _applyFilePreviewExpanded() {
+    const on = this._filePreviewPref('expanded');
+    const win = this.$('filePreviewOverlay')?.querySelector?.('.file-preview-window');
+    win?.classList?.toggle('expanded', on);
+    // The label stays "Expand" and aria-pressed carries the state, like MD, Lines and
+    // Wrap, so a screen reader never announces "Restore size, pressed".
+    this.$('filePreviewExpandBtn')?.setAttribute('aria-pressed', on ? 'true' : 'false');
+  },
+
+  /**
+   * One-time wiring for the window chrome: Alt+←/→ for back/forward (capture phase
+   * so the terminal behind the overlay never types the arrow) and the corner grip.
+   */
+  _bindFilePreviewChrome() {
+    if (this._filePreviewChromeBound) return;
+    this._filePreviewChromeBound = true;
+    document.addEventListener(
+      'keydown',
+      (ev) => {
+        if (!ev.altKey || ev.ctrlKey || ev.metaKey || ev.shiftKey) return;
+        if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+        if (!this.$('filePreviewOverlay')?.classList.contains('visible')) return;
+        const t = ev.target;
+        if (t && (t.isContentEditable || (/^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) && !t.classList?.contains('xterm-helper-textarea')))) return;
+        // Swallowed even at the ends of the list: otherwise the terminal behind the overlay
+        // types it as word-left/right, and on a header button the browser's own Alt+← goes Back.
+        ev.preventDefault();
+        ev.stopPropagation();
+        const h = this.filePreviewHistory;
+        const delta = ev.key === 'ArrowLeft' ? -1 : 1;
+        if (!h || h.index + delta < 0 || h.index + delta >= h.entries.length) return;
+        this.stepFilePreviewHistory(delta);
+      },
+      true
+    );
+    this._bindFilePreviewResize();
+  },
+
+  /** Drag the corner grip to size the window; the window is centred, so the delta counts twice. */
+  _bindFilePreviewResize() {
+    const grip = this.$('filePreviewResize');
+    const win = grip?.parentElement;
+    if (!grip || !win) return;
+    grip.addEventListener('pointerdown', (ev) => {
+      if (ev.button !== 0) return; // a right-click on the grip must not start a resize
+      ev.preventDefault();
+      const startX = ev.clientX;
+      const startY = ev.clientY;
+      const startW = win.offsetWidth;
+      const startH = win.offsetHeight;
+      grip.setPointerCapture?.(ev.pointerId);
+      const move = (e) => {
+        const w = Math.max(320, Math.min(window.innerWidth * 0.96, startW + 2 * (e.clientX - startX)));
+        const h = Math.max(240, Math.min(window.innerHeight * 0.94, startH + 2 * (e.clientY - startY)));
+        win.style.width = `${Math.round(w)}px`;
+        win.style.height = `${Math.round(h)}px`;
+      };
+      const up = () => {
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', up);
+        grip.removeEventListener('pointercancel', up);
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', up);
+      grip.addEventListener('pointercancel', up);
+    });
+  },
+
   /** "Show folder" in the preview: the grid of the previewed file's folder. */
   openFolderOfPreview() {
     const target = this.filePreviewFolderTarget;
@@ -4728,6 +4877,8 @@ Object.assign(CodemanApp.prototype, {
     // Back on the grid (if one is open underneath): its current tile stays marked.
     if (this.folderGrid) this.folderGrid.index = null;
     this._updateFolderPreviewNav(null);
+    this.filePreviewHistory = null;
+    this._updateFilePreviewHistoryNav();
     const overlay = this.$('filePreviewOverlay');
     if (overlay) {
       overlay.classList.remove('visible');
@@ -6360,16 +6511,7 @@ Object.assign(CodemanApp.prototype, {
     closeBtn.onclick = (e) => { e.stopPropagation(); dismiss(); };
     toast.appendChild(closeBtn);
 
-    // Cache toast container reference
-    if (!this._toastContainer) {
-      this._toastContainer = document.querySelector('.toast-container');
-      if (!this._toastContainer) {
-        this._toastContainer = document.createElement('div');
-        this._toastContainer.className = 'toast-container';
-        document.body.appendChild(this._toastContainer);
-      }
-    }
-    this._toastContainer.appendChild(toast);
+    this._toastStack().appendChild(toast);
 
     requestAnimationFrame(() => toast.classList.add('show'));
 
@@ -6381,6 +6523,189 @@ Object.assign(CodemanApp.prototype, {
     // to update or dismiss itself once its own condition resolves (e.g. a "loading model"
     // toast a poll loop dismisses once the model reports ready).
     return { dismiss, setMessage: (text) => { msgSpan.textContent = text; } };
+  },
+
+  /** The fixed toast stack (`.toast-container`), created on first use and cached. */
+  _toastStack() {
+    if (!this._toastContainer) {
+      this._toastContainer = document.querySelector('.toast-container');
+      if (!this._toastContainer) {
+        this._toastContainer = document.createElement('div');
+        this._toastContainer.className = 'toast-container';
+        document.body.appendChild(this._toastContainer);
+      }
+    }
+    return this._toastContainer;
+  },
+
+  /**
+   * A security notice (security-notices.json) as its own card in the toast stack: shield,
+   * "Security notice" eyebrow, the notice's title and message, its link as the primary
+   * button, a quiet Dismiss and the ×. Same container as every toast, so it never fights
+   * the z-index stack. Sticky: only the user ends it.
+   *
+   * The notice's own text (title, message, link label) is already in the UI language, so it
+   * is set with textContent and carries `data-i18n-skip`; the card's own copy ("Security
+   * notice", "Dismiss", the × label) is application text and translates as usual.
+   *
+   * `opts.onClose(reason)` fires ONCE, and only on a user action: `'link'`, `'dismiss'` or
+   * `'close'`. Never on the handle's own `dismiss()`, which does not mean the user saw it.
+   *
+   * @param {{id: string, title: string, message: string, label: string, url: string}} notice
+   * @param {{onClose?: (reason: string) => void}} [opts]
+   */
+  showSecurityNotice(notice, opts = {}) {
+    const card = this._noticeCard('security-notice', opts.onClose);
+    const main = this._noticeEl('div', 'security-notice-main');
+    main.append(this._noticeEl('div', 'security-notice-eyebrow', 'Security notice'));
+    main.append(...this._noticeTextBlock(notice));
+    const actions = this._noticeEl('div', 'security-notice-actions');
+    const link = this._noticeLinkButton(notice, card, () => card.close('link'));
+    if (link) actions.append(link);
+    actions.append(this._noticeButton('security-notice-quiet', 'Dismiss', () => card.close('dismiss')));
+    main.append(actions);
+    card.el.append(this._noticeIcon('shield', 'security-notice-icon'), main, card.closeButton);
+    card.mount();
+    return { dismiss: () => card.close(null) };
+  },
+
+  /**
+   * The once-per-release update toast when security notices ride INSIDE it
+   * (CodemanSecurityNotices.plan in constants.js decides that; with no notice the plain
+   * showToast toast is used, unchanged). Styled as the security card: the release text as
+   * before (translated by the same i18n.js pattern), one warning section per notice, then
+   * each notice's link button beside "See what's new".
+   *
+   * Sticky, since it carries a warning. `onNoticeSeen(id)` records a notice: the × records
+   * every notice in the card, a notice's link records that one and closes the card. "See
+   * what's new" opens the release notes and leaves the card up, because the warning in it
+   * has not been answered yet.
+   *
+   * @param {{text: string, releaseUrl: string, notices: Array<object>, onNoticeSeen: (id: string) => void}} opts
+   */
+  showUpdateNotice({ text, releaseUrl, notices, onNoticeSeen }) {
+    const seen = (id) => { try { onNoticeSeen?.(id); } catch (err) { console.error('[notice] onNoticeSeen failed:', err); } };
+    const card = this._noticeCard('security-notice update-notice', (reason) => {
+      if (reason === 'close') for (const notice of notices) seen(notice.id);
+    });
+    const main = this._noticeEl('div', 'security-notice-main');
+    main.append(this._noticeEl('p', 'update-notice-text', text));
+    const actions = this._noticeEl('div', 'security-notice-actions');
+    for (const notice of notices) {
+      const section = this._noticeEl('section', 'security-notice-section');
+      const head = this._noticeEl('div', 'security-notice-section-head');
+      head.append(this._noticeIcon('shield'), this._noticeEl('span', 'security-notice-eyebrow', 'Security notice'));
+      section.append(head, ...this._noticeTextBlock(notice));
+      main.append(section);
+      const link = this._noticeLinkButton(notice, card, () => { seen(notice.id); card.close('link'); });
+      if (link) actions.append(link);
+    }
+    actions.append(
+      this._noticeButton(
+        'security-notice-secondary',
+        "See what's new",
+        card.act(() => window.open(releaseUrl, '_blank', 'noopener,noreferrer'))
+      )
+    );
+    main.append(actions);
+    card.el.append(this._noticeIcon('update', 'security-notice-icon update-notice-icon'), main, card.closeButton);
+    card.mount();
+    return { dismiss: () => card.close(null) };
+  },
+
+  /**
+   * The shell both notice cards share: role=alert, the ×, mount and a once-only close.
+   * A closing card stays in the DOM for its 200 ms fade, so close() also makes it inert, and
+   * `act(fn)` wraps a button's handler to do nothing once the card is closing (a double click
+   * on a link used to open it twice; the × and Dismiss go through close(), already once-only).
+   */
+  _noticeCard(className, onUserClose) {
+    const el = this._noticeEl('div', className);
+    el.setAttribute('role', 'alert');
+    el.setAttribute('aria-live', 'assertive');
+    let closed = false;
+    const close = (reason) => {
+      if (closed) return;
+      closed = true;
+      el.inert = true;
+      el.classList.remove('show');
+      setTimeout(() => el.remove(), 200);
+      if (reason && typeof onUserClose === 'function') {
+        try { onUserClose(reason); } catch (err) { console.error('[notice] onClose failed:', err); }
+      }
+    };
+    const closeButton = this._noticeButton('security-notice-close', '×', () => close('close'));
+    closeButton.setAttribute('aria-label', 'Close');
+    const mount = () => {
+      this._toastStack().appendChild(el);
+      requestAnimationFrame(() => el.classList.add('show'));
+    };
+    const act = (fn) => () => { if (!closed) fn(); };
+    return { el, closeButton, close, mount, act };
+  },
+
+  /** The notice's own title (when it has one) and message: textContent, never translated. */
+  _noticeTextBlock(notice) {
+    const parts = [];
+    if (notice.title) parts.push(this._noticeEl('div', 'security-notice-title', notice.title, true));
+    parts.push(this._noticeEl('p', 'security-notice-body', notice.message, true));
+    return parts;
+  },
+
+  /**
+   * The notice's link as the primary button, or null when the link is not https.
+   * selectSecurityNotices() already drops such a notice; the URL is checked again here, at the
+   * sink, because showSecurityNotice/showUpdateNotice take any object. Opened with noopener
+   * AND noreferrer: noopener alone still sends this instance's origin (a tailnet name, a tunnel
+   * URL) to the linked site as the Referer.
+   */
+  _noticeLinkButton(notice, card, after) {
+    const url = notice.url;
+    if (!window.CodemanSecurityNotices?.urlOk?.(url)) return null;
+    return this._noticeButton(
+      'security-notice-primary',
+      notice.label,
+      card.act(() => { window.open(url, '_blank', 'noopener,noreferrer'); after(); }),
+      true
+    );
+  },
+
+  _noticeButton(className, label, onClick, untranslated = false) {
+    const btn = this._noticeEl('button', className, label, untranslated);
+    btn.type = 'button';
+    btn.onclick = (e) => { e.stopPropagation(); onClick(); };
+    return btn;
+  },
+
+  _noticeEl(tag, className, text, untranslated = false) {
+    const el = document.createElement(tag);
+    el.className = className;
+    if (text !== undefined) el.textContent = text;
+    if (untranslated) el.setAttribute('data-i18n-skip', '');
+    return el;
+  },
+
+  /** Inline SVG icons (no asset): `shield` (with an exclamation) or `update` (arrow up). */
+  _noticeIcon(kind, wrapperClass) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    for (const [k, v] of Object.entries({
+      viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+      'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', focusable: 'false',
+    })) svg.setAttribute(k, v);
+    const shapes = kind === 'shield'
+      ? [['path', { d: 'M12 3 4.5 6v5.2c0 4.5 3.1 8.4 7.5 9.8 4.4-1.4 7.5-5.3 7.5-9.8V6L12 3z' }], ['path', { d: 'M12 8.5v4.5' }], ['path', { d: 'M12 16.5h.01' }]]
+      : [['circle', { cx: '12', cy: '12', r: '9' }], ['path', { d: 'M12 16.5v-9' }], ['path', { d: 'm8.5 11 3.5-3.5 3.5 3.5' }]];
+    for (const [tag, attrs] of shapes) {
+      const shape = document.createElementNS(NS, tag);
+      for (const [k, v] of Object.entries(attrs)) shape.setAttribute(k, v);
+      svg.appendChild(shape);
+    }
+    if (!wrapperClass) return svg;
+    const wrap = this._noticeEl('span', wrapperClass);
+    wrap.setAttribute('aria-hidden', 'true');
+    wrap.appendChild(svg);
+    return wrap;
   },
 
   /**

@@ -20,6 +20,7 @@ export { registerGitStatusRoutes } from './git-status-routes.js';
 export { registerEditHistoryRoutes } from './edit-history-routes.js';
 export { registerStatusTelemetryRoutes } from './status-telemetry-routes.js';
 export { registerCaseRoutes } from './case-routes.js';
+export { registerWorktreeRoutes } from './worktree-routes.js';
 export { registerSessionRoutes } from './session-routes.js';
 export { registerRespawnRoutes } from './respawn-routes.js';
 export { registerRalphRoutes } from './ralph-routes.js';
@@ -34,6 +35,7 @@ export { registerVoiceRoutes } from './voice-routes.js';
 export { registerWebviewRoutes, tryWebviewRefererFallback } from './webview-routes.js';
 export { registerTabLayoutRoutes } from './tab-layout-routes.js';
 export { registerMcpSyncRoutes } from './mcp-sync-routes.js';
+export { registerConfigBackupRoutes, runConfigBackup } from './config-backup-routes.js';
 export { registerWebhookRoutes } from './webhook-routes.js';
 export { registerDoctorRoutes } from './doctor-routes.js';
 export {
