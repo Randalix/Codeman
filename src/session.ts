@@ -298,8 +298,8 @@ function cliExportsTruecolor(mode: SessionMode): boolean {
  * Codex, Claude Code, and Gemini are known, controlled (Ink/React) TUIs that
  * repaint via cursor positioning, so dropping the alt-screen switch is safe —
  * content stays in the normal buffer. Excluded: `shell` (arbitrary programs like
- * vim/less/htop legitimately need the alt screen), `opencode` (its own MIDDLE strip,
- * isMuxMouseStripMode), `pi` (below) and `grok` (a fullscreen alt-screen TUI with
+ * vim/less/htop legitimately need the alt screen), `opencode` and `pi` (their own MIDDLE strip,
+ * isMuxMouseStripMode; pi since 1.4.0) and `grok` (a fullscreen alt-screen TUI with
  * mouse support). Keep parity with the replay-side strip (`stripReplayBuffer` in
  * session-routes.ts); the table in `CliCapabilities.altScreen` is pinned for every
  * stock CLI in test/claude-scrollback-strip.test.ts.
