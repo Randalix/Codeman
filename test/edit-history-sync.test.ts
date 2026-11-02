@@ -470,12 +470,15 @@ describe('EditHistorySync', () => {
   it('a store whose run is in flight is not dropped, and loads once', async () => {
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    const { host, sync, loads } = setup();
+    const { host, sync, loads, readers } = setup();
     host.append('main', editLine('t1', T0, '/w/a.ts'));
     const orig = host.read;
     let first = true;
     host.read = async (...a) => {
-      if (first) {
+      // Hold only the read of s1 (readSources records its session just before this call). "The
+      // first read" is not enough: the stores load from disk, so under load another session's
+      // read could arrive first, block on the gate and wait for a release() that comes after it.
+      if (first && readers[readers.length - 1] === 's1') {
         first = false;
         await gate;
       }
