@@ -835,6 +835,15 @@ function formatKeepWarmStatus(status, now, statusLine) {
 // Pure: no DOM, no timers, no side effects. `now` is passed in.
 const SSE_STALE_TIMEOUT_MS = 45000; // three missed 15s heartbeats
 
+// The watchdog above cannot see a connect attempt that never opens: an
+// EventSource whose request gets no response headers (a resumed phone on a
+// VPN, a proxy that accepted the socket and went silent) stays CONNECTING
+// without firing `open` or `error`, and its status is never 'connected'.
+// connectSSE() bounds each attempt by this much and then retries it through
+// the normal backoff. Generous next to a healthy open (well under a second)
+// so a slow link is not cut off mid-handshake.
+const SSE_CONNECT_TIMEOUT_MS = 15000;
+
 function computeSseStale(input) {
   const {
     lastMessageAt = null,
@@ -1552,6 +1561,7 @@ if (typeof window !== 'undefined') {
   window.CodemanSseStale = {
     compute: computeSseStale,
     TIMEOUT_MS: SSE_STALE_TIMEOUT_MS,
+    CONNECT_TIMEOUT_MS: SSE_CONNECT_TIMEOUT_MS,
   };
   window.CodemanPromptCache = {
     format: formatPromptCacheStatus,
@@ -1922,6 +1932,7 @@ const SSE_EVENTS = {
   CASE_CREATED: 'case:created',
   CASE_LINKED: 'case:linked',
   CASE_DELETED: 'case:deleted',
+  CASE_RENAMED: 'case:renamed',
   CASE_ORDER_CHANGED: 'case:order-changed',
   DOCKER_EXPORT_COMPLETE: 'docker:exportComplete',
   DOCKER_EXPORT_FAILED: 'docker:exportFailed',
@@ -2273,12 +2284,15 @@ function findBraceSetLinks(text, skip) {
 }
 
 /**
- * Every linkable file path in `text`, in order: absolute (rooted) paths first,
- * then `~/` and relative ones, then folder paths — each only where it overlaps
- * neither an earlier one nor a URL.
+ * Every linkable file path in `text`, sorted by position. Spaced candidates
+ * reserve their whole span first, even when unlinkable; rooted, `~/`, relative
+ * and folder detectors then skip reserved spans, earlier matches and URLs.
  *
  * The one entry point for both consumers (terminal link provider, response
- * viewer), so a path form is clickable in both or in neither.
+ * viewer). The viewer carries a leading bold label into the text it passes
+ * (spacedFilePathOnLine judges it, as for the same line in the terminal) and
+ * reads a text node that follows another inline element as mid-line; paths
+ * split across inline elements are still detected per text node.
  *
  * @param {string} text
  * @returns {Array<{path: string, index: number, folder?: true, braces?: true}>} `index` is where
@@ -2293,18 +2307,38 @@ function findFilePathLinks(text) {
   // `?img=b.png` belong to the URL link, not to a second, overlapping file link.
   // (`file:///home/x.png` is not one of them: its path is the file.)
   const urls = [];
-  const urlPattern = /\bhttps?:\/\/\S+/gi;
+  const webUrlPattern = /\bhttps?:\/\/\S+/gi;
   let match;
-  while ((match = urlPattern.exec(value)) !== null) urls.push({ index: match.index, path: match[0] });
+  while ((match = webUrlPattern.exec(value)) !== null) urls.push({ index: match.index, path: match[0] });
   const inUrl = (index, length) => urls.some((u) => index < u.index + u.path.length && u.index < index + length);
 
   // Brace sets first: the rooted pattern would take `/a/{x,y}/b.png` whole, braces
   // and all, and the relative one stops at the first `{`.
   found.push(...findBraceSetLinks(value, inUrl));
 
+  // A path with spaces is taken whole, or the span it covers links nothing
+  // (spacedFilePathOnLine). Either way no detector below may cut a fragment out of it.
+  const reserved = [];
+  let lineStart = 0;
+  for (const line of value.split('\n')) {
+    const spaced = spacedFilePathOnLine(line);
+    if (spaced && !inUrl(lineStart + spaced.index, spaced.path.length)) {
+      const index = lineStart + spaced.index;
+      reserved.push({ index, path: spaced.path });
+      if (spaced.link) found.push({ path: spaced.path, index });
+    }
+    lineStart += line.length + 1;
+  }
+  const isReserved = (index, length) =>
+    reserved.some((r) => index < r.index + r.path.length && r.index < index + length);
+
   const absolute = absoluteFilePathPattern();
   while ((match = absolute.exec(value)) !== null) {
-    if (!inUrl(match.index, match[1].length) && !overlaps(match.index, match[1].length)) {
+    if (
+      !inUrl(match.index, match[1].length) &&
+      !overlaps(match.index, match[1].length) &&
+      !isReserved(match.index, match[1].length)
+    ) {
       found.push({ path: match[1], index: match.index });
     }
   }
@@ -2312,17 +2346,121 @@ function findFilePathLinks(text) {
   while ((match = relative.exec(value)) !== null) {
     const path = match[2];
     const index = match.index + match[1].length;
-    if (overlaps(index, path.length) || inUrl(index, path.length)) continue;
+    if (overlaps(index, path.length) || inUrl(index, path.length) || isReserved(index, path.length)) continue;
     found.push({ path, index });
   }
   const folders = new RegExp(FOLDER_PATH_LINK_PATTERN.source, 'g');
   while ((match = folders.exec(value)) !== null) {
     const path = folderLinkPath(match[2]);
     const index = match.index + match[1].length;
-    if (!path || overlaps(index, path.length) || inUrl(index, path.length)) continue;
+    if (!path || overlaps(index, path.length) || inUrl(index, path.length) || isReserved(index, path.length)) continue;
     found.push({ path, index, folder: true });
   }
   return found.sort((a, b) => a.index - b.index);
+}
+
+/** Labels that explicitly identify a path, for {@link spacedFilePathOnLine}. */
+const SPACED_FILE_PATH_LABEL_PATTERN =
+  /^(?:path|files?|saved (?:to|as)|wrote|written to|output|created|location|attachment):[ \t]*$/i;
+
+/**
+ * A file path WITH SPACES on one line, or null.
+ *
+ * Every path pattern ends a path at whitespace, so `/mnt/c/OneDrive - Contoso/a.docx`
+ * linked `/mnt/c/OneDrive` plus a relative `Contoso/a.docx`, two links to the
+ * wrong targets. A space is only safe inside a path where the line itself bounds
+ * the path, so a spaced path is recognised in exactly these shapes:
+ *
+ *   /mnt/c/My Docs/report.docx              the whole line is the path
+ *   - /mnt/c/My Docs/report.docx            after a list marker (`-`, `*`, `•`, `1.`, `2)`)
+ *   Saved to: 03 Attachments/Build SIPOC Design/plan.pptx      after a path label (SPACED_FILE_PATH_LABEL_PATTERN)
+ *
+ * An absolute path may stand alone or follow a marker. Any label, before an
+ * absolute, relative or `~/` path, must be an explicit path label
+ * (SPACED_FILE_PATH_LABEL_PATTERN), with an optional marker before it: generic
+ * labels (`Error:`, `Note:`) and bare bullets also introduce prose, so a relative
+ * path needs a path label to be taken spaced. One trailing sentence mark is left
+ * out, and a leading run of `./` or `../` is not a segment. The candidate must read as ONE path:
+ * it ends on a known extension, a rooted one has a directory before its first
+ * space, no earlier word holds an extension (`a.md,`, `a.ts#L12`) or ends in `/`,
+ * and none holds a `:` and a digit (`a.ts:42`, a line suffix ends the path). Later words cannot start a new
+ * `/`, `~/`, `./` or `../` path, no earlier word ends in `:`, is an arrow or has
+ * no letter or digit (a prompt glyph such as `❯` or `$`; a bare `-` is kept), and
+ * a run of spaces (a column gap) is refused, so two paths on a line are never
+ * merged. A relative candidate whose only `/` word is its last is prose after the
+ * label (`Wrote: 120 lines to src/foo.ts`) and is left alone, which also splits
+ * `Saved to: My Docs/plan.md` as master does. An earlier word that is a lowercase
+ * connective or verb (SPACED_PATH_PROSE_WORD: `and`, `in`, `has`, `contains`, ...)
+ * or a bare `=` makes the candidate a sentence (`/tmp/out has the logs in run.log`),
+ * so a name such as `Pros and Cons.md` splits as master does. A command line is
+ * refused: an executable under `bin/`, `.bin/`, `scripts/` or `tools/` as the
+ * first word, any earlier word ending in `$` (a shell prompt, `/home/me/proj$ cat a.md`,
+ * `/mnt/c/My Docs$ ls a.md`), or any `-x`/`--x` flag word.
+ *
+ * A candidate that is one path but not a linkable one (an unknown root such as
+ * `/etc`, a `.`/`..`/empty segment) comes back with `link: false` when its last
+ * word still holds a `/`: its span links nothing, rather than the fragment after
+ * its last space. Otherwise (`/usr/bin/env node build.js`) the line is left to
+ * the ordinary detectors.
+ *
+ * Linear: one bounded prefix match, then string scans.
+ *
+ * @param {string} line One line, no newline.
+ * @returns {{path: string, index: number, link: boolean} | null}
+ */
+function spacedFilePathOnLine(line) {
+  const text = String(line || '');
+  const prefix = /^[ \t]*((?:\d{1,3}[.)]|[-*•])[ \t]+)?((?:[A-Za-z][\w-]{0,30}(?: [\w-]{1,30}){0,3}):[ \t]+)?/.exec(text);
+  const index = prefix[0].length;
+  const path = text.slice(index).trimEnd().replace(/[.,;:!?]$/, '');
+  if (!path.includes(' ') || !path.includes('/') || path.length > 1000) return null;
+  // After a label, only a path label introduces a path; with no label, only an
+  // absolute path may stand alone. `Error: /a/b contains c.md` is prose.
+  if (prefix[2] ? !SPACED_FILE_PATH_LABEL_PATTERN.test(prefix[2]) : !path.startsWith('/')) return null;
+  if (!PATH_TOKEN_ENDS_WITH_EXTENSION.test(path)) return null;
+  // A run of spaces is a column gap (`git status`, `ls -l`), not a name.
+  if (/[\t"'`<>|;&\x00-\x1f\\]/.test(path) || path.includes('://') || path.includes('  ')) return null;
+  const words = path.split(' ');
+  // A rooted candidate must have a directory before its first space: `/usr/bin/env node a.js`
+  // or `/review the changes in src/a.ts` is a command, not a spaced path.
+  if (path.startsWith('/') && !/^\/[^/]+\//.test(words[0])) return null;
+  // A command whose executable sits under a known root (`/opt/homebrew/bin/node a.js`,
+  // `/home/me/proj/node_modules/.bin/tsc -p tsconfig.json`, `/home/me/proj/scripts/deploy prod.yml`)
+  // is not a path either.
+  if (/\/(?:\.?bin|scripts?|tools)\/[^/]+$/.test(words[0]) || words.some((word) => /^-{1,2}\w/.test(word))) {
+    return null;
+  }
+  for (const word of words.slice(0, -1)) {
+    if (word.endsWith('/') || word.endsWith(':') || /^(?:—|–|→|=>|->|<-|=)$/.test(word)) return null;
+    // A shell prompt that prints its working directory in full (`/home/me/proj$ cat
+    // notes.md`; WSL's `/mnt/c/...` is outside `$HOME`) is a command line too, and so is
+    // one whose directory has a space in it (`/mnt/c/My Docs$ ls notes.md`): the `$`
+    // can end any earlier word, not only the first.
+    if (word.endsWith('$')) return null;
+    // A word with no letter or digit (a prompt glyph `❯` or `$`, a `✓`) is never
+    // part of a file name, apart from a bare `-` (`OneDrive - Contoso`).
+    if (word !== '-' && !/[\p{L}\p{N}]/u.test(word)) return null;
+    // `a.ts:42` (grep -n, compiler output): the path already ended at the line suffix.
+    if (/:\d/.test(word)) return null;
+    // An extension anywhere in an earlier word (`a.md,`, `a.ts#L12`) ends a path there.
+    if (PATH_TOKEN_HAS_EXTENSION.test(word)) return null;
+    // A connective or verb joins a path to prose (`/tmp/out has the logs in run.log`,
+    // `Files: src/components and utils/x.ts`), so the candidate is a sentence.
+    if (SPACED_PATH_PROSE_WORD.test(word)) return null;
+  }
+  if (words.slice(1).some((word) => /^(?:\/|~\/|\.{1,2}\/)/.test(word))) return null;
+  const rooted = SPACED_PATH_ROOT.test(path) || path.startsWith('~/');
+  const segments = path.replace(/^(?:~?\/|(?:\.\.?\/)+)/, '').split('/');
+  const link = (rooted || !path.startsWith('/')) && segments.every((seg) => seg && seg !== '.' && seg !== '..');
+  // A path label vouches that a path follows, not for the words before it: when
+  // only the last word holds a `/` (`Wrote: 120 lines to src/foo.ts`), the spaces
+  // are prose, so a relative candidate is left to the ordinary detectors.
+  const firstSlash = words.findIndex((word) => word.includes('/'));
+  if (link && firstSlash === words.length - 1 && !path.startsWith('/')) return null;
+  // Reserve an unlinkable span only when it still reads as a path to its end;
+  // otherwise leave the line to the ordinary detectors.
+  if (!link && !words[words.length - 1].includes('/')) return null;
+  return { path, index, link };
 }
 
 /**
@@ -2459,8 +2597,16 @@ function terminalLogicalLine(buffer, row, cols, maxRows) {
   const continuesPrevious = (r) => {
     if (r <= 0) return false;
     if (lineAt(r)?.isWrapped) return true;
+    // A divider row never continues the row above, even when that row reaches
+    // the right edge: a URL ending at the edge must not absorb `────` below it.
+    if (/^[\s─━═╌╍┄┅┈┉-]+$/u.test(lineAt(r)?.translateToString(true) || '')) return false;
     const prev = lineAt(r - 1);
-    return !!prev && (prev.translateToString(true) || '').length >= width;
+    const prevText = prev?.translateToString(true) || '';
+    // A full-width table divider is a row boundary, not a hard-wrapped line.
+    // Treating it as a continuation glues the divider onto the row below and
+    // hides that row's wrapped URL from the link provider.
+    if (/^[\s─━═╌╍┄┅┈┉-]+$/u.test(prevText)) return false;
+    return prevText.length >= width;
   };
 
   let startRow = row;
@@ -2511,6 +2657,16 @@ const FILE_LINK_ROOT_GROUP = /^\(\\\/\(\?:([^()]*)\)/.exec(FILE_PATH_LINK_PATTER
 const PATH_TOKEN_ENDS_WITH_EXTENSION = new RegExp(`\\.${FILE_LINK_EXTENSION_GROUP}$`);
 const PATH_TOKEN_HAS_EXTENSION = new RegExp(`\\.${FILE_LINK_EXTENSION_GROUP}\\b`);
 const PATH_TOKEN_STARTS_NEW_PATH = new RegExp(`^(?:~\\/|\\/(?:${FILE_LINK_ROOT_GROUP})\\/)`);
+/**
+ * Lowercase connectives and verbs that put a spaced candidate in a sentence, for
+ * {@link spacedFilePathOnLine}. `at` stays out (`Screenshot 2026-10-24 at 10.00.00.png`)
+ * and so does `of` (`Copy of report.docx`); a name using a listed word
+ * (`Pros and Cons.md`) splits as it did before spaced paths were linked.
+ */
+const SPACED_PATH_PROSE_WORD =
+  /^(?:and|or|to|in|into|from|the|is|are|was|were|has|have|had|contains|holds|see|then|vs|via|as)$/;
+/** A rooted path's start (`/home/`, `/mnt/`, …), for {@link spacedFilePathOnLine}. */
+const SPACED_PATH_ROOT = new RegExp(`^\\/(?:${FILE_LINK_ROOT_GROUP})\\/`);
 /** A relative head that names its own location (`./a`, `../a`) is an entry of its own. */
 const PATH_TOKEN_STARTS_EXPLICIT_RELATIVE = /^\.{1,2}\//;
 /** First directory of a path, a leading `/` or `./` ignored: `src` for `src/a.ts` and `/src/a.ts`. */
@@ -2636,6 +2792,395 @@ function terminalPathLine(buffer, row, cols, maxRows) {
     return -1;
   };
   return { startRow: parts[0].startRow, endRow: parts[parts.length - 1].endRow, text, offsetToCell, cellToOffset };
+}
+
+/**
+ * Web URLs in terminal text, with the trimming the link provider applies.
+ *
+ * A single `&` is part of the URL (query separator); `&&` is the shell operator
+ * and ends it. `)` is kept INSIDE a URL when it closes a `(` that is also inside
+ * it (`…/Team-Space(QA)Archive/…` used to link only as far as `(QA`), and an
+ * unmatched `)` ends the URL, which keeps the closing paren of `(https://…)` and
+ * `[text](https://…)` out of the link. Trailing sentence punctuation is trimmed.
+ *
+ * @param {string} text
+ * @returns {Array<{url: string, startIndex: number, endIndex: number, rawEnd: number}>}
+ *          `endIndex` is exclusive; `rawEnd` is where the match ran to before the
+ *          paren/punctuation trim (the wrap-continuation test needs it).
+ */
+function findTerminalUrls(text) {
+  // Named `urlPattern` on purpose: test/link-provider-regex.test.ts extracts it
+  // by name to prove it stays linear-time on hostile lines.
+  const urlPattern = /https?:\/\/(?:[^\s"'<>|;&\]\x00-\x1f]|&(?!&))+/g;
+  const urls = [];
+  let match;
+  while ((match = urlPattern.exec(String(text || ''))) !== null) {
+    const raw = match[0];
+    let end = raw.length;
+    let depth = 0;
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === '(') depth++;
+      else if (raw[i] === ')') {
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+        depth--;
+      }
+    }
+    const url = raw.slice(0, end).replace(/[.,;:!?&]+$/, '');
+    if (!/:\/\/[^/]/.test(url)) continue;
+    urls.push({ url, startIndex: match.index, endIndex: match.index + url.length, rawEnd: match.index + raw.length });
+  }
+  return urls;
+}
+
+/**
+ * The row span a URL covers when the CLI wrapped it with its OWN newlines at a
+ * point short of the terminal width.
+ *
+ * {@link terminalLogicalLine} joins soft wraps and full-width hard wraps. A CLI
+ * that word-wraps inside a table cell or a paragraph (codex's markdown tables,
+ * for one) breaks a long URL at `/`, `?`, `-` … well before the right edge and
+ * indents the rest to the cell's column, so neither rule fires and each row
+ * linked a fragment. A row continues the URL above it only when ALL hold:
+ *   - the URL fragment ends on a character a wrapper breaks after
+ *     (`/ ? & = - _ % # + ~`); a following table column may be excluded;
+ *   - the next row is indented, but no further right than the column the URL
+ *     started in (a table cell or list item continuation, not unrelated text),
+ *     and no column gap lies between its indent and the URL on the first row
+ *     (that would be the next record of a table);
+ *   - that row's first token looks like URL material (contains one of
+ *     `% & = / ? . - _`), is not a bare number/version or list marker,
+ *     and is not itself a new `scheme://`, a shell prompt (`user@host:`),
+ *     a home path (`~/`), an email address, an HTTP status line, a label
+ *     ending in `:`, a measurement or clock time (`45%`, `12.3ms`,
+ *     `10:00:00`), or a `name=value` field under a URL ending in `/`;
+ *     without `% & = / ?`, the token must finish its cell (row end or a
+ *     gap of at least two spaces) and must not be code with a call paren
+ *     or a word ending a sentence (`Done.`).
+ * The last rule is what stops prose such as "…/files/" + "then run it" from
+ * being glued into one link.
+ *
+ * Bounded by `maxRows`, like the logical line. Pure: reads rows only.
+ *
+ * @param {{getLine: (row: number) => any, length: number}} buffer
+ * @param {number} row 0-based absolute row being examined.
+ * @param {number} cols Terminal width.
+ * @param {number} [maxRows]
+ * @returns {{startRow: number, endRow: number, firstRowUrlEnd?: number} | null}
+ *          `firstRowUrlEnd` is where the URL's cell ends on the first row when
+ *          other table columns follow it and that row does not soft-wrap; null
+ *          means the row is not part of a URL continued this way.
+ */
+function terminalUrlContinuationExtent(buffer, row, cols, maxRows) {
+  const bound = Math.max(1, maxRows || 12);
+  const here = terminalLogicalLine(buffer, row, cols, bound);
+  if (!here) return null;
+
+  const chainFrom = (start) => {
+    const first = terminalLogicalLine(buffer, start, cols, bound);
+    if (!first || first.startRow !== start) return null;
+    let text = first.text.replace(/\s+$/, '');
+    let endRow = first.endRow;
+    let urlStartCol = -1;
+    let firstRowUrlEnd = null;
+    let extended = false;
+    while (endRow - start + 1 < bound) {
+      const urls = findTerminalUrls(text);
+      const last = urls[urls.length - 1];
+      // Only on a one-row first line: firstRowUrlEnd cuts the first PHYSICAL
+      // row (terminalLinkLine), so a column sitting on the soft-wrapped part of
+      // the URL's row would stay in the text and take the next row with it.
+      const trailingColumns =
+        first.startRow === first.endRow &&
+        endRow === first.endRow &&
+        last &&
+        last.rawEnd < text.length &&
+        /^ {2,}\S/.test(text.slice(last.rawEnd));
+      const urlText = trailingColumns ? text.slice(0, last.rawEnd) : text;
+      if (!last || last.rawEnd !== urlText.length || !/[/?&=\-_%#+~]$/.test(urlText)) break;
+      if (urlStartCol < 0) urlStartCol = first.offsetToCell(last.startIndex).col;
+      const next = buffer.getLine(endRow + 1);
+      if (!next || next.isWrapped) break;
+      const nextText = next.translateToString(true) || '';
+      const indent = nextText.length - nextText.replace(/^\s+/, '').length;
+      const token = nextText.slice(indent).split(/\s/, 1)[0];
+      // A hard continuation is indented (a table cell, a list item, Claude's
+      // two-space paragraph indent); a column-0 row is a new line of output.
+      if (!token || !indent || indent > urlStartCol || /^(?:\d+[.)]|[-*•])(?:\s|$)/.test(nextText.slice(indent)))
+        break;
+      // When other table columns follow the URL, the next row must align with
+      // the start of its cell. A new numbered row must not become URL text.
+      if (
+        trailingColumns &&
+        (!indent ||
+          first.text[indent - 1] !== ' ' ||
+          first.text[indent] === ' ' ||
+          / {2,}/.test(first.text.slice(indent, last.startIndex)))
+      )
+        break;
+      // The next row must start inside the URL's own cell: a column gap between
+      // its indent and the URL on the first row means it opens an earlier
+      // column (the next record of a table), not the rest of the URL.
+      if (/ {2,}/.test(first.text.slice(indent, last.startIndex).trimStart())) break;
+      if (/^[a-z][a-z0-9+.-]*:\/\//i.test(token) || !/^[A-Za-z0-9%_~]/.test(token)) break;
+      // A shell prompt (`user@host:~/dir$`), a home path and an HTTP status line
+      // are never the rest of a URL, however much URL punctuation they carry.
+      if (/^[\w.-]+@[\w.-]+:|^~\/|^HTTP\/\d/i.test(token)) break;
+      // Nor is a token that is a whole email address.
+      if (/^[\w.+-]+@[\w-]+(?:\.[\w-]+)+$/.test(token)) break;
+      if (!/[%&=/?.\-_]/.test(token) || /^v?\d+(?:\.\d+)*(?:[-+][\w.-]+)?[.,;:!?)]?$/i.test(token)) break;
+      // A label ends with a colon (`Failure/Error:`, `prometheus.io/scrape:`);
+      // the rest of a URL does not.
+      if (token.endsWith(':')) break;
+      // After a `/`, a `name=value` token is the next assignment or log field
+      // (`API_KEY=...`, `level=info`), not the URL: a query starts with `?`.
+      if (urlText.endsWith('/') && /^[A-Za-z_][\w.-]*=/.test(token)) break;
+      // Nor is a measurement or a clock time: `45%` and `45%|####` progress,
+      // `12.3MB/45.0MB`, `12.3ms`, `10:00:00` (`%7B` stays percent-encoding).
+      if (/^\d+(?:\.\d+)?(?:%(?![0-9A-Fa-f]{2})|(?:ms|s|[kKMGT]i?B)(?![\w-]))|^\d{1,2}:\d{2}/.test(token)) break;
+      // Hyphens, underscores and dots also occur in prose. Without stronger
+      // URL punctuation, the token must finish its cell, not introduce a sentence.
+      const rest = nextText.slice(indent + token.length);
+      if (!/[%&=/?]/.test(token)) {
+        // Code (`client.get()`, `expect(x).toBe(y)`) is not a URL piece, and a
+        // word that ends a sentence (`ready.`, `Done.`) is prose. A wiki title
+        // (`Mercury_(planet)`) and a file name before its period
+        // (`install.html.`) still continue the URL.
+        if (/[^_]\(/.test(token)) break;
+        if (/[.,;!]$/.test(token) && !/\.[A-Za-z][A-Za-z0-9]{1,4}[.,;!]+$/.test(token)) break;
+        if (rest.trim() !== '' && !/^ {2,}/.test(rest)) break;
+      }
+      const nextLogical = terminalLogicalLine(buffer, endRow + 1, cols, bound);
+      if (!nextLogical) break;
+      if (trailingColumns) firstRowUrlEnd = last.rawEnd;
+      text = urlText + nextLogical.text.slice(indent).replace(/\s+$/, '');
+      endRow = nextLogical.endRow;
+      extended = true;
+    }
+    return { startRow: start, endRow, extended, firstRowUrlEnd };
+  };
+
+  // Walk up through earlier logical lines: the nearest one whose URL chain
+  // reaches this row owns it.
+  let start = here.startRow;
+  while (start >= 0 && here.startRow - start < bound) {
+    const chain = chainFrom(start);
+    if (chain && chain.extended && chain.endRow >= here.startRow) {
+      return {
+        startRow: chain.startRow,
+        endRow: chain.endRow,
+        ...(chain.firstRowUrlEnd === null ? {} : { firstRowUrlEnd: chain.firstRowUrlEnd }),
+      };
+    }
+    if (start === 0) break;
+    const above = terminalLogicalLine(buffer, start - 1, cols, bound);
+    if (!above) break;
+    start = above.startRow;
+  }
+  return null;
+}
+
+/**
+ * The text the link provider scans for `row`: {@link terminalPathLine}, widened
+ * to the rows of a URL the CLI wrapped short of the edge
+ * ({@link terminalUrlContinuationExtent}). Same shape as terminalPathLine.
+ *
+ * Over a widened span every row is read trimmed (except one a soft wrap
+ * continues from, which fills the width), a HARD continuation's indent is
+ * dropped (the cell mapping keeps the cells), and the first row stops at the
+ * URL's cell when other table columns follow it, so those columns never sit
+ * between the URL's pieces. Those columns still link: they are moved after the
+ * stitched rows as a segment of their own, mapped back to their cells.
+ *
+ * @returns Same shape as {@link terminalPathLine}; null when the row does not exist.
+ */
+function terminalLinkLine(buffer, row, cols, maxRows) {
+  const base = terminalPathLine(buffer, row, cols, maxRows);
+  if (!base) return null;
+  const extent = terminalUrlContinuationExtent(buffer, row, cols, maxRows);
+  if (!extent || (extent.startRow >= base.startRow && extent.endRow <= base.endRow)) return base;
+  const startRow = Math.min(extent.startRow, base.startRow);
+  const endRow = Math.max(extent.endRow, base.endRow);
+  const segments = [];
+  let text = '';
+  let columnsAfterUrl = '';
+  for (let r = startRow; r <= endRow; r++) {
+    const line = buffer.getLine(r);
+    if (!line) break;
+    const next = r < endRow ? buffer.getLine(r + 1) : null;
+    let rowText = line.translateToString(!(next && next.isWrapped)) || '';
+    if (r === extent.startRow && extent.firstRowUrlEnd != null) {
+      columnsAfterUrl = rowText.slice(extent.firstRowUrlEnd);
+      rowText = rowText.slice(0, extent.firstRowUrlEnd);
+    }
+    let colStart = 0;
+    if (r > startRow && !line.isWrapped) {
+      colStart = rowText.length - rowText.replace(/^\s+/, '').length;
+      rowText = rowText.slice(colStart);
+    }
+    segments.push({ row: r, textStart: text.length, colStart });
+    text += rowText;
+  }
+  const lastRow = segments[segments.length - 1].row;
+  // The columns cut off the URL's first row (a path or date column of a table)
+  // are scanned after the stitched rows, so they keep their links on that row.
+  // They open with the cell gap, which keeps them apart from the URL; the one
+  // space before them belongs to the last row, so an end offset there still
+  // maps onto that row and never onto their first cell.
+  if (columnsAfterUrl.trim()) {
+    text += ' ';
+    segments.push({ row: extent.startRow, textStart: text.length, colStart: extent.firstRowUrlEnd });
+    text += columnsAfterUrl;
+  }
+  const offsetToCell = (offset) => {
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i];
+      if (offset >= seg.textStart || i === 0) return { row: seg.row, col: seg.colStart + (offset - seg.textStart) };
+    }
+    return { row: startRow, col: offset };
+  };
+  // The cut row has two segments: the one starting at or left of the cell owns it.
+  const cellToOffset = (targetRow, targetCol) => {
+    let seg = null;
+    for (const s of segments) if (s.row === targetRow && (!seg || s.colStart <= targetCol)) seg = s;
+    return seg ? seg.textStart + Math.max(0, targetCol - seg.colStart) : -1;
+  };
+  return { startRow, endRow: lastRow, text, offsetToCell, cellToOffset };
+}
+
+/**
+ * Absolute file paths the CLI word-wrapped INSIDE a table cell (codex markdown
+ * tables), returned as one link per path with a segment per row.
+ *
+ *    Before screenshot (/tmp/x/docs/review/          After screenshot (/tmp/x/review/BLDMESH-
+ *    BLDMESH-243/before-overview.png)                243/after-overview.png)
+ *
+ * Neither fragment matches FILE_PATH_LINK_PATTERN alone (the first has no
+ * extension, the second no absolute root), and a linear stitch of the rows
+ * cannot serve a two-column table: each column's continuation sits in the same
+ * next row. So each fragment is followed DOWN ITS OWN CELL: the cell's left
+ * edge is where its text starts after the previous ≥2-space column gap, and the
+ * continuation is the token starting at exactly that column on the next row.
+ * A fragment qualifies only when it is the last thing in its cell on that row
+ * (row end or a ≥2-space gap follows) and ends on `/` or `-`, the only places
+ * a wrapper breaks a path; a cell that ends inside a name (`/home/u/proj` over
+ * `config.yaml`) is a whole value, never the first piece of the next row's. A
+ * continuation row must be blank to the left of the cell (a wrapper wraps every
+ * column of one table row together), unless a path in a left column continued
+ * on it too: a label there (`Entry`, `│ Log │`) is the next record. Every
+ * continuation must pass pathContinuation and its cell must be no wider than the
+ * preceding cell's text, so independent listing rows and longer prose never
+ * displace links.
+ *
+ * Pure: reads rows only. Cells are taken one per string character (xterm rows
+ * with wide glyphs would shift columns; such rows simply fail the alignment).
+ *
+ * @param {{getLine: (row: number) => any, length: number}} buffer
+ * @param {number} row 0-based absolute row being examined.
+ * @param {number} [maxRows] Bound on rows one path may span.
+ * @returns {Array<{path: string, segments: Array<{row: number, startCol: number, endCol: number}>}>}
+ *          Paths with a segment on `row`; `endCol` is exclusive, columns 0-based.
+ */
+function terminalCellWrappedPaths(buffer, row, maxRows) {
+  const bound = Math.max(2, maxRows || 4);
+  const rootPattern = new RegExp(`\\/(?:${FILE_LINK_ROOT_GROUP})\\/`, 'g');
+  // Box-drawing verticals are cell borders (Claude Code draws tables with them).
+  const isPathChar = (ch) => !!ch && !/[\s"'<>|;&\x00-\x1f│┃║]/.test(ch);
+  const rowText = (r) => {
+    const line = buffer.getLine(r);
+    return line ? (line.translateToString(true) || '').replace(/\s+$/, '') : null;
+  };
+  // A fragment is the last text in its cell on this row when the row ends, a
+  // column gap (≥2 spaces) follows it, or a cell border does.
+  const endsCell = (text, end) => end >= text.length || /^(?: {2,}| *[│┃║|])/.test(text.slice(end));
+
+  const fromStart = (startRow) => {
+    const found = [];
+    const text = rowText(startRow);
+    if (!text) return found;
+    rootPattern.lastIndex = 0;
+    let m;
+    while ((m = rootPattern.exec(text)) !== null) {
+      const start = m.index;
+      if (start > 0 && !/[\s(\[{"'`<]/.test(text[start - 1])) continue;
+      let end = start;
+      while (end < text.length && isPathChar(text[end])) end++;
+      rootPattern.lastIndex = Math.max(end, start + 1);
+      if (!endsCell(text, end)) continue;
+      // Already a complete path on its own row: the ordinary detector owns it.
+      const alone = absoluteFilePathPattern().exec(text.slice(start, end));
+      if (alone && alone.index === 0 && alone[0].length === end - start) continue;
+      // The cell's left edge: just past the nearest ≥2-space gap or cell border
+      // (and the padding after it) before the path.
+      const before = text.slice(0, start);
+      let cellCol = before.length - before.replace(/^\s+/, '').length;
+      const edge = /(?: {2,}|[│┃║|] *)(?=\S)/g;
+      let e;
+      const upToPath = text.slice(0, start + 1);
+      while ((e = edge.exec(upToPath)) !== null) cellCol = e.index + e[0].length;
+
+      let joined = text.slice(start, end);
+      let previousCellLength = end - cellCol;
+      const segments = [{ row: startRow, startCol: start, endCol: end }];
+      for (let r = startRow + 1; r < startRow + bound; r++) {
+        const line = buffer.getLine(r);
+        if (!line || line.isWrapped) break;
+        const next = rowText(r);
+        if (!next || !isPathChar(next[cellCol]) || (cellCol > 0 && next[cellCol - 1] !== ' ')) break;
+        let tokenEnd = cellCol;
+        while (tokenEnd < next.length && isPathChar(next[tokenEnd])) tokenEnd++;
+        const token = next.slice(cellCol, tokenEnd);
+        // Include prose after the token in this cell, but not another column.
+        const cellText = next.slice(cellCol).split(/ {2,}|[│┃║|]/, 1)[0].trimEnd();
+        // A wrapper breaks a path after `/` or `-`; a fragment that ends inside a
+        // name (`/home/u/proj` over `config.yaml`) is a whole value, not a piece.
+        // codex wraps table cells on Unicode line-break opportunities plus a
+        // hyphen splitter, which break after `/` and `-` but never at `_` (UAX #14
+        // class AL).
+        if (!/[/-]$/.test(joined)) break;
+        // A wrapper wraps every column of one table row together, so a row that
+        // carries a cell's continuation is blank to its left unless a path in a
+        // left column continued on that row too. A label there (`Entry`,
+        // `│ Log │`) opens the next record, even under a directory ending in `/`
+        // (`Workspace /home/u/proj/app/` over `Entry main.py`). A left column of
+        // wrapped prose (a `Description | Path` table) fills that row as well, so
+        // the path beside it is not joined and keeps its per-row fragment links:
+        // the safe direction.
+        // Known trade-off: with nothing to the left, a directory written with its
+        // trailing slash over a relative path in the same column (`/home/u/proj/`
+        // over `index.ts`) still joins, since it reads exactly like a wrap at `/`.
+        if (
+          /[^\s│┃║|]/.test(next.slice(0, cellCol)) &&
+          !found.some((hit) => hit.segments.some((seg) => seg.row === r && seg.endCol <= cellCol))
+        ) {
+          break;
+        }
+        if (cellText.length > previousCellLength || !pathContinuation(joined, token)) break;
+        const candidate = joined + token;
+        const match = absoluteFilePathPattern().exec(candidate);
+        if (match && match.index === 0 && match[0].length > joined.length) {
+          segments.push({ row: r, startCol: cellCol, endCol: cellCol + match[0].length - joined.length });
+          found.push({ path: match[0], segments });
+          break;
+        }
+        if (!endsCell(next, tokenEnd)) break;
+        joined = candidate;
+        previousCellLength = cellText.length;
+        segments.push({ row: r, startCol: cellCol, endCol: tokenEnd });
+      }
+    }
+    return found;
+  };
+
+  const results = [];
+  for (let s = row; s >= 0 && row - s < bound; s--) {
+    for (const hit of fromStart(s)) {
+      if (hit.segments.some((seg) => seg.row === row)) results.push(hit);
+    }
+  }
+  return results;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3468,7 +4013,9 @@ function clampTerminalDimensions(proposed) {
  * could reach it. Output visible, typing invisible, for as long as the claim
  * stayed hot. Width is the axis the wrap arithmetic depends on; rows only
  * decide how much is on screen at once, and keeping the local row count keeps
- * the composer at the bottom of a viewport that scrolls.
+ * the composer at the bottom of a viewport that scrolls. The one deliberate
+ * screen taller than its box is this device's own rows held under the
+ * on-screen keyboard, which keyboardClipPx keeps the composer in view for.
  *
  * @param {{cols: number, rows: number}|null} local - what xterm currently holds
  * @param {{cols: number, rows: number}|null} pty - what the server just reported
@@ -3478,6 +4025,62 @@ function reconcilePtyGeometry(local, pty) {
   if (!pty || !Number.isFinite(pty.cols)) return { adopt: false, cols: null };
   if (!local || !Number.isFinite(local.cols) || local.cols === pty.cols) return { adopt: false, cols: null };
   return { adopt: true, cols: pty.cols };
+}
+
+/** Rows below the last content within which the cursor still counts (keyboardClipPx). */
+const KEYBOARD_CLIP_CURSOR_REACH = 2;
+
+/**
+ * How far to scroll the terminal SCREEN up while its rows are held under the
+ * on-screen keyboard (setting `keyboardHoldsRows`).
+ *
+ * Every PTY height change makes Claude Code clear the screen and reprint only
+ * the transcript tail that fits, so rows above that tail are lost from tmux and
+ * older ones stay in history as stale copies. The keyboard opening and closing
+ * was such a change each time. Instead the rows stay as they were and
+ * `.xterm-screen` (taller than its box now) is translated up by this many px.
+ *
+ * This is the one deliberate exception to "a screen taller than its container
+ * hides the input line" (see reconcilePtyGeometry): the offset below is what
+ * keeps the live content in view.
+ *
+ * - Following live output: the last row with content sits at the bottom of the
+ *   box. A fresh shell prompting on row 1 shows the top; Claude's footer under
+ *   its composer stays visible. The cursor counts only when it is right below
+ *   that content (a prompt or composer line still empty): a TUI that parks its
+ *   cursor far below what it drew (codex's dialogs, with the cursor on the last
+ *   row of an otherwise blank screen) must not scroll its content out of view.
+ * - Reading history: the offset follows the scroll position, so the top of the
+ *   scrollback is reachable and scrolling stays continuous.
+ *
+ * Recomputed on every render with no hysteresis; add some if a TUI's mid-redraw
+ * frames ever make the view jitter.
+ *
+ * @param {{rows: number, cellHeight: number, viewHeight: number, cursorRow: number,
+ *   lastContentRow: number, following: boolean, viewportY: number, baseY: number}} input
+ *   lastContentRow: the last non-blank screen row, or -1 when the screen is blank
+ * @returns {number} px, between 0 and the screen's overflow
+ */
+function keyboardClipPx(input) {
+  const { rows, cellHeight, viewHeight, cursorRow, lastContentRow, following, viewportY, baseY } = input;
+  if (!(cellHeight > 0) || !(viewHeight > 0) || !(rows > 0)) return 0;
+  const max = Math.max(0, rows * cellHeight - viewHeight);
+  if (max === 0) return 0;
+  if (!following && baseY > 0) return Math.round(max * Math.min(1, Math.max(0, viewportY / baseY)));
+  const cursorCounts = lastContentRow < 0 || cursorRow <= lastContentRow + KEYBOARD_CLIP_CURSOR_REACH;
+  const contentBottomRow = cursorCounts ? Math.max(cursorRow, lastContentRow) : lastContentRow;
+  const bottom = (Math.min(rows - 1, Math.max(0, contentBottomRow)) + 1) * cellHeight;
+  return Math.round(Math.min(max, Math.max(0, bottom - viewHeight)));
+}
+
+/**
+ * How many screen rows, from the top, are fully visible at a given offset: the
+ * local-echo overlay grows upward from the last of them (`setRowLimit`).
+ * @returns {number}
+ */
+function keyboardVisibleRowLimit(clipPx, viewHeight, cellHeight) {
+  if (!(cellHeight > 0)) return 0;
+  return Math.max(1, Math.floor((clipPx + viewHeight) / cellHeight));
 }
 
 /**
@@ -3561,7 +4164,14 @@ if (typeof window !== 'undefined') {
     rendersAsPage,
     HTML_PAGE_EXTENSIONS,
   };
-  window.CodemanTerminalLines = { terminalLogicalLine, terminalPathLine };
+  window.CodemanTerminalLines = {
+    terminalLogicalLine,
+    terminalPathLine,
+    terminalLinkLine,
+    terminalUrlContinuationExtent,
+    findTerminalUrls,
+    terminalCellWrappedPaths,
+  };
   window.CodemanUrlSession = { sessionIdFromFragment };
   window.CodemanSplitPane = {
     clampDividerPercent,
@@ -3612,6 +4222,8 @@ if (typeof window !== 'undefined') {
   window.CodemanTerminalGeometry = {
     clampTerminalDimensions,
     reconcilePtyGeometry,
+    keyboardClipPx,
+    keyboardVisibleRowLimit,
     TERMINAL_MIN_COLS,
     TERMINAL_MIN_ROWS,
   };

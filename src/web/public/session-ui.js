@@ -684,9 +684,12 @@ Object.assign(CodemanApp.prototype, {
 
   /**
    * Run using the selected mode (Claude Code, OpenCode, Codex, Gemini, or Antigravity).
-   * `options` comes from the tab group menu's "New session": `count` overrides
-   * the instance steppers for this launch only, `tabGroupId` rides every create
-   * request so the server places the session in that group.
+   * `options` comes from the tab group menu's "New session", `_launchOnce` (a
+   * worktree, a tab's "+"): `count` overrides the instance steppers for this
+   * launch only, `tabGroupId` rides every create request so the server places the
+   * session in that group, `caseName` launches in that case instead of the
+   * toolbar's selected one, and `mode` starts that CLI instead of the Run
+   * button's mode, which is never touched.
    */
   async run(options = {}) {
     if (this._runInFlight) return;
@@ -701,7 +704,7 @@ Object.assign(CodemanApp.prototype, {
     }
 
     try {
-      const mode = this._runMode || 'claude';
+      const mode = options.mode || this._runMode || 'claude';
       if (mode === 'shell') {
         return await this.runShell(options);
       }
@@ -782,38 +785,18 @@ Object.assign(CodemanApp.prototype, {
    * run modes like the rest, and neither `agy` nor `pi` is likely to be installed.
    */
   _refreshRunModeAvailability(menu) {
-    // A DOCKER case runs its agents INSIDE the container, so host CLI
-    // availability answers the wrong question: the host may have no claude at
-    // all while the container ships one, and gating on the host hides a mode
-    // that would have worked. Adoption records what the container really has
-    // (`availableModes`); an owned container runs our base image, which ships
-    // every CLI, so an absent list means "do not gate" rather than "nothing".
     // Same source every run* path reads the selected case from.
     const caseName = document.getElementById('quickStartCase')?.value;
     const activeCase = caseName ? (this.cases || []).find((c) => c.name === caseName) : null;
     const isDocker = activeCase?.location === 'docker';
-    // Prefer a LIVE probe over the value stored at attach time: a container's
-    // CLIs can be installed or removed long after the case was linked, and a
-    // case linked before that field existed has none at all.
-    const containerModes = isDocker
-      ? this._dockerCaseModes?.[caseName] || activeCase.docker?.availableModes || null
-      : null;
     if (isDocker && !this._dockerCaseModes?.[caseName]) void this._probeDockerCaseModes(activeCase, menu);
-    // An unreachable container hides every agent mode and explains why, instead
-    // of silently offering modes that cannot start.
-    //
-    // ⚠️ ADOPTED cases only. For an OWNED case a missing container is the normal
-    // state before the first session — the launch chain creates and starts it — so
-    // reporting it as a fault hid every agent mode on a freshly linked Docker case
-    // behind "start it yourself first", for a container Codeman was about to create.
+    // An unreachable (adopted) container hides every agent mode and explains why,
+    // instead of silently offering modes that cannot start; see _runModeAvailableForCase.
     const probeError = isDocker ? this._dockerCaseProbeError?.[caseName] : null;
     for (const option of menu.querySelectorAll('.run-mode-option[data-mode]')) {
       const mode = option.dataset.mode;
       if (!mode || mode === 'shell') continue;
-      let available;
-      if (isDocker) available = probeError ? false : containerModes ? containerModes.includes(mode) : true;
-      else available = this.isCliAvailable(mode);
-      option.style.display = available ? 'flex' : 'none';
+      option.style.display = this._runModeAvailableForCase(mode, caseName) ? 'flex' : 'none';
     }
     this._renderRunModeNotice(menu, probeError);
     // DeepSeek is the one mode whose availability has two halves: `dsh` can be
@@ -830,6 +813,45 @@ Object.assign(CodemanApp.prototype, {
     // all (and is the honest thing to offer there).
     const dsWeb = menu.querySelector('#runModeDeepSeekWeb');
     if (dsWeb) dsWeb.style.display = avail.deepseekBinary ? 'flex' : 'none';
+  },
+
+  /**
+   * Does the case named `caseName` offer agent run mode `mode`? The ONE rule
+   * behind the Run menu's entries (_refreshRunModeAvailability) and the Cmd+K
+   * new-session row's agents (_commandPaletteAgentChoices, panels-ui.js), so the
+   * two never disagree on what a case can start. Shell needs no CLI and is
+   * never gated; both callers skip it before asking.
+   *
+   * Reads only what is already known and never starts a container probe: the
+   * Run menu and a tab's "+" (openTabNewSessionMenu, app.js) start one
+   * (_probeDockerCaseModes), and its answer lands in
+   * _dockerCaseModes, which this reads. Until then (a probe still in flight)
+   * the stored availableModes decide, else nothing is gated.
+   */
+  _runModeAvailableForCase(mode, caseName) {
+    const activeCase = caseName ? (this.cases || []).find((c) => c.name === caseName) : null;
+    if (activeCase?.location === 'docker') {
+      // A DOCKER case runs its agents INSIDE the container, so host CLI
+      // availability answers the wrong question: the host may have no claude at
+      // all while the container ships one, and gating on the host hides a mode
+      // that would have worked. Adoption records what the container really has
+      // (`availableModes`); an owned container runs our base image, which ships
+      // every CLI, so an absent list means "do not gate" rather than "nothing".
+      //
+      // An unreachable container offers no agent mode. ⚠️ Only an ADOPTED case
+      // ever records that error: for an OWNED case a missing container is the
+      // normal state before the first session (the launch chain creates and
+      // starts it), so reporting it as a fault hid every agent mode on a freshly
+      // linked Docker case behind "start it yourself first", for a container
+      // Codeman was about to create.
+      if (this._dockerCaseProbeError?.[caseName]) return false;
+      // Prefer a LIVE probe over the value stored at attach time: a container's
+      // CLIs can be installed or removed long after the case was linked, and a
+      // case linked before that field existed has none at all.
+      const containerModes = this._dockerCaseModes?.[caseName] || activeCase.docker?.availableModes || null;
+      return containerModes ? containerModes.includes(mode) : true;
+    }
+    return this.isCliAvailable(mode);
   },
 
   /** Render every enabled agent entry from the server's registry projection. */
@@ -1996,11 +2018,28 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  /** The case a launch runs in: its worktree's, the one it names (a tab's "+"), else the toolbar's. */
+  _runCaseName(options) {
+    if (options.worktree) return options.worktree.caseName;
+    return options.caseName || document.getElementById('quickStartCase').value || 'testcase';
+  },
+
+  /**
+   * Re-reads the case list after a launch, keeping the toolbar on its own case.
+   * The no-argument reload would re-select the server's `lastUsedCase`, and a
+   * tab's "+" launching through quick-start sets that to the tab's case while the
+   * toolbar stays where it was, so every later launch (a worktree's, a plain Run,
+   * a group's "New session") would otherwise move the toolbar there.
+   */
+  _reloadCasesAfterRun() {
+    this.loadQuickStartCases(document.getElementById('quickStartCase').value || null);
+  },
+
   async runClaude(options = {}) {
     // `options.worktree` ({ caseName, name, path }, from the worktree modal): the session runs in
     // that git worktree of the case and its tab is named after the worktree.
     const wt = options.worktree || null;
-    const caseName = wt ? wt.caseName : document.getElementById('quickStartCase').value || 'testcase';
+    const caseName = this._runCaseName(options);
     const nameBase = wt ? wt.name : caseName;
     const tabCount = this._readTabCount(options.count);
     const group = options.tabGroupId ? { tabGroupId: options.tabGroupId } : {};
@@ -2105,7 +2144,7 @@ Object.assign(CodemanApp.prototype, {
         this._appendSessionLaunchStatus(ownsLaunchTerminal, `All ${tabCount} remote session(s) ready`);
         if (remoteIds[0]) {
           await this.selectSession(remoteIds[0]);
-          this.loadQuickStartCases();
+          this._reloadCasesAfterRun();
         }
         this.terminal.focus();
         return;
@@ -2184,7 +2223,7 @@ Object.assign(CodemanApp.prototype, {
       // Auto-switch to the new session using selectSession (does proper refresh)
       if (firstSessionId) {
         await this.selectSession(firstSessionId);
-        this.loadQuickStartCases();
+        this._reloadCasesAfterRun();
       }
 
       this.terminal.focus();
@@ -2231,7 +2270,7 @@ Object.assign(CodemanApp.prototype, {
   async runShell(options = {}) {
     // `options.worktree`: see runClaude.
     const wt = options.worktree || null;
-    const caseName = wt ? wt.caseName : document.getElementById('quickStartCase').value || 'testcase';
+    const caseName = this._runCaseName(options);
     const nameBase = wt ? wt.name : caseName;
     // Run Shell reads the toolbar's one instance stepper, like every other run*();
     // its own second `− 1 +` group (#shellCount) was removed (#428).
@@ -2432,7 +2471,7 @@ Object.assign(CodemanApp.prototype, {
     // `options.worktree`: see runClaude. Quick-start resolves it server-side (`worktree`), so the
     // session starts through the same path as any other, only in the worktree's folder.
     const wt = options.worktree || null;
-    const caseName = wt ? wt.caseName : document.getElementById('quickStartCase').value || 'testcase';
+    const caseName = this._runCaseName(options);
     // Remote/docker cases run the CLI on the OTHER side — the local status
     // probe and the local-only config/env below don't apply (quick-start
     // rejects them for remote cases).
@@ -2667,7 +2706,13 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('modalKeepWarmEnabled').checked =
       session.keepWarm?.enabled ?? session.keepWarmEnabled ?? false;
     this.updateKeepWarmStatus(sessionId);
-    document.getElementById('modalImageWatcherEnabled').checked = session.imageWatcherEnabled ?? true;
+    // Git: the session's own choice if it has one, otherwise the app setting. updateGitFetchStatus is also
+    // what SSE calls when a scheduled run lands, so the rows stay current while the modal is open.
+    this.updateGitFetchStatus(sessionId);
+    const imageWatcherToggle = document.getElementById('modalImageWatcherEnabled');
+    imageWatcherToggle.checked = session.imageWatcherEnabled ?? true;
+    // The server never watches a remote session's directory (it is on another host), so the row is hidden.
+    imageWatcherToggle.closest('.set-row').style.display = session.remote ? 'none' : '';
     document.getElementById('modalFlickerFilterEnabled').checked = session.flickerFilterEnabled ?? false;
 
     // Populate session name input with prefix/suffix split
@@ -2722,6 +2767,12 @@ Object.assign(CodemanApp.prototype, {
       if (ralphTabBtn) ralphTabBtn.style.display = '';
       if (respawnTabBtn) respawnTabBtn.style.display = '';
     }
+
+    // Git is local git only: a remote (SSH) or Docker case answers 'unsupported' on both git routes and is
+    // never fetched by the interval scheduler, so its Git tab has nothing to say and its rail entry goes
+    // hidden the same way.
+    const gitTabBtn = document.querySelector('#sessionOptionsModal .set-rail-item[data-tab="git"]');
+    if (gitTabBtn) gitTabBtn.style.display = session.remote || session.docker ? 'none' : '';
 
     // Populate Ralph Wiggum form with current session values (skip for external CLI sessions)
     if (!isExternalCli) {
@@ -3004,11 +3055,114 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
+  /**
+   * The Git tab: the session's last scheduled run, and which values its rows show. A session with no choice of
+   * its own follows the app setting, so its switch and interval display the app's numbers and go inert (the
+   * same inert-row pattern as updateKeepWarmStatus above), because changing them here is what makes the session
+   * stop following. The app numbers come from the settings cache, so what this shows can be one settings load
+   * behind; the server decides from a fresh read, not from what the page displays.
+   *
+   * SSE calls this on every `session:updated` for the open session (app.js `_onSessionUpdated`), and a working
+   * session sends one on each working/idle change, so a control the user is in (`document.activeElement`) is
+   * left as it is: rewriting it put a half-typed interval back to the stored one before `onchange` could save it.
+   */
+  updateGitFetchStatus(sessionId) {
+    const statusEl = document.getElementById('gitFetchStatus');
+    const followBox = document.getElementById('modalGitFetchFollow');
+    const box = document.getElementById('modalGitFetchEnabled');
+    const num = document.getElementById('modalGitFetchInterval');
+    if (!statusEl || !followBox || !box || !num || this.editingSessionId !== sessionId) return;
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+
+    const app = this.loadAppSettingsFromStorage() || {};
+    // No choice of its own on either field means the session follows the app. A partial one (its own switch,
+    // the app's interval) means it does not, and the row that still follows shows the app's value, which is
+    // also the value the scheduler runs it with (a default here would show one number and fetch at another).
+    const follows = session.gitFetchEnabled === undefined && session.gitFetchIntervalSeconds === undefined;
+    const enabled = session.gitFetchEnabled ?? (app.gitFetchEnabled === true);
+    const interval = session.gitFetchIntervalSeconds ?? app.gitFetchIntervalSeconds ?? 300;
+
+    const focused = document.activeElement;
+    if (followBox !== focused) followBox.checked = follows;
+    if (box !== focused) box.checked = enabled;
+    if (num !== focused) num.value = interval;
+    for (const el of [box, num]) {
+      el.closest('.set-row')?.classList.toggle('set-row-disabled', follows);
+      el.disabled = follows;
+    }
+
+    const run = session.gitFetch;
+    const parts = run
+      ? [
+          `Last run ${this._gitFetchAgo(run.ranAt)}${run.trigger === 'interval' ? ' on the interval' : ' by click'}`,
+          run.state === 'ok' ? `${run.repos} repositories` : run.state,
+          run.failed ? `${run.failed} failed` : '',
+        ]
+      : [follows ? 'Nothing fetched on a timer yet, and this session follows the app setting.' : 'Nothing fetched on a timer yet for this session.'];
+    statusEl.textContent = parts.filter(Boolean).join(' · ');
+    statusEl.hidden = false;
+  },
+
+  /** 'just now', '4m', '2h': the short stamps the tab rows use, measured from a run's start. */
+  _gitFetchAgo(ts) {
+    const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
+    if (seconds < 60) return seconds < 10 ? 'just now' : `${seconds}s`;
+    if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
+    return `${Math.round(seconds / 3600)}h`;
+  },
+
+  async autoSaveGitFetch() {
+    if (!this.editingSessionId) return;
+    const follow = document.getElementById('modalGitFetchFollow').checked;
+    const num = document.getElementById('modalGitFetchInterval');
+    // `null` on the route means "no choice of your own", which is what following the app setting is.
+    const body = follow
+      ? { enabled: null, intervalSeconds: null }
+      : {
+          enabled: document.getElementById('modalGitFetchEnabled').checked,
+          intervalSeconds: Math.min(3600, Math.max(30, parseInt(num.value, 10) || 300)),
+        };
+    // Enter fires `onchange` with the field still focused, and updateGitFetchStatus leaves a focused field
+    // alone, so the clamped number is written back here or the field would keep showing what was typed.
+    if (!follow) num.value = body.intervalSeconds;
+    try {
+      // `_apiPost` hands back the Response without checking it, so a refused body (a 400) still read as a
+      // save. `_apiJson` is the one that says whether the call went through, and null here means it did not.
+      const data = await this._apiJson(`/api/sessions/${this.editingSessionId}/git-fetch-settings`, {
+        method: 'POST',
+        body,
+      });
+      if (!data) {
+        this.showToast('Failed to save Git fetch settings', 'error');
+        return;
+      }
+      const session = this.sessions.get(this.editingSessionId);
+      const saved = data.gitFetchSettings;
+      if (session && saved) {
+        session.gitFetchEnabled = saved.enabled ?? undefined;
+        session.gitFetchIntervalSeconds = saved.intervalSeconds ?? undefined;
+      }
+      this.updateGitFetchStatus(this.editingSessionId);
+      this.showToast('Git fetch settings saved', 'success');
+    } catch (err) {
+      this.showToast('Failed to save Git fetch settings: ' + err.message, 'error');
+    }
+  },
+
   async toggleSessionImageWatcher() {
     if (!this.editingSessionId) return;
-    const enabled = document.getElementById('modalImageWatcherEnabled').checked;
+    const toggle = document.getElementById('modalImageWatcherEnabled');
+    const enabled = toggle.checked;
     try {
-      await this._apiPost(`/api/sessions/${this.editingSessionId}/image-watcher`, { enabled });
+      const res = await this._apiPost(`/api/sessions/${this.editingSessionId}/image-watcher`, { enabled });
+      // `_apiPost` hands back the Response without checking it, so a refused request (a 400) must not
+      // read as a save: put the switch back and say so.
+      if (!res?.ok) {
+        toggle.checked = !enabled;
+        this.showToast('Failed to toggle image watcher', 'error');
+        return;
+      }
       // Update local session state
       const session = this.sessions.get(this.editingSessionId);
       if (session) {
@@ -3142,6 +3296,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('context-tab').classList.toggle('hidden', tabName !== 'context');
     document.getElementById('ralph-tab').classList.toggle('hidden', tabName !== 'ralph');
     document.getElementById('summary-tab').classList.toggle('hidden', tabName !== 'summary');
+    document.getElementById('git-tab').classList.toggle('hidden', tabName !== 'git');
 
     // A switched-to section starts at its own top, not at the scroll offset the
     // previous one was left at.
@@ -4968,6 +5123,12 @@ Object.assign(CodemanApp.prototype, {
                     title="${reorderTitle || 'Move up'}" ${isFirst ? 'disabled' : ''}>&#x25B2;</button>
             <button class="case-manage-btn" onclick="app.moveCaseDown(${escapeHtml(JSON.stringify(c.name))})"
                     title="${reorderTitle || 'Move down'}" ${isLast ? 'disabled' : ''}>&#x25BC;</button>
+            ${
+              c.location === 'docker' || c.location === 'remote'
+                ? ''
+                : `<button class="case-manage-btn" onclick="app.renameCase(${escapeHtml(JSON.stringify(c.name))})"
+                    title="Rename case (and its folder)">&#x270E;</button>`
+            }
             <button class="case-manage-btn case-manage-btn-delete" onclick="app.deleteCase(${escapeHtml(JSON.stringify(c.name))})"
                     title="Delete case">&#x2715;</button>
           </div>
@@ -4998,6 +5159,113 @@ Object.assign(CodemanApp.prototype, {
     this.cases = reordered;
     this.renderCaseManageList();
     await this.saveCaseOrder(reordered.map(c => c.name));
+  },
+
+  /**
+   * Rename a case and its folder (POST /api/cases/:name/rename), in the app's own dialog.
+   *
+   * A linked case shows a checkbox for renaming the real folder too (unticked = the name only). When live
+   * sessions have the folder open the server refuses and lists them; the dialog then lists them and its button
+   * becomes "Stop sessions and rename", so they are only stopped after a second, explicit press. Errors from
+   * the server (a taken name, a folder another program has open) stay inside the dialog so the name can be fixed.
+   */
+  renameCase(name) {
+    const info = (this.cases || []).find((c) => c.name === name);
+    this._renameCaseState = { name, linked: Boolean(info?.linked), stop: false, busy: false };
+    const input = document.getElementById('renameCaseInput');
+    const label = document.getElementById('renameCaseLabel');
+    if (label) label.textContent = `New name for "${name}"`;
+    if (input) input.value = name;
+    const row = document.getElementById('renameCaseFolderRow');
+    row?.classList.toggle('hidden', !info?.linked);
+    const box = document.getElementById('renameCaseFolder');
+    if (box) box.checked = false;
+    const hint = document.getElementById('renameCaseFolderHint');
+    if (hint) hint.textContent = info?.linked ? `${info.path}  (unticked: only the name in this list changes)` : '';
+    document.getElementById('renameCaseNote')?.classList.toggle('hidden', Boolean(info?.linked));
+    this._renameCaseNotice('');
+    const submit = document.getElementById('renameCaseSubmit');
+    if (submit) submit.textContent = 'Rename';
+    document.getElementById('renameCaseModal')?.classList.add('active');
+    input?.focus?.();
+    input?.select?.();
+  },
+
+  closeRenameCase() {
+    document.getElementById('renameCaseModal')?.classList.remove('active');
+    this._renameCaseState = null;
+  },
+
+  /** Show (or clear, with '') a message inside the rename dialog. */
+  _renameCaseNotice(message) {
+    const el = document.getElementById('renameCaseError');
+    if (!el) return;
+    el.textContent = message;
+    el.classList.toggle('hidden', !message);
+  },
+
+  async submitRenameCase() {
+    const state = this._renameCaseState;
+    if (!state || state.busy) return;
+    const name = state.name;
+    const newName = (document.getElementById('renameCaseInput')?.value || '').trim();
+    if (!newName || newName === name) {
+      this._renameCaseNotice('Enter a different name.');
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(newName)) {
+      this._renameCaseNotice('Use only letters, numbers, hyphens and underscores.');
+      return;
+    }
+    const body = { newName };
+    if (state.linked) body.renameFolder = Boolean(document.getElementById('renameCaseFolder')?.checked);
+    if (state.stop) body.stopSessions = true;
+    state.busy = true;
+    const submit = document.getElementById('renameCaseSubmit');
+    if (submit) submit.disabled = true;
+    try {
+      const res = await fetch(`/api/cases/${encodeURIComponent(name)}/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({ success: false, error: 'Unexpected response' }));
+      if (data.requiresStop) {
+        const list = (data.sessions || []).map((s) => `${s.name}`).join(', ');
+        state.stop = true;
+        this._renameCaseNotice(`These sessions have the folder open: ${list}. They will be closed (their tabs go away and nothing is restarted) before the folder is renamed.`);
+        if (submit) submit.textContent = 'Stop sessions and rename';
+        return;
+      }
+      if (!data.success) {
+        // A rename that failed after closing sessions says so: their tabs are gone either way.
+        const closed = Number(data.stoppedSessions) || 0;
+        const message = data.error || 'Failed to rename the case.';
+        this._renameCaseNotice(
+          closed > 0 ? `${message} (${closed} session${closed === 1 ? ' was' : 's were'} already closed.)` : message
+        );
+        return;
+      }
+      this.closeRenameCase();
+      this.showToast(`Case renamed to "${newName}"`, 'success');
+      // The per-case run options are stored under the case name in this browser.
+      try {
+        const stored = localStorage.getItem('caseSettings_' + name);
+        if (stored !== null) {
+          localStorage.setItem('caseSettings_' + newName, stored);
+          localStorage.removeItem('caseSettings_' + name);
+        }
+      } catch { /* storage blocked: the options fall back to their defaults */ }
+      const select = document.getElementById('quickStartCase');
+      const current = select?.value;
+      await this.loadQuickStartCases(current === name ? newName : current);
+      this.renderCaseManageList();
+    } catch (err) {
+      this._renameCaseNotice('Failed to rename the case: ' + err.message);
+    } finally {
+      state.busy = false;
+      if (submit) submit.disabled = false;
+    }
   },
 
   async deleteCase(name) {
@@ -5634,7 +5902,7 @@ Object.assign(CodemanApp.prototype, {
       const created = r.data.worktree;
       this.showToast?.(`Worktree ${created.name} created on branch ${created.branch}`, 'success');
       this.closeWorktreeModal();
-      await this._launchInWorktree({ caseName, name: created.name, path: created.path }, mode);
+      await this._launchOnce(mode, { worktree: { caseName, name: created.name, path: created.path } });
     } finally {
       if (btn) btn.disabled = false;
     }
@@ -5646,26 +5914,22 @@ Object.assign(CodemanApp.prototype, {
     if (!caseName || !wt) return;
     const mode = this._selectedWorktreeMode();
     this.closeWorktreeModal();
-    await this._launchInWorktree({ caseName, name, path: wt.path }, mode);
+    await this._launchOnce(mode, { worktree: { caseName, name, path: wt.path } });
   },
 
   /**
-   * Start ONE session of `mode` in a worktree through run(), the Run button's own entry (its
-   * launch lock, its per-mode paths), with the same temporary `_runMode` swap the custom-model
-   * entries use, so the Run button's chosen mode is untouched afterwards.
+   * Start ONE session of `mode` through run(), the Run button's own entry (its launch lock, its
+   * per-mode paths), outside the toolbar's choices: `runOptions` names a worktree, or a case and
+   * tab group (a tab's "+"). The mode rides the call (`run({ mode })`) rather than a swap of the
+   * Run button's mode, so a mode the user picks while the launch is pending is never overwritten.
    */
-  async _launchInWorktree(worktree, mode) {
+  async _launchOnce(mode, runOptions) {
     if (this._runInFlight) {
       this.showToast?.('A launch is already in progress', 'info');
       return;
     }
-    const previous = this._runMode;
-    this._runMode = mode || previous;
-    try {
-      await this.run({ count: 1, worktree });
-    } finally {
-      this._runMode = previous;
-    }
+    if (runOptions.tabGroupId) this.toggleTabGroupCollapsed?.(runOptions.tabGroupId, false);
+    await this.run({ count: 1, ...runOptions, ...(mode ? { mode } : {}) });
   },
 
   /** The Codeman-managed worktree a session runs in, or null (see managedWorktreeOfDir). */

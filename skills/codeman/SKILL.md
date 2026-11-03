@@ -8,11 +8,18 @@ description: >-
   read their output, and clean up; where available, message claude workers directly
   (Claude Code cross-session messaging). Use when asked to orchestrate or parallelize
   work across Codeman sessions, get a second opinion from another CLI or model, watch
-  another session, or start and manage workers. Only usable inside a Codeman-managed
-  session (CODEMAN_MUX=1); refuse to act otherwise.
+  another session, start and manage workers, or retrieve saved local Codex history
+  by file/native ID or root and descendants with topic/date filters. Live API
+  operations require a Codeman-managed session (CODEMAN_MUX=1). Offline history
+  reads do not require a server or managed session.
 ---
 
 # Driving Codeman from inside a session
+
+For **saved Codex conversation history**, use `codeman history read` and
+[reference/history.md](reference/history.md). This is a read-only local command:
+route to it **before §0**, including outside a managed session. It needs no API
+URL, credentials or running server. All live API operations below retain §0.
 
 You are an agent running inside a Codeman-managed terminal session. Codeman is the
 server that spawned you; its HTTP API can start, prompt, watch, and delete other
@@ -30,12 +37,15 @@ through: the verbs in detail (the old §5) in [reference/verbs.md](reference/ver
 worked multi-worker flows in [reference/recipes.md](reference/recipes.md), endpoint
 tables and a symptom gallery in [reference/endpoints.md](reference/endpoints.md), and
 direct messaging to claude workers in [reference/messaging.md](reference/messaging.md).
+Experimental bounded inspection and guarded stage/submit load only when needed from
+[reference/inspection-and-staging.md](reference/inspection-and-staging.md).
 
 This skill works the same whichever CLI you are: Codeman puts it where each CLI looks
 for skills (`.claude/skills/` for Claude Code, `.agents/skills/` for Codex, Gemini CLI,
 OpenCode, Antigravity, Grok, DeepSeek and OMP). A **pi** or **shell** worker never gets
 it, but has the same environment: tell it *"other sessions: `codeman agent --help`"*.
-That bundled CLI (`ls`, `spawn`, `send`, `wait`, `read`, `interrupt`, `rm`) is the same
+That bundled CLI (`ls`, `spawn`, `send`, `wait`, `read`, `inspect`, `stage`, `submit`,
+`interrupt`, `rm`, and the inbox verbs `post`, `inbox`, `ack`) is the same
 verbs over the same endpoints, with the guards below (no control bytes, no self-delete,
 no guessed URL) enforced in code, and it is also your own way through when this
 machine has no `jq` for the preamble below. It also carries the **mailbox**:
@@ -51,7 +61,8 @@ anything that is a message rather than a prompt — it never starts a billed tur
 never risks a control byte in a fullscreen TUI.
 
 **`codeman agent spawn [case]`** starts a worker where you work: without a case it
-inherits **your** working directory, `--cwd <dir>` puts it elsewhere (an existing
+inherits **your** shell's cwd (refused in a remote or container session: there it is a
+path on another machine), `--cwd <dir>` puts it elsewhere (an existing
 directory, e.g. a git worktree), and a case name keeps the old quick-start behaviour
 (`~/codeman-cases/<case>`, created if missing). `--model <id>` picks this worker's model
 (claude: `opus`, `sonnet`, `claude-opus-5-5`, … as `claude --model`, nothing written to
@@ -116,10 +127,20 @@ reported once if it still stands idle. Mutes and subscriptions survive a server 
 (HTTP: `POST /api/v1/sessions/:id/report-subscription {"subscriber": "<your id>", "subscribed": true|false}`,
 `GET /api/v1/agent-report-subscriptions`; `POST /api/v1/sessions/:id/report-mute {"forMs": n}`, 0 = unmute).
 
+For an existing project, use one command:
+`codeman agent spawn --working-dir /path/to/project --mode codex`. With no case and
+no `--working-dir`, `spawn` uses cwd. Give editing workers separate worktrees. A
+positional case keeps quick-start behavior and cannot be combined with
+`--working-dir`; an empty `--working-dir` (`"$WT"` unset) refuses with exit 4
+rather than falling back to cwd, and a cwd that is HOME refuses too (hooks would
+land in `~/.claude`; pass `--working-dir ~` to mean it). Directory launches keep parent lineage and never
+mark the project as agent scratch. If startup fails or is ambiguous, the CLI
+reports the exact created ID: inspect it before retrying or cleaning up.
+
 ## 0. Guard and bootstrap
 
-If `CODEMAN_MUX` is not `1`, **stop and say so**. Do not guess an API URL; a server
-you are not part of is not yours to drive.
+For live API operations, if `CODEMAN_MUX` is not `1`, **stop and say so**.
+Do not guess an API URL; a server you are not part of is not yours to drive.
 
 Two failures come from your CLI, not from Codeman: name them to the user instead of
 retrying.
@@ -195,9 +216,9 @@ fi
 AUTH=(); [ -n "${CODEMAN_PASSWORD:-}" ] && AUTH=(-u "${CODEMAN_USERNAME:-admin}:$CODEMAN_PASSWORD")
 # -k: harmless on http, required on https (self-signed cert).
 # X-Codeman-Parent-Session: tags workers YOU spawn as your children, so the web UI can
-# draw the lineage. Set once here and every present and future create call carries it;
-# it is ignored on every other endpoint. Purely cosmetic (see §5.1) and it can never
-# fail a spawn, so there is no case where you would want to leave it off.
+# draw the lineage. Set once here and every present and future create call carries it.
+# The agent inbox reads it too, as "who is calling" (§5.15); every other endpoint ignores
+# it. It can never fail a spawn, so there is no case where you would want to leave it off.
 # X-Codeman-Agent-Origin: marks a case directory a spawn CREATES as agent scratch, so the
 # user can find and delete it long after your workers are gone (§5.14). Same deal: set
 # once, cosmetic, never fails a spawn, and it labels only directories Codeman creates.
@@ -678,6 +699,7 @@ One row per job. Acting on this table alone is correct; the §5 links are the de
 | find yourself, list what exists | `GET /api/v1/sessions`, match your `$SELF` by **prefix** | [§5.11](reference/verbs.md#511-list-and-find-yourself) |
 | read or record what the user wants | `GET/PUT .../intent`, and `POST .../readmymind` to predict | [§5.12](reference/verbs.md#512-read-my-mind) |
 | talk to a claude worker directly | `ListAgents` / `SendMessage`, when the feature is on at both ends | [§5.13](reference/verbs.md#513-messaging-claude-workers) |
+| leave a message a session reads when it is ready, any mode, multi-line | `codeman agent post <id> "…"` (`POST .../inbox`). Nothing is typed into its pane and no turn starts; the receiver reads with `codeman agent inbox --wait` and removes with `codeman agent ack <id>`. An idle receiver never looks on its own: `codeman agent ls` shows unread mail, then `send` it one line | [§5.15](reference/verbs.md#515-agent-inbox) |
 | clean up | `delete_session "$SID"` per id you created. Case directories and git worktrees are **not** removed with it; `GET /api/v1/cases/agent-created` lists the scratch case dirs your spawns left behind, for you to report | [§5.14](reference/verbs.md#514-clean-up) |
 
 ## 3. Rules digest
@@ -781,6 +803,7 @@ these**; open the one row you actually hit.
 | [5.12 Read My Mind](reference/verbs.md#512-read-my-mind) | read or record what the user wants for a case |
 | [5.13 Messaging claude workers](reference/verbs.md#513-messaging-claude-workers) | `ListAgents` / `SendMessage` instead of the HTTP path |
 | [5.14 Clean up](reference/verbs.md#514-clean-up) | what deleting a session does **not** remove, and how to list the case dirs you left |
+| [5.15 Agent inbox](reference/verbs.md#515-agent-inbox) | messages that wait for the receiver instead of being typed: post, read until ack, who counts as the receiver |
 
 ## 6. Setup and auth
 

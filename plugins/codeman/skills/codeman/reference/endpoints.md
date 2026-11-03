@@ -35,8 +35,13 @@ only and can never drive a session.
 with a parse error and `.errorCode` is simply absent (see
 [symptom 6](#6-jq-parse-error-instead-of-an-errorcode)). Ten failed attempts from one
 IP then get a plain-text `429 Too Many Requests` with `Retry-After`, decaying over 15
-minutes (`AUTH_FAILURE_MAX` = 10, `AUTH_FAILURE_WINDOW_MS` = 15 min). **Never retry a
-failing credential in a loop**: you will lock the address out of the login path for
+minutes (`AUTH_FAILURE_MAX` = 10, `AUTH_FAILURE_WINDOW_MS` = 15 min). In multi-user
+mode the per-IP cap is 50 (`AUTH_IP_FAILURE_MAX`) and each account allows 10 failed
+guesses per IP; both are checked before the password, so past either even a correct
+password from that address gets the 429 (for the per-account one, only for that
+account). From the 10th failed guess on, an account's wrong guesses also get the 429
+from every address, but a correct password still logs in. **Never retry a failing
+credential in a loop**: you will lock the address out of the login path for
 everything, including the user's browser through a tunnel (tunneled traffic arrives as
 127.0.0.1, so one bucket covers it all).
 
@@ -608,6 +613,22 @@ Approving a permission dialog on your own is exactly the laundering this skill f
 can access, which includes the user's own working sessions. An approval belonging to one
 of those is something you **report**, never something you answer.
 
+### Agent inbox: hand a worker text without typing into its pane
+
+Stored, not typed: the receiver reads it when it asks. Semantics, CLI form and the
+receiver loop: `verbs.md` §5.15.
+
+| Task | Call |
+|------|------|
+| post to a session's inbox | `POST /api/v1/sessions/:id/inbox` body `{"text":"…"}` → `.data.message.{id,from}`; 409 = inbox full, nothing stored |
+| read (yours marks seen, anyone else's is a peek) | `GET /api/v1/sessions/:id/inbox` → `.data.{receiver,pending,unseen,messages[]}` |
+| block until something unseen arrives | `GET /api/v1/sessions/:id/inbox?wait=60000` → `.data.wait.{posted,timedOut,ended}` |
+| remove what you handled (receiver only, idempotent) | `POST /api/v1/sessions/:id/inbox/ack` body `{"ids":["…"]}`; 403 from anyone else |
+| counts per session, never text | `GET /api/v1/agent-inbox/summary` → `.data.sessions[id].{pending,unseen,oldestUnseenAt,parked}` |
+
+`from` and "who is the receiver" both come from the `X-Codeman-Parent-Session` header the
+preamble's `CURL` sends, never from the body.
+
 ### The wait primitives
 
 Three bounded long-polls. Shared semantics:
@@ -801,7 +822,7 @@ response echoes.
 | sessions, per user | half the global cap (25 by default) in multi-user mode | the same 409, with a different message |
 | SSE clients, process-wide | 100 (`MAX_SSE_CLIENTS`) | plain-text `503 Too many SSE connections`; shared with every browser tab |
 | active bash tools tracked | 20 per session | oldest entries drop off `active-tools` |
-| auth failures per IP | 10, decaying over 15 min | plain-text 429 with `Retry-After`; locks out the login path, so never loop a bad credential |
+| auth failures per IP | 10, decaying over 15 min (multi-user: 50 per IP, plus 10 per account per IP) | plain-text 429 with `Retry-After`; locks out the login path, so never loop a bad credential |
 
 Case creation is **uncapped**, which is the one place restraint has to come from you:
 every `quick-start` with a new `caseName` creates a real directory on the user's disk.

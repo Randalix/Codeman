@@ -92,6 +92,7 @@ describe('isSensitivePath', () => {
       // contents included): 0600 and kept out of /api/search like intents.json.
       ['codeman edit history store', `${HOME}/.codeman/edit-history/s1.json`],
       ['codeman edit history on a named instance', `${HOME}/.codeman-beta/edit-history/s1.json`],
+      ['codeman agent inbox snapshot', `${HOME}/.codeman/agent-inbox.json`],
     ];
 
     it.each(blocked)('blocks the %s', (_label, path) => {

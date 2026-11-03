@@ -33,7 +33,7 @@
  * - **Agent inbox** (1): message (a post to a session's agent mailbox)
  * - **Orchestrator** (12): stateChanged, planProgress, planReady, phase*, verification, task*, completed, error
  * - **Clipboard** (1): write
- * - **Cases** (4): created, linked, deleted, order-changed
+ * - **Cases** (5): created, linked, deleted, renamed, order-changed
  * - **Docker cases** (8): exportComplete/Failed, importComplete, imageBuild*, containerRecreated
  * - **Multi-user** (3): admin:usersChanged, auth:passwordChangeRequired, session:orderChanged
  * - **Web tabs** (2): webview:changed, tab:layoutChanged
@@ -464,6 +464,8 @@ export const CaseCreated = 'case:created' as const;
 export const CaseLinked = 'case:linked' as const;
 /** Case deleted or unlinked. */
 export const CaseDeleted = 'case:deleted' as const;
+/** Case renamed (name and folder). */
+export const CaseRenamed = 'case:renamed' as const;
 /** Case ordering changed. */
 export const CaseOrderChanged = 'case:order-changed' as const;
 
@@ -710,6 +712,7 @@ export const SseEvent = {
   CaseCreated,
   CaseLinked,
   CaseDeleted,
+  CaseRenamed,
   CaseOrderChanged,
 
   // Docker cases

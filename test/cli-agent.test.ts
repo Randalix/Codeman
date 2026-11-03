@@ -5,16 +5,17 @@
  */
 
 import http from 'node:http';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
 import { Command } from 'commander';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   AgentGuardError,
   EXIT,
   agentAck,
-  agentInbox,
+  agentInboxRead,
+  inboxWaitArgs,
   agentInterrupt,
   agentLs,
   stalledPairLines,
@@ -26,6 +27,7 @@ import {
   agentRm,
   agentSend,
   agentSpawn,
+  isLoopbackApiUrl,
   agentHosts,
   normalizeRemotePath,
   remoteCaseName,
@@ -48,7 +50,10 @@ import {
   buildSpawnExtras,
   deleteRefusal,
   describeFailure,
+  describeRequestError,
   httpRequest,
+  inboxCell,
+  waitCell,
   inputRefusal,
   isSelfSession,
   opencodePermissionEnv,
@@ -57,9 +62,11 @@ import {
   MIN_ID_PREFIX_LENGTH,
   sendPromptFromArgs,
   parsePositiveInt,
+  postTextFromArgs,
   registerAgentCommands,
   resolveAgentContext,
   stripAnsi,
+  terminalSafeText,
   waitExitCode,
   type AgentContext,
   type AgentDeps,
@@ -260,7 +267,7 @@ describe('agent ls', () => {
   const withSummary =
     (summary: unknown, list: unknown = sessions, subs: unknown = {}) =>
     (o: RequestOptions): ApiResponse =>
-      o.path === SUMMARY ? ok(summary) : o.path === SUBS ? ok(subs) : ok(list);
+      o.path === SUMMARY ? ok({ sessions: summary }) : o.path === SUBS ? ok(subs) : ok(list);
 
   it('marks this session and falls back to workingDir for the name', async () => {
     const deps = fakeDeps(withSummary({}));
@@ -271,12 +278,15 @@ describe('agent ls', () => {
   });
 
   it('--json is the envelope data plus a self flag and the mailbox state', async () => {
-    const deps = fakeDeps(withSummary({ [OTHER]: { pending: 2, waiting: false, waitingSince: null } }), true);
+    const deps = fakeDeps(
+      withSummary({ [OTHER]: { pending: 2, unseen: 0, oldestUnseenAt: null, parked: false, parkedSince: null } }),
+      true
+    );
     await agentLs(deps);
     const parsed = JSON.parse(deps.out.join('')) as Array<{ id: string; self: boolean; inbox: unknown }>;
     expect(parsed.map((s) => [s.id.slice(0, 8), s.self, s.inbox])).toEqual([
-      ['058ee7b5', true, { pending: 0, waiting: false, waitingSince: null }],
-      ['94990c6d', false, { pending: 2, waiting: false, waitingSince: null }],
+      ['058ee7b5', true, { pending: 0, unseen: 0, oldestUnseenAt: null, parked: false, parkedSince: null }],
+      ['94990c6d', false, { pending: 2, unseen: 0, oldestUnseenAt: null, parked: false, parkedSince: null }],
     ]);
   });
 
@@ -284,8 +294,8 @@ describe('agent ls', () => {
     const since = new Date(2026, 8, 19, 8, 43).toISOString(); // local 08:43
     const deps = fakeDeps(
       withSummary({
-        [SELF]: { pending: 0, waiting: true, waitingSince: since },
-        [OTHER]: { pending: 3, waiting: false, waitingSince: null },
+        [SELF]: { pending: 0, unseen: 0, oldestUnseenAt: null, parked: true, parkedSince: Date.parse(since) },
+        [OTHER]: { pending: 3, unseen: 0, oldestUnseenAt: null, parked: false, parkedSince: null },
       })
     );
     await agentLs(deps);
@@ -300,7 +310,10 @@ describe('agent ls', () => {
     const planner = { id: SELF, mode: 'claude', status: 'idle', name: 'w10 planner' };
     const builder = { id: OTHER, mode: 'claude', status: 'idle', name: 'w12 builder', parentSessionId: SELF };
     const deps = fakeDeps(
-      withSummary({ [SELF]: { pending: 0, waiting: true, waitingSince: since } }, [planner, builder])
+      withSummary(
+        { [SELF]: { pending: 0, unseen: 0, oldestUnseenAt: null, parked: true, parkedSince: Date.parse(since) } },
+        [planner, builder]
+      )
     );
     await agentLs(deps);
     const footer = deps.out.at(-1) ?? '';
@@ -382,8 +395,8 @@ describe('agent ls', () => {
 
   describe('stalledPairLines', () => {
     const since = new Date(2026, 8, 19, 8, 43).toISOString();
-    const waiting = { pending: 0, waiting: true, waitingSince: since };
-    const quiet = { pending: 0, waiting: false, waitingSince: null };
+    const waiting = { pending: 0, unseen: 0, oldestUnseenAt: null, parked: true, parkedSince: Date.parse(since) };
+    const quiet = { pending: 0, unseen: 0, oldestUnseenAt: null, parked: false, parkedSince: null };
 
     it('is silent while the peer is busy or has mail — someone is working', () => {
       const a = { id: SELF, status: 'idle', parentSessionId: null };
@@ -814,27 +827,104 @@ describe('agent spawn', () => {
     expect(deps.calls).toHaveLength(1);
     expect(deps.err.join('')).toMatch(/SESSION_BUSY/);
   });
+
+  it.each([false, true])('preserves the created id when readiness throws (json=%s)', async (json) => {
+    const deps = fakeDeps((options) => {
+      if (options.path === '/api/v1/quick-start') return ok({ sessionId: OTHER, caseName: 'c' });
+      throw new Error('readiness connection reset');
+    }, json);
+    const exit = await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 }).catch(
+      () => undefined
+    );
+
+    if (json) {
+      expect(deps.out).toHaveLength(1);
+      expect(JSON.parse(deps.out[0])).toEqual({
+        sessionId: OTHER,
+        caseName: 'c',
+        readinessError: 'readiness connection reset',
+        subscribed: false,
+      });
+      expect(deps.err).toEqual([]);
+    } else {
+      expect(deps.out).toEqual([OTHER]);
+      expect(deps.err.join('')).toContain('readiness check failed: readiness connection reset');
+      expect(deps.err.join('')).not.toMatch(/composer not seen|startup dialog/);
+    }
+    expect(exit).toBe(EXIT.error);
+    expect(deps.calls.map(({ method, path }) => ({ method, path }))).toEqual([
+      { method: 'POST', path: '/api/v1/quick-start' },
+      { method: 'GET', path: `/api/v1/sessions/${OTHER}/wait-output` },
+    ]);
+  });
+
+  it.each([
+    { error: new Error(''), kind: 'Error' },
+    { error: '', kind: 'string' },
+  ])('reports a readiness failure when the thrown $kind has no message', async ({ error }) => {
+    const deps = fakeDeps((options) => {
+      if (options.path === '/api/v1/quick-start') return ok({ sessionId: OTHER });
+      throw error;
+    }, true);
+
+    expect(await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.error);
+    expect(deps.out).toHaveLength(1);
+    expect(JSON.parse(deps.out[0])).toEqual({
+      sessionId: OTHER,
+      readinessError: 'request failed without a message',
+      subscribed: false,
+    });
+    expect(deps.calls).toHaveLength(2);
+  });
+
+  it('keeps the error code when a refused connection rejects with an empty AggregateError', async () => {
+    // Node 22 on a host resolving to ::1 and 127.0.0.1: message '', code ECONNREFUSED.
+    const refused = Object.assign(new AggregateError([new Error('connect ECONNREFUSED ::1:3000')], ''), {
+      code: 'ECONNREFUSED',
+    });
+    const deps = fakeDeps((options) => {
+      if (options.path === '/api/v1/quick-start') return ok({ sessionId: OTHER });
+      throw refused;
+    }, true);
+
+    expect(await agentSpawn(deps, { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 })).toBe(EXIT.error);
+    expect(JSON.parse(deps.out[0])).toEqual({ sessionId: OTHER, readinessError: 'ECONNREFUSED', subscribed: false });
+  });
+});
+
+describe('describeRequestError', () => {
+  it('prefers the message, then the code, then a generic line', () => {
+    expect(describeRequestError(new Error('socket hang up'))).toBe('socket hang up');
+    expect(describeRequestError(Object.assign(new AggregateError([], ''), { code: 'ECONNREFUSED' }))).toBe(
+      'ECONNREFUSED'
+    );
+    expect(describeRequestError(new Error(''))).toBe('request failed without a message');
+    expect(describeRequestError('')).toBe('request failed without a message');
+  });
 });
 
 describe('agent spawn: where it starts and which model it runs', () => {
-  const PARENT_DIR = '/home/joe/work/parent';
-  const listed = () =>
-    ok([
-      { id: SELF, workingDir: PARENT_DIR },
-      { id: OTHER, workingDir: '/elsewhere' },
-    ]);
+  // Real directories: a local worker directory must exist (checked before any request).
+  const ROOT = mkdtempSync(join(tmpdir(), 'agent-spawn-dirs-'));
+  const PARENT_DIR = join(ROOT, 'parent');
+  const REPO = join(ROOT, 'repo');
+  const SUB = join(ROOT, 'sub', 'dir');
+  for (const dir of [PARENT_DIR, REPO, SUB]) mkdirSync(dir, { recursive: true });
+  afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
+  // Upstream's default: the caller's cwd. Pinned here so the suite's own cwd never matters.
+  beforeEach(() => void vi.spyOn(process, 'cwd').mockReturnValue(PARENT_DIR));
+  afterEach(() => vi.restoreAllMocks());
   const created = () => ok({ session: { id: OTHER } });
   const base = { mode: 'claude', ready: false, timeoutMs: 1000 } as const;
 
-  it('without a case inherits the parent directory: create + start, no scratch label', async () => {
-    const deps = fakeDeps([listed(), created(), ok({})]);
+  it('without a case starts in the caller cwd: create + start, no lookup, no scratch label', async () => {
+    const deps = fakeDeps([created(), ok({})]);
     expect(await agentSpawn(deps, { ...base, name: 'w1' })).toBe(EXIT.ok);
     expect(deps.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
-      'GET /api/v1/sessions',
       'POST /api/v1/sessions',
       `POST /api/v1/sessions/${OTHER}/interactive`,
     ]);
-    expect(deps.calls[1].body).toEqual({ workingDir: PARENT_DIR, mode: 'claude', parentSessionId: SELF, name: 'w1' });
+    expect(deps.calls[0].body).toEqual({ workingDir: PARENT_DIR, mode: 'claude', parentSessionId: SELF, name: 'w1' });
     for (const call of deps.calls) expect(call.headers?.['X-Codeman-Agent-Origin']).toBeUndefined();
     expect(deps.out).toEqual([OTHER]);
     expect(deps.err.join('')).toContain(`dir ${PARENT_DIR}`);
@@ -842,11 +932,15 @@ describe('agent spawn: where it starts and which model it runs', () => {
 
   it('--cwd sets the directory (relative to this process), without asking for the parent', async () => {
     const deps = fakeDeps([created(), ok({})]);
-    expect(await agentSpawn(deps, { ...base, cwd: 'sub/dir' })).toBe(EXIT.ok);
-    expect(deps.calls[0].body).toMatchObject({ workingDir: join(process.cwd(), 'sub/dir') });
+    expect(await agentSpawn(deps, { ...base, cwd: relative(process.cwd(), SUB) })).toBe(EXIT.ok);
+    expect(deps.calls[0].body).toMatchObject({ workingDir: SUB });
     const abs = fakeDeps([created(), ok({})]);
-    await agentSpawn(abs, { ...base, cwd: '/srv/repo' });
-    expect(abs.calls[0].body).toMatchObject({ workingDir: '/srv/repo' });
+    await agentSpawn(abs, { ...base, cwd: REPO });
+    expect(abs.calls[0].body).toMatchObject({ workingDir: REPO });
+    // upstream's flag name is the same option
+    const alias = fakeDeps([created(), ok({})]);
+    await agentSpawn(alias, { ...base, workingDir: REPO });
+    expect(alias.calls[0].body).toMatchObject({ workingDir: REPO });
   });
 
   it('a case still quick-starts; a case together with --cwd is refused before any call', async () => {
@@ -865,13 +959,13 @@ describe('agent spawn: where it starts and which model it runs', () => {
     expect(modelFields('opencode', 'anthropic/x')).toEqual({ openCodeConfig: { model: 'anthropic/x' } });
     for (const mode of ['shell', 'deepseek']) expect(() => modelFields(mode, 'x')).toThrow(/no model to set/);
 
-    const codex = fakeDeps([listed(), created(), ok({})]);
+    const codex = fakeDeps([created(), ok({})]);
     await agentSpawn(codex, { ...base, mode: 'codex', model: 'gpt-5.5', resume: 'r-1' });
-    expect(codex.calls[1].body).toMatchObject({ codexConfig: { model: 'gpt-5.5', resumeSessionId: 'r-1' } });
+    expect(codex.calls[0].body).toMatchObject({ codexConfig: { model: 'gpt-5.5', resumeSessionId: 'r-1' } });
 
-    const plain = fakeDeps([listed(), created(), ok({})]);
+    const plain = fakeDeps([created(), ok({})]);
     await agentSpawn(plain, base);
-    expect(plain.calls[1].body).not.toHaveProperty('model');
+    expect(plain.calls[0].body).not.toHaveProperty('model');
 
     const shell = fakeDeps([]);
     expect(await agentSpawn(shell, { ...base, mode: 'shell', model: 'x' })).toBe(EXIT.refused);
@@ -880,45 +974,105 @@ describe('agent spawn: where it starts and which model it runs', () => {
 
   it('deepseek keeps its permission posture next to a placed directory', async () => {
     const deps = fakeDeps([created(), ok({})]);
-    await agentSpawn(deps, { ...base, mode: 'deepseek', cwd: '/srv' });
+    await agentSpawn(deps, { ...base, mode: 'deepseek', cwd: REPO });
     expect(deps.calls[0].body).toMatchObject({ deepSeekConfig: { permissionMode: 'danger-full-access' } });
   });
 
-  it('a start that fails removes the created session again; a parent it cannot find is refused', async () => {
-    const deps = fakeDeps([listed(), created(), apiError(409, 'SESSION_BUSY', 'Session is busy'), ok({})]);
+  it('a refused start keeps the created session and reports its id (upstream: never delete or hide it)', async () => {
+    const deps = fakeDeps([created(), apiError(409, 'SESSION_BUSY', 'Session is busy')]);
     expect(await agentSpawn(deps, base)).toBe(EXIT.error);
-    expect(deps.calls.at(-1)).toMatchObject({ method: 'DELETE', path: `/api/v1/sessions/${OTHER}` });
-    expect(deps.err.join('')).toMatch(/could not start .*removed again.*SESSION_BUSY/);
-    expect(deps.out).toEqual([]);
-
-    const orphan = fakeDeps([ok([{ id: OTHER, workingDir: '/x' }])]);
-    expect(await agentSpawn(orphan, base)).toBe(EXIT.refused);
-    expect(orphan.err.join('')).toMatch(/--cwd or a case/);
-
-    // a remote parent's directory is a path on another host: never start a local worker there
-    const remote = fakeDeps([ok([{ id: SELF, workingDir: '/home/joe/x', remote: { hostId: 'huff' } }])]);
-    expect(await agentSpawn(remote, base)).toBe(EXIT.refused);
-    expect(remote.calls).toHaveLength(1);
-    expect(remote.err.join('')).toMatch(/cannot inherit a remote directory/);
+    expect(deps.calls.some((c) => c.method === 'DELETE')).toBe(false);
+    expect(deps.out).toEqual([OTHER]);
+    expect(deps.err.join('')).toMatch(/created but startup failed: .*SESSION_BUSY/);
   });
 
-  it('the readiness wait runs for an inherited-directory worker too', async () => {
-    const deps = fakeDeps([listed(), created(), ok({}), ok({ wait: { matched: true } })]);
+  it('off the Codeman host (non-loopback API URL) an implicit directory is refused before any request', async () => {
+    // A remote/container session's cwd is a path on another machine; Hufflepuff's /home/joe/…
+    // exists on Albus too, so a local worker there would start on the wrong host.
+    for (const apiUrl of ['http://192.168.50.194:3459', 'http://host.docker.internal:3459']) {
+      const remote = fakeDeps([]);
+      remote.ctx = { ...remote.ctx, apiUrl };
+      expect(await agentSpawn(remote, base)).toBe(EXIT.refused);
+      expect(remote.calls).toEqual([]);
+      expect(remote.err.join('')).toMatch(/does not run on the Codeman host.*--cwd/);
+      // naming the directory is the caller's explicit choice and goes through
+      const placed = fakeDeps([created(), ok({})]);
+      placed.ctx = { ...placed.ctx, apiUrl };
+      expect(await agentSpawn(placed, { ...base, cwd: REPO })).toBe(EXIT.ok);
+    }
+    for (const url of ['http://localhost:3000', 'http://127.0.0.1:1', 'http://[::1]:3000']) {
+      expect(isLoopbackApiUrl(url)).toBe(true);
+    }
+    for (const url of ['http://192.168.50.194:3459', 'https://codeman.example', 'not a url']) {
+      expect(isLoopbackApiUrl(url)).toBe(false);
+    }
+  });
+
+  it('refuses a missing directory, an empty --cwd and an implicit HOME before creating anything', async () => {
+    const missing = fakeDeps([]);
+    expect(await agentSpawn(missing, { ...base, cwd: join(ROOT, 'nope') })).toBe(EXIT.refused);
+    expect(missing.calls).toEqual([]);
+    expect(missing.err.join('')).toMatch(/not an existing local directory/);
+
+    const empty = fakeDeps([]);
+    expect(await agentSpawn(empty, { ...base, cwd: '' })).toBe(EXIT.refused);
+    expect(empty.calls).toEqual([]);
+    expect(empty.err.join('')).toMatch(/--cwd is empty/);
+
+    const emptyUpstream = fakeDeps([]);
+    expect(await agentSpawn(emptyUpstream, { ...base, workingDir: ' ' })).toBe(EXIT.refused);
+    expect(emptyUpstream.err.join('')).toMatch(/--working-dir is empty/);
+
+    // the server would install hooks + skill into ~/.claude: only an explicit --cwd ~ may
+    vi.mocked(process.cwd).mockReturnValue(homedir());
+    const home = fakeDeps([]);
+    expect(await agentSpawn(home, base)).toBe(EXIT.refused);
+    expect(home.calls).toEqual([]);
+    expect(home.err.join('')).toMatch(/home directory; pass --working-dir ~ \(or --cwd ~\)/);
+    const explicitHome = fakeDeps([created(), ok({})]);
+    expect(await agentSpawn(explicitHome, { ...base, cwd: homedir() })).toBe(EXIT.ok);
+  });
+
+  it('a start request that fails in transit is ambiguous: the id is reported and the session kept', async () => {
+    const deps = fakeDeps((o) => {
+      if (o.method === 'POST' && o.path === '/api/v1/sessions') return ok({ session: { id: OTHER } });
+      throw new Error('socket hang up');
+    });
+    expect(await agentSpawn(deps, { ...base, cwd: REPO })).toBe(EXIT.error);
+    expect(deps.out).toEqual([OTHER]);
+    expect(deps.err.join('')).toMatch(/created but startup is ambiguous: socket hang up/);
+    expect(deps.calls.some((c) => c.method === 'DELETE')).toBe(false);
+  });
+
+  it("starts through the mode's start route (a shell mode is not interactive)", async () => {
+    const deps = fakeDeps([created(), ok({})]);
+    expect(await agentSpawn(deps, { ...base, mode: 'shell', cwd: REPO })).toBe(EXIT.ok);
+    expect(deps.calls[1].path).toBe(`/api/v1/sessions/${OTHER}/shell`);
+  });
+
+  it('the readiness wait runs for a cwd worker too', async () => {
+    const deps = fakeDeps([created(), ok({}), ok({ wait: { matched: true } })]);
     expect(await agentSpawn(deps, { ...base, ready: true })).toBe(EXIT.ok);
-    expect(deps.calls[3]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/wait-output` });
+    expect(deps.calls[2]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/wait-output` });
   });
 });
 
 describe('agent post / inbox (mailbox)', () => {
+  it('inboxWaitArgs: --wait <ms> (downstream), bare --wait with -t (upstream), --wait <id> is the id', () => {
+    expect(inboxWaitArgs(undefined, undefined, '5000')).toEqual({ id: undefined });
+    expect(inboxWaitArgs(undefined, '600000', undefined)).toEqual({ id: undefined, waitMs: 600000 });
+    expect(inboxWaitArgs(undefined, true, '5000')).toEqual({ id: undefined, waitMs: 5000 });
+    expect(inboxWaitArgs(undefined, OTHER, '5000')).toEqual({ id: OTHER, waitMs: 5000 });
+    expect(inboxWaitArgs(OTHER, 'abc', undefined)).toMatchObject({ error: expect.stringMatching(/budget in ms/) });
+  });
+
   it("post stores in the receiver's inbox with the caller as sender; nothing goes to /input", async () => {
     const deps = fakeDeps([ok({ message: { id: 'm1', from: SELF, text: 'multi\nline', createdAt: 1 }, pending: 3 })]);
     expect(await agentPost(deps, { id: OTHER, text: 'multi\nline' })).toBe(EXIT.ok);
     expect(deps.calls).toHaveLength(1);
-    expect(deps.calls[0]).toMatchObject({
-      method: 'POST',
-      path: `/api/v1/sessions/${OTHER}/inbox`,
-      body: { text: 'multi\nline', from: SELF },
-    });
+    // The server resolves the sender from X-Codeman-Parent-Session; the strict schema has no `from`.
+    expect(deps.calls[0]).toMatchObject({ method: 'POST', path: `/api/v1/sessions/${OTHER}/inbox` });
+    expect(deps.calls[0].body).toEqual({ text: 'multi\nline' });
     expect(deps.out.join('')).toMatch(/posted .*3 pending/);
   });
 
@@ -941,41 +1095,50 @@ describe('agent post / inbox (mailbox)', () => {
 
   it("inbox reads the caller's own mailbox WITHOUT acknowledging; it only marks it seen", async () => {
     const msgs = [
-      { id: 'm1', from: OTHER, text: 'first', createdAt: 0 },
-      { id: 'm2', from: 'label', text: 'second', createdAt: 0 },
+      { id: 'm1', from: OTHER, text: 'first', createdAt: 0, seen: false },
+      { id: 'm2', from: null, text: 'second', createdAt: 0, seen: false },
     ];
-    const deps = fakeDeps([ok({ messages: msgs, pending: 2, timedOut: false, waitedMs: 0 })]);
-    expect(await agentInbox(deps, { peek: false })).toBe(EXIT.ok);
+    const deps = fakeDeps([ok({ receiver: true, messages: msgs, pending: 2, unseen: 0 })]);
+    expect(await agentInboxRead(deps, {})).toBe(EXIT.ok);
     expect(deps.calls).toHaveLength(1); // no ack call: reading is not processing
     expect(deps.calls[0]).toMatchObject({ method: 'GET', path: `/api/v1/sessions/${SELF}/inbox` });
     expect(deps.calls[0].query).toMatchObject({ peek: undefined });
-    expect(deps.out.join('\n')).toMatch(/from 94990c6d[\s\S]*first[\s\S]*from label[\s\S]*second/);
+    expect(deps.out.join('\n')).toMatch(/from 94990c6d[\s\S]*first[\s\S]*from user[\s\S]*second/);
     // The read output tells the receiver how to acknowledge once it has handled the mail.
     expect(deps.err.join('\n')).toMatch(/codeman agent ack/);
   });
 
   it('prints status lines (quiet IDLE reports) last, as one compact digest block', async () => {
     const msgs = [
-      { id: 'q1', from: OTHER, text: '[codeman watch] IDLE  94990c6d  claude  …', createdAt: 0, quiet: true },
-      { id: 'm1', from: OTHER, text: 'the result', createdAt: 0 },
+      {
+        id: 'q1',
+        from: OTHER,
+        text: '[codeman watch] IDLE  94990c6d  claude  …',
+        createdAt: 0,
+        seen: false,
+        quiet: true,
+      },
+      { id: 'm1', from: OTHER, text: 'the result', createdAt: 0, seen: false },
     ];
-    const deps = fakeDeps([ok({ messages: msgs, pending: 2, timedOut: false, waitedMs: 0 })]);
-    expect(await agentInbox(deps, { peek: false })).toBe(EXIT.ok);
+    const deps = fakeDeps([ok({ receiver: true, messages: msgs, pending: 2, unseen: 0 })]);
+    expect(await agentInboxRead(deps, {})).toBe(EXIT.ok);
     const out = deps.out.join('\n');
     expect(out).toMatch(/from 94990c6d[^\n]*\nthe result\n[\s\S]*watch digest \(1\):\n\[codeman watch\] IDLE/);
     expect(out.match(/from 94990c6d/g)).toHaveLength(1); // no header line per status
   });
 
   it('--peek asks the server to mark nothing; an empty --wait is exit 2', async () => {
-    const peek = fakeDeps([ok({ messages: [{ id: 'm1', from: OTHER, text: 'x', createdAt: 0 }], pending: 1 })]);
-    expect(await agentInbox(peek, { peek: true })).toBe(EXIT.ok);
+    const peek = fakeDeps([
+      ok({ receiver: false, messages: [{ id: 'm1', from: OTHER, text: 'x', createdAt: 0, seen: false }], pending: 1 }),
+    ]);
+    expect(await agentInboxRead(peek, { peek: true })).toBe(EXIT.ok);
     expect(peek.calls).toHaveLength(1);
     expect(peek.calls[0].query).toMatchObject({ peek: 1 });
-    // The server clamps: --wait 1 is a 1000 ms wait, and the message says so.
-    const timeout = fakeDeps([ok({ messages: [], pending: 0, timedOut: true, waitedMs: 1000 })]);
-    expect(await agentInbox(timeout, { peek: false, waitMs: 1 })).toBe(EXIT.timeout);
+    expect(peek.err.join('')).toMatch(/peek: nothing was marked seen/);
+    const timeout = fakeDeps([ok({ messages: [], pending: 0, unseen: 0, wait: { timedOut: true } })]);
+    expect(await agentInboxRead(timeout, { waitMs: 1 })).toBe(EXIT.timeout);
     expect(timeout.calls[0].query).toMatchObject({ wait: 1 });
-    expect(timeout.err.join('')).toMatch(/nothing arrived within 1000 ms/);
+    expect(timeout.err.join('')).toMatch(/wait timed out, exit 2/);
   });
 
   it('agentAck with no ids acknowledges everything seen; with ids it acknowledges exactly those', async () => {
@@ -986,7 +1149,7 @@ describe('agent post / inbox (mailbox)', () => {
       path: `/api/v1/sessions/${SELF}/inbox/ack`,
       body: {},
     });
-    expect(all.out.join('')).toMatch(/acknowledged 2/);
+    expect(all.out.join('')).toMatch(/acked 2/);
     const some = fakeDeps([ok({ removed: 1, pending: 1 })]);
     expect(await agentAck(some, { ids: ['m1'] })).toBe(EXIT.ok);
     expect(some.calls[0]).toMatchObject({ body: { ids: ['m1'] } });
@@ -995,7 +1158,8 @@ describe('agent post / inbox (mailbox)', () => {
   it('a failed ack is reported as such (the messages stay for the next read)', async () => {
     const deps = fakeDeps([{ status: 500, text: 'boom' }]);
     expect(await agentAck(deps, { ids: ['m1'] })).toBe(EXIT.error);
-    expect(deps.err.join('')).toMatch(/could not acknowledge/);
+    expect(deps.calls).toHaveLength(1);
+    expect(deps.err.join('')).toMatch(/500/);
   });
 });
 
@@ -1408,6 +1572,207 @@ describe('send takes the prompt as ONE argument', () => {
   });
 });
 
+describe('agent inbox verbs', () => {
+  const MSG = {
+    id: 'm-1',
+    from: OTHER,
+    text: 'line one\nline two',
+    createdAt: 1_700_000_000_000 - 90_000,
+    seen: false,
+  };
+
+  it('ls merges the inbox summary into an INBOX column', async () => {
+    const deps = fakeDeps((o) =>
+      o.path === '/api/v1/agent-inbox/summary'
+        ? ok({
+            sessions: {
+              [SELF]: { pending: 2, unseen: 1, oldestUnseenAt: 1, parked: false },
+              [OTHER]: { pending: 0, unseen: 0, oldestUnseenAt: null, parked: true },
+            },
+          })
+        : ok([
+            { id: SELF, mode: 'claude', status: 'busy', name: 'me' },
+            { id: OTHER, mode: 'codex', status: 'idle', name: 'worker' },
+          ])
+    );
+    expect(await agentLs(deps)).toBe(EXIT.ok);
+    const text = deps.out.join('\n');
+    // Downstream layout: INBOX counts, parking in its own WAIT column.
+    expect(text).toMatch(/ID\s+MODE\s+MODEL\s+HOST\s+STATUS\s+INBOX\s+WAIT/);
+    expect(text).toMatch(/058ee7b5\s+claude\s+-\s+local\s+busy\s+2 \(1 new\)\s+-/);
+    expect(text).toMatch(/94990c6d\s+codex\s+-\s+local\s+idle\s+0\s+parked/);
+  });
+
+  it('ls --json carries each session’s inbox row (the empty row when it has none)', async () => {
+    const deps = fakeDeps(
+      (o) =>
+        o.path === '/api/v1/agent-inbox/summary'
+          ? ok({ sessions: { [OTHER]: { pending: 1, unseen: 1, oldestUnseenAt: 5, parked: false } } })
+          : ok([{ id: SELF }, { id: OTHER }]),
+      true
+    );
+    await agentLs(deps);
+    const parsed = JSON.parse(deps.out.join('')) as Array<{ id: string; inbox: unknown }>;
+    expect(parsed.map((s) => s.inbox)).toEqual([
+      { pending: 0, unseen: 0, oldestUnseenAt: null, parked: false, parkedSince: null },
+      { pending: 1, unseen: 1, oldestUnseenAt: 5, parked: false },
+    ]);
+  });
+
+  it('ls still lists sessions when the server has no summary route', async () => {
+    const deps = fakeDeps((o) =>
+      o.path === '/api/v1/agent-inbox/summary' ? apiError(404, 'NOT_FOUND', 'Route not found') : ok([{ id: OTHER }])
+    );
+    expect(await agentLs(deps)).toBe(EXIT.ok);
+    // "no data" reads `?`, never "no mail"
+    expect(deps.out.join('\n')).toMatch(/94990c6d\s+\?\s+-\s+local\s+\?\s+\?\s+\?/);
+  });
+
+  it('inboxCell and waitCell', () => {
+    expect(inboxCell(undefined)).toBe('0');
+    expect(inboxCell({ pending: 3, unseen: 0, oldestUnseenAt: null, parked: false })).toBe('3');
+    expect(inboxCell({ pending: 3, unseen: 2, oldestUnseenAt: 1, parked: true })).toBe('3 (2 new)');
+    expect(waitCell(undefined)).toBe('-');
+    expect(waitCell({ pending: 0, unseen: 0, oldestUnseenAt: null, parked: true })).toBe('parked');
+    const since = new Date(2026, 8, 19, 8, 43).getTime();
+    expect(waitCell({ pending: 0, unseen: 0, oldestUnseenAt: null, parked: true, parkedSince: since })).toBe(
+      'since 08:43'
+    );
+  });
+
+  it('post sends the text as data to the resolved session and never to /input', async () => {
+    const deps = fakeDeps([ok({ message: MSG, pending: 1, unseen: 1 })]);
+    expect(await agentPost(deps, { id: OTHER, text: 'line one\nline two' })).toBe(EXIT.ok);
+    expect(deps.calls).toEqual([
+      expect.objectContaining({
+        method: 'POST',
+        path: `/api/v1/sessions/${OTHER}/inbox`,
+        body: { text: 'line one\nline two' },
+      }),
+    ]);
+    expect(deps.out.join('')).toMatch(/posted to 94990c6d \(1 pending, 1 unseen\)/);
+  });
+
+  it('post passes a full inbox (409) through as an error', async () => {
+    const deps = fakeDeps([apiError(409, 'CONFLICT', 'Inbox of x is full (200 messages).')]);
+    expect(await agentPost(deps, { id: OTHER, text: 'x' })).toBe(EXIT.error);
+    expect(deps.err.join('')).toMatch(/CONFLICT: Inbox of x is full/);
+  });
+
+  it('post takes ONE argument and refuses an empty one before any request', async () => {
+    expect(postTextFromArgs(['a\nb'])).toEqual({ text: 'a\nb' });
+    expect(postTextFromArgs(['a', 'b'])).toEqual({ error: expect.stringMatching(/ONE argument, got 2/) });
+    const deps = fakeDeps([]);
+    expect(await agentPost(deps, { id: OTHER, text: '' })).toBe(EXIT.refused);
+    expect(deps.calls).toEqual([]);
+  });
+
+  it('inbox reads this session’s own inbox by default and prints full ids plus the ack hint', async () => {
+    const deps = fakeDeps([ok({ receiver: true, messages: [MSG], pending: 1, unseen: 0 })]);
+    expect(await agentInboxRead(deps, {})).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({ method: 'GET', path: `/api/v1/sessions/${SELF}/inbox` });
+    expect(deps.calls[0].query).toEqual({ wait: undefined });
+    const text = deps.out.join('\n');
+    expect(text).toMatch(/── m-1 from 94990c6d, 2m ago, new/);
+    expect(text).toContain('line one\nline two');
+    expect(deps.err.join('')).toMatch(/codeman agent ack <id>/);
+  });
+
+  it('inbox prints message text with escape sequences and control characters neutralized', async () => {
+    const hostile = {
+      ...MSG,
+      text: 'title \x1b]0;pwned\x07ok\r\nred \x1b[31mtext\x1b[0m\rover\bwrite\ttab\x9b2J\nend',
+    };
+    const deps = fakeDeps([ok({ receiver: true, messages: [hostile], pending: 1, unseen: 0 })]);
+    expect(await agentInboxRead(deps, {})).toBe(EXIT.ok);
+    // out[0] is the `── <id> from …` header (styled by the palette), out[1] the text.
+    expect(deps.out).toHaveLength(2);
+    expect(deps.out[1]).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/);
+    expect(deps.out[1]).toBe('title ok\nred text\\x0dover\\x08write\ttab\\x9b2J\nend');
+  });
+
+  it('terminalSafeText keeps newline and tab and escapes every other control', () => {
+    expect(terminalSafeText('a\nb\tc')).toBe('a\nb\tc');
+    expect(terminalSafeText('a\r\nb')).toBe('a\nb');
+    expect(terminalSafeText('\x1b[2J\x1bc\x00\x7f')).toBe('\\x1bc\\x00\\x7f');
+    expect(terminalSafeText('ünïcödé ✓')).toBe('ünïcödé ✓');
+  });
+
+  it('inbox --json hands the text out as stored', async () => {
+    const raw = { ...MSG, text: 'red \x1b[31mtext' };
+    const deps = fakeDeps([ok({ receiver: true, messages: [raw], pending: 1, unseen: 0 })], true);
+    await agentInboxRead(deps, {});
+    expect((JSON.parse(deps.out.join('')) as { messages: Array<{ text: string }> }).messages[0].text).toBe(
+      'red \x1b[31mtext'
+    );
+  });
+
+  it('inbox <id> is a peek and says so', async () => {
+    const deps = fakeDeps([ok([{ id: OTHER }]), ok({ receiver: false, messages: [MSG], pending: 1, unseen: 1 })]);
+    expect(await agentInboxRead(deps, { id: OTHER.slice(0, 8) })).toBe(EXIT.ok);
+    expect(deps.calls[1].path).toBe(`/api/v1/sessions/${OTHER}/inbox`);
+    expect(deps.err.join('')).toMatch(/peek: nothing was marked seen/);
+  });
+
+  it('inbox --wait passes the budget and maps timeout to exit 2', async () => {
+    const timedOut = fakeDeps([ok({ receiver: true, messages: [], pending: 0, unseen: 0, wait: { timedOut: true } })]);
+    expect(await agentInboxRead(timedOut, { waitMs: 30_000 })).toBe(EXIT.timeout);
+    expect(timedOut.calls[0]).toMatchObject({ query: { wait: 30_000 }, timeoutMs: 40_000 });
+  });
+
+  describe('a wait the server ended', () => {
+    const ended = ok({ receiver: true, messages: [], pending: 0, unseen: 0, wait: { ended: true } });
+
+    it('is exit 3 only when the session list confirms the session is gone', async () => {
+      const deps = fakeDeps([ended, ok([{ id: OTHER }])]);
+      expect(await agentInboxRead(deps, { waitMs: 30_000 })).toBe(EXIT.dead);
+      expect(deps.calls[1]).toMatchObject({ method: 'GET', path: '/api/v1/sessions' });
+      expect(deps.err.join('')).toMatch(/went away/);
+    });
+
+    it('is exit 2 (wait again) while the session is still listed: a restart or detach', async () => {
+      const deps = fakeDeps([ended, ok([{ id: SELF }])]);
+      expect(await agentInboxRead(deps, { waitMs: 30_000 })).toBe(EXIT.timeout);
+      expect(deps.err.join('')).toMatch(/ended the wait early/);
+    });
+
+    it('is exit 2 when the list cannot be had (the server is still coming back)', async () => {
+      const deps = fakeDeps([ended, apiError(503, 'INTERNAL_ERROR', 'restarting')]);
+      expect(await agentInboxRead(deps, { waitMs: 30_000 })).toBe(EXIT.timeout);
+    });
+  });
+
+  it('ack posts the ids to this session’s own inbox', async () => {
+    const deps = fakeDeps([ok({ removed: 2, pending: 0 })]);
+    expect(await agentAck(deps, { ids: ['m-1', ' m-2 '] })).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${SELF}/inbox/ack`,
+      body: { ids: ['m-1', 'm-2'] },
+    });
+    expect(deps.out.join('')).toMatch(/acked 2 \(0 still pending\)/);
+  });
+
+  it('ack without ids acknowledges everything read (downstream) and passes a 403 through', async () => {
+    const none = fakeDeps([ok({ removed: 2, pending: 0 })]);
+    expect(await agentAck(none, { ids: [' '] })).toBe(EXIT.ok);
+    expect(none.calls[0]).toMatchObject({ path: `/api/v1/sessions/${SELF}/inbox/ack`, body: {} });
+    const forbidden = fakeDeps([apiError(403, 'FORBIDDEN', 'Only x itself can acknowledge its inbox')]);
+    expect(await agentAck(forbidden, { ids: ['m-1'] })).toBe(EXIT.error);
+  });
+
+  it('none of the inbox verbs writes to a pane', async () => {
+    const deps = fakeDeps((o) =>
+      o.path === '/api/v1/sessions' ? ok([{ id: OTHER }]) : ok({ messages: [], pending: 0, unseen: 0 })
+    );
+    await agentPost(deps, { id: OTHER, text: 'x' });
+    await agentInboxRead(deps, {});
+    await agentInboxRead(deps, { id: OTHER, waitMs: 1000 });
+    await agentAck(deps, { ids: ['m'] });
+    for (const call of deps.calls) expect(call.path).not.toMatch(/\/input$/);
+  });
+});
+
 describe('help texts carry the traps the skill documents', () => {
   const agent = registerAgentCommands(new Command());
   const sub = (name: string) => agent.commands.find((c) => c.name() === name)!;
@@ -1420,6 +1785,26 @@ describe('help texts carry the traps the skill documents', () => {
 
   it('send names the -- escape for a prompt that starts with "-"', () => {
     expect(sub('send').description()).toContain('send <id> -- "- fix the bug"');
+  });
+
+  it('post takes text that starts with "-" (markdown from a file) without --', async () => {
+    const program = new Command();
+    program.exitOverride();
+    const post = registerAgentCommands(program).commands.find((c) => c.name() === 'post')!;
+    const got: Array<{ words: string[]; json: boolean }> = [];
+    post.action((_id: string, words: string[], o: { json?: boolean }) => {
+      got.push({ words, json: Boolean(o.json) });
+    });
+    for (const text of ['- [ ] item\nnext', '---\ntitle: a', '-v is great']) {
+      await program.parseAsync(['node', 'codeman', 'agent', 'post', 'abcdefgh', text]);
+    }
+    await program.parseAsync(['node', 'codeman', 'agent', 'post', 'abcdefgh', 'hi', '--json']);
+    expect(got).toEqual([
+      { words: ['- [ ] item\nnext'], json: false },
+      { words: ['---\ntitle: a'], json: false },
+      { words: ['-v is great'], json: false },
+      { words: ['hi'], json: true },
+    ]);
   });
 
   it('rm does not claim a lineage check it does not make', () => {

@@ -77,6 +77,14 @@ An agent tab shows its CLI's logo before the name, and a shell tab an `SH` badge
 on Tabs** (App Settings → Appearance → Tabs) hides the logos on that device; the tile and split
 headers and the Run menus keep theirs.
 
+**New Session Button on Tabs** (same place, per device, off by default) adds a **+** beside
+the tab's gear. It lists the CLIs that tab's case can start, each with its logo and name (a
+Docker case lists what its container has), and a pick starts one session in that tab's case,
+or the worktree it runs in, and in its named group. The Run button keeps its own mode and case.
+Wherever a tab has a row menu (the vertical rail, the sidebar, `Shift+F10` on a grouped row),
+the same list is its **New session here…** entry. From a tab outside any named group, the new
+session lands in the case's default group if the case has one, as a Run from the toolbar does.
+
 **Status is carried by the dot and the tab's own styling:**
 
 | Look                          | Meaning                                                                 |
@@ -177,6 +185,14 @@ The connection readout, CPU, MEM and the plan usage windows can be drawn three w
 | **As before**  | The bars and the `5H · 7D` chip, exactly as they were.                                 |
 
 Hiding System Stats or Plan Usage still hides them in every style.
+
+The line between the session tabs and the toolbar is a handle: drag it right to narrow the toolbar
+(it wraps onto a second line and the usage readings shed their labels, then their provider names,
+then, in the Compact style, their percentages), left to widen it. The GPU, VRAM and clock readings
+keep their labels, since their values look like CPU's and MEM's; at the narrowest Compact step a
+clock, which has no ring, is hidden. Arrow keys resize it, and
+double-click or Home resets it. It stops at the widest reading, the width is kept per device, and it
+is not shown on phones, in the sidebar layout, in the vertical rail or in a solo window.
 
 New header controls never appear on phones. Phone layout is deliberately minimal and is
 covered in [Mobile Guide](Mobile-Guide).

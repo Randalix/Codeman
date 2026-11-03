@@ -105,7 +105,9 @@ The warning points at three ways to secure the instance:
 2. `--host 127.0.0.1` + an authenticated tunnel (`cloudflared` / `tailscale serve`).
 3. `--allow-unauthenticated-network` / `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1`
    — explicitly accept the risk (downgrades the warning to a one‑line note). This
-   flag is **only** an acknowledgement; it does not change reachability.
+   flag is **only** an acknowledgement; it does not change reachability. It covers
+   the bind and nothing else: it does **not** let the managed Cloudflare tunnel
+   start without a password, which has its own opt‑in (§2, the tunnel caveat).
 
 `CODEMAN_API_URL` (used by hooks/child processes) is always derived as a loopback
 address (`0.0.0.0`/`localhost`/`::1` → `127.0.0.1`) so in‑process hooks reach the
@@ -149,7 +151,7 @@ by presence in a server‑side map, so they cannot be forged offline.
 
 ### Rate limiting / lockout recovery
 
-Failed auth is tracked **per IP**: 10 failures → `429`, with a 15‑minute decay.
+Failed logins are tracked **per IP**: 10 failures (`AUTH_FAILURE_MAX`) → `429`, with a 15‑minute decay. Multi-user mode replaces that with three buckets, all with the same decay: a wider per-IP **pre-gate** of 50 failures (`AUTH_IP_FAILURE_MAX`), checked before the scrypt verify, which bounds scrypt cost from one source and tolerates many users behind one egress IP; a **per-(username, IP)** gate of 10 failures (`AUTH_FAILURE_MAX`), also checked before the verify, which is what caps verified guesses against one account from one source; and a **per-username** bucket, checked after the verify, that answers `429` to failed guesses from the 10th on, from any IP (the count is incremented before the check). The last two exist in multi-user mode only. So the wider per-IP cap does not widen guessing against any one account from one IP, and other IPs cannot lock an account out.
 The QR path has its own separate limiter.
 
 The lockout check sits **after** the cookie/credential checks (step 4, not first).
@@ -158,6 +160,22 @@ immediately** even while an attacker is hammering the same IP — important beca
 all traffic through a tunnel shares one source IP (loopback). Wrong credentials
 are still counted and still hit the `429` at the threshold, so brute‑force
 protection is unchanged.
+The two multi-user pre-verify gates are the exception: once the per-IP pre-gate
+or an account's (username, IP) gate trips, even a correct password from that IP
+gets `429` until the decay (for the pair gate, only for that account; the same
+account from another IP still logs in), which is why the per-IP cap is the
+widest. The per-username bucket stays after the verify on purpose: checked
+first, a username-wide lockout let throwaway IPs keep a known account (admin
+included) locked out even with the right password.
+Both pre-verify gates count a request the moment it passes them, before its
+verify starts, so a burst of concurrent attempts cannot all slip through on one
+stale count; a correct password then clears its slot with the rest, and a
+failure is not counted a second time. A verify still in flight therefore holds a
+slot, even one carrying the right password, but identical credentials from the
+same IP that arrive during it share that verify, its slot and its outcome, and
+skip both gates: they add no guess and no scrypt work. So a browser replaying its
+cached login on many parallel requests after a restart (cookie sessions live in
+memory) is not refused by the slots its own password filled.
 
 ---
 
@@ -193,8 +211,15 @@ requests as local:
 **Mitigation:** set `CODEMAN_PASSWORD` whenever a loopback‑connecting tunnel is
 up — it gates everything except the (secret‑gated) hook exemption and is the
 documented practice; since COD‑55 enabling the managed tunnel **refuses** to start
-without it unless `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1` explicitly
-acknowledges the exposure. Prefer `tailscale serve` (below), which authenticates
+without a login (`CODEMAN_PASSWORD` or multi‑user mode) unless
+`CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL=1` / `--allow-unauthenticated-tunnel`
+acknowledges the exposure, or the request carries `acknowledgeUnauthTunnel: true`
+(what the browser sends after its confirm). The network acknowledgement
+(`CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK`) does **not** count: the installer writes
+it for every LAN install without a password, so it once turned a click on the
+welcome screen's tunnel link into a public, login‑free URL with no confirm. With
+no login the browser asks before every enable, whatever the server would accept,
+reading `loginConfigured` from `GET /api/tunnel/status`. Prefer `tailscale serve` (below), which authenticates
 at the tailnet layer so untrusted clients never reach the loopback port at all.
 
 ### Host‑header & Origin allowlist (DNS‑rebinding & CSRF defense)
@@ -569,7 +594,8 @@ Opt-in and off by default: the server POSTs the Web Push events (permission prom
 | `--host` / `CODEMAN_HOST` | Bind host (default `127.0.0.1`) |
 | `CODEMAN_ALLOWED_HOSTS` | Extra `Host`/`Origin` allowlist entries for reverse proxies (comma‑separated; exact host, or leading‑dot `.suffix` for subdomains) — see §3 |
 | `--base-url` / `CODEMAN_BASE_URL` | Sub‑path prefix Codeman is mounted under behind a reverse proxy, e.g. `/codeman` (default `/`); the proxy must forward the prefix unchanged. Independent of `CODEMAN_ALLOWED_HOSTS` |
-| `--allow-unauthenticated-network` / `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK` | Acknowledge an unauthenticated non‑loopback bind (downgrades the warning) |
+| `--allow-unauthenticated-network` / `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK` | Acknowledge an unauthenticated non‑loopback bind (downgrades the warning). Does not cover the tunnel |
+| `--allow-unauthenticated-tunnel` / `CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL` | Let the managed Cloudflare tunnel start without a login (the browser still asks first). Never written by the installer |
 | `--https` | Enable TLS (adds HSTS) |
 | `CODEMAN_INSTANCE` | Scope tmux socket + data dir for isolation |
 | `CODEMAN_GESTURE=1` | Make the gesture overlay available (widens CSP) |

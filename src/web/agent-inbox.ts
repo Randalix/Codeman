@@ -1,349 +1,220 @@
 /**
- * @fileoverview Agent inbox: a per-session mailbox other agents can post to, and the
- * receiving agent reads WHEN IT WANTS TO.
+ * @fileoverview Agent inbox: a per-session mailbox other agents (or the user) post to,
+ * and the receiving agent reads when it chooses to.
  *
- * The other agent-to-agent channel — `POST /api/sessions/:id/input` — types into the
- * receiver's composer. That is the right primitive for a prompt, and the wrong one
- * for a message: every delivery starts (or interrupts) a billed turn, the receiver
- * cannot defer it, and for the fullscreen TUIs a stray byte is a dead session. The
- * inbox stores instead of typing: the message never reaches the pane, the receiver
- * polls (`codeman agent inbox --wait`) between its own steps, and a message is gone
- * only when the receiver acknowledges it. The one exception is `inbox-nudger.ts`: a
- * receiver that would never poll (idle, nobody parked) gets a single short line
- * saying that mail is waiting — never the message itself.
+ * The other agent-to-agent channel, `POST /api/sessions/:id/input`, types into the
+ * receiver's composer. That is right for a prompt and wrong for a message: every
+ * delivery starts or interrupts a turn, the receiver cannot defer it, and it is one
+ * line only. The inbox stores instead of typing. Nothing here ever reaches a pane.
  *
- * Invariants:
- * - Module-level singleton in the style of `session-wait-registry.ts` /
- *   `approval-inbox.ts`: no `Session` import, no IO; the server injects the
- *   `onMessage`/`onChange` callbacks (SSE, persistence).
- * - Bounded: `MAX_MESSAGES_PER_INBOX` per session and `MAX_TEXT_LENGTH` per message.
- *   A full inbox REJECTS the post (the sender learns) rather than dropping the
- *   oldest (the receiver would never know what it missed).
- * - Reads are non-destructive AND do not acknowledge: they only mark the returned
- *   messages as "seen" so `ackSeen()` can remove exactly those. A client that crashes
- *   between read and ack sees the message again, never loses it; a message that
- *   arrives after a read is never swept away by an `ackSeen()`. `peek` marks nothing.
- * - Long-poll waiters are bounded per session (`MAX_INBOX_WAITERS_PER_SESSION`) and
- *   resolve on the first post, on `drop()`, on `stop()`, or on timeout — never hang.
- * - Persistence is a whole-store snapshot the server writes on `onChange`; a message
- *   survives a server restart (deploys use KillMode=process, sessions survive too).
- * - A QUIET message (`post(…, { quiet: true })`, a worker's IDLE report) is stored,
- *   read, acknowledged and persisted like any other, but it never ends a wait: it does
- *   not release waiters, and a `read` with `wait` that finds only quiet mail keeps
- *   waiting. It is handed out with the next loud post or when the wait runs out — a
- *   digest at most one wait slice old. A status line used to cost the coordinator a
- *   whole turn each, ~20 an hour (w3c, 2026-10-11).
+ * Invariants (each pinned in `test/agent-inbox.test.ts`):
+ * - **Read until ack.** A read hands out every pending message and removes nothing.
+ *   A message goes only when the receiver acknowledges its id. "Read and dropped"
+ *   and "done" must not look the same to the sender (discussion #558, the 09-23 case).
+ * - **Seen is the receiver's alone.** `read(…, { receiver: true })` marks what it
+ *   handed out as seen; any other read is a peek and changes nothing. The route
+ *   decides who the receiver is; this module only takes the flag.
+ * - **Bounded, and full refuses.** `MAX_MESSAGES_PER_INBOX`, `MAX_MESSAGE_BYTES` and
+ *   `MAX_INBOX_BYTES`. A post that would cross any of them is refused so the sender
+ *   learns. The oldest message is never dropped to make room.
+ * - **TTL from the message's own timestamp** (`MESSAGE_TTL_MS`). A restore keeps
+ *   `createdAt`, so a restart does not restart the clock. Expiry is lazy: every
+ *   accessor sweeps the inbox it touches, `summary()` and `snapshot()` sweep all.
+ * - **No IO, no `Session` import.** Persistence (`agent-inbox-persistence.ts`) hooks
+ *   `onChange`; long-poll waiters live in `session-wait-registry.ts`.
  *
- * @consumedby web/routes/inbox-routes, web/server (callbacks, persistence, drop on cleanup)
+ * @consumedby web/routes/inbox-routes, web/agent-inbox-persistence, web/server
  * @module web/agent-inbox
  */
 
 import { randomUUID } from 'node:crypto';
-import { MIN_WAIT_MS, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../config/agent-wait.js';
 
 // ─── Bounds ──────────────────────────────────────────────────────────────────
 
 /** Messages one inbox holds before posts are refused. */
 export const MAX_MESSAGES_PER_INBOX = 200;
-/** Characters per message. Big payloads belong in the workspace; send a path. */
-export const MAX_TEXT_LENGTH = 16_384;
-/** Characters for the free-form `from` label (usually a session id). */
-export const MAX_FROM_LENGTH = 128;
-/** Concurrent long-polls on one inbox. */
-export const MAX_INBOX_WAITERS_PER_SESSION = 4;
+/** UTF-8 bytes per message. A bigger payload belongs in the workspace; post its path. */
+export const MAX_MESSAGE_BYTES = 16_384;
+/** UTF-8 bytes of message text one inbox holds before posts are refused. */
+export const MAX_INBOX_BYTES = 512 * 1024;
+/** A message older than this is gone, read or not (same span as the approvals inbox). */
+export const MESSAGE_TTL_MS = 12 * 60 * 60 * 1000;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export interface InboxMessage {
+/** A message as it is stored (and persisted). */
+interface StoredMessage {
   id: string;
-  /** Who posted: the sender's session id, or a label the sender chose. */
-  from: string;
+  /** The posting session's full id, or null when no session could be resolved (the user). */
+  from: string | null;
   text: string;
+  /** Epoch ms. The TTL counts from here. */
   createdAt: number;
-  /** Never ends a wait or draws a nudge; read together with the next loud mail. */
+  /** Epoch ms of the first receiver read that handed this message out; null while unseen. */
+  seenAt: number | null;
+  /** Downstream: see {@link InboxMessage.quiet}. */
   quiet?: true;
 }
 
-export interface InboxSnapshot {
-  version: 1;
-  inboxes: Record<string, InboxMessage[]>;
+/** A message as a read hands it out. */
+export interface InboxMessage {
+  id: string;
+  from: string | null;
+  text: string;
+  createdAt: number;
+  /** True when a receiver read had handed this message out BEFORE this read. */
+  seen: boolean;
+  /**
+   * Downstream (coordinator reports): a status line that never ends a wait or draws a
+   * nudge; it is read together with the next loud message.
+   */
+  quiet?: true;
 }
 
-export interface InboxReadResult {
-  messages: InboxMessage[];
-  /** Messages still in the inbox after this read (reads do not ack). */
-  pending: number;
-  /** True when a `wait` ran its full budget with nothing arriving. */
-  timedOut: boolean;
-  /** The wait actually applied after clamping, 0 for a plain read. */
-  waitedMs: number;
-}
-
-/** How a read treats the "seen" set that `ackSeen()` later drains. */
-export interface InboxReadOptions {
-  /** Mark nothing as seen (the monitor's `--peek`: reading must not consume the mail). */
-  peek?: boolean;
-}
-
+/** Downstream options of {@link AgentInbox.post}. */
 export interface PostOptions {
-  /** See `InboxMessage.quiet`. */
+  /** See {@link InboxMessage.quiet}. */
   quiet?: boolean;
   /**
-   * First withdraw this sender's quiet messages no read has handed out yet, so the
-   * inbox holds one current status line per sender instead of a backlog of stale ones.
-   * Seen-but-unacked ones stay: `ackSeen()` must find what the read handed out.
+   * First withdraw this sender's quiet messages no receiver read has handed out yet, so
+   * the inbox holds one current status line per sender instead of a backlog of stale ones.
    */
   replaceQuiet?: boolean;
 }
 
-export type PostResult =
-  | { ok: true; message: InboxMessage; pending: number }
-  | { ok: false; reason: 'full' | 'text-too-long' | 'text-empty' | 'from-too-long' | 'stopped' };
+export interface InboxReadResult {
+  /** Every pending message, oldest first: unseen and seen-but-unacked alike. */
+  messages: InboxMessage[];
+  pending: number;
+  /** Unseen after this read (0 after a receiver read; unchanged by a peek). */
+  unseen: number;
+}
 
-interface Waiter {
-  resolve: () => void;
-  timer: NodeJS.Timeout;
+export type PostResult =
+  | { ok: true; message: InboxMessage; pending: number; unseen: number }
+  | { ok: false; reason: 'empty' | 'message-too-large' | 'inbox-full-count' | 'inbox-full-bytes' };
+
+/** What `summary()` reports for one session. Counts and times only, never text. */
+export interface InboxCounts {
+  pending: number;
+  unseen: number;
+  /** `createdAt` of the oldest unseen message, null when nothing is unseen. */
+  oldestUnseenAt: number | null;
+}
+
+/** On-disk shape. `version` lets a later format refuse an older file instead of misreading it. */
+export interface InboxSnapshot {
+  version: 1;
+  inboxes: Record<string, StoredMessage[]>;
 }
 
 // ─── Store ───────────────────────────────────────────────────────────────────
 
-/**
- * How long a session keeps counting as "waiting" after its last waiter left without a
- * post. A long-poll client loops in slices (`inbox --wait 590000` inside a Monitor):
- * every slice ends in a timeout and a fresh request a few ms later, and without the
- * grace `waitingSince` would reset every ten minutes and `ls` would forever say
- * "waiting since just now".
- */
-export const WAITING_GRACE_MS = 15_000;
-
-/** What `summary()` says about one session's mailbox. */
-export interface InboxSummary {
-  pending: number;
-  /** A long-poll waiter is parked on this inbox right now (or left within the grace). */
-  waiting: boolean;
-  /** When the current uninterrupted wait began (epoch ms), null when not waiting. */
-  waitingSince: number | null;
-}
-
-interface WaitingState {
-  since: number;
-  /** When the last waiter left without a post; null while one is parked. */
-  lastLeft: number | null;
-}
-
 export class AgentInbox {
-  private readonly inboxes = new Map<string, InboxMessage[]>();
-  private readonly waiters = new Map<string, Set<Waiter>>();
-  /** Per session: since when someone has been waiting for mail (see `summary`). */
-  private readonly waiting = new Map<string, WaitingState>();
-  /**
-   * Message ids a non-peek read handed out and that `ackSeen()` may remove. This is
-   * the whole point of the split: "the receiver has seen it" (read) is not "the
-   * receiver is done with it" (ack). A read that is never followed by an ack leaves
-   * the mail pending — visible in `summary`, re-delivered on the next read — instead
-   * of silently losing it. In-memory like `waiting`: a server restart empties it and
-   * `ackSeen()` becomes a no-op, which is the safe direction.
-   */
-  private readonly seen = new Map<string, Set<string>>();
-  private stopped = false;
+  private readonly inboxes = new Map<string, StoredMessage[]>();
 
-  /** A message landed: `{sessionId, message, pending}`. The server maps it to SSE. */
-  onMessage: ((sessionId: string, message: InboxMessage, pending: number) => void) | undefined;
-  /** Any mutation (post, ack, clear, drop, prune). The server persists on it. */
+  /** Any mutation (post, seen, ack, expiry, drop, prune, restore excluded). Persistence hooks this. */
   onChange: (() => void) | undefined;
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  /** Store a message for `sessionId`. Never touches the session's pane. */
-  post(sessionId: string, from: string, text: string, options: PostOptions = {}): PostResult {
-    if (this.stopped) return { ok: false, reason: 'stopped' };
-    if (text.length === 0) return { ok: false, reason: 'text-empty' };
-    if (text.length > MAX_TEXT_LENGTH) return { ok: false, reason: 'text-too-long' };
-    if (from.length > MAX_FROM_LENGTH) return { ok: false, reason: 'from-too-long' };
-    if (options.replaceQuiet) this.removeUnseenQuiet(sessionId, from);
-    const queue = this.inboxes.get(sessionId) ?? [];
-    if (queue.length >= MAX_MESSAGES_PER_INBOX) return { ok: false, reason: 'full' };
-    const message: InboxMessage = { id: randomUUID(), from, text, createdAt: this.now() };
-    if (options.quiet) message.quiet = true;
-    queue.push(message);
+  /**
+   * Store a message for `sessionId`. `from` is the RESOLVED sender (the route's job),
+   * never a client-supplied label.
+   */
+  post(sessionId: string, from: string | null, text: string, options: PostOptions = {}): PostResult {
+    if (text.length === 0) return { ok: false, reason: 'empty' };
+    const bytes = Buffer.byteLength(text, 'utf8');
+    if (bytes > MAX_MESSAGE_BYTES) return { ok: false, reason: 'message-too-large' };
+    // Downstream: the stale status line goes first, so it frees its room in a full inbox.
+    // A post refused after that still changed the store: tell the snapshot.
+    const withdrew = options.replaceQuiet && from !== null ? this.removeUnseenQuiet(sessionId, from) : 0;
+    const refuse = (reason: 'inbox-full-count' | 'inbox-full-bytes'): PostResult => {
+      if (withdrew > 0) this.onChange?.();
+      return { ok: false, reason };
+    };
+    const queue = this.live(sessionId);
+    if (queue.length >= MAX_MESSAGES_PER_INBOX) return refuse('inbox-full-count');
+    if (inboxBytes(queue) + bytes > MAX_INBOX_BYTES) return refuse('inbox-full-bytes');
+    const stored: StoredMessage = { id: randomUUID(), from, text, createdAt: this.now(), seenAt: null };
+    if (options.quiet) stored.quiet = true;
+    queue.push(stored);
     this.inboxes.set(sessionId, queue);
     this.onChange?.();
-    this.onMessage?.(sessionId, message, queue.length);
-    if (!message.quiet) this.releaseWaiters(sessionId);
-    return { ok: true, message, pending: queue.length };
+    return { ok: true, message: view(stored), pending: queue.length, unseen: countUnseen(queue) };
   }
 
   /**
-   * Remove `from`'s quiet messages in `sessionId`'s inbox that no read has handed out
-   * yet: its status changed and the old line no longer holds. Returns how many.
+   * Every pending message, oldest first. Removes nothing. With `receiver`, the
+   * messages handed out are marked seen (each keeps its first `seenAt`); without it
+   * this is a peek and changes nothing at all.
    */
-  withdrawQuiet(sessionId: string, from: string): number {
-    const removed = this.removeUnseenQuiet(sessionId, from);
-    if (removed > 0) this.onChange?.();
-    return removed;
+  read(sessionId: string, options: { receiver: boolean }): InboxReadResult {
+    const queue = this.live(sessionId);
+    const messages = queue.map(view);
+    if (options.receiver) {
+      let marked = false;
+      const at = this.now();
+      for (const m of queue) {
+        if (m.seenAt !== null) continue;
+        m.seenAt = at;
+        marked = true;
+      }
+      if (marked) this.onChange?.();
+    }
+    return { messages, pending: queue.length, unseen: countUnseen(queue) };
   }
 
-  private removeUnseenQuiet(sessionId: string, from: string): number {
-    const queue = this.inboxes.get(sessionId);
-    if (!queue) return 0;
-    const seen = this.seen.get(sessionId);
-    const kept = queue.filter((m) => !(m.quiet && m.from === from && !seen?.has(m.id)));
-    const removed = queue.length - kept.length;
-    if (removed === 0) return 0;
-    if (kept.length === 0) this.inboxes.delete(sessionId);
-    else this.inboxes.set(sessionId, kept);
-    return removed;
-  }
-
-  /** Every pending message, oldest first. Non-destructive. */
-  list(sessionId: string): InboxMessage[] {
-    return [...(this.inboxes.get(sessionId) ?? [])];
+  /** Messages no receiver read has handed out yet. A `?wait=` read parks while this is 0. */
+  unseenCount(sessionId: string): number {
+    return countUnseen(this.live(sessionId));
   }
 
   pendingCount(sessionId: string): number {
-    return this.inboxes.get(sessionId)?.length ?? 0;
+    return this.live(sessionId).length;
   }
 
   /**
-   * Read, blocking up to `waitMs` (clamped to the agent-wait bounds) while the inbox
-   * holds no loud mail (empty, or quiet messages only — those ride along with the
-   * next loud post or the timeout). Resolves at once when loud mail is there; a wait that
-   * ends by timeout, `drop()` or `stop()` answers with an empty list and `timedOut`
-   * set only for the timeout case. Non-destructive: the messages stay and are only
-   * marked as seen (unless `peek`) so `ackSeen()` can remove exactly them later.
+   * Remove the given messages. Idempotent: an id that is unknown or already gone is
+   * not an error, so a retry after a lost response succeeds. Returns how many went.
    */
-  async read(
-    sessionId: string,
-    waitMs?: number,
-    abortSignal?: AbortSignal,
-    options?: InboxReadOptions
-  ): Promise<InboxReadResult> {
-    const peek = options?.peek === true;
-    const existing = this.list(sessionId);
-    if (existing.some((m) => !m.quiet) || waitMs === undefined || this.stopped || abortSignal?.aborted) {
-      if (!peek) this.markSeen(sessionId, existing);
-      return { messages: existing, pending: existing.length, timedOut: false, waitedMs: 0 };
-    }
-    const applied = clampWait(waitMs);
-    const ended = await this.waitForPost(sessionId, applied, abortSignal);
-    const messages = this.list(sessionId);
-    if (!peek) this.markSeen(sessionId, messages);
-    // `timedOut` is which path released the waiter, never a clock comparison: the
-    // timer runs on libuv's cached loop time and can fire a few ms before Date.now()
-    // agrees, which read as "not a timeout" and told the CLI the inbox was simply empty.
-    return { messages, pending: messages.length, timedOut: ended === 'timeout', waitedMs: applied };
-  }
-
-  /** How many waiters `sessionId` has right now (for the cap check in the route). */
-  waiterCount(sessionId: string): number {
-    return this.waiters.get(sessionId)?.size ?? 0;
-  }
-
-  /**
-   * "Who is waiting for whom": pending count and wait state for every session that has
-   * mail or a waiter. A session that is idle AND has an empty inbox while its peer
-   * waits is the shape of a stalled pair (each side waiting for the other's post);
-   * the CLI's `ls` derives that from this plus the session list. Never blocks.
-   */
-  summary(): Map<string, InboxSummary> {
-    const out = new Map<string, InboxSummary>();
-    const ids = new Set([...this.inboxes.keys(), ...this.waiting.keys()]);
-    for (const id of ids) {
-      const w = this.waitingState(id);
-      const pending = this.pendingCount(id);
-      // Nothing to read and nobody waiting: not worth a row (an emptied inbox keeps its
-      // key until the session goes, and the grace expiry above is lazy).
-      if (pending === 0 && w === null) continue;
-      out.set(id, { pending, waiting: w !== null, waitingSince: w });
-    }
-    return out;
-  }
-
-  /** `waitingSince` for one session, after applying the grace; null when not waiting. */
-  private waitingState(sessionId: string): number | null {
-    const state = this.waiting.get(sessionId);
-    if (!state) return null;
-    if (state.lastLeft !== null && this.now() - state.lastLeft > WAITING_GRACE_MS) {
-      this.waiting.delete(sessionId);
-      return null;
-    }
-    return state.since;
-  }
-
-  /**
-   * Pending messages no non-peek read has handed out yet, oldest first. The inbox
-   * nudger's question: "is there mail this session has not seen?" A parked
-   * `inbox --wait` reads a post the moment it lands, so its mail never shows up here.
-   */
-  unseen(sessionId: string): InboxMessage[] {
-    const seen = this.seen.get(sessionId);
-    return this.list(sessionId).filter((m) => !seen?.has(m.id));
-  }
-
-  /** Remember the messages a non-peek read handed out, so `ackSeen()` can remove them. */
-  private markSeen(sessionId: string, messages: readonly InboxMessage[]): void {
-    if (messages.length === 0) return;
-    const set = this.seen.get(sessionId) ?? new Set<string>();
-    for (const m of messages) set.add(m.id);
-    this.seen.set(sessionId, set);
-  }
-
-  /**
-   * Remove every message a read has handed out but not acknowledged. This is the verb
-   * behind `codeman agent ack`: read, do the work, then acknowledge — so a read that
-   * is never acted on keeps the message pending instead of losing it. A message posted
-   * after the read was never marked seen and survives. Returns how many were removed.
-   */
-  ackSeen(sessionId: string): number {
-    const ids = this.seen.get(sessionId);
-    if (!ids || ids.size === 0) return 0;
-    return this.ack(sessionId, [...ids]);
-  }
-
-  /** Remove the given messages. Unknown ids are ignored. Returns how many were removed. */
   ack(sessionId: string, ids: readonly string[]): number {
-    const queue = this.inboxes.get(sessionId);
-    if (ids.length === 0) return 0;
-    // Drop the ids from the seen set regardless of whether they were still queued, so a
-    // stale seen id can never acknowledge a later message that happens to reuse it.
-    const seen = this.seen.get(sessionId);
-    if (seen) {
-      for (const id of ids) seen.delete(id);
-      if (seen.size === 0) this.seen.delete(sessionId);
-    }
-    if (!queue) return 0;
+    const queue = this.live(sessionId);
+    if (queue.length === 0 || ids.length === 0) return 0;
     const drop = new Set(ids);
     const kept = queue.filter((m) => !drop.has(m.id));
     const removed = queue.length - kept.length;
     if (removed === 0) return 0;
-    if (kept.length === 0) this.inboxes.delete(sessionId);
-    else this.inboxes.set(sessionId, kept);
+    this.store(sessionId, kept);
     this.onChange?.();
     return removed;
   }
 
-  /** Empty one inbox. Returns how many messages were discarded. */
-  clear(sessionId: string): number {
-    this.seen.delete(sessionId);
-    const count = this.pendingCount(sessionId);
-    if (count === 0) return 0;
-    this.inboxes.delete(sessionId);
-    this.onChange?.();
-    return count;
+  /** Per-session counts for every inbox that holds anything. Never blocks. */
+  summary(): Map<string, InboxCounts> {
+    const out = new Map<string, InboxCounts>();
+    for (const sessionId of [...this.inboxes.keys()]) {
+      const queue = this.live(sessionId);
+      if (queue.length === 0) continue;
+      const unseen = queue.filter((m) => m.seenAt === null);
+      out.set(sessionId, {
+        pending: queue.length,
+        unseen: unseen.length,
+        oldestUnseenAt: unseen.length > 0 ? unseen[0].createdAt : null,
+      });
+    }
+    return out;
+  }
+
+  /** The session was DELETED: its mail goes with it. Not called on detach or shutdown. */
+  drop(sessionId: string): void {
+    if (this.inboxes.delete(sessionId)) this.onChange?.();
   }
 
   /**
-   * The session was DETACHED (kept for recovery): release its waiters, keep its mail.
-   * A re-adopted session comes back to the messages posted while it was away.
-   */
-  detach(sessionId: string): void {
-    this.releaseWaiters(sessionId);
-  }
-
-  /**
-   * Boot-time sweep: discard inboxes whose session did not come back. Every route
-   * needs the session to exist, so an orphan could otherwise never be removed and
-   * would ride the snapshot forever. Returns how many inboxes were dropped.
+   * Boot-time sweep, run only after the session restore succeeded: discard inboxes
+   * whose session did not come back. Every route needs a live session, so an orphan
+   * could otherwise never be removed. Returns how many inboxes were dropped.
    */
   pruneExcept(keep: Iterable<string>): number {
     const alive = new Set(keep);
@@ -353,151 +224,177 @@ export class AgentInbox {
       this.inboxes.delete(sessionId);
       dropped++;
     }
-    // Wait state is in-memory only; a session that did not come back cannot be waiting.
-    for (const sessionId of [...this.waiting.keys()]) if (!alive.has(sessionId)) this.waiting.delete(sessionId);
-    for (const sessionId of [...this.seen.keys()]) if (!alive.has(sessionId)) this.seen.delete(sessionId);
     if (dropped > 0) this.onChange?.();
     return dropped;
   }
 
-  /** The session is gone: discard its inbox and release anyone waiting on it. */
-  drop(sessionId: string): void {
-    const had = this.inboxes.delete(sessionId);
-    this.seen.delete(sessionId);
-    this.releaseWaiters(sessionId);
-    if (had) this.onChange?.();
-  }
-
-  /** Whole-store snapshot for persistence. */
+  /** Whole-store snapshot for persistence, expired messages already swept. */
   snapshot(): InboxSnapshot {
-    const inboxes: Record<string, InboxMessage[]> = {};
-    for (const [sessionId, queue] of this.inboxes) inboxes[sessionId] = [...queue];
+    const inboxes: Record<string, StoredMessage[]> = {};
+    for (const sessionId of [...this.inboxes.keys()]) {
+      const queue = this.live(sessionId);
+      if (queue.length > 0) inboxes[sessionId] = queue.map((m) => ({ ...m }));
+    }
     return { version: 1, inboxes };
   }
 
   /**
-   * Replace the store from a snapshot (server boot). Malformed input is ignored
-   * entry by entry rather than throwing: a corrupt file must not stop the server.
+   * Replace the store from a snapshot (server boot). Malformed input is skipped entry
+   * by entry rather than thrown: a corrupt file must not stop the server. Expired
+   * messages are not restored, and the caps hold for what is. Does not fire
+   * `onChange`: writing back what was just read would be a no-op at best.
    */
   restore(snapshot: unknown): number {
     const data = snapshot as Partial<InboxSnapshot> | null;
-    if (!data || data.version !== 1 || typeof data.inboxes !== 'object' || data.inboxes === null) return 0;
-    let restored = 0;
     this.inboxes.clear();
-    for (const [sessionId, queue] of Object.entries(data.inboxes)) {
-      if (!Array.isArray(queue)) continue;
-      const valid = queue.filter(isInboxMessage).slice(0, MAX_MESSAGES_PER_INBOX);
-      if (valid.length === 0) continue;
-      this.inboxes.set(sessionId, valid);
-      restored += valid.length;
+    if (!data || data.version !== 1 || typeof data.inboxes !== 'object' || data.inboxes === null) return 0;
+    const cutoff = this.now() - MESSAGE_TTL_MS;
+    let restored = 0;
+    for (const [sessionId, raw] of Object.entries(data.inboxes)) {
+      if (!Array.isArray(raw)) continue;
+      const queue: StoredMessage[] = [];
+      let bytes = 0;
+      // Oldest first whatever order the file has, so the caps keep the oldest mail,
+      // which is the rule for posts too.
+      // Downstream: a snapshot from the earlier downstream store has no `seenAt` (it kept
+      // seen marks in memory only); such a message restores as unseen.
+      const entries = raw
+        .map((entry: unknown) =>
+          entry && typeof entry === 'object' && !('seenAt' in entry) ? { ...entry, seenAt: null } : entry
+        )
+        .filter((entry): entry is StoredMessage => isStoredMessage(entry) && entry.createdAt > cutoff)
+        .sort((a, b) => a.createdAt - b.createdAt);
+      for (const entry of entries) {
+        const size = Buffer.byteLength(entry.text, 'utf8');
+        if (queue.length >= MAX_MESSAGES_PER_INBOX || bytes + size > MAX_INBOX_BYTES) break;
+        queue.push({ ...entry });
+        bytes += size;
+      }
+      if (queue.length === 0) continue;
+      this.inboxes.set(sessionId, queue);
+      restored += queue.length;
     }
     return restored;
   }
 
-  /** Server shutdown: release every waiter so no response hangs. */
-  stop(): void {
-    this.stopped = true;
-    for (const sessionId of [...this.waiters.keys()]) this.releaseWaiters(sessionId);
+  // ─── Downstream (Randalix fork): quiet status lines, nudger, ack-all, clear ─────
+  // Kept in one block on top of upstream's store so upstream syncs touch it rarely.
+
+  /**
+   * Remove `from`'s quiet messages no receiver read has handed out yet: its status
+   * changed and the old line no longer holds. Returns how many went.
+   */
+  withdrawQuiet(sessionId: string, from: string): number {
+    const removed = this.removeUnseenQuiet(sessionId, from);
+    if (removed > 0) this.onChange?.();
+    return removed;
   }
 
-  /** Test hook: back to an empty, running store. */
-  resetForTests(): void {
-    this.stop();
-    this.stopped = false;
-    this.inboxes.clear();
-    this.waiters.clear();
-    this.waiting.clear();
-    this.seen.clear();
-    this.onMessage = undefined;
-    this.onChange = undefined;
+  /** Unseen messages that are not quiet: what ends a wait and what the nudger nudges for. */
+  loudUnseenCount(sessionId: string): number {
+    let n = 0;
+    for (const m of this.live(sessionId)) if (m.seenAt === null && !m.quiet) n++;
+    return n;
+  }
+
+  /** Pending messages no receiver read has handed out yet, oldest first (the nudger's question). */
+  unseen(sessionId: string): InboxMessage[] {
+    return this.live(sessionId)
+      .filter((m) => m.seenAt === null)
+      .map(view);
   }
 
   /**
-   * One waiter, released by a post, by timeout, or by the caller's abort signal;
-   * the result names which. The abort path matters for the waiter cap: a client that hangs
-   * up mid-poll must give its slot back now, not when the timeout fires.
+   * Remove every message a receiver read has handed out (`codeman agent ack` without
+   * ids: read, do the work, ack). Mail posted after that read is unseen and stays.
    */
-  private waitForPost(
-    sessionId: string,
-    waitMs: number,
-    abortSignal?: AbortSignal
-  ): Promise<'post' | 'timeout' | 'aborted'> {
-    return new Promise((resolve) => {
-      const set = this.waiters.get(sessionId) ?? new Set<Waiter>();
-      const remove = () => {
-        set.delete(waiter);
-        if (set.size === 0 && this.waiters.get(sessionId) === set) this.waiters.delete(sessionId);
-        this.noteWaiterLeft(sessionId);
-      };
-      const onAbort = () => {
-        clearTimeout(waiter.timer);
-        remove();
-        resolve('aborted');
-      };
-      const waiter: Waiter = {
-        resolve: () => {
-          abortSignal?.removeEventListener('abort', onAbort);
-          resolve('post');
-        },
-        timer: setTimeout(() => {
-          abortSignal?.removeEventListener('abort', onAbort);
-          remove();
-          resolve('timeout');
-        }, waitMs),
-      };
-      abortSignal?.addEventListener('abort', onAbort, { once: true });
-      set.add(waiter);
-      this.waiters.set(sessionId, set);
-      this.noteWaiterArrived(sessionId);
-    });
+  ackSeen(sessionId: string): number {
+    return this.ack(
+      sessionId,
+      this.live(sessionId)
+        .filter((m) => m.seenAt !== null)
+        .map((m) => m.id)
+    );
   }
 
-  /** A waiter parked: start the wait clock, or resume it inside the grace. */
-  private noteWaiterArrived(sessionId: string): void {
-    const state = this.waiting.get(sessionId);
-    if (state && (state.lastLeft === null || this.now() - state.lastLeft <= WAITING_GRACE_MS)) {
-      state.lastLeft = null;
-      return;
-    }
-    this.waiting.set(sessionId, { since: this.now(), lastLeft: null });
+  /** Empty the inbox (`DELETE …/inbox`). Returns how many messages went. */
+  clear(sessionId: string): number {
+    const removed = this.live(sessionId).length;
+    if (removed === 0) return 0;
+    this.inboxes.delete(sessionId);
+    this.onChange?.();
+    return removed;
   }
 
-  /** The last waiter left without a post (timeout/abort): the clock keeps running for the grace. */
-  private noteWaiterLeft(sessionId: string): void {
-    const state = this.waiting.get(sessionId);
-    if (state && this.waiterCount(sessionId) === 0) state.lastLeft = this.now();
+  private removeUnseenQuiet(sessionId: string, from: string): number {
+    const queue = this.live(sessionId);
+    const kept = queue.filter((m) => !(m.quiet && m.from === from && m.seenAt === null));
+    const removed = queue.length - kept.length;
+    if (removed > 0) this.store(sessionId, kept);
+    return removed;
   }
 
-  private releaseWaiters(sessionId: string): void {
-    // Released by a post (or drop/stop): the wait is over, the clock stops for good.
-    this.waiting.delete(sessionId);
-    const set = this.waiters.get(sessionId);
-    if (!set) return;
-    this.waiters.delete(sessionId);
-    for (const waiter of set) {
-      clearTimeout(waiter.timer);
-      waiter.resolve();
-    }
+  // ─── End downstream ───────────────────────────────────────────────────────────
+
+  /** Test hook: back to an empty store with no listener. */
+  resetForTests(): void {
+    this.inboxes.clear();
+    this.onChange = undefined;
+  }
+
+  /** The inbox with expired messages swept out (fires `onChange` when it swept any). */
+  private live(sessionId: string): StoredMessage[] {
+    const queue = this.inboxes.get(sessionId);
+    if (!queue) return [];
+    const cutoff = this.now() - MESSAGE_TTL_MS;
+    // Every message, not only queue[0]: a clock stepping back can put an older
+    // createdAt behind a newer one. At most 200 entries, so the scan is cheap.
+    if (!queue.some((m) => m.createdAt <= cutoff)) return queue;
+    const kept = queue.filter((m) => m.createdAt > cutoff);
+    this.store(sessionId, kept);
+    this.onChange?.();
+    return kept;
+  }
+
+  private store(sessionId: string, queue: StoredMessage[]): void {
+    if (queue.length === 0) this.inboxes.delete(sessionId);
+    else this.inboxes.set(sessionId, queue);
   }
 }
 
-/** Same clamp as the wait primitives, so `?wait=` behaves like `?timeout=` elsewhere. */
-export function clampWait(waitMs: number | undefined): number {
-  if (waitMs === undefined) return DEFAULT_WAIT_MS;
-  return Math.max(MIN_WAIT_MS, Math.min(MAX_WAIT_MS, waitMs));
+function view(m: StoredMessage): InboxMessage {
+  const out: InboxMessage = { id: m.id, from: m.from, text: m.text, createdAt: m.createdAt, seen: m.seenAt !== null };
+  if (m.quiet) out.quiet = true;
+  return out;
 }
 
-function isInboxMessage(value: unknown): value is InboxMessage {
-  const m = value as Partial<InboxMessage> | null;
+function countUnseen(queue: readonly StoredMessage[]): number {
+  let n = 0;
+  for (const m of queue) if (m.seenAt === null) n++;
+  return n;
+}
+
+function inboxBytes(queue: readonly StoredMessage[]): number {
+  let total = 0;
+  for (const m of queue) total += Buffer.byteLength(m.text, 'utf8');
+  return total;
+}
+
+function isStoredMessage(value: unknown): value is StoredMessage {
+  const m = value as Partial<StoredMessage> | null;
   return (
     !!m &&
     typeof m.id === 'string' &&
-    typeof m.from === 'string' &&
+    (m.from === null || typeof m.from === 'string') &&
     typeof m.text === 'string' &&
-    m.text.length <= MAX_TEXT_LENGTH &&
+    m.text.length > 0 &&
+    Buffer.byteLength(m.text, 'utf8') <= MAX_MESSAGE_BYTES &&
     typeof m.createdAt === 'number' &&
+    Number.isFinite(m.createdAt) &&
+    (m.seenAt === null || typeof m.seenAt === 'number') &&
     (m.quiet === undefined || m.quiet === true)
   );
 }
 
+/** Process-wide store used by the routes and the server wiring. Tests construct their own. */
 export const agentInbox = new AgentInbox();

@@ -94,7 +94,10 @@ ssh -o BatchMode=yes -t <connection-args> user@host \
   'tmux -L codeman-remote new-session -A -s codeman-ssh-<id8> -c <remotePath> "cd <remotePath> && exec <cli>" \; \
      set -t codeman-ssh-<id8> status off \; set -t codeman-ssh-<id8> mouse off \; \
      set -t codeman-ssh-<id8> prefix C-q \; set -s escape-time 0 \; \
-     set -t codeman-ssh-<id8> window-size latest'
+     set -t codeman-ssh-<id8> window-size latest \; \
+     bind-key -T prefix C-q send-prefix \; unbind-key -a -T prefix \; \
+     bind-key -T prefix C-q send-prefix \; \
+     set -t codeman-ssh-<id8> remain-on-exit failed'
 ```
 
 Key points:
@@ -108,7 +111,14 @@ Key points:
 - **`-L codeman-remote`** = a DEDICATED socket for sessions launched by remote
   Codemans, NOT the canonical `-L codeman` socket the remote host's own Codeman
   uses. Options are set per-session (`set -t`), never `-g`, so a shared remote
-  tmux server's other sessions are untouched (#145 hardening). Note the
+  tmux server's other sessions are untouched (#145 hardening). The prefix
+  *table* is server-global, so the create chain reduces it to `C-q send-prefix`
+  (bind `send-prefix`, then `unbind-key -a -T prefix`, then bind it again). The
+  leading bind keeps an empty prefix table from aborting the chain:
+  `unbind-key -a` fails with "table prefix doesn't exist" and tmux drops every
+  later command, including `remain-on-exit failed`. Without that reduction, Ctrl+Q then `)` moves
+  the inner client onto a sibling session. A non-owned attach does not do this:
+  it joins the remote Codeman's own socket. Note the
   asymmetry: **discovery/attach (COD-105) target the canonical `-L codeman`
   socket** — they join sessions the remote's own Codeman manages, while owned
   durable launches live on `-L codeman-remote`.
@@ -348,6 +358,8 @@ and it follows the same rule as the launch path: every ssh command line comes fr
 | `GET /api/sessions/:id/folders/:folderId/files/:name/raw` | Streams one file of a granted remote folder over ssh after the same re-probe + guard as an attachment; `preview` (office) and `thumbnail` answer `400` |
 | `GET /api/sessions/:id/attachments/:attachmentId`, `GET …/attachments` (history) | Size/mtime/existence resolved over ssh, so a remote entry is not reported `missing`; the history list resolves EVERY entry in one batched probe, never one connection per entry |
 | `GET /api/sessions/:id/last-response` (claude) | The transcript lives in the **remote** user's `~/.claude/projects`, so the end of it (4 MB) is read over ssh in one round trip (`remoteReadClaudeTranscriptTail`). No transcript yet → empty answer; host unreachable → empty answer plus `unavailable: <reason>`, which `codeman agent read` prints instead of "nothing answered yet". Only the response viewer and `agent read` call it — nothing polls, and a sleeping host is a connect timeout, never a wake |
+| `POST /api/sessions/:id/fix-plan/read` | Reads `@fix_plan.md` on the **remote** host (one probe of the file and the workspace, the same confinement, a 1 MB cap); missing or resolving outside the workspace → `NOT_FOUND`, not a regular file, over the cap or an ssh failure → `OPERATION_FAILED`; never a local fallback |
+| `POST /api/sessions/:id/fix-plan/write`, `POST /api/sessions/:id/ralph-prompt/write` | `400` (`INVALID_INPUT`) before any disk is touched: remote writes are out of scope, and a local write would land in a same-named local folder |
 
 ⚠️ The attachment route is the one a clicked path takes when it is **outside** the case
 directory (a remote `/tmp` scratchpad capture, a screenshot elsewhere in the home dir):
@@ -428,6 +440,14 @@ different file on each host. What decides which host to read is therefore never 
 path but the SESSION (`session.remote`): a remote session never falls back to local
 `fs`, and a local session never opens an ssh connection — including for attachment
 records, which are keyed to the session that registered them.
+
+**Local watchers skip a remote session.** The Ralph tracker's `@fix_plan.md` auto-load
+(and the `fs.watch` behind it) never runs for a remote session, because the watcher reads
+the LOCAL disk, where that path is missing or a different tree: `setupSessionListeners()`
+(`server.ts`) calls `setRemoteWorkingDir()` instead, which only records the path. The fix
+plan stays authoritative exactly as for a local session, so the tracker's output-based
+completion guessers stay off there too; the file reaches the tracker only through
+`fix-plan/read`, over ssh. The image watcher skips remote sessions the same way.
 
 ## Wake-on-LAN from user input
 

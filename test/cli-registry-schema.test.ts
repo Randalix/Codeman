@@ -184,6 +184,69 @@ describe('workDetect.workingLine is guarded like every other config regex', () =
     }
   });
 
+  it('holds the optional composerFooterLine to the same guard', () => {
+    // Run over the rows under the composer each time guarded input reads the pane.
+    for (const composerFooterLine of ['(a+)+b', 'a'.repeat(201), '([unclosed', '']) {
+      expectRejected((e) => {
+        (e.capabilities as Record<string, unknown>).workDetect = {
+          promptGlyph: '>',
+          workingLine: 'working',
+          composerFooterLine,
+        };
+      }, 'guarded input tests it against pane rows a clis.json override can supply');
+    }
+  });
+
+  it('accepts every shipped composerFooterLine', () => {
+    for (const entry of STOCK_CLIS) {
+      const src = entry.capabilities.workDetect?.composerFooterLine;
+      if (!src) continue;
+      expect(compileVersionRegex(src), `${entry.id} declares a composerFooterLine the guard refuses`).not.toBeNull();
+    }
+  });
+
+  it('holds the optional composerPopupLine to the same guard, and accepts the shipped one', () => {
+    // Run over the rows just above the composer each time guarded input reads the pane.
+    for (const composerPopupLine of ['(a+)+b', 'a'.repeat(201), '([unclosed', '']) {
+      expectRejected((e) => {
+        (e.capabilities as Record<string, unknown>).workDetect = {
+          promptGlyph: '>',
+          workingLine: 'working',
+          composerPopupLine,
+        };
+      }, 'guarded input tests it against pane rows a clis.json override can supply');
+    }
+    for (const entry of STOCK_CLIS) {
+      const src = entry.capabilities.workDetect?.composerPopupLine;
+      if (src)
+        expect(compileVersionRegex(src), `${entry.id} declares a composerPopupLine the guard refuses`).not.toBeNull();
+    }
+  });
+
+  it('takes only short runs of ASCII punctuation as composer trigger characters', () => {
+    for (const field of ['composerCommandPrefixes', 'composerCompletionSigils']) {
+      for (const value of ['', 'a', '/a', '/ ', '/\t', '\u00a7', '!!!!!!!!!']) {
+        expectRejected(
+          (e) => {
+            (e.capabilities as Record<string, unknown>).workDetect = {
+              promptGlyph: '>',
+              workingLine: 'working',
+              [field]: value,
+            };
+          },
+          `${field} ${JSON.stringify(value)} would refuse letters, spaces or an unbounded set`
+        );
+      }
+      const entry = baseEntry();
+      (entry.capabilities as Record<string, unknown>).workDetect = {
+        promptGlyph: '>',
+        workingLine: 'working',
+        [field]: '/!@$',
+      };
+      expect(CliEntrySchema.safeParse(entry).success, field).toBe(true);
+    }
+  });
+
   it('holds the optional blockedLine to the same guard', () => {
     // Run over the foot of a capture at every settle and on a timer while a dialog is
     // up, and a clis.json override can set it.
@@ -483,6 +546,30 @@ describe('capability shapes', () => {
     expectRejected((e) => {
       (e.capabilities as Record<string, unknown>).transcriptPageKeys = 'yes';
     }, 'transcriptPageKeys is a boolean');
+  });
+
+  it("takes keyboardHold as an optional 'inline', absent meaning the keyboard resizes", () => {
+    const inline = baseEntry();
+    (inline.capabilities as Record<string, unknown>).keyboardHold = 'inline';
+    expect(CliEntrySchema.safeParse(inline).success).toBe(true);
+    const absent = baseEntry();
+    delete (absent.capabilities as Record<string, unknown>).keyboardHold;
+    expect(CliEntrySchema.safeParse(absent).success).toBe(true);
+    for (const value of [true, 'fullscreen', '']) {
+      expectRejected(
+        (e) => {
+          (e.capabilities as Record<string, unknown>).keyboardHold = value;
+        },
+        `keyboardHold=${JSON.stringify(value)} names no renderer kind`
+      );
+    }
+  });
+
+  it('declares keyboardHold for exactly the inline renderer measured losing lines on a height change', () => {
+    // Claude Code 2.1.306's inline renderer was measured dropping transcript lines from
+    // tmux on keyboard-driven height changes; every other stock entry resizes.
+    const holding = STOCK_CLIS.filter((e) => e.capabilities.keyboardHold === 'inline').map((e) => e.id as string);
+    expect(holding).toEqual(['claude']);
   });
 
   it('declares which CLIs get the wheel forwarded, and whether a version gates it', () => {

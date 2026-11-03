@@ -31,7 +31,9 @@ import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { AgentWatchQuerySchema, ReportMuteSchema, ReportSubscriptionSchema } from '../schemas.js';
 import { canAccessOwned, findSessionOrFail, getAuthUser, parseBody } from '../route-helpers.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
-import { agentInbox, clampWait } from '../agent-inbox.js';
+import { agentInbox } from '../agent-inbox.js';
+import { sessionWaits } from '../session-wait-registry.js';
+import { clampWaitMs } from '../../config/agent-wait.js';
 import { approvalInbox } from '../approval-inbox.js';
 import type { Session } from '../../session.js';
 import { turnWatch, MAX_TURN_WATCHERS, MAX_WATCH_SESSIONS } from '../agent-watch.js';
@@ -123,7 +125,7 @@ export function buildWatchRow(
     turnEndSource: session.turnEndSource,
     reason: classifyWatchReason(session, {
       blocked: dialogAt !== null,
-      inboxWaiting: agentInbox.waiterCount(id) > 0,
+      inboxWaiting: sessionWaits.inboxWaiterCount(id, true) > 0,
       inboxUnseen,
       inboxPending,
       openTodos,
@@ -247,7 +249,7 @@ export function registerAgentWatchRoutes(
     // Nothing qualified at the first scan, so from here on anything stamped at or
     // after that scan is new, whether or not the caller passed `since`.
     const since = query.since ?? result.cursor;
-    const deadline = Date.now() + clampWait(query.wait);
+    const deadline = Date.now() + clampWaitMs(query.wait);
     const abort = abortOnClientHangUp(reply);
     for (;;) {
       const outcome = await turnWatch.wait(ids, Math.max(0, deadline - Date.now()), abort.signal);

@@ -1,54 +1,67 @@
 /**
- * @fileoverview Agent inbox routes: the mailbox channel between sessions.
+ * @fileoverview Agent inbox routes: post, read (optionally long-polling), ack, and an
+ * owner-scoped summary of counts. Store semantics live in `agent-inbox.ts`.
  *
- * - `POST   /api/sessions/:id/inbox`      store a message for the session; the pane is
- *                                         typed at only by the nudger, and only when the
- *                                         receiver would never see the mail on its own
- *                                         (`web/inbox-nudger.ts`, opt out with `nudge:false`)
- * - `GET    /api/sessions/:id/inbox`      read, non-destructive; `?wait=<ms>` long-polls
- *                                         while the inbox is empty; `?peek=1` marks nothing
- * - `POST   /api/sessions/:id/inbox/ack`  remove messages the reader is done with: an
- *                                         empty body acknowledges everything it has read
- *                                         (`ackSeen`), explicit `ids` a subset
- * - `DELETE /api/sessions/:id/inbox`      discard everything pending
- * - `GET    /api/agent-inbox/summary`     pending count + wait state per session the
- *                                         caller can see ("who is waiting for whom")
+ * Who is calling decides what a read or an ack does, so it is resolved here and never
+ * taken from the body. `resolveParentSessionId()` reads the `X-Codeman-Parent-Session`
+ * header `codeman agent` sends on every request and accepts it only for a live session
+ * the caller can see that has the same owner as the receiver (exact id, or a unique
+ * prefix of at least 8). Anything else is "no session": a post is from the user, and a
+ * read is a peek. What that buys: in multi-user mode a caller cannot name another
+ * owner's session (an admin, who can see every session, can act as any session of
+ * the receiver's owner, as admins can everywhere else). In single-user mode every
+ * local process holds the same credentials, so the header is a hint the client sets
+ * about itself.
  *
- * Store and invariants: `web/agent-inbox.ts`. Ownership is the session-route rule
- * (`findSessionOrFail`: a session the caller cannot see is a 404, never a 403). The
- * poster's identity is whatever it says in `from`, falling back to the
- * `X-Codeman-Parent-Session` header every skill/CLI call carries — it is a label for
- * the reader, not an authorization claim.
+ * - `POST /api/sessions/:id/inbox` stores a message. `from` is the resolved caller or
+ *   null. A full inbox is 409 CONFLICT; the oldest message is never dropped.
+ * - `GET /api/sessions/:id/inbox[?wait=ms]` returns every pending message. Only the
+ *   receiver's own read marks them seen. With `wait`, it parks while nothing is
+ *   UNSEEN (a seen-but-unacked message does not end the wait, or a receiver holding
+ *   one would spin).
+ * - `POST /api/sessions/:id/inbox/ack` removes messages by id, idempotently, and only
+ *   for the receiver itself (403 otherwise).
+ * - `GET /api/agent-inbox/summary` reports `pending`, `unseen`, `oldestUnseenAt` and
+ *   `parked` per session the caller can see. Counts only, never text, and kept out of
+ *   `toState()` so a post does not fan out a `session:updated` to every browser.
+ *
+ * Nothing here writes to a pane. Downstream (Randalix fork) additions, marked below: a
+ * post schedules the inbox nudger (`nudge: false` opts out; the nudger types one short
+ * prompt into an idle receiver), `?peek=1` reads as a peek even for the receiver, an ack
+ * without ids acknowledges everything a receiver read handed out, and
+ * `DELETE /api/sessions/:id/inbox` empties the inbox (receiver only, like ack).
+ *
+ * @module web/routes/inbox-routes
  */
 
-import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { FastifyInstance } from 'fastify';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { InboxAckSchema, InboxPostSchema, InboxReadQuerySchema } from '../schemas.js';
-import { canAccessOwned, findSessionOrFail, getAuthUser, parseBody } from '../route-helpers.js';
-import { isMultiUserMode } from '../../config/multiuser.js';
-import { agentInbox, MAX_INBOX_WAITERS_PER_SESSION, MAX_MESSAGES_PER_INBOX, MAX_TEXT_LENGTH } from '../agent-inbox.js';
+import {
+  abortOnClientHangUp,
+  canAccessOwned,
+  findSessionOrFail,
+  getAuthUser,
+  ownerFor,
+  parseBody,
+  resolveParentSessionId,
+  waitCapacityResponse,
+} from '../route-helpers.js';
+import { agentInbox, MAX_INBOX_BYTES, MAX_MESSAGE_BYTES, MAX_MESSAGES_PER_INBOX } from '../agent-inbox.js';
+import { sessionWaits, WaitCapacityError, type InboxWaitResult } from '../session-wait-registry.js';
+import { clampWaitMs } from '../../config/agent-wait.js';
 import type { SessionPort } from '../ports/index.js';
 import type { InboxNudger } from '../inbox-nudger.js';
 
-/** The sender label: an explicit `from`, else the caller's session header, else "api". */
-export function senderLabel(req: FastifyRequest, from: string | undefined): string {
-  if (from) return from;
-  const header = req.headers['x-codeman-parent-session'];
-  const value = Array.isArray(header) ? header[0] : header;
-  return typeof value === 'string' && value.trim() ? value.trim().slice(0, 128) : 'api';
-}
-
-/**
- * Same shape as session-routes' `abortOnClientHangUp`: `reply.raw` emits `close` both
- * when the response completes and when the socket dies; `writableFinished` tells
- * them apart. Only observable over real HTTP (`app.inject()` never emits `close`).
- */
-function abortOnClientHangUp(reply: FastifyReply): AbortController {
-  const controller = new AbortController();
-  reply.raw.on('close', () => {
-    if (!reply.raw.writableFinished) controller.abort();
-  });
-  return controller;
+/** Per-session counts the summary route reports. */
+export interface InboxSessionSummary {
+  pending: number;
+  unseen: number;
+  oldestUnseenAt: number | null;
+  /** The receiver itself is parked on `GET …/inbox?wait=` right now. */
+  parked: boolean;
+  /** Downstream: since when (epoch ms) it is parked, null when not. */
+  parkedSince: number | null;
 }
 
 export function registerInboxRoutes(
@@ -56,81 +69,151 @@ export function registerInboxRoutes(
   ctx: SessionPort,
   options: { nudger?: Pick<InboxNudger, 'schedule'> } = {}
 ): void {
-  // "Who is waiting for whom": one read-only call the CLI's `ls` folds into its table.
-  // A session that waits on its inbox while its peer sits idle with an empty inbox is a
-  // stalled pair (each side waiting for the other's post) — the state that cost a
-  // planner/builder pair 26 minutes and was invisible in every UI surface. Filtered
-  // like `GET /api/sessions`: a session the caller cannot see is simply absent.
-  app.get('/api/agent-inbox/summary', async (req) => {
-    const user = isMultiUserMode() ? getAuthUser(req) : null;
-    const out: Record<string, { pending: number; waiting: boolean; waitingSince: string | null }> = {};
-    for (const [id, entry] of agentInbox.summary()) {
-      const session = ctx.sessions.get(id);
-      if (!session) continue;
-      if (user && user.role !== 'admin' && !canAccessOwned(user, session.owner)) continue;
-      out[id] = {
-        pending: entry.pending,
-        waiting: entry.waiting,
-        waitingSince: entry.waitingSince === null ? null : new Date(entry.waitingSince).toISOString(),
-      };
-    }
-    return out;
-  });
+  /** The resolved caller is the receiving session itself. */
+  const callerIsReceiver = (req: Parameters<typeof resolveParentSessionId>[1], id: string, owner?: string) =>
+    resolveParentSessionId(ctx, req, undefined, owner) === id;
 
   app.post('/api/sessions/:id/inbox', async (req) => {
     const { id } = req.params as { id: string };
-    findSessionOrFail(ctx, id, req);
-    const body = parseBody(InboxPostSchema, req.body);
-    const from = senderLabel(req, body.from);
-    // Read before posting: the post releases any parked long-poll and clears the wait.
-    const receiverWaiting = agentInbox.waiterCount(id) > 0;
-    const result = agentInbox.post(id, from, body.text);
+    const session = findSessionOrFail(ctx, id, req);
+    const { text, nudge } = parseBody(InboxPostSchema, req.body, 'Invalid inbox message');
+    const from = resolveParentSessionId(ctx, req, undefined, session.owner) ?? null;
+    // Downstream: read before posting, the post releases a parked receiver.
+    const receiverWaiting = sessionWaits.inboxWaiterCount(id, true) > 0;
+
+    const result = agentInbox.post(id, from, text);
     if (!result.ok) {
       switch (result.reason) {
-        case 'full':
+        case 'empty':
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'text must not be empty');
+        case 'message-too-large':
           return createErrorResponse(
-            ApiErrorCode.OPERATION_FAILED,
-            `Inbox of ${id} is full (${MAX_MESSAGES_PER_INBOX} messages); the receiver has to ack or clear first`
+            ApiErrorCode.INVALID_INPUT,
+            `Message is larger than ${MAX_MESSAGE_BYTES} bytes (UTF-8). Write it to a file in the workspace and post the path.`
           );
-        case 'text-too-long':
-          return createErrorResponse(ApiErrorCode.INVALID_INPUT, `text exceeds ${MAX_TEXT_LENGTH} characters`);
-        case 'stopped':
-          return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Server is shutting down');
-        default:
-          return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Invalid message: ${result.reason}`);
+        case 'inbox-full-count':
+          return createErrorResponse(
+            ApiErrorCode.CONFLICT,
+            `Inbox of ${id} is full (${MAX_MESSAGES_PER_INBOX} messages). Nothing was stored; the receiver has to ack before more can be posted.`
+          );
+        case 'inbox-full-bytes':
+          return createErrorResponse(
+            ApiErrorCode.CONFLICT,
+            `Inbox of ${id} is full (${MAX_INBOX_BYTES} bytes of pending text). Nothing was stored; the receiver has to ack before more can be posted.`
+          );
       }
     }
-    options.nudger?.schedule(id, from, { nudge: body.nudge, messageId: result.message.id, receiverWaiting });
-    return { message: result.message, pending: result.pending };
+    // After the store, so a parked reader that wakes finds the message.
+    sessionWaits.notifyInbox(id);
+    // Downstream: an idle receiver that never reads gets one short nudge (web/inbox-nudger).
+    options.nudger?.schedule(id, from ?? 'user', { nudge, messageId: result.message.id, receiverWaiting });
+    return {
+      success: true,
+      data: { sessionId: id, message: result.message, pending: result.pending, unseen: result.unseen },
+    };
   });
 
   app.get('/api/sessions/:id/inbox', async (req, reply) => {
     const { id } = req.params as { id: string };
-    findSessionOrFail(ctx, id, req);
-    const query = parseBody(InboxReadQuerySchema, req.query ?? {});
-    if (query.wait !== undefined && agentInbox.waiterCount(id) >= MAX_INBOX_WAITERS_PER_SESSION) {
-      return createErrorResponse(
-        ApiErrorCode.SESSION_BUSY,
-        `Too many inbox waiters on ${id} (max ${MAX_INBOX_WAITERS_PER_SESSION})`
-      );
+    const session = findSessionOrFail(ctx, id, req);
+    const query = parseBody(InboxReadQuerySchema, req.query);
+    const self = callerIsReceiver(req, id, session.owner);
+    // Downstream: `peek=1` keeps even the receiver's own read from marking anything seen.
+    // Its wait still counts as the receiver's (`parked`, the nudger's "already waiting").
+    const receiver = query.peek !== 1 && self;
+    // A receiver loops on this URL with identical parameters; a cached 200 would turn
+    // the loop into a busy spin (same reason as GET …/wait).
+    reply.header('Cache-Control', 'no-store');
+
+    let wait: InboxWaitResult | undefined;
+    if (query.wait !== undefined) {
+      const timeoutMs = clampWaitMs(query.wait);
+      // Downstream: quiet status lines (coordinator reports) never end a wait.
+      if (agentInbox.loudUnseenCount(id) > 0) {
+        wait = {
+          posted: false,
+          timedOut: false,
+          immediate: true,
+          ended: false,
+          aborted: false,
+          waitedMs: 0,
+          timeoutMs,
+        };
+      } else {
+        const abort = abortOnClientHangUp(reply);
+        try {
+          wait = await sessionWaits.waitForInbox(id, {
+            timeoutMs,
+            owner: ownerFor(req),
+            abortSignal: abort.signal,
+            receiver: self,
+          });
+        } catch (err) {
+          if (err instanceof WaitCapacityError) return waitCapacityResponse(err);
+          throw err;
+        }
+      }
     }
-    // A client that hangs up mid-poll hands its waiter slot back at once (the cap
-    // above is small on purpose); nobody is reading the answer anyway.
-    const abort = query.wait === undefined ? undefined : abortOnClientHangUp(reply);
-    return agentInbox.read(id, query.wait, abort?.signal, { peek: query.peek === 1 });
+
+    // Read AFTER the wait: this is what the caller gets, so it must be current. A wait
+    // that ended because the session was deleted reads an empty inbox. A client that
+    // hung up never sees this answer, so its read must not mark anything seen.
+    const read = agentInbox.read(id, { receiver: receiver && !wait?.aborted });
+    return { success: true, data: { sessionId: id, receiver, ...read, ...(wait ? { wait } : {}) } };
   });
 
   app.post('/api/sessions/:id/inbox/ack', async (req) => {
     const { id } = req.params as { id: string };
-    findSessionOrFail(ctx, id, req);
-    const body = parseBody(InboxAckSchema, req.body ?? {});
-    const removed = body.ids ? agentInbox.ack(id, body.ids) : agentInbox.ackSeen(id);
-    return { removed, pending: agentInbox.pendingCount(id) };
+    const session = findSessionOrFail(ctx, id, req);
+    const { ids } = parseBody(InboxAckSchema, req.body);
+    if (!callerIsReceiver(req, id, session.owner)) {
+      // A no-op here would let a coordinator believe it cleared a worker's mail, and
+      // would hide a client that forgot the header. Refusing says both out loud.
+      return createErrorResponse(
+        ApiErrorCode.FORBIDDEN,
+        `Only ${id} itself can acknowledge its inbox (X-Codeman-Parent-Session must resolve to it). Reading as anyone else is a peek.`
+      );
+    }
+    // Downstream: no ids = everything a receiver read handed out.
+    const removed = ids ? agentInbox.ack(id, ids) : agentInbox.ackSeen(id);
+    return {
+      success: true,
+      data: { sessionId: id, removed, pending: agentInbox.pendingCount(id), unseen: agentInbox.unseenCount(id) },
+    };
   });
 
+  // Downstream: empty the inbox. Receiver only, for the same reason as ack.
   app.delete('/api/sessions/:id/inbox', async (req) => {
     const { id } = req.params as { id: string };
-    findSessionOrFail(ctx, id, req);
-    return { removed: agentInbox.clear(id), pending: 0 };
+    const session = findSessionOrFail(ctx, id, req);
+    if (!callerIsReceiver(req, id, session.owner)) {
+      return createErrorResponse(
+        ApiErrorCode.FORBIDDEN,
+        `Only ${id} itself can clear its inbox (X-Codeman-Parent-Session must resolve to it).`
+      );
+    }
+    return { success: true, data: { sessionId: id, removed: agentInbox.clear(id), pending: 0, unseen: 0 } };
+  });
+
+  app.get('/api/agent-inbox/summary', async (req, reply) => {
+    reply.header('Cache-Control', 'no-store');
+    const user = getAuthUser(req);
+    const counts = agentInbox.summary();
+    const sessions: Record<string, InboxSessionSummary> = {};
+    for (const session of ctx.sessions.values()) {
+      if (!canAccessOwned(user, session.owner)) continue;
+      const c = counts.get(session.id);
+      const parkedSince = sessionWaits.inboxParkedSince(session.id);
+      const parked = parkedSince !== null;
+      if (!c && !parked) continue;
+      sessions[session.id] = {
+        pending: c?.pending ?? 0,
+        unseen: c?.unseen ?? 0,
+        oldestUnseenAt: c?.oldestUnseenAt ?? null,
+        parked,
+        parkedSince,
+      };
+    }
+    return { success: true, data: { sessions } };
   });
 }

@@ -622,6 +622,45 @@ body {
   padding-left: var(--lineage-spine-channel);
 }
 
+/* L-shaped strip (`_syncTabStripCorner()`, app.js): a wrapped classic strip
+   runs the header's full width, the toolbar sits over its top-right corner,
+   and only the rows beside the toolbar stop short of it. A flex line cannot
+   be shortened on its own, so the strip lays its tabs out inline, around a
+   float the size of the toolbar's box (measured into --tab-corner-width and
+   --tab-corner-height). The strip is a scroll container, so it contains the
+   float and is never shorter than the toolbar it now holds up; a strip that
+   would actually scroll keeps the plain wrap instead. Inline tabs space their
+   rows with a bottom margin (the old row-gap, lineage's included); the strip
+   carries no font size of its own, so the whitespace between tabs is 0 wide. */
+.header:has(> .session-tabs-host > .session-tabs.tabs-corner) > .header-right {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.75rem;
+}
+
+.session-tabs-host > .session-tabs.tabs-corner {
+  display: block;
+  font-size: 0;
+  padding-bottom: 0;
+}
+
+.session-tabs-host > .session-tabs.tabs-corner::before {
+  content: '';
+  float: right;
+  width: var(--tab-corner-width, 0px);
+  height: var(--tab-corner-height, 0px);
+}
+
+.session-tabs-host > .session-tabs.tabs-corner > .session-tab {
+  display: inline-flex;
+  vertical-align: top;
+  margin: 0 2px var(--lineage-row-gap, 4px) 0;
+}
+
+.session-tabs-host > .session-tabs.lineage-tree.tabs-corner {
+  padding-bottom: calc(var(--lineage-bottom-room) - var(--lineage-row-gap));
+}
+
 .session-tabs::-webkit-scrollbar {
   width: 4px;
   height: 0;
@@ -2255,6 +2294,132 @@ html[data-tab-orientation='vertical'].tab-rail-compact
   margin-left: auto;
   padding-left: 0.75rem;
   border-left: 1px solid var(--glass-border);
+  position: relative;
+}
+
+/* Draggable edge of the toolbar (header-divider.js). Absolute, so it takes no layout room and the
+   existing border-left stays the visible line. */
+.header-divider {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -6px;
+  width: 12px;
+  cursor: col-resize;
+  touch-action: none;
+  z-index: 2;
+}
+
+.header-divider:hover,
+.header-divider:focus-visible {
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  outline: none;
+}
+
+.header-divider:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+/* Everything below applies only where the tabs share the header with the toolbar, i.e. where the handle is
+   visible to undo it: not in the sidebar layout, the vertical rail or a solo window, and not on a phone. */
+
+/* A width the user chose: the toolbar keeps it and wraps onto a second line when its content is wider. */
+@media (min-width: 769px) {
+  html[data-header-right-width]:not([data-tab-orientation='vertical']):not([data-session-list='sidebar'])
+    body:not(.solo-mode)
+    .header-right {
+    flex: 0 0 var(--header-right-width);
+    width: var(--header-right-width);
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    align-content: center;
+    row-gap: 0.25rem;
+    min-height: var(--header-height);
+  }
+
+  /* The narrower the toolbar, the less each usage reading shows (data-header-density, header-divider.js):
+     tight drops the window and CPU/MEM labels, dense shortens the provider names, tiny keeps only the rings.
+     The prefix outweighs the per-style rules further down, so every header-stats style follows it.
+     The opt-in host readings (.stat-item--host: GPU, VRAM and the two clocks) keep their labels at every
+     step: their values look like CPU's and MEM's ("40%", "3.2G", "1800 MHz" beside "4200 MHz"), so the
+     label is the only thing that says which reading is which. */
+  html[data-header-density]:not([data-tab-orientation='vertical']):not([data-session-list='sidebar'])
+    body:not(.solo-mode)
+    :is(.header-system-stats .stat-item:not(.stat-item--host) .stat-label, .header-plan-usage .pu-label) {
+    display: none;
+  }
+
+  html[data-header-density]:not([data-tab-orientation='vertical']):not([data-session-list='sidebar'])
+    body:not(.solo-mode)
+    :is(.header-system-stats, .header-plan-usage) {
+    gap: 8px;
+    padding: 0 8px;
+  }
+
+  html:is([data-header-density='dense'], [data-header-density='tiny']):not([data-tab-orientation='vertical']):not(
+      [data-session-list='sidebar']
+    )
+    body:not(.solo-mode)
+    .header-plan-usage
+    .pu-provider {
+    font-size: 0;
+  }
+
+  html:is([data-header-density='dense'], [data-header-density='tiny']):not([data-tab-orientation='vertical']):not(
+      [data-session-list='sidebar']
+    )
+    body:not(.solo-mode)
+    .header-plan-usage
+    .pu-provider::after {
+    content: attr(data-short);
+    font-size: 0.6rem;
+  }
+
+  /* Rings-only is a Compact-style reading: the other styles have no rings, so they keep their values. */
+  html[data-header-stats='compact'][data-header-density='tiny']:not([data-tab-orientation='vertical']):not(
+      [data-session-list='sidebar']
+    )
+    body:not(.solo-mode)
+    :is(.header-system-stats .stat-value, .header-plan-usage .pu-val) {
+    display: none;
+  }
+
+  /* With its value gone, a reading with no ring (the two clocks, and VRAM while its total is unknown:
+     .stat-item--ringless, toggled by panels-ui.js) would be an empty item that still takes a gap. */
+  html[data-header-stats='compact'][data-header-density='tiny']:not([data-tab-orientation='vertical']):not(
+      [data-session-list='sidebar']
+    )
+    body:not(.solo-mode)
+    .header-system-stats
+    .stat-item--ringless {
+    display: none;
+  }
+}
+
+body.header-divider-dragging,
+body.header-divider-dragging * {
+  cursor: col-resize !important;
+  user-select: none !important;
+}
+
+/* Only where the tabs share the header with the toolbar. */
+html[data-tab-orientation='vertical'] .header-divider,
+html[data-session-list='sidebar'] .header-divider,
+body.solo-mode .header-divider {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .header-divider {
+    display: none;
+  }
+}
+
+/* The opt-in host readings (GPU, VRAM, MHz) start hidden and are shown by panels-ui.js once the host
+   reports them; a plain `display` on .stat-item would override the attribute, and the Tiles style sets its own
+   (a grid) at a higher specificity, so the selector carries the style attribute to outrank it. */
+html[data-header-stats] .header-system-stats .stat-item[hidden] {
+  display: none;
 }
 
 /* Connection Indicator */
@@ -2872,6 +3037,33 @@ html[data-tab-orientation='vertical'].tab-rail-compact
   transform: rotate(45deg);
 }
 
+/* "+" (new session beside this tab, app.openTabNewSessionMenu): same reveal as the gear. */
+.session-tab .tab-new {
+  opacity: 0;
+  width: 0;
+  padding: 0;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+  overflow: hidden;
+  transition: opacity 0.15s, width 0.15s, padding 0.15s;
+}
+.session-tab.active .tab-new {
+  opacity: 1;
+  width: auto;
+  padding: 0 0.3rem;
+}
+.session-tab .tab-new:hover {
+  color: var(--accent-hover);
+}
+
+/* Per-device toggle (App Settings → Tab Bar), mirrored as tabs-show-new on <html>
+   by settings-ui.js. !important so no layout's reveal rule (sidebar, touch) wins. */
+html:not(.tabs-show-new) .session-tab .tab-new {
+  display: none !important;
+}
+
 /* ===== Session detach / undock (beta/session-detach) ===================== */
 
 /* Pop-out (detach) icon on each tab — mirrors .tab-gear reveal-on-hover. */
@@ -3025,7 +3217,7 @@ html[data-tab-orientation='vertical']:not(.tab-rail-compact) .tab-rail
   pointer-events: auto;
 }
 
-html[data-tab-orientation='vertical'].tab-rail-compact .session-tab .tab-actions > :is(.tab-gear, .tab-detach, .tab-close) {
+html[data-tab-orientation='vertical'].tab-rail-compact .session-tab .tab-actions > :is(.tab-gear, .tab-new, .tab-detach, .tab-close) {
   display: none;
 }
 
@@ -9029,6 +9221,37 @@ kbd {
   font-size: 0.72rem;
 }
 
+/* New-session row: the agent it will start, switchable with Left/Right or the arrows */
+.command-palette-item--agent {
+  grid-template-columns: 26px minmax(0, 1fr) auto;
+}
+.command-palette-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.2rem;
+  font-size: 0.78rem;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.command-palette-agent-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  color: var(--text-muted);
+  border-radius: 4px;
+  font-size: 1rem;
+  line-height: 1;
+}
+.command-palette-agent-arrow:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.1);
+}
+
 /* COD-192: "Browse all sessions…" escape hatch — visually secondary */
 .command-palette-item--browse {
   margin-top: 4px;
@@ -12456,13 +12679,21 @@ html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="cat
 
 /* ---- File Viewer rendered markdown ----
    Styling comes from the Response Viewer's .rv-text rules; .rv-text itself
-   carries no padding or base font (the chat card supplies those). */
+   carries no padding or base font (the chat card supplies those).
+
+   No width cap. The window is whatever the user drags or expands it to, so the
+   document must reflow to fill it; the fixed 960px reading column this rule
+   shipped before the resize grip existed stops reflow once the window is wider
+   than the cap. --rv-content-max: none lets ASCII-diagram blocks
+   (.rv-text .rv-diagram-wrap, capped by that variable with a 720px fallback
+   meant for the Response Viewer) follow the rest of the document too. Pinned by
+   test/file-preview-window.test.ts. */
 
 .file-preview-body > .file-preview-md {
   padding: 1rem 1.25rem 2rem;
   font-size: 15px;
   line-height: 1.55;
-  max-width: 960px;
+  --rv-content-max: none;
 }
 
 /* Relative links in the document are rebased onto a.rv-path so the Response
@@ -19777,6 +20008,7 @@ html[data-tab-orientation='vertical'] .tab-rail .session-tab .tab-name-row > .ta
    actions permanently visible on the active session — no layout jitter when
    the pointer crosses the list. */
 html[data-session-list="sidebar"] .session-sidebar .session-tab.active .tab-gear,
+html[data-session-list="sidebar"] .session-sidebar .session-tab.active .tab-new,
 html[data-session-list="sidebar"] .session-sidebar .session-tab.active .tab-detach,
 html[data-session-list="sidebar"] .session-sidebar .session-tab.active .tab-close {
   opacity: 1;
@@ -20291,6 +20523,7 @@ html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .se
 html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .tab-info,
 html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .tab-number,
 html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .tab-gear,
+html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .tab-new,
 html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .tab-detach,
 html[data-session-list="sidebar"][data-sidebar="collapsed"] .session-sidebar .tab-close {
   display: none;
@@ -22060,6 +22293,42 @@ html .toolbar .btn-git-status[aria-expanded='true'] {
   gap: 0.25rem;
 }
 
+/* A Fetch button cannot be clicked twice while its fetch is running, and is not offered for a session
+   there is nothing to fetch for (no repository, remote or Docker). Scoped to the Git panel's header: the
+   File Viewer's Back/Forward and the folder grid's Up button are .btn-icon-sm too, and keep their own look. */
+.git-status-actions .btn-icon-sm[disabled] {
+  color: var(--text-dim);
+  opacity: 0.45;
+  cursor: default;
+}
+
+.git-status-actions .btn-icon-sm[disabled]:hover {
+  background: none;
+}
+
+.git-status-actions .btn-icon-sm[aria-busy='true'] {
+  color: var(--text);
+  animation: btn-icon-busy 1.1s ease-in-out infinite;
+}
+
+@keyframes btn-icon-busy {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* No pulse under reduced motion: the button holds the pulse's brighter step, still dimmer than at rest. */
+@media (prefers-reduced-motion: reduce) {
+  .git-status-actions .btn-icon-sm[aria-busy='true'] {
+    animation: none;
+    opacity: 0.7;
+  }
+}
+
 .git-status-body {
   flex: 1;
   overflow-y: auto;
@@ -22079,13 +22348,32 @@ html .toolbar .btn-git-status[aria-expanded='true'] {
 .git-status-empty,
 .git-status-ok,
 .git-status-note,
-.git-status-more {
+.git-status-more,
+.git-status-fetch-note {
   color: var(--text-muted);
   padding: 0.25rem 0;
 }
 
 .git-status-ok {
   color: rgb(34, 197, 94);
+}
+
+/* The last Fetch's result: a summary line, then a row per repository it could not fetch. */
+.git-status-fetch-note {
+  margin-top: 0.6rem;
+  padding-top: 0.4rem;
+  border-top: 1px solid var(--border);
+}
+
+.git-status-fetch-summary {
+  margin-bottom: 0.2rem;
+}
+
+.git-status-fetch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.1rem 0;
 }
 
 .git-status-branchline {
@@ -23397,4 +23685,13 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
   background: var(--control-bg);
   border: 1px solid var(--control-border);
   color: var(--text-muted);
+}
+
+/* Rows held under the on-screen keyboard (keyboardHoldsRows; keyboardClipPx in
+   constants.js): the screen stays taller than its box and is scrolled up by
+   --kb-clip, set on #terminalContainer by _applyKeyboardClip (terminal-ui.js).
+   The helper textarea, IME preview, link layer and both echo overlays live
+   inside .xterm-screen, so they move with it, and every hit test reads rects. */
+body.keyboard-visible .terminal-container .xterm-screen {
+  transform: translateY(calc(-1 * var(--kb-clip, 0px)));
 }

@@ -31,7 +31,7 @@ wrong directory.** `quick-start` with a new `caseName` does not find your repo: 
 |-------------------|------|------------------------------|
 | a fresh scratch dir (throwaway experiments) | `POST /api/v1/quick-start {"caseName":"scratch-1","mode":"claude"}` with a **new** case name | Codeman creates the directory and **writes hooks**: `stop` and `blocked` fire, send-and-wait is trustworthy |
 | a linked case (a real repo in the linked-cases registry) | same call with the linked name | **hooks installed at session create**, so `stop` fires here too. Not guaranteed: the operator can turn it off. Check |
-| any other absolute path, e.g. a git worktree you made | `POST /api/v1/sessions {"workingDir":"/abs/path","mode":"claude"}` then `POST /api/v1/sessions/:id/interactive` | same: **hooks installed at session create**, subject to the same setting. Check |
+| any other absolute path, e.g. a git worktree you made | `POST /api/v1/sessions {"workingDir":"/abs/path","mode":"claude"}` then `POST /api/v1/sessions/:id/interactive` (what `codeman agent spawn --working-dir /abs/path` sends) | same: **hooks installed at session create**, subject to the same setting. Check |
 
 Read `.data.casePath` back from the `quick-start` response and check it is where you
 meant. `caseName` accepts letters, digits, `-` and `_` only, and it resolves through
@@ -550,8 +550,10 @@ this (`src/web/routes/approval-routes.ts:43`). ESC is then claude's own interrup
 that half is the CLI's behavior, not something this API guarantees.
 
 - **This is not the composer-clearing tool.** Esc (and Ctrl+U) do **not** clear a
-  typed-but-unsubmitted prompt, verified live. The only recovery there is to submit it
-  with `{"input":"\r"}` and let the worker read the junk line.
+  typed-but-unsubmitted Claude prompt, verified live. Do not submit an unverified
+  draft merely to clear it. For a refused guarded local Codex stage or submit, use the
+  verified-unsent recovery in [inspection and staging](inspection-and-staging.md#recover-a-stranded-draft);
+  when the composer is unclear, ask the user to clear it in the terminal.
 - The interrupted turn already burned its tokens. Interrupting early saves the rest.
 - `POST /api/sessions/:id/send-key` is a different endpoint and cannot do this: its
   allowlist is S-Enter / C-Enter only.
@@ -764,3 +766,70 @@ Confirm cleanup with `GET /api/v1/sessions`, never with `/api/v1/sessions/unifie
 (that one folds in transcript history from the whole machine and will keep showing
 your worker forever).
 
+### 5.15 Agent inbox
+
+Every session has an inbox. A message posted there is stored, not typed: the receiver's
+pane is untouched, no turn starts, and the text may span several lines. The receiver
+reads when it is ready. Use it for results a worker hands back, for a follow-up task a
+busy worker should pick up after its current one, and for anything longer than one
+composer line. Use `send` when you want a turn to start now.
+
+```bash
+codeman agent post "$WORKER" "$(cat task.md)"   # ONE quoted argument; prints pending/unseen
+codeman agent inbox --wait --timeout 300000     # your own inbox; blocks while nothing is new
+codeman agent ack <id> [<id>…]                  # remove what you handled, by the full id inbox printed
+codeman agent inbox "$WORKER"                   # peek at someone else's: marks nothing
+codeman agent ls                                # INBOX column: pending (new), parked
+```
+
+The same over HTTP: `POST /api/v1/sessions/:id/inbox {"text":…}`, `GET
+/api/v1/sessions/:id/inbox?wait=<ms>`, `POST /api/v1/sessions/:id/inbox/ack {"ids":[…]}`,
+`GET /api/v1/agent-inbox/summary`. The preamble's `CURL` already sends
+`X-Codeman-Parent-Session`, which is how the server knows who you are.
+
+Rules that matter:
+
+- **Reading removes nothing.** Every read returns every pending message until you ack
+  it, so a crash between reading and doing loses nothing. Ack once the work is done,
+  not when you have read it: a sender looking at `ls` sees unacked mail as not done.
+- **Only the receiver's own read counts.** Your read of your own inbox marks messages
+  seen (`seen: true` on the next read); reading another session's inbox is a peek and
+  changes nothing for it. Only the receiver can ack (403 otherwise).
+- **`--wait` waits for something new.** It returns at once when there is unseen mail
+  and otherwise blocks until a post arrives; seen but unacked messages come back with it
+  and do not end the wait. Timeout is exit 2, and so is a wait the server cut short
+  (a restart): loop again. Exit 3 means the session list no longer has the session.
+  `--wait` on someone else's inbox returns at once while they have unseen mail (only
+  their read clears it); check `ls` instead.
+- **The sender is resolved, not claimed.** `from` is the session the header resolves to,
+  or `null` (the user). In single-user mode that is a hint, since every local process
+  holds the same credentials. In multi-user mode it is checked against the owner;
+  an admin can still act as any session of the receiver's owner.
+- **Full means refused.** 200 messages or 512 KiB per inbox, 16 KiB per message. A full
+  inbox answers 409 and stores nothing; the oldest is never dropped. Messages expire 12
+  hours after they were posted.
+- **An idle receiver gets one nudge line.** An idle receiver that is not parked on
+  `inbox --wait` gets one short line typed into its composer
+  (`[codeman inbox] 1 new message from …`), never over a draft or an open dialog.
+  `post --no-nudge` stores only; then `send` it one line yourself if it should look now.
+- **Lifetime.** An inbox goes with its session on delete. A server restart empties all
+  inboxes unless the user turned on *Keep agent inbox across restarts* in Settings.
+
+This Codeman also accepts the older forms: `inbox --wait <ms>` (same as
+`--wait -t <ms>`), `inbox --peek` (read your own without marking anything seen, for a
+monitor loop), `ack` without ids (everything your last reads handed out; mail posted
+after them stays), and quiet IDLE/BLOCKED reports from `agent subscribe`, which never end
+a wait and print last as a `watch digest` block. `ls` adds `WAIT` (parked since).
+
+## Experimental bounded inspection and guarded submission
+
+These three commands and their HTTP routes are labeled experimental, so they may
+change or be removed in minor or patch releases. They are also opt-in
+(`agentCoordinationEnabled`, off by default: a 403 naming it until the user turns
+it on). Use `codeman agent inspect` for bounded evidence and incremental local
+Codex cursors.
+Use `codeman agent stage --message-file` followed by one hash-confirmed
+`codeman agent submit --stage-id --confirm-sha` when the exact local Codex
+composer and caret can be verified. Other targets provide labeled snapshots or
+refuse guarded input. See [inspection and staging](inspection-and-staging.md)
+for budgets, receipt expiry, conflict handling and supported composers.

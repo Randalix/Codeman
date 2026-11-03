@@ -4,7 +4,8 @@
  * auto-clear, auto-compact, image watcher, flicker filter, and logout.
  */
 
-import { FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
+import { claudeProjectDirName } from '../../case-rename.js';
+import { FastifyInstance, type FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { join, dirname, extname, basename, resolve as resolvePath } from 'node:path';
 import { homedir } from 'node:os';
@@ -33,6 +34,7 @@ import {
   type OmpConfig,
 } from '../../types.js';
 import {
+  GuardedInputBusyError,
   Session,
   cliTakesSessionModel,
   isAltScreenStripMode,
@@ -55,6 +57,7 @@ import {
   AutoCompactSchema,
   AutoResumeSchema,
   KeepWarmSchema,
+  GitFetchSettingsSchema,
   PinSessionSchema,
   ImageWatcherSchema,
   FlickerFilterSchema,
@@ -112,10 +115,13 @@ import {
   resolveCasesDir,
   resolveParentSessionId,
   sessionCapacityMessage,
-  SETTINGS_PATH,
   validatePathWithinBase,
+  waitCapacityResponse,
+  abortOnClientHangUp,
 } from '../route-helpers.js';
+import { mutateSettingsFile } from '../settings-writer.js';
 import { buildAgentCaseMarker, writeAgentCaseMarker } from '../../agent-case-marker.js';
+import { agentInbox } from '../agent-inbox.js';
 import { canUsernameRunPrivilegedCommands, resolveClaudeModeForUsername } from '../../user-store.js';
 import { clampEnvOverridesForOwner } from '../../session-env-clamp.js';
 import { enabledClis, getCli } from '../../config/cli-registry/registry.js';
@@ -749,23 +755,6 @@ function parseWaitQuery<T>(schema: z.ZodType<T>, query: unknown, label: string):
 }
 
 /**
- * Map a waiter-cap rejection to the code that tells the caller the truth.
- *
- * The two caps mean different things and warrant different recovery: `session` is
- * genuinely about THIS session, while `owner` and `total` are process-wide budgets
- * that say nothing about it. Reporting a global cap as `SESSION_BUSY` (409,
- * documented as "Session is busy") sent an agent off to a different session to hit
- * the identical error. `RATE_LIMITED` is the code whose whole meaning is "come back
- * later", and clients and proxies already treat 429 that way.
- */
-function waitCapacityResponse(err: WaitCapacityError): ApiResponse<never> {
-  const code = err.scope === 'session' ? ApiErrorCode.SESSION_BUSY : ApiErrorCode.RATE_LIMITED;
-  // The registry's message already names the scope and the limit; passing it through
-  // verbatim keeps the wording in one place.
-  return createErrorResponse(code, err.message);
-}
-
-/**
  * The signal a session is ALREADY emitting, corrected for liveness.
  *
  * `signalForStatus` alone is not enough here, because `Session` parks a DEAD PTY at
@@ -939,34 +928,6 @@ export function _resetPaneLivenessState(): void {
 /** Test seam: how many panes are currently being watched for a dead worker. */
 export function _paneDeathWatcherCount(): number {
   return paneDeathWatchers.size;
-}
-
-/**
- * An `AbortController` that fires when the CLIENT goes away, and only then.
- *
- * Freeing an abandoned waiter matters because the documented pattern is a loop of
- * short waits: `curl --max-time 30 ".../wait?timeout=600000"` abandons a live waiter
- * every iteration until the cap is hit and an innocent session reports busy. Same for
- * any proxy that cuts the connection.
- *
- * ⚠️ **It must listen on the RESPONSE, not the request.** `req.raw` emits `'close'`
- * as soon as the request body has finished streaming, which on a POST is BEFORE the
- * handler ever blocks — measured at +1ms with `aborted: false`, indistinguishable
- * from a real hang-up at +0ms. Wiring the abort there cancels every send-and-wait
- * instantly and silently kills the feature (it survives on GET only because a GET has
- * no body to finish). `reply.raw` emits `'close'` both when the response completes
- * and when the socket dies, and `writableFinished` is what tells those apart: true
- * only if the response actually went out. The guard is load-bearing, not defensive.
- *
- * `app.inject()` never emits `'close'` at all, so this is only observable over real
- * HTTP — which is why the regression test for it binds a port.
- */
-function abortOnClientHangUp(reply: FastifyReply): AbortController {
-  const controller = new AbortController();
-  reply.raw.on('close', () => {
-    if (!reply.raw.writableFinished) controller.abort();
-  });
-  return controller;
 }
 
 /**
@@ -1718,6 +1679,9 @@ export function registerSessionRoutes(
       findPersistedSessionOrFail(ctx.store, id, req);
       // The edit history goes with the record (same rule as `cleanupSession`).
       if (ctx.store.demoteOrRemoveSession(id) === 'removed') ctx.forgetEditHistory(id);
+      // A detached session kept its agent inbox (server.ts _doCleanupSession drops it
+      // only on killMux); retiring the row is the delete, so the mail goes now.
+      agentInbox.drop(id);
       // Mirrors the broadcast at the tail of the live-session cleanup path
       // (_doCleanupSession in server.ts) — without it, other open tabs keep
       // showing the retired row until their next unrelated fetch.
@@ -2110,6 +2074,32 @@ export function registerSessionRoutes(
       }
     }
 
+    // A guarded submit (agent-staging.ts) holds the input lease for the few
+    // milliseconds of its conditional Enter, and input that arrives meanwhile is held
+    // and written in arrival order after it. A TAGGED request is refused for that span
+    // (the lease plus the held input's drain) rather than overtake held input: say so
+    // instead of answering 200 for bytes that were never written, and give the seq
+    // back so the browser's durable queue (which keeps a frame on any 409, and whose
+    // POST drainer sends one frame at a time) delivers it on its next retry. An
+    // UNTAGGED request has no retry behind it (the phone accessory keys and the Stop
+    // button's Ctrl+C are fire-and-forget POSTs that never read the answer), so it is
+    // held instead, like a WebSocket frame: `writeViaMux` takes its own turn behind
+    // the lease, and the raw write below is held explicitly. Nothing from here to the
+    // write below awaits, so the lease cannot be taken in between.
+    const refuseGuarded = () =>
+      reply
+        .code(409)
+        .send(
+          createErrorResponse(
+            ApiErrorCode.CONFLICT,
+            'A guarded submit is in progress on this session; nothing was written. Retry the input.'
+          )
+        );
+    if (!duplicate && tagged && session.guardedInputHeld === true) {
+      session.forgetInputSeq(clientId as string, seq as number);
+      return refuseGuarded();
+    }
+
     // Only a waiting request pays for the tmux probe: the browser's plain input path
     // (thousands of calls per session) must stay exec-free.
     const workerDead = wantsWait && workerIsDead(ctx.mux, session);
@@ -2220,7 +2210,38 @@ export function registerSessionRoutes(
       // Same rollback. NOT an error response, deliberately: a session can
       // legitimately have no PTY yet (created but not started), and callers have
       // always been able to write to one without a 4xx.
-      delivered = session.write(inputStr, { fromUser: true });
+      //
+      // During a guarded submit (untagged only: a tagged one was refused above) the
+      // write is held and runs in arrival order once the lease is released. The answer
+      // is a 200 once held; a send-and-wait reads `delivered` from the held write. Only
+      // a full hold queue refuses, after releasing the waiter registered above.
+      let heldWrite: Promise<boolean> | null = null;
+      if (session.guardedInputHeld === true) {
+        let settle!: (written: boolean) => void;
+        const written = new Promise<boolean>((resolve) => {
+          settle = resolve;
+        });
+        const held = session.holdForGuardedLease(
+          () => {
+            let ok = false;
+            try {
+              ok = session.write(inputStr, { fromUser: true });
+            } finally {
+              settle(ok);
+            }
+          },
+          inputStr.length,
+          inputStr
+        );
+        if (held === 'full') {
+          abort.abort();
+          stopDeathWatch();
+          return refuseGuarded();
+        }
+        if (held === 'held') heldWrite = written;
+      }
+      if (heldWrite && !waitPromise) return {};
+      delivered = heldWrite ? await heldWrite : session.write(inputStr, { fromUser: true });
       if (!delivered && tagged) {
         session.forgetInputSeq(clientId as string, seq as number);
       }
@@ -2431,7 +2452,7 @@ export function registerSessionRoutes(
   // own `capabilities.newline`. Claude Code's Ink input recognizes 0x0a as "insert newline" vs
   // 0x0d (carriage return = submit).
 
-  app.post('/api/sessions/:id/send-key', async (req) => {
+  app.post('/api/sessions/:id/send-key', async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = req.body as Record<string, unknown>;
     const key = typeof body?.key === 'string' ? body.key : '';
@@ -2461,18 +2482,26 @@ export function registerSessionRoutes(
     try {
       // Route through the dedicated Codeman socket — bare `tmux` would target the
       // user's default server and never find this session (same #80 regression class).
-      await new Promise<void>((resolve, reject) => {
-        execFile(
-          'tmux',
-          ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
-          { timeout: 5000 },
-          (err) => {
-            if (err) reject(err);
-            else resolve();
-          }
-        );
-      });
+      await session.performAuxiliaryInput(
+        () =>
+          new Promise<void>((resolve, reject) => {
+            execFile(
+              'tmux',
+              ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
+              { timeout: 5000 },
+              (err) => {
+                if (err) reject(err);
+                else resolve();
+              }
+            );
+          })
+      );
     } catch (err) {
+      // A guarded submit's lease holds the key until its Enter is out; only a full
+      // hold queue refuses it, and that is a retryable conflict, not a tmux failure.
+      if (err instanceof GuardedInputBusyError) {
+        return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, err.message));
+      }
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
     }
@@ -3719,6 +3748,40 @@ export function registerSessionRoutes(
     };
   });
 
+  // ========== Git fetch on an interval ==========
+
+  // Per-session override for the fetch interval (src/git-fetch-scheduler.ts), which is what the Session
+  // Options rows say it is: two sessions on one folder can hold different choices, and that folder is
+  // fetched when the first of them is due. `null` on either field clears this session's choice so the
+  // app-wide setting applies again, and a field left out of the body leaves the other half as it was: the
+  // Session Options rows save on their own. Refused for a remote or Docker session, exactly as the Git
+  // panel excludes them: a container can write to the repository it mounts, so git there would run that
+  // repository's own configuration on the host.
+  app.post('/api/sessions/:id/git-fetch-settings', async (req) => {
+    const { id } = req.params as { id: string };
+    const body = parseBody(GitFetchSettingsSchema, req.body, 'Invalid request body');
+    const session = findSessionOrFail(ctx, id, req);
+    if (session.remote || session.docker) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Git fetch does not run for remote or Docker sessions');
+    }
+
+    const enabled = 'enabled' in body ? (body.enabled ?? undefined) : session.gitFetchEnabled;
+    const intervalSeconds =
+      'intervalSeconds' in body ? (body.intervalSeconds ?? undefined) : session.gitFetchIntervalSeconds;
+    session.setGitFetchSettings(enabled, intervalSeconds);
+    persistAndBroadcastSession(ctx, session);
+
+    return {
+      success: true,
+      data: {
+        gitFetchSettings: {
+          enabled: session.gitFetchEnabled ?? null,
+          intervalSeconds: session.gitFetchIntervalSeconds ?? null,
+        },
+      },
+    };
+  });
+
   // ========== Auto-Resume (usage-limit pause) ==========
 
   app.post('/api/sessions/:id/auto-resume', async (req) => {
@@ -3790,6 +3853,11 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const body = parseBody(ImageWatcherSchema, req.body, 'Invalid request body');
     const session = findSessionOrFail(ctx, id, req);
+    // A remote session's workingDir is a path on the remote host; the watcher would watch it on the
+    // LOCAL disk (a missing folder, or a same-named local one whose images are not the session's).
+    if (body.enabled && session.remote) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Image watching does not run for remote sessions');
+    }
 
     if (body.enabled) {
       imageWatcher.watchSession(session.id, session.workingDir);
@@ -4708,28 +4776,14 @@ export function registerSessionRoutes(
       // settings.json, readable by every user through GET /api/settings, so a non-admin's
       // case name is not written there in multi-user mode (writes are admin-only, like
       // PUT /api/settings). isAdmin is always true in single-user mode.
+      // Awaited and serialized with every other settings.json writer (mutateSettingsFile): the
+      // un-awaited write this replaced could land after the response, over a settings save.
       if (isAdmin(req)) {
         try {
-          const settingsFilePath = SETTINGS_PATH;
-          let settings: Record<string, unknown> = {};
-          try {
-            settings = JSON.parse(await fs.readFile(settingsFilePath, 'utf-8'));
-          } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-          }
-          settings.lastUsedCase = caseName;
-          const dir = dirname(settingsFilePath);
-          if (!existsSync(dir)) {
-            mkdirSync(dir, { recursive: true });
-          }
-          // Use async write to avoid blocking event loop
-          fs.writeFile(settingsFilePath, JSON.stringify(settings, null, 2)).catch((err) => {
-            // Non-critical but log for debugging
-            console.warn('[Server] Failed to save settings (lastUsedCase):', err);
-          });
+          await mutateSettingsFile((settings) => ({ ...settings, lastUsedCase: caseName }));
         } catch (err) {
-          // Non-critical but log for debugging
-          console.warn('[Server] Failed to prepare settings update:', err);
+          // Non-critical: the session is already running.
+          console.warn('[Server] Failed to save settings (lastUsedCase):', getErrorMessage(err));
         }
       }
 
@@ -5212,6 +5266,7 @@ export function registerSessionRoutes(
     if (!stat?.isDirectory()) return out;
 
     const workingDir = await decodeProjectKey(projDir);
+    const staleCwd = new Map<string, boolean>();
     const entries = await fs.readdir(projPath).catch(() => [] as string[]);
 
     for (const entry of entries) {
@@ -5316,13 +5371,35 @@ export function registerSessionRoutes(
         worktreeRepo: headGit.worktreeRepo ?? tailGit.worktreeRepo,
       };
 
+      // A case rename moves the project directory but leaves the old path in each transcript's
+      // cwd. When that cwd is gone and the decoded key is a real folder that encodes back to this
+      // very key (not the $HOME collapse of #265), the key is the truer answer.
+      let cwd = git.cwd;
+      if (cwd !== undefined && cwd !== workingDir) {
+        let stale = staleCwd.get(cwd);
+        if (stale === undefined) {
+          stale =
+            claudeProjectDirName(workingDir) === projDir &&
+            (await fs.stat(cwd).then(
+              () => false,
+              () => true
+            )) &&
+            (await fs.stat(workingDir).then(
+              (s) => s.isDirectory(),
+              () => false
+            ));
+          staleCwd.set(cwd, stale);
+        }
+        if (stale) cwd = undefined;
+      }
+
       out.push({
         sessionId,
         // The transcript's literal cwd beats decodeProjectKey's stat-walked guess,
         // which silently collapses to $HOME once the directory is gone (#265).
         // Absent cwd falls back to the old behaviour rather than inventing a path.
-        workingDir: git.cwd ?? workingDir,
-        workingDirExact: git.cwd !== undefined,
+        workingDir: cwd ?? workingDir,
+        workingDirExact: cwd !== undefined,
         projectKey: projDir,
         sizeBytes: fileStat.size,
         lastModified: fileStat.mtime.toISOString(),

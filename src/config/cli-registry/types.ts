@@ -432,6 +432,39 @@ export interface CliCapabilities {
      * this is sized for the narrowest pane the CLI was measured at. Default 1.
      */
     blockedLines?: number;
+    /**
+     * Source of a regex every non-blank row BELOW an idle composer must match (at most
+     * three rows): the footer and hint rows this CLI draws there and nowhere else. It is
+     * what lets the experimental guarded stage/submit routes (`agent-staging.ts`) prove
+     * that the `promptGlyph` row they read is this CLI's own composer, at rest, and not
+     * a dialog option or a transcript line the agent printed. A CLI that omits it never
+     * takes guarded input: stage and submit refuse it. Tested one row at a time.
+     */
+    composerFooterLine?: string;
+    /**
+     * Source of a regex matching a row of a suggestion popup this CLI draws directly
+     * ABOVE its composer (a slash-command list, a file or mention search, its key-hint
+     * row). The footer below such a composer is unchanged, so without this guarded
+     * stage/submit would read the popup frame as an idle composer, and Enter would
+     * accept the highlighted entry instead of sending the draft. Tested one row at a
+     * time against the contiguous block just above the composer row, never further
+     * up the pane: a match there refuses the frame. See `readGuardedComposer()`.
+     */
+    composerPopupLine?: string;
+    /**
+     * Characters that, as the first character of a draft, make Enter run a command
+     * rather than send a prompt (codex: `/` slash commands, `!` shell commands).
+     * Guarded stage refuses such a message before typing; commands go through the
+     * ordinary input route.
+     */
+    composerCommandPrefixes?: string;
+    /**
+     * Characters that, starting the word under the caret, open a completion popup
+     * whose highlighted entry Enter accepts (codex: `@` file and mention search, `$`
+     * skills). Guarded stage refuses a message whose LAST word starts with one,
+     * before typing: the caret ends there, and the popup follows the caret.
+     */
+    composerCompletionSigils?: string;
   };
   /**
    * How many columns this CLI indents its transcript body by, so a copy taken from its
@@ -563,6 +596,30 @@ export interface CliCapabilities {
    * Absent means no paging, so a CLI nobody has measured keeps plain local scrolling.
    */
   transcriptPageKeys?: boolean;
+  /**
+   * `'inline'`: the CLI renders inline (its content stacks at the bottom of the
+   * main screen), so while a phone's on-screen keyboard is up the browser keeps
+   * the PTY's rows and scrolls the view instead of resizing (`keyboardHoldsRows`,
+   * terminal-ui.js `_keyboardHoldEligible`). Read by the frontend through
+   * `window.__codemanKeyboardHoldModes`, which the server builds from this field.
+   *
+   * Why it exists: every PTY height change makes Claude Code's inline renderer
+   * clear the screen and reprint only the tail that fits (#672). Measured on
+   * Claude Code 2.1.306 with tmux 3.2a, a fresh session already at the phone's
+   * size printing 100 numbered lines: five keyboard open/close cycles (PTY
+   * 62x38 to 62x15 and back, one SIGWINCH per transition) left 75 of the 100 in
+   * `tmux capture-pane` history, the other 25 gone for good; with the rows held
+   * the PTY stayed 62x38, no SIGWINCH reached the pane and all 100 remained.
+   *
+   * ⚠ Only for a renderer that is inline. A CLI that lays out the FULL height
+   * (codex: banner at the top, composer pinned to the bottom) cannot fit both
+   * ends above the keyboard and must be resized instead, so it stays absent.
+   * Absent means resize, the safe default for an unmeasured CLI. Even when set,
+   * the hold stands aside while the CLI reports mouse tracking (Claude's
+   * fullscreen mode, which lays out the full height and has not been measured
+   * losing lines, so it resizes as before), and for remote and docker sessions.
+   */
+  keyboardHold?: 'inline';
   keyboardAccessory: 'agent' | 'shell';
   /** Multi-user: this CLI is a raw shell, so its commands need the privileged gate. */
   privilegedCommandGate: boolean;

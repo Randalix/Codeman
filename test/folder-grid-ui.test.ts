@@ -83,7 +83,12 @@ describe('folder links are routed to the grid', () => {
   it('terminal provider opens folder links in the grid', () => {
     const src = read('terminal-ui.js');
     expect(src).toMatch(/addLink\(found\.path, found\.index, !!found\.folder, !!found\.braces\)/);
-    expect(src).toMatch(/self\._openTerminalPathLink\(text, getSessionId\(\), folder, braces\)/);
+    // Path provider: upstream's activateFilePath (folder → grid), a brace set → its grid.
+    expect(src).toMatch(/if \(folder\) \{\s*self\.openFolderGrid\(target, sessionId\);/);
+    expect(src).toMatch(
+      /if \(braces\) self\.openPathSet\(text, getSessionId\(\)\);\s*else activateFilePath\(text, folder\);/
+    );
+    // OSC 8 file links: the same rule through _openTerminalPathLink.
     expect(src).toMatch(/if \(folder\) \{\s*this\.openFolderGrid\(target, sessionId\);/);
   });
 

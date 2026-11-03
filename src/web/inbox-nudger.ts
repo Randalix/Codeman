@@ -35,11 +35,12 @@
  * - NEVER wakes a host. A remote session is nudged only when its host answers a plain
  *   TCP probe; a sleeping host keeps the mail until something legitimate wakes it.
  *   This module has no access to the wake registry (wiring guard in the tests).
- * - Survives a server restart: the store is persisted but this state is not, so boot
- *   calls `rearm()` for every restored inbox with mail (after `NUDGE_RESTART_DELAY_MS`,
- *   once the adopted sessions report real status). Read-but-unacked mail counts as
- *   unseen then — `seen` is not persisted — and gets one reminder. A busy receiver's
- *   `NUDGE_MAX_DEFER_MS` counts from the oldest such post, not from the boot.
+ * - Survives a server restart: the store can be persisted (opt-in
+ *   `agentInboxPersistEnabled`) but this state is not, so boot calls `rearm()` for every
+ *   restored inbox with mail (after `NUDGE_RESTART_DELAY_MS`, once the adopted sessions
+ *   report real status). The snapshot keeps `seenAt`, so only mail no receiver read has
+ *   handed out is announced again. A busy receiver's `NUDGE_MAX_DEFER_MS` counts from
+ *   the oldest such post, not from the boot.
  * - Opt-out per post (`nudge: false`, CLI `--no-nudge`) and globally
  *   (`CODEMAN_INBOX_NUDGE=0`).
  *
@@ -123,7 +124,9 @@ export function nudgeText(fresh: readonly InboxMessage[], pending: number): stri
   );
 }
 
-function shortId(from: string): string {
+/** A sender for the nudge line; null is a post nobody could be resolved for, i.e. the user. */
+function shortId(from: string | null): string {
+  if (from === null) return 'user';
   const clean = from.replace(/[^\x20-\x7e]/g, '');
   return /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(clean) ? clean.slice(0, 8) : clean.slice(0, 40);
 }

@@ -85,6 +85,7 @@ import {
   remoteLoginShellCommand,
   remoteSshTarget,
   remoteTmuxSessionAlive,
+  withRemoteTmuxPath,
 } from './remote-hosts.js';
 import { installRemoteAgentCli, installRemoteAgentSkill, remoteAgentEnvPrefix } from './remote-agent-cli.js';
 import {
@@ -130,7 +131,7 @@ import {
 
 import { EXEC_TIMEOUT_MS } from './config/exec-timeout.js';
 import { ensureDeepSeekStatusShim } from './deepseek-status-shim.js';
-import { restrictTmuxPrefixTable } from './tmux-prefix-table.js';
+import { NESTED_TMUX_PREFIX, nestedPrefixTableResetCommands, restrictTmuxPrefixTable } from './tmux-prefix-table.js';
 
 /** How long a cached process snapshot stays usable. */
 const PROC_SNAPSHOT_TTL_MS = 2000;
@@ -484,9 +485,11 @@ export interface PasteTextCommands {
 
 /**
  * Escape a final `;` for tmux. tmux splits commands on an argument that ENDS in
- * `;` (`set-buffer -- 'a;'` stores `a`, `send-keys -l 'a;'` types `a`, a lone `;`
+ * `;` (`set-buffer -- 'a;'` stores `a`, `send-keys -l -- 'a;'` types `a`, a lone `;`
  * is no argument at all); a final `\;` is its escape for a literal `;`. A `;`
- * anywhere else in the argument is literal already. Exported for unit testing.
+ * anywhere else in the argument is literal already. Every `send-keys -l` passes
+ * `--` before the text, like `set-buffer`, or tmux parses a text that starts with
+ * `-` as its own options. Exported for unit testing.
  */
 export function escapeTmuxTrailingSemicolon(text: string): string {
   return text.endsWith(';') ? `${text.slice(0, -1)}\\;` : text;
@@ -1014,6 +1017,20 @@ export function formatCursorRestore(geometry: PaneCursorGeometry): string {
   return `${up > 0 ? `\x1b[${up}A` : ''}\r${right > 0 ? `\x1b[${right}C` : ''}`;
 }
 
+/**
+ * Split the output of `capture-pane -p \; display-message -p '<cursor format>'`
+ * into the captured rows and the cursor line, which tmux prints last. Null unless
+ * that last line has the cursor query's shape (four leading integers), so a query
+ * that printed nothing can never have the frame's own last row taken for it.
+ */
+export function splitFrameAndCursor(output: string): { frame: string; cursor: string } | null {
+  const body = output.endsWith('\n') ? output.slice(0, -1) : output;
+  const split = body.lastIndexOf('\n');
+  const cursor = body.slice(split + 1);
+  if (!/^\d+ \d+ \d+ \d+(?: |$)/.test(cursor)) return null;
+  return { frame: body.slice(0, split + 1), cursor };
+}
+
 export function formatPaneSnapshot(
   lines: string[],
   geometry: { cols: number; rows: number; cursorX: number; cursorY: number }
@@ -1262,7 +1279,9 @@ export function remoteTmuxLocation(remote: SessionRemote, sessionId: string): { 
  *   ssh -o BatchMode=yes -t [<COD-107 connection opts>] user@host \
  *     'tmux -u -L codeman-remote new-session -A -s codeman-ssh-<id> -c <path> "cd <path> && exec <cli>" \
  *        \; set -t codeman-ssh-<id> status off \; set -t codeman-ssh-<id> mouse off \
- *        \; set -t codeman-ssh-<id> prefix C-q \; set -s escape-time 0'
+ *        \; set -t codeman-ssh-<id> prefix C-q \; set -s escape-time 0 \; \
+ *        bind-key -T prefix C-q send-prefix \; unbind-key -a -T prefix \; \
+ *        bind-key -T prefix C-q send-prefix \; set -t codeman-ssh-<id> remain-on-exit failed'
  *
  * COD-107 — the connection options (`-p`, `-i`, `-J`, SOCKS `-o ProxyCommand`,
  * arbitrary `-o`) come from the shared `buildSshConnectionArgs(remote)`, so the
@@ -1393,7 +1412,7 @@ export function buildRemoteLaunchCommand(options: {
     `tmux -u -L ${REMOTE_TMUX_SOCKET} new-session -A -s ${remoteName} -c ${shellescape(remote.remotePath)} ${shellescape(paneCommand)}`,
     `set -t ${remoteName} status off`,
     `set -t ${remoteName} mouse off`,
-    `set -t ${remoteName} prefix C-q`,
+    `set -t ${remoteName} prefix ${NESTED_TMUX_PREFIX}`,
     'set -s escape-time 0',
     // COD-106 — shared/collaborative sessions: tmux defaults to sizing a window
     // to the SMALLEST attached client, so two Codemans at different viewports
@@ -1402,6 +1421,15 @@ export function buildRemoteLaunchCommand(options: {
     // Per-session scoped (`set -t <name>`, matching #145's hardening) so a shared
     // remote tmux server's other sessions keep their own sizing behavior.
     `set -t ${remoteName} window-size latest`,
+    // The prefix TABLE is server-global (unlike `prefix C-q`, which is per
+    // session). This socket is dedicated to Codeman's owned sessions, so the
+    // same reduction as the local socket applies: Ctrl+Q then )/(/s/w/L must
+    // not switch-client / choose-tree onto a sibling. Bind, then unbind-all,
+    // then bind again: a user config that left the prefix table empty makes
+    // `unbind-key -a -T prefix` fail and abort the rest of this chain.
+    // BEFORE remain-on-exit, which stays last because an old remote tmux
+    // rejects `failed` and aborts the rest of the chain.
+    ...nestedPrefixTableResetCommands(),
     // #210: keep a CRASHED pane so the failure is still on screen. Without this,
     // tmux destroys the pane -> window -> session (and, being the only session,
     // the whole remote server) the instant the pane command exits, which tears the
@@ -1418,7 +1446,8 @@ export function buildRemoteLaunchCommand(options: {
     // LAST in the chain on purpose: tmux aborts the remaining commands of a `\;`
     // sequence once one errors (also verified), and `failed` needs tmux >= 3.2 on
     // the REMOTE host. Trailing, a rejection costs only this option; leading, it
-    // would silently drop status/mouse/prefix/escape-time/window-size with it.
+    // would silently drop status/mouse/prefix/escape-time/window-size and the
+    // prefix-table reduction with it.
     `set -t ${remoteName} remain-on-exit failed`,
   ].join(' \\; ');
 
@@ -1431,7 +1460,14 @@ export function buildRemoteLaunchCommand(options: {
   // `ssh -o BatchMode=yes` (preserving the historical token order), then the rest
   // of the connection args, then the target and the quoted tmux invocation.
   const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
-  const sshParts = [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)];
+  const sshParts = [
+    ssh,
+    batchMode,
+    '-t',
+    ...connectionArgs,
+    remoteSshTarget(remote),
+    shellescape(withRemoteTmuxPath(tmuxInvocation)),
+  ];
   return sshParts.join(' ');
 }
 
@@ -1448,7 +1484,7 @@ export function buildRemoteKillCommand(options: { remote: SessionRemote; session
   const remoteName = remoteTmuxSessionName(sessionId);
   const killCmd = `tmux -L ${REMOTE_TMUX_SOCKET} kill-session -t ${shellescape(remoteName)}`;
   const [ssh, ...connectionArgs] = buildSshConnectionArgs(remote);
-  return [ssh, ...connectionArgs, remoteSshTarget(remote), shellescape(killCmd)].join(' ');
+  return [ssh, ...connectionArgs, remoteSshTarget(remote), shellescape(withRemoteTmuxPath(killCmd))].join(' ');
 }
 
 // ========== Docker cases (COD-Docker) ==========
@@ -1590,8 +1626,12 @@ export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
     `new-session -A -s ${dkrName} -c ${workdir} ${shellescape(paneCommand)}`,
     `set -t ${dkrName} status off`,
     `set -t ${dkrName} mouse off`,
-    `set -t ${dkrName} prefix C-q`,
+    `set -t ${dkrName} prefix ${NESTED_TMUX_PREFIX}`,
     'set -s escape-time 0',
+    // Same reduction as the owned-remote chain: the in-container server is
+    // Codeman's (`-L codeman-docker`), and its stock prefix table would move
+    // the inner client to a sibling session on Ctrl+Q then )/(/s/w/L.
+    ...nestedPrefixTableResetCommands(),
   ].join(' \\; ');
 
   const execEnvFlags: string[] = [];
@@ -1828,7 +1868,14 @@ export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionNam
   // `-u` for the same reason as the launch: a locale-less ssh client renders no UTF-8.
   const tmuxInvocation = `tmux -u -L codeman attach -t ${shellescape(remoteSessionName)}`;
   const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
-  const sshParts = [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)];
+  const sshParts = [
+    ssh,
+    batchMode,
+    '-t',
+    ...connectionArgs,
+    remoteSshTarget(remote),
+    shellescape(withRemoteTmuxPath(tmuxInvocation)),
+  ];
   return sshParts.join(' ');
 }
 
@@ -4056,7 +4103,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * - `Enter` key is sent as a SEPARATE tmux invocation after a small delay
    * - Ink (Claude CLI) needs text and Enter split to avoid treating Enter as a newline
    */
-  async sendInput(sessionId: string, input: string): Promise<boolean> {
+  async sendInput(sessionId: string, input: string, options?: { beforeDispatch?: () => boolean }): Promise<boolean> {
+    if (options?.beforeDispatch && input !== '\r') return false;
     const session = this.sessions.get(sessionId);
     if (!session) {
       console.error(
@@ -4069,7 +4117,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // inputRunner() so a test subclass can record what WOULD reach tmux.
     const run = this.inputRunner();
     if (!run) {
-      return true;
+      return options?.beforeDispatch?.() ?? true;
     }
 
     console.log(
@@ -4103,7 +4151,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // highlighted option (see submitsAsKeys).
         if (submitsAsKeys(textPart)) {
           await run(
-            `${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`
+            `${this.tmux()} send-keys -t "${session.muxName}" -l -- ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`
           );
         } else {
           await pasteText(run, buildPasteTextCommands(this.tmux(), session.muxName, textPart));
@@ -4120,10 +4168,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       } else if (textPart) {
         // Text only, no Enter
         await run(
-          `${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`
+          `${this.tmux()} send-keys -t "${session.muxName}" -l -- ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`
         );
       } else if (hasCarriageReturn) {
-        // Enter only
+        // Enter only: no await between the guard and dispatch.
+        if (options?.beforeDispatch && !options.beforeDispatch()) return false;
         await run(`${this.tmux()} send-keys -t "${session.muxName}" Enter`);
       }
 
@@ -4274,7 +4323,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       if (textPart && hasCarriageReturn) {
         execSync(
-          `${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
+          `${tmux} send-keys -t ${shellescape(target)} -l -- ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
           {
             encoding: 'utf-8',
             timeout: EXEC_TIMEOUT_MS,
@@ -4286,7 +4335,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         });
       } else if (textPart) {
         execSync(
-          `${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
+          `${tmux} send-keys -t ${shellescape(target)} -l -- ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
           {
             encoding: 'utf-8',
             timeout: EXEC_TIMEOUT_MS,
@@ -4370,7 +4419,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   capturePaneBuffer(muxName: string, paneTarget?: string, opts?: PaneCaptureOptions): string | null {
-    if (IS_TEST_MODE) return '';
+    const exec = this.captureRunner();
+    if (!exec) return '';
     const target = resolveTmuxPaneTarget(muxName, paneTarget);
     if (!target) {
       console.error('[TmuxManager] Invalid pane target in capturePaneBuffer:', { muxName, paneTarget });
@@ -4408,9 +4458,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         execOpts.maxBuffer =
           (opts?.maxCaptureBytes ?? DEFAULT_TERMINAL_BUFFER_MAX_BYTES) + FULL_HISTORY_CAPTURE_SLACK_BYTES;
       }
+      const cursorQuery = `display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height} #{history_size} #{alternate_on}'`;
+      const captureCommand = `${this.tmux()} ${captureFlags} -t ${shellescape(target)}`;
+      // The visible frame and its caret come from ONE tmux invocation
+      // (the capture, `\;`, then the cursor query): tmux runs a command list back to back
+      // in its command queue, with no pane output parsed between the two, so the
+      // caret belongs to the frame. Two separate calls raced the CLI's repaint: a
+      // CLI that redraws its composer a few ms after input arrives (codex) could be
+      // captured before the redraw and its caret queried after it, and guarded
+      // stage then refused a frame the keys had already reached. Only output that
+      // splitFrameAndCursor() cannot split (a last line that is not the query's)
+      // falls back to the two separate calls, which is what this always did. A call
+      // that THREW (a hung tmux timing out) goes to the catch below like any other
+      // capture failure: retrying it would block the event loop for a second timeout
+      // on every `GET .../terminal` load.
+      const combined = fullHistory
+        ? null
+        : splitFrameAndCursor(
+            exec(`${captureCommand} \\; ${cursorQuery}`, { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS })
+          );
       const rawCapture = joinScrollbackAndFrame(
         scrollbackOverride,
-        execSync(`${this.tmux()} ${captureFlags} -t ${shellescape(target)}`, execOpts),
+        combined?.frame ?? exec(captureCommand, execOpts),
         scrollbackOverride !== undefined ? opts?.scrollbackOverrideScreen : undefined
       );
       // Query the cursor BEFORE deciding anything else. On the full-history path
@@ -4418,10 +4487,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // appended, and those two have to agree: trailing blank rows are only safe
       // to keep when a move follows to put the caret back above them.
       const geometry = queryPaneCursor(() =>
-        execSync(
-          `${this.tmux()} display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height} #{history_size} #{alternate_on}'`,
-          { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS }
-        )
+        combined
+          ? combined.cursor
+          : exec(`${this.tmux()} ${cursorQuery}`, { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS })
       );
       // Report the size the pane was really drawing at. The visible-frame path
       // below addresses every row absolutely, so a consumer whose terminal is
@@ -4485,6 +4553,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
       return null;
     }
+  }
+
+  /**
+   * How {@link capturePaneBuffer} runs tmux, or null where it must not (vitest).
+   * Split out like {@link inputRunner} so a test subclass can count and script the
+   * calls a capture makes.
+   */
+  protected captureRunner():
+    | ((cmd: string, opts: { encoding: 'utf-8'; timeout: number; maxBuffer?: number }) => string)
+    | null {
+    if (IS_TEST_MODE) return null;
+    return (cmd, opts) => execSync(cmd, opts);
   }
 
   /**

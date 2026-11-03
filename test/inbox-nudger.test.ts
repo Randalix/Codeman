@@ -42,6 +42,8 @@ class FakeSession extends EventEmitter implements NudgeTarget {
 
 function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?: boolean } = {}) {
   const inbox = new AgentInbox();
+  // Receivers parked on `inbox --wait` (the wait registry's receiver-owned inbox waiters).
+  const parked = new Set<string>();
   const dialogs = new Set<string>();
   const sessions = new Map<string, FakeSession>();
   const probes: string[] = [];
@@ -50,7 +52,7 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
     getSession: (id) => sessions.get(id),
     unseen: (id) => inbox.unseen(id),
     pendingCount: (id) => inbox.pendingCount(id),
-    isWaiting: (id) => inbox.summary().get(id)?.waiting === true,
+    isWaiting: (id) => parked.has(id),
     dialogOpen: (id) => dialogs.has(id),
     isShellMode: (mode) => mode === 'shell',
     agentInForeground: () => ['codex', 'claude'].includes(opts.foreground ?? ''),
@@ -63,13 +65,13 @@ function setup(opts: { foreground?: string | null; reachable?: boolean; enabled?
     log: (line) => logs.push(line),
   });
   const post = (to: string, from: string, text = 'hi', nudge?: boolean) => {
-    const receiverWaiting = inbox.waiterCount(to) > 0; // what the route does
+    const receiverWaiting = parked.has(to); // what the route does
     const r = inbox.post(to, from, text);
     if (!r.ok) throw new Error(r.reason);
     nudger.schedule(to, from, { nudge, messageId: r.message.id, receiverWaiting });
     return r.message;
   };
-  return { inbox, sessions, nudger, post, probes, logs, dialogs };
+  return { inbox, sessions, nudger, post, probes, logs, dialogs, parked };
 }
 
 /** Let the debounce fire and the async check (probe + write) settle. */
@@ -256,23 +258,25 @@ describe('when a post is announced', () => {
 
 describe('when it is deliberately not announced', () => {
   it('a receiver parked on inbox --wait has already seen it', async () => {
-    const { inbox, sessions, post } = setup();
+    const { inbox, sessions, post, parked } = setup();
     const s = new FakeSession(A);
     sessions.set(A, s);
-    const reading = inbox.read(A, 60_000);
+    parked.add(A);
     post(A, B);
-    await reading;
+    inbox.read(A, { receiver: true }); // the woken long-poll reads it
+    parked.delete(A);
     await settle();
     expect(s.written).toEqual([]);
   });
 
   it('a --peek monitor loop parked on the inbox is not typed at either', async () => {
-    const { inbox, sessions, post } = setup();
+    const { inbox, sessions, post, parked } = setup();
     const s = new FakeSession(A);
     sessions.set(A, s);
-    const peeking = inbox.read(A, 60_000, undefined, { peek: true });
+    parked.add(A); // a ?peek=1 wait still counts as the receiver's own
     post(A, B);
-    await peeking;
+    inbox.read(A, { receiver: false }); // the peek marks nothing seen
+    parked.delete(A);
     await settle();
     expect(s.written).toEqual([]);
   });
@@ -285,7 +289,7 @@ describe('when it is deliberately not announced', () => {
     post(A, B, 'one');
     await settle();
     await settle(NUDGE_MAX_DEFER_MS / 2);
-    await inbox.read(A);
+    inbox.read(A, { receiver: true });
     s.emit('idle'); // turn ended after reading: nothing left to announce
     await settle(0);
     await settle(NUDGE_MAX_DEFER_MS);
@@ -299,7 +303,7 @@ describe('when it is deliberately not announced', () => {
     const s = new FakeSession(A);
     sessions.set(A, s);
     post(A, B);
-    await inbox.read(A);
+    inbox.read(A, { receiver: true });
     await settle();
     expect(s.written).toEqual([]);
   });

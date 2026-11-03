@@ -87,6 +87,17 @@
     'Web tab settings': '网页标签设置',
     'New group': '新建分组',
     'Rename group': '重命名分组',
+    'Rename case': '重命名案例',
+    Rename: '重命名',
+    'New name': '新名称',
+    'letters, numbers, - and _': '字母、数字、- 和 _',
+    'Also rename the folder on disk': '同时重命名磁盘上的文件夹',
+    'A case under the cases folder is renamed together with its folder.':
+      '案例文件夹下的案例会连同其文件夹一起重命名。',
+    'Stop sessions and rename': '停止会话并重命名',
+    'Enter a different name.': '请输入不同的名称。',
+    'Use only letters, numbers, hyphens and underscores.': '只能使用字母、数字、连字符和下划线。',
+    'Failed to rename the case.': '重命名案例失败。',
     'Move group up': '上移分组',
     'Move group down': '下移分组',
     'Delete group': '删除分组',
@@ -95,6 +106,13 @@
     'Move to Ungrouped': '移到未分组',
     'Move to new group': '移到新分组',
     'New session': '新建会话',
+    // The Cmd+K palette's new-session agent switch (panels-ui.js, its title tooltip).
+    'Agent for the new session (Left/Right to change)': '新会话使用的智能体（按左/右方向键切换）',
+    'New session here': '在此新建会话',
+    'New session here…': '在此新建会话…',
+    "New session in this tab's case": '在此标签页的案例中新建会话',
+    "This tab's folder is not a case, so there is nothing to start beside it.":
+      '此标签页的文件夹不是案例，无法在其旁边新建会话。',
     'A session is already starting.': '已有会话正在启动。',
     'Follow parent again': '重新跟随父会话',
     'Parent closed; placed on its own': '父会话已关闭；单独放置',
@@ -339,6 +357,7 @@
     Delete: '删除',
     Remove: '移除',
     Edit: '编辑',
+    Fetch: '拉取',
     Refresh: '刷新',
     Back: '返回',
     Next: '下一步',
@@ -450,6 +469,8 @@
     'Header Displays': '顶部栏显示',
     'Font Controls': '字体控制',
     'System Stats': '系统状态',
+    'GPU Stats': 'GPU 状态',
+    'CPU MHz': 'CPU 频率',
     'Lifecycle Log': '生命周期日志',
     'Response Viewer': '回复查看器',
     'Attachments Button': '附件按钮',
@@ -469,6 +490,9 @@
       '会话列表显示为顶栏横向标签条，或左侧可折叠侧边栏（Alt+B）。完整侧边栏为每个会话显示与主界面相同的详细信息。',
     'Tall Tabs (Name + Folder)': '双行标签（名称 + 文件夹）',
     'Pop-out Button on Tabs': '标签页弹出窗口按钮',
+    'New Session Button on Tabs': '标签页新建会话按钮',
+    'A + on the tab that starts a session in the same case and group, in any installed CLI.':
+      '标签页上的 + 按钮，可在同一案例和分组中，用任一已安装的 CLI 启动新会话。',
     'CLI Logos on Tabs': '标签页上的 CLI 图标',
     "Show each agent's CLI logo before the session name on tabs and the home screen's tab list. Off leaves the status dot and the shell's SH badge. Tiles, split headers and the Run menus keep their logos.":
       '在标签页和主界面的标签列表中，于会话名称前显示每个智能体的 CLI 图标。关闭后仍保留状态圆点和 Shell 的 SH 标记。平铺、分屏标题栏和运行菜单中的图标不受影响。',
@@ -505,12 +529,13 @@
     'Connection tile: offline': '离线',
     'Connection tile: queued': '已排队',
     'Connection tile: retry': '重连中',
-    // App Settings → Bottom bar, translated as one group (the Git status rows,
-    // #543's two included). Keys are the trimmed label text, without the scope tag.
+    // App Settings → Bottom bar, translated as one group (the Git status rows, #543's two included, and the
+    // two Git fetch rows, in the order the page lists them). Keys are the trimmed label text, without the
+    // scope tag. The Session Options → Git strings are in that group's own block further down.
     'Bottom bar': '底部栏',
     'Git status': 'Git 状态',
-    "Shows, at the right of the bottom bar, when the active session's repository (or each repository inside its folder, up to two levels down) has uncommitted files or commits that are not pushed. Click it for the list. Read-only: Codeman never fetches or changes the repository. Not shown for Docker or remote sessions. Off by default.":
-      '在底部栏右侧显示当前会话的仓库（或其文件夹内向下两层以内的每个仓库）是否有未提交的文件或未推送的提交。点击可查看列表。只读：{name} 从不拉取或更改仓库。Docker 和远程会话不显示。默认关闭。',
+    "Shows, at the right of the bottom bar, when the active session's repository (or each repository inside its folder, up to two levels down) has uncommitted files or commits that are not pushed. Click it for the list. Read-only apart from Fetch: Codeman never commits or changes the repository, and `git fetch` runs only when you click Fetch in that window, or on the interval below if you turned it on. It is the only git command the Git window runs that writes, and the only one Codeman runs on a timer (cloning and worktree management write too, but only when you asked for them at the moment you asked). Not shown for Docker or remote sessions. Off by default.":
+      '在底部栏右侧显示当前会话的仓库（或其文件夹内向下两层以内的每个仓库）是否有未提交的文件或未推送的提交。点击可查看列表。除拉取外只读：{name} 从不提交或更改仓库，而拉取是 Git 窗口运行的唯一会写入的 git 命令，也是 {name} 唯一会按间隔自行运行的命令（克隆和工作树管理也会写入，但只在您当时要求时才运行），它只在您点击该窗口中的拉取按钮时运行，或在您开启了下方的定时后按间隔运行。Docker 和远程会话不显示。默认关闭。',
     'Git status: group files by folder': 'Git 状态：按文件夹分组显示文件',
     'In the Git window, show changed files under their folders, collapsed until you click a folder. Off lists every file by its full path. On by default.':
       '在 Git 窗口中，将更改的文件显示在各自的文件夹下，点击文件夹前保持折叠。关闭时按完整路径列出每个文件。默认开启。',
@@ -520,6 +545,13 @@
     'Git status: git timeout': 'Git 状态：git 超时',
     'Seconds one git command may run before that repository is reported as unreadable (5 to 120, default 30). Raise it for repositories on a slow network share.':
       '单条 git 命令可运行的秒数，超时后该仓库会被报告为无法读取（5 到 120，默认 30）。仓库位于较慢的网络共享上时请调高此值。',
+    'Git fetch on an interval': 'Git 定时拉取',
+    'Runs `git fetch` for the repositories the Git window lists on a timer, so the "behind" number is current without a click. Off by default: this is the only git command the Git panel runs that writes, and the only one Codeman runs on a timer (cloning and worktree management write too, but only when you asked for them at the moment you asked), so nothing runs until you turn it on. A session can override both the switch and the interval in Session Options → Git.':
+      '按间隔为 Git 窗口列出的仓库运行拉取，这样“落后”的数字无需点击就是最新的。默认关闭：这是 Git 窗口运行的唯一会写入的 git 命令，也是 {name} 唯一会按间隔自行运行的命令（克隆和工作树管理也会写入，但只在您当时要求时才运行），所以在您开启之前不会有任何运行。会话可以在“会话选项 → Git”中同时覆盖开关和间隔。',
+    'Git fetch: how often': 'Git 定时拉取：多久一次',
+    'Seconds between runs for a session that has no override of its own (30 to 3600, default 300). Only a session that is on (here, or in Session Options → Git) is fetched, and sessions sharing one folder are fetched by one run.':
+      '没有自己覆盖设置的会话，两次运行之间的秒数（30 到 3600，默认 300）。只有已开启的会话（这里，或在“会话选项 → Git”）才会被拉取，共用一个文件夹的会话由一次运行拉取。',
+    'Fetch git status': '拉取 Git 状态',
     'Refresh git status': '刷新 Git 状态',
     'Close git status': '关闭 Git 状态',
     // Edit history (edit-history-ui.js): settings chip, header button and panel.
@@ -584,7 +616,6 @@
     Send: '发送',
     Permission: '权限',
     Question: '问题',
-    Idle: '空闲',
     'Read My Mind': '读心术',
     'Read My Mind: predict your next prompt': '读心术：预测您的下一条提示',
     'Predict my next prompt': '预测我的下一条提示',
@@ -689,6 +720,9 @@
     'Weight for bold terminal text. Only useful with a family carrying something heavier than its bold face.':
       '终端粗体文本的字重。仅当字体提供比其粗体更重的字形时才有意义。',
     'Local Echo': '本地回显',
+    'Keep Size Under Keyboard': '键盘弹出时保持尺寸',
+    "For local Claude sessions, opening the on-screen keyboard keeps the session's size and scrolls the view instead, so Claude does not reprint its screen and lose transcript lines. Full-screen interfaces (Codex, Claude's fullscreen mode) are resized as before.":
+      '对于本地 Claude 会话，打开屏幕键盘时会保持会话尺寸并改为滚动视图，这样 Claude 不会重绘屏幕而丢失对话记录行。全屏界面（Codex、Claude 的全屏模式）仍像以前一样调整尺寸。',
     'CJK Input': '中日韩输入',
     'Extended Keyboard Bar': '扩展键盘栏',
     'Gesture Control (beta)': '手势控制（测试版）',
@@ -719,6 +753,9 @@
     'New sessions for this case land in this group': '此案例的新会话将放入此分组',
     'Could not save the default session group.': '无法保存默认会话分组。',
     'Remote auto-reconnect': '远程自动重连',
+    'Experimental agent coordination': '实验性智能体协作',
+    "Lets agents read another session's output in bounded pages and type a prompt into a local Codex composer, then press Enter once after checking it is unchanged (the inspect, stage and submit commands). Experimental: the commands and their HTTP routes may change in any release. Off by default; while off those routes refuse every request.":
+      '允许智能体分页读取另一个会话的输出（每页有上限），并把提示词输入本地 Codex 输入框，确认未被改动后只按一次 Enter（即 inspect、stage 和 submit 命令）。实验性功能：这些命令及其 HTTP 路由可能在任何版本中变化。默认关闭；关闭时这些路由拒绝所有请求。',
     'Pin tab names on the CLI': '在 CLI 上固定标签名',
     "Launch every Claude session with its tab name, so the CLI's prompt label and /resume list match your tabs. Claude then stops generating its own titles for those sessions, and a rename in Codeman holds only until the next turn. Applies from the next session start or respawn, no server restart needed.":
       '以标签名启动每个 Claude 会话，让 CLI 的提示框标签和 /resume 列表与你的标签一致。Claude 随后不再为这些会话生成自己的标题，在 Codeman 中的重命名也只保留到下一轮。从下一次会话启动或重新生成时生效，无需重启服务器。',
@@ -853,6 +890,24 @@
     CPUs: 'CPU 数',
     Memory: '内存',
     GPUs: 'GPU',
+
+    // Session Options → Git (the tab's blurb, its group head, its hint and its three rows in index.html, plus
+    // the save toast session-ui.js raises). 'Status' is not a key here: that row's text is built at runtime
+    // by updateGitFetchStatus, and 'Git' stays a technical name.
+    "Whether Codeman fetches this session's repositories on a timer.": '{name} 是否按间隔拉取此会话的仓库。',
+    'Fetch on an interval': '按间隔拉取',
+    "Fetching is the only git command the Git panel runs that writes, and the only one Codeman runs on a timer, so nothing runs until you turn it on (here, or in App Settings → Bottom bar). Cloning and worktree management write too, but only when you asked for them at the moment you asked. The panel's Fetch button is always just a click.":
+      '拉取是 Git 窗口运行的唯一会写入的 git 命令，也是 {name} 唯一会按间隔自行运行的命令，所以在您开启之前（这里，或“应用设置 → 底部栏”）不会有任何运行。克隆和工作树管理也会写入，但只在您当时要求时才运行。该窗口中的拉取按钮始终只是一次点击。',
+    'Follow the app setting': '跟随应用设置',
+    'Uses the app-wide switch and interval for this session. Switch it off to pick your own.':
+      '为此会话使用应用级的开关和间隔。关闭它即可自行选择。',
+    'Fetch this session': '拉取此会话',
+    "Runs on its own even while the app-wide switch is off: a session that turned itself on means exactly that. Sessions sharing one folder share one run, and each sees that run's result.":
+      '即使应用级开关关闭也自行运行：一个自己开启的会话正是这个意思。共用一个文件夹的会话共享一次运行，每个会话都会看到该运行的结果。',
+    'How often': '多久一次',
+    '30 sec to 1 hr, timed from the start of a run, so a slow repository does not push the next one out.':
+      '30 秒到 1 小时，从一次运行的开始计时，所以较慢的仓库不会把下一次推远。',
+    'Git fetch settings saved': 'Git 定时拉取设置已保存',
 
     // Cron / lifecycle / panels
     'Cron Jobs': '定时任务',
@@ -1369,6 +1424,12 @@
         (_m, version, shown, more) => `Codeman 已更新到 v${version}：${shown}${more ? `（另有 ${more} 项）` : ''}`,
       ],
       [/^Selected: (.+)$/, (_m, value) => `已选择：${value}`],
+      [/^Case renamed to "(.+)"$/, (_m, name) => `案例已重命名为“${name}”`],
+      [/^New name for "(.+)"$/, (_m, name) => `“${name}”的新名称`],
+      [
+        /^These sessions have the folder open: (.+)\. They will be closed \(their tabs go away and nothing is restarted\) before the folder is renamed\.$/,
+        (_m, list) => `这些会话正在使用该文件夹：${list}。重命名前将关闭它们（其标签页会消失，不会重新启动）。`,
+      ],
       [/^Failed to (.+)$/, (_m, action) => `操作失败：${action}`],
       [/^Will create: (.+)$/, (_m, path) => `将创建：${path}`],
       // The spreadsheet preview: an HTTP status, and the notice bar's counts.

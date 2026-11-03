@@ -526,7 +526,7 @@ describe('wiring guard', () => {
     expect(restore).toBeGreaterThan(0);
     expect(subscribe).toBeGreaterThan(restore);
     expect(server).toContain('this.unsubscribeCoordinatorReports?.();');
-    expect(server).toContain('this.coordinatorReports.drop(sessionId, { keepSubscriptions: !killMux });');
+    expect(server).toContain('this.coordinatorReports?.drop(sessionId, { keepSubscriptions: !killMux });');
   });
 
   it('boot restores the subscriptions (or adopts the parents) before it subscribes, and persists them', () => {
@@ -536,7 +536,7 @@ describe('wiring guard', () => {
     expect(restoreSubs).toBeLessThan(subscribe);
     expect(server).toContain('saveSubscriptions: (snapshot) => this.persistReportSubscriptions(snapshot),');
     expect(server).toContain('this.coordinatorReports.adoptParents(this.sessions.keys())');
-    expect(server).toContain('this.coordinatorReports.drop(sessionId, { keepSubscriptions: !killMux });');
+    expect(server).toContain('this.coordinatorReports?.drop(sessionId, { keepSubscriptions: !killMux });');
   });
 
   it('boot restores the mutes before it subscribes, and the route gets the reporter', () => {
@@ -566,7 +566,8 @@ describe('wiring guard', () => {
       server.indexOf('private unsubscribeCoordinatorReports')
     );
     expect(block).toContain('agentInbox.post(to, from, text, { quiet, replaceQuiet: true })');
-    expect(block).toContain('if (!quiet) this.inboxNudger.schedule(');
+    // Only a loud report wakes a parked reader and schedules the nudger.
+    expect(block).toMatch(/if \(!quiet\) \{\s*sessionWaits\.notifyInbox\(to\);\s*this\.inboxNudger\.schedule\(/);
     expect(block).toContain('agentInbox.withdrawQuiet(to, from)');
     expect(server).toContain('unseen: (id) => agentInbox.unseen(id).filter((m) => !m.quiet),');
   });

@@ -588,11 +588,11 @@ describe('page-key travel, cap and coalescing', () => {
     FakeFit.proposed = { cols: 80, rows: 36 };
   });
 
-  it('accumulates coarse sub-page travel before sending one page', async () => {
+  it('pages a coarse opening event at once, and the next one repays it instead of paging again', async () => {
     const { ws, mount } = await connectTile(makeApp({ 's-tile': { mode: 'opencode' } }));
 
     mount.fire('wheel', wheelLines(-10));
-    expect(flushed(ws)).toEqual([]);
+    expect(flushed(ws)).toEqual([{ t: 'i', d: PAGE_UP }]);
     mount.fire('wheel', wheelLines(-10));
 
     expect(flushed(ws)).toEqual([{ t: 'i', d: PAGE_UP }]);
@@ -843,6 +843,54 @@ describe("the dialog check reads the TILE's session, never the active tab's", ()
   });
 });
 
+describe("a Codex selection menu on the tile's own screen", () => {
+  const MENU = [
+    '  Implement this plan?',
+    '',
+    '› 1. Yes, implement this plan          Switch to Default and start coding',
+    '  2. Yes, clear context and implement  Start a fresh thread (current context: 2% used)',
+    '  3. No, stay in Plan mode             Continue planning with the model',
+    '',
+    '  enter select · esc back',
+  ];
+  /** Puts `rows` on the bottom of the tile's 24-row screen, the way xterm's buffer answers getLine. */
+  function showOnScreen(term: { rows: number; buffer: { active: Record<string, unknown> } }, rows: string[]) {
+    const screen = [...Array(term.rows - rows.length).fill(''), ...rows];
+    term.buffer.active.getLine = (y: number) => ({ translateToString: () => screen[y] ?? '' });
+  }
+
+  it('consumes the wheel without paging, and pages again once the menu is gone', async () => {
+    const app = makeApp({ other: { mode: 'claude' }, 's-tile': { mode: 'codex' } }, 'other');
+    const { ws, term, mount } = await connectTile(app, { mode: 'codex' });
+    showOnScreen(term, MENU);
+
+    for (const lines of [-18, 18, -18]) {
+      const ev = wheelLines(lines);
+      mount.fire('wheel', ev);
+      // Consumed (xterm does not scroll the stale rows under the menu either), and no key was sent.
+      expect(ev.preventDefault).toHaveBeenCalled();
+    }
+    expect(flushed(ws)).toEqual([]);
+
+    // Menu closed: the composer is back on screen and the same wheel pages the transcript.
+    showOnScreen(term, ['› Ask Codex to do anything', '', '  GPT-6-Astra medium · ~/cases/x', '  ? for shortcuts']);
+    mount.fire('wheel', wheelLines(-18));
+    expect(flushed(ws)).toEqual([{ t: 'i', d: PAGE_UP }]);
+  });
+
+  it("asks about THIS tile's terminal, not the active tab's", async () => {
+    const app = makeApp({ other: { mode: 'codex' }, 's-tile': { mode: 'codex' } }, 'other');
+    (app as App & { terminal: unknown }).terminal = {
+      rows: 24,
+      buffer: { active: { getLine: () => ({ translateToString: () => '' }) } },
+    };
+    const { ws, term, mount } = await connectTile(app, { mode: 'codex' });
+    showOnScreen(term, MENU);
+    mount.fire('wheel', wheelLines(-18));
+    expect(flushed(ws)).toEqual([]);
+  });
+});
+
 describe('rows the tile pushed above the screen itself are not history', () => {
   it('pages after a one-screen capture taken at a taller size (the first load)', async () => {
     serveCapture(lines(40), 40); // the PTY was 40 rows when it was captured
@@ -946,14 +994,14 @@ describe('rows the tile pushed above the screen itself are not history', () => {
     }
     expect(flushed(ws)).toEqual([]);
 
-    // Back on the live screen, only travel made there counts: two quarter-screen
-    // wheels are one PageUp, with nothing carried over from the wheels xterm had
-    // (the gate sits before the pending travel is touched).
+    // Back on the live screen, only travel made there counts: the first quarter-screen wheel pages at
+    // once and the second repays it, with nothing carried over from the wheels xterm had (the gate sits
+    // before the pending travel is touched).
     term.buffer.active.viewportY = baseY;
     const first = wheelLines(-6);
     mount.fire('wheel', first);
     expect(first.preventDefault).toHaveBeenCalled();
-    expect(flushed(ws)).toEqual([]);
+    expect(flushed(ws)).toEqual([{ t: 'i', d: PAGE_UP }]);
     mount.fire('wheel', wheelLines(-6));
     expect(flushed(ws)).toEqual([{ t: 'i', d: PAGE_UP }]);
   });

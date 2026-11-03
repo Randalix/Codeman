@@ -1,13 +1,12 @@
 {
-  "version": "1.44.0",
+  "version": "1.47.0",
   "highlights": [
-    "Config backups (#661)",
-    "Keep an idle Claude session's prompt cache warm (#666, opt-in)",
-    "A default tab group per case (#676)",
-    "A File Viewer you can resize, with Back and Forward (#659)",
-    "Copilot's premium-request quota in the plan-usage chip (#662)",
-    "More (or fewer) sessions with `CODEMAN_MAX_SESSIONS` (#668)",
-    "Multi-line prompts keep their line breaks (#670)",
-    "A warning for llama.cpp slots that split the context too thin (#658)"
+    "The wrapped tab strip uses the room under the toolbar (#721)",
+    "Bodyless requests work through Cloudflare Tunnel (#725)",
+    "A desktop dead key is typed once, and Ctrl+V stays a paste after a replay (#726, #716)",
+    "Remote sessions no longer touch the local disk at their path (#722, #727, #728)",
+    "Rendered Markdown fills a resized File Viewer (#730)",
+    "A middle click on a file path opens the file (#731)",
+    "No more duplicate-key warning on build (#729)"
   ]
 }

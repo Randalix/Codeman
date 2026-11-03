@@ -46,6 +46,7 @@ import { rebootRestoreRegistry } from './reboot-restore-registry.js';
 import { runBootRemoteReattach } from './reboot-remote-reattach.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
+import { stopHostSensors } from '../host-sensors.js';
 import type { WebhookUrgency } from '../types/push.js';
 import { webviewFetch } from './webview-egress.js';
 import { readRemoteHosts, rehydrateRemoteHostFields } from '../remote-hosts.js';
@@ -100,6 +101,7 @@ import { getLifecycleLog } from '../session-lifecycle-log.js';
 import {
   applyWorkspaceHooks,
   pruneAgentSessionPreambles,
+  readGitFetchSettings,
   readKeepWarmSettingsOrThrow,
   readPlanUsageTelemetryEnabled,
   removeAgentSessionPreamble,
@@ -117,9 +119,10 @@ import {
 } from './session-listener-wiring.js';
 import { sessionWaits } from './session-wait-registry.js';
 import { intentStore } from '../intent-store.js';
+import { agentInbox } from './agent-inbox.js';
+import { agentInboxPersistence } from './agent-inbox-persistence.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
-import { agentInbox } from './agent-inbox.js';
 import { turnWatch } from './agent-watch.js';
 import { InboxNudger } from './inbox-nudger.js';
 import { CoordinatorReports, type MuteSnapshot, type SubscriptionSnapshot } from './coordinator-reports.js';
@@ -129,6 +132,10 @@ import { probeRemoteHostReachable } from '../remote-probe.js';
 import { remoteTmuxLocation } from '../tmux-manager.js';
 import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
 import { PromptCacheKeepWarmService } from '../prompt-cache-keepwarm.js';
+import { fetchWorkspaceOnce } from '../git-fetch.js';
+import { GitFetchScheduler } from '../git-fetch-scheduler.js';
+import { probePathKind } from '../utils/bounded-path-probe.js';
+import { defaultDockerWorkspaces } from './routes/git-status-routes.js';
 import { composerIsEmpty, plainFrame } from '../session-submit-verifier.js';
 import { detectUsageLimitPause } from '../usage-limit-patterns.js';
 import { EditHistorySync, remoteTranscriptIds } from './edit-history-sync.js';
@@ -189,6 +196,7 @@ import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
 import { MAX_ROUTE_PARAM_LENGTH } from './route-helpers.js';
+import { mutateSettingsFile } from './settings-writer.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage, setLatestCopilotPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -209,6 +217,7 @@ import {
 import { isMultiUserMode } from '../config/multiuser.js';
 import { bootstrapInitialAdmin, hasUsers, resolveClaudeModeForUsername } from '../user-store.js';
 import { installRouteErrorHandler } from './route-error-handler.js';
+import { installEmptyApiPostParser } from './request-body-parser.js';
 import { isExplicitlyEnabled, isLoopbackBindHost, buildHostPolicy, type HostPolicy } from './network-auth-policy.js';
 import {
   registerPushRoutes,
@@ -219,8 +228,8 @@ import {
   registerScheduledRoutes,
   registerHookEventRoutes,
   registerApprovalRoutes,
-  registerRebootRestoreRoutes,
   registerInboxRoutes,
+  registerRebootRestoreRoutes,
   registerAgentWatchRoutes,
   registerReadMyMindRoutes,
   registerGitStatusRoutes,
@@ -230,6 +239,7 @@ import {
   registerCaseRoutes,
   registerWorktreeRoutes,
   registerSessionRoutes,
+  registerAgentSessionRoutes,
   registerRespawnRoutes,
   registerRalphRoutes,
   registerPlanRoutes,
@@ -259,6 +269,7 @@ import {
 } from './routes/index.js';
 import { isLostWebviewFrameNavigation } from './webview-proxy.js';
 import { CronService } from '../cron/cron-service.js';
+import { caseSessionSettled } from '../case-rename.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -309,6 +320,7 @@ import {
   STATS_COLLECTION_INTERVAL_MS,
   INACTIVITY_TIMEOUT_MS,
   CRON_TICK_INTERVAL,
+  GIT_FETCH_TICK_INTERVAL_MS,
 } from '../config/server-timing.js';
 
 /**
@@ -360,7 +372,7 @@ export class WebServer extends EventEmitter {
     // Quiet mail (IDLE reports) is never worth a nudge on its own.
     unseen: (id) => agentInbox.unseen(id).filter((m) => !m.quiet),
     pendingCount: (id) => agentInbox.pendingCount(id),
-    isWaiting: (id) => agentInbox.summary().get(id)?.waiting === true,
+    isWaiting: (id) => sessionWaits.inboxWaiterCount(id, true) > 0,
     dialogOpen: (id) => {
       const kind = approvalInbox.getForSession(id)?.kind;
       return kind === 'question' || kind === 'permission';
@@ -430,11 +442,15 @@ export class WebServer extends EventEmitter {
     },
     post: (to, from, text, { quiet }) => {
       // What the post route does: read the wait before the post releases it.
-      const receiverWaiting = agentInbox.waiterCount(to) > 0;
+      const receiverWaiting = sessionWaits.inboxWaiterCount(to, true) > 0;
       const result = agentInbox.post(to, from, text, { quiet, replaceQuiet: true });
       if (!result.ok) return false;
-      // A quiet report (IDLE) waits for the next loud mail or the end of the wait slice.
-      if (!quiet) this.inboxNudger.schedule(to, from, { messageId: result.message.id, receiverWaiting });
+      // A quiet report (IDLE) waits for the next loud mail or the end of the wait slice:
+      // only a loud post wakes a parked reader (as the post route does) or the nudger.
+      if (!quiet) {
+        sessionWaits.notifyInbox(to);
+        this.inboxNudger.schedule(to, from, { messageId: result.message.id, receiverWaiting });
+      }
       return true;
     },
     withdraw: (to, from) => {
@@ -498,6 +514,37 @@ export class WebServer extends EventEmitter {
       if (status.state !== 'off' || status.reason !== 'off') {
         console.log(`[KeepWarm] ${id.slice(0, 8)}: ${status.state}${status.reason ? ` (${status.reason})` : ''}`);
       }
+    },
+    log: (message) => console.log(message),
+  });
+  // Git fetch on an interval (git-fetch-scheduler.ts): the due-tracking lives in the service; the server
+  // lends it the facts a decision needs and stores what it reports on the session. A field initializer for
+  // the same reason as the keep-warm one above, and the scheduler reads the app setting FRESH on every tick:
+  // that is what makes a live toggle take effect on the next tick, and what makes turning it off actually
+  // stop the fetching. Default OFF, so an install that never enabled it spawns nothing at all.
+  private readonly gitFetchScheduler = new GitFetchScheduler({
+    sessionIds: () => this.sessions.keys(),
+    getSession: (id) => this.sessions.get(id),
+    readSettings: readGitFetchSettings,
+    // The same Docker list the panel's Fetch button uses: the rule has to be one rule. It rejects on a list
+    // that cannot be read, and the tick then fetches nothing (fail closed).
+    dockerWorkspaces: defaultDockerWorkspaces,
+    // Bounded probe, DEFAULT options (rule #516): a tick is a bulk scan, so it keeps the stall cap and must
+    // never be handed `pastCap`. A folder on a mount that stopped answering is skipped, not fetched.
+    probePath: (path) => probePathKind(path),
+    // Through the join, so the tick and the panel's Fetch button are the same run: a click on a folder the
+    // tick is already fetching joins it rather than starting a second `git fetch` in the same clone, and the
+    // run that gets published is the one that ran, with its own trigger.
+    fetch: (cwd, opts, trigger) => fetchWorkspaceOnce(cwd, opts, trigger),
+    publish: (id, status) => {
+      const session = this.sessions.get(id);
+      if (!session?.setGitFetchStatus(status)) return;
+      // No new SSE event: the status rides the session state the page already listens for, and the Git
+      // panel polls on its own clock. It is written to disk with the rest of the record, but the restore
+      // copies only the fields its own config lists and this is not one of them (src/types/session.ts), so
+      // what a run found is the panel's truth for the life of the session, not across a restart.
+      this.persistSessionState(session);
+      this.broadcast(SseEvent.SessionUpdated, this.getSessionStateWithRespawn(session));
     },
     log: (message) => console.log(message),
   });
@@ -574,6 +621,7 @@ export class WebServer extends EventEmitter {
   private qrAuthFailures: StaleExpirationMap<string, number> | null = null;
   private hookSecretFailures: StaleExpirationMap<string, number> | null = null;
   private userFailures: StaleExpirationMap<string, number> | null = null;
+  private userIpFailures: StaleExpirationMap<string, number> | null = null;
   private pushStore: PushSubscriptionStore = new PushSubscriptionStore();
   /** ntfy / Slack / Discord / generic webhook for the push events; config in webhook.json (0600). */
   private webhookNotifier = new WebhookNotifier(() => readWebhookConfig(getDataDir()), webviewFetch);
@@ -583,6 +631,8 @@ export class WebServer extends EventEmitter {
   private windowTitle: string;
   private readonly indexHtmlTemplate: string;
   private readonly allowUnauthenticatedNetwork: boolean;
+  /** `--allow-unauthenticated-tunnel`; the tunnel guard reads it through the route context (#706). */
+  private readonly allowUnauthenticatedTunnel: boolean;
   private _pasteImageGcStop: (() => void) | null = null;
   private _eventLoopMonitor: EventLoopMonitorHandle | null = null;
   /** Opt-in hooks-only listener on the docker bridge gateway (CODEMAN_DOCKER_BRIDGE_HOOKS). */
@@ -600,7 +650,8 @@ export class WebServer extends EventEmitter {
     host: string = '127.0.0.1',
     titleHostname?: string,
     allowUnauthenticatedNetwork: boolean = false,
-    basePath: string = ''
+    basePath: string = '',
+    allowUnauthenticatedTunnel: boolean = false
   ) {
     super();
     this.setMaxListeners(0);
@@ -612,6 +663,7 @@ export class WebServer extends EventEmitter {
     this.testMode = testMode;
     this.allowUnauthenticatedNetwork =
       allowUnauthenticatedNetwork || isExplicitlyEnabled(process.env.CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK);
+    this.allowUnauthenticatedTunnel = allowUnauthenticatedTunnel;
     this.titleHostname = titleHostname || getHostname();
     this.windowTitle = `codeman:${this.titleHostname}`;
     this.indexHtmlTemplate = readFileSync(join(__dirname, 'public', 'index.html'), 'utf-8');
@@ -666,15 +718,6 @@ export class WebServer extends EventEmitter {
     approvalInbox.onPending = (item) => this.broadcast(SseEvent.ApprovalPending, { ...item });
     approvalInbox.onUpdated = (item) => this.broadcast(SseEvent.ApprovalUpdated, { ...item });
     approvalInbox.onResolved = (info) => this.broadcast(SseEvent.ApprovalResolved, { ...info });
-
-    // Agent inbox → SSE + persistence. Same shape: the singleton only sees these
-    // callbacks. The payload carries sessionId, so `inbox:` routes per owner. The
-    // store is restored here (before routes answer) and written debounced on every
-    // mutation, so a message posted right before a deploy restart is still there.
-    this.restoreAgentInbox();
-    agentInbox.onMessage = (sessionId, message, pending) =>
-      this.broadcast(SseEvent.InboxMessage, { sessionId, from: message.from, messageId: message.id, pending });
-    agentInbox.onChange = () => this.persistAgentInboxSoon();
 
     // Set up mux event listeners
     this.mux.on('sessionCreated', (session) => {
@@ -927,6 +970,8 @@ export class WebServer extends EventEmitter {
   private async registerSessionWithLayout(session: Session, placement?: SessionPlacementHint): Promise<TabLayout> {
     return this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner), session.id, placement, () => {
       this.sessions.set(session.id, session);
+      // In the map now, so a case rename lists (and on request stops) it instead of refusing the move.
+      caseSessionSettled(session);
       return () => {
         if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
       };
@@ -999,6 +1044,7 @@ export class WebServer extends EventEmitter {
       scheduledRuns: this.scheduledRuns,
       teamWatcher: this.teamWatcher,
       tunnelManager: this.tunnelManager,
+      allowUnauthenticatedTunnel: this.allowUnauthenticatedTunnel,
       pushStore: this.pushStore,
       startScheduledRun: this.startScheduledRun.bind(this),
       stopScheduledRun: this.stopScheduledRun.bind(this),
@@ -1086,7 +1132,11 @@ export class WebServer extends EventEmitter {
       this.qrAuthFailures = authState.qrAuthFailures;
       this.hookSecretFailures = authState.hookSecretFailures;
       this.userFailures = authState.userFailures;
+      this.userIpFailures = authState.userIpFailures;
     }
+
+    // Bodyless API POSTs may arrive as empty chunked streams through a proxy.
+    installEmptyApiPostParser(this.app);
 
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
     await this.app.register(fastifyWebsocket);
@@ -1362,6 +1412,21 @@ export class WebServer extends EventEmitter {
     registerReadMyMindRoutes(this.app, ctx);
     registerGitStatusRoutes(this.app, ctx);
     registerEditHistoryRoutes(this.app, ctx, this.editHistorySync);
+    // Git fetch on an interval: this is only the wake-up, the scheduler itself decides what is due. Off in
+    // tests for the same reason as the polls below: a test drives `tick()` directly instead of waiting on
+    // a timer the harness would have to keep alive. The setting is read FRESH inside `tick()`, so turning
+    // it on takes effect on the next tick and turning it off actually stops the fetching.
+    if (!this.testMode) {
+      this.cleanup.setInterval(
+        () => {
+          this.gitFetchScheduler.tick().catch((err) => {
+            console.error('[git fetch] interval tick failed:', getErrorMessage(err));
+          });
+        },
+        GIT_FETCH_TICK_INTERVAL_MS,
+        { description: 'git fetch interval checker' }
+      );
+    }
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     // The registry's lifetime is the server's: it drops per-session wake state on every
@@ -1370,6 +1435,7 @@ export class WebServer extends EventEmitter {
     this.remoteWake = registerSessionRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx, { remoteWake: this.remoteWake });
     registerWorktreeRoutes(this.app, ctx);
+    registerAgentSessionRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
@@ -1620,6 +1686,9 @@ export class WebServer extends EventEmitter {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     this.keepWarmService.remove(sessionId);
+    // A closed session takes its place in the fetch schedule with it: otherwise a detached-and-forgotten id
+    // would still count as tracked, and its next run would land on a session that no longer exists.
+    this.gitFetchScheduler.remove(sessionId);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
@@ -1830,6 +1899,11 @@ export class WebServer extends EventEmitter {
     // The 'exit' here is NOT redundant with the PTY-exit listener: listeners are
     // detached a few lines above, before `session.stop()`, so on a delete the
     // session's own exit event never reaches the registry.
+    // The agent inbox goes with a DELETED session only. killMux=false is shutdown or
+    // detach: mail posted before that is still there when the session is re-attached
+    // (while detached, the routes answer 404, so nothing new arrives). Before
+    // cancelAll, so a reader released by it reads an empty inbox.
+    if (killMux) agentInbox.drop(sessionId);
     sessionWaits.notifySignal(sessionId, 'exit');
     sessionWaits.cancelAll(sessionId);
     approvalInbox.resolveForSession(sessionId, 'session_ended');
@@ -1838,13 +1912,12 @@ export class WebServer extends EventEmitter {
     // rather than in the two delete routes, where it left an entry behind, including up
     // to 4 KB of the user's buffered keystrokes.
     this.remoteWake?.drop(sessionId);
-    // A detach keeps the session recoverable, so its mail is kept too; only a real
-    // delete discards the inbox. Waiters are released either way (the pane is gone).
-    if (killMux) agentInbox.drop(sessionId);
-    else agentInbox.detach(sessionId);
-    this.inboxNudger.drop(sessionId);
+    // The inbox itself was handled above (dropped on a delete, kept on a detach).
+    // Downstream fields, `?.` like `remoteWake`: upstream's wiring tests build the server
+    // without its constructor (Object.create) and only stub upstream's own members.
+    this.inboxNudger?.drop(sessionId);
     // Like the inbox: a detach keeps the session's subscriptions for when it comes back.
-    this.coordinatorReports.drop(sessionId, { keepSubscriptions: !killMux });
+    this.coordinatorReports?.drop(sessionId, { keepSubscriptions: !killMux });
 
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
   }
@@ -2050,6 +2123,16 @@ export class WebServer extends EventEmitter {
       '</head>',
       () => `<script>window.__codemanTranscriptPageKeys=${JSON.stringify(pageKeyClis)};</script>\n</head>`
     );
+    // Which run modes keep their PTY rows under a phone keyboard (inline renderers,
+    // the `keyboardHold` capability; `_keyboardHoldEligible` in terminal-ui.js). Same
+    // shape and reasoning as the page-key list above.
+    const keyboardHoldClis = enabledClis()
+      .filter((entry) => entry.capabilities.keyboardHold === 'inline')
+      .map((entry) => entry.id);
+    html = html.replace(
+      '</head>',
+      () => `<script>window.__codemanKeyboardHoldModes=${JSON.stringify(keyboardHoldClis)};</script>\n</head>`
+    );
     if (!soloSessionId && process.env.CODEMAN_GESTURE === '1') {
       html = html.replace('</head>', () => `<script>window.__codemanGestureAvailable=true;</script>\n</head>`);
       if (settings.gestureControlEnabled === true) {
@@ -2125,13 +2208,23 @@ export class WebServer extends EventEmitter {
     this.runSummaryTrackers.set(session.id, summaryTracker);
     summaryTracker.recordSessionStarted(session.mode, session.workingDir);
 
-    // Set working directory for Ralph tracker to auto-load @fix_plan.md (not supported for external CLIs)
+    // Set working directory for Ralph tracker to auto-load @fix_plan.md (not supported for external CLIs).
+    // A remote session's workingDir is a path on the remote host, and the watcher reads and
+    // fs.watch()es it on the LOCAL disk, so a remote session only records the path: the fix plan stays
+    // authoritative as for a local session (keeping the output-based completion guessers off), and its
+    // file is read over ssh only on an explicit import (fix-plan/read).
     if (!isExternalCliMode(session.mode)) {
-      session.ralphTracker.setWorkingDir(session.workingDir);
+      if (session.remote) {
+        session.ralphTracker.setRemoteWorkingDir(session.workingDir);
+      } else {
+        session.ralphTracker.setWorkingDir(session.workingDir);
+      }
     }
 
-    // Start watching for new images in this session's working directory (if enabled globally and per-session)
-    if ((await this.isImageWatcherEnabled()) && session.imageWatcherEnabled) {
+    // Start watching for new images in this session's working directory (if enabled globally and per-session).
+    // A remote session's workingDir is a path on the remote host, and the watcher watches it on the LOCAL
+    // disk, so it is skipped there (the per-session and app-wide toggles skip it too).
+    if ((await this.isImageWatcherEnabled()) && session.imageWatcherEnabled && !session.remote) {
       imageWatcher.watchSession(session.id, session.workingDir);
     }
 
@@ -2363,6 +2456,13 @@ export class WebServer extends EventEmitter {
   private async getAgentSkillEnabled(): Promise<boolean> {
     const settings = await this.readSettings();
     return settings.agentSkillEnabled === true;
+  }
+
+  // Whether pending agent-inbox mail is snapshotted to disk (synced
+  // `agentInboxPersistEnabled` setting). Default OFF: an absent key writes nothing.
+  private async getAgentInboxPersistEnabled(): Promise<boolean> {
+    const settings = await this.readSettings();
+    return settings.agentInboxPersistEnabled === true;
   }
 
   // Whether a Claude session installs Codeman's hooks block into its workspace
@@ -2845,70 +2945,6 @@ export class WebServer extends EventEmitter {
     this.sse.batchTerminalData(sessionId, data);
   }
 
-  // ========== Agent inbox persistence ==========
-
-  private agentInboxPersistTimer: NodeJS.Timeout | null = null;
-  /** The write in flight, if any; writes are chained so two never share the tmp file. */
-  private agentInboxWrite: Promise<void> = Promise.resolve();
-  /** Set when a change arrived while a write was in flight: run once more afterwards. */
-  private agentInboxDirty = false;
-
-  /** The whole-store snapshot file; small, rewritten atomically. */
-  private agentInboxPath(): string {
-    return dataPath('agent-inbox.json');
-  }
-
-  private restoreAgentInbox(): void {
-    if (this.testMode) return;
-    try {
-      const restored = agentInbox.restore(JSON.parse(readFileSync(this.agentInboxPath(), 'utf-8')));
-      if (restored > 0) console.log(`[Inbox] Restored ${restored} pending agent message(s)`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-        console.warn(`[Inbox] Could not restore agent inbox: ${getErrorMessage(err)}`);
-      }
-    }
-  }
-
-  private persistAgentInboxSoon(): void {
-    if (this.testMode) return;
-    if (this.agentInboxPersistTimer) return;
-    this.agentInboxPersistTimer = setTimeout(() => {
-      this.agentInboxPersistTimer = null;
-      void this.persistAgentInboxNow();
-    }, 250);
-  }
-
-  /**
-   * Write the snapshot, serialized: a second call while a write is in flight marks
-   * the store dirty and the running chain writes once more when it finishes. Two
-   * concurrent writers on the same tmp file interleave (both truncate, both write
-   * from offset 0) and the rename promotes a mix of two payloads — which then fails
-   * to parse at the next boot, losing every message the file exists to protect.
-   */
-  private persistAgentInboxNow(): Promise<void> {
-    if (this.testMode) return Promise.resolve();
-    if (this.agentInboxPersistTimer) {
-      clearTimeout(this.agentInboxPersistTimer);
-      this.agentInboxPersistTimer = null;
-    }
-    this.agentInboxDirty = true;
-    this.agentInboxWrite = this.agentInboxWrite.then(async () => {
-      while (this.agentInboxDirty) {
-        this.agentInboxDirty = false;
-        const path = this.agentInboxPath();
-        const tmp = `${path}.tmp`;
-        try {
-          await fs.writeFile(tmp, JSON.stringify(agentInbox.snapshot()), { mode: 0o600 });
-          await fs.rename(tmp, path);
-        } catch (err) {
-          console.warn(`[Inbox] Could not persist agent inbox: ${getErrorMessage(err)}`);
-        }
-      }
-    });
-    return this.agentInboxWrite;
-  }
-
   // ========== Coordinator report mutes ==========
 
   /** A handful of `id → until` pairs, rewritten whole and atomically on every change. */
@@ -3346,6 +3382,10 @@ export class WebServer extends EventEmitter {
     // This prevents race conditions where clients connect before state is ready
     // CRITICAL: Skip in test mode to prevent tests from picking up user sessions
     if (!this.testMode) {
+      // Pending agent mail first (opt-in snapshot), so it is in place before any
+      // route can answer. Pruned against the restored sessions in finalizeRestoredState.
+      const restoredMail = agentInboxPersistence.load(await this.getAgentInboxPersistEnabled());
+      if (restoredMail > 0) console.log(`[AgentInbox] restored ${restoredMail} pending message(s)`);
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
 
@@ -3652,16 +3692,12 @@ export class WebServer extends EventEmitter {
     // Tunnel only starts when user clicks the toggle in the UI — never on boot.
     // Reset persisted tunnelEnabled so the UI toggle reflects actual state.
     if (await this.isTunnelEnabled()) {
-      const settingsPath = dataPath('settings.json');
       try {
-        const content = await fs.readFile(settingsPath, 'utf-8');
-        const settings = JSON.parse(content);
-        settings.tunnelEnabled = false;
-        await fs.writeFile(settingsPath, JSON.stringify(settings, null, 2));
-      } catch {
-        /* ignore */
+        await mutateSettingsFile((settings) => ({ ...settings, tunnelEnabled: false }));
+        console.log('Cloudflare tunnel setting reset (tunnel only starts on explicit UI toggle)');
+      } catch (err) {
+        console.warn('Could not reset the Cloudflare tunnel setting:', getErrorMessage(err));
       }
-      console.log('Cloudflare tunnel setting reset (tunnel only starts on explicit UI toggle)');
     }
 
     // Start team watcher for agent team awareness (always on — lightweight polling)
@@ -3845,6 +3881,9 @@ export class WebServer extends EventEmitter {
     }
     if (saved.autoClearEnabled !== undefined || saved.autoClearThreshold !== undefined) {
       session.setAutoClear(saved.autoClearEnabled ?? false, saved.autoClearThreshold);
+    }
+    if (saved.gitFetchEnabled !== undefined || saved.gitFetchIntervalSeconds !== undefined) {
+      session.setGitFetchSettings(saved.gitFetchEnabled, saved.gitFetchIntervalSeconds);
     }
     if (saved.autoResumeEnabled) {
       // The stamp is re-armed by default, because a Codeman restart leaves the
@@ -4068,6 +4107,11 @@ export class WebServer extends EventEmitter {
               // below, a future `expiresAt` re-arms the timer once the pane is attached.
               lastRealPromptAt: savedState?.lastRealPromptAt,
               keepWarmEnabled: savedState?.keepWarmEnabled,
+              // The session's own fetch switch and interval, carried over rather than reset to the app default:
+              // the choice is the user's and outlives the run that made it. The scheduler reads them fresh
+              // on its next tick, so a restored session is back on its own schedule without a restart.
+              gitFetchEnabled: savedState?.gitFetchEnabled,
+              gitFetchIntervalSeconds: savedState?.gitFetchIntervalSeconds,
               // Conversations this pane provably owned, oldest first. Its tail is
               // the conversation the CLI was on when the server stopped, which is
               // what a re-attach must point the viewer at instead of the launch id.
@@ -4274,6 +4318,7 @@ export class WebServer extends EventEmitter {
             }
 
             this.sessions.set(session.id, session);
+            caseSessionSettled(session);
             await this.setupSessionListeners(session);
 
             // Auto-attach PTY to the surviving tmux session immediately.
@@ -4353,6 +4398,20 @@ export class WebServer extends EventEmitter {
     this.tabLayouts.markRestorationComplete();
     await this.cleanupStaleSessions();
     await this.tabLayouts.reconcileAfterRestoration();
+    // Same gate as the tab layouts: only a restore that succeeded may decide which
+    // inboxes are orphans. A failed one returns above and leaves every message alone.
+    // Kept: live sessions plus every record state.json still holds (a session that
+    // was not re-adopted this boot but is kept for recovery keeps its mail), plus the
+    // sessions on the reboot-restore offer. `cleanupStaleSessions()` above has already
+    // pruned their records, and a rebuild reuses the old id, so without them a restored
+    // session would come back to an empty inbox. The 12 h TTL bounds what is never rebuilt.
+    const keep = new Set([
+      ...this.sessions.keys(),
+      ...Object.keys(this.store.getSessions()),
+      ...rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId),
+    ]);
+    const pruned = agentInbox.pruneExcept(keep);
+    if (pruned > 0) console.log(`[AgentInbox] dropped ${pruned} inbox(es) of sessions that did not come back`);
   }
 
   /**
@@ -4513,6 +4572,9 @@ export class WebServer extends EventEmitter {
     // got wrong once.
     void stopDeepSeekWeb();
 
+    // The header's GPU / CPU clock sampler is a Windows child process under WSL, and its idle sweep a timer.
+    stopHostSensors();
+
     // Same teardown rule: the per-endpoint llama-swap log tails are otherwise closed
     // only by the periodic idle sweep, whose interval is disposed just below.
     closeAllLlamaSwapLogTails();
@@ -4529,16 +4591,20 @@ export class WebServer extends EventEmitter {
     sessionWaits.cancelEverything();
     approvalInbox.stop();
     this.keepWarmService.stop();
+    // Stops the fetch sweep from starting another run while the server is closing; a git process already
+    // running is left to finish, which is what a fetch does to a repository nothing else is touching.
+    this.gitFetchScheduler.stop();
+    // A post within the debounce window before shutdown would otherwise not reach disk.
+    // Flushed again after `app.close()` below, for a post that lands in between.
+    agentInboxPersistence.flush();
     // Same reason as `cancelEverything` above: an in-flight wake is awaited by a request,
-    // and `app.close()` (the last line of this method) does not abort in-flight requests —
+    // and `app.close()` (at the end of this method) does not abort in-flight requests,
     // so without this a restart during a wake waits out the readiness poll.
     this.remoteWake?.stop();
-    agentInbox.stop();
     turnWatch.stop();
     this.unsubscribeCoordinatorReports?.();
     this.coordinatorReports.stop();
     this.inboxNudger.stop();
-    await this.persistAgentInboxNow();
 
     this.lastRecordedTokens.clear();
 
@@ -4673,6 +4739,10 @@ export class WebServer extends EventEmitter {
       this.userFailures.dispose();
       this.userFailures = null;
     }
+    if (this.userIpFailures) {
+      this.userIpFailures.dispose();
+      this.userIpFailures = null;
+    }
     this.activePlanOrchestrators.clear();
     this.cleaningUp.clear();
     this.killingSessions.clear();
@@ -4680,7 +4750,13 @@ export class WebServer extends EventEmitter {
     // Dispose push store (flush pending saves)
     this.pushStore.dispose();
 
-    await this.app.close();
+    try {
+      await this.app.close();
+    } finally {
+      // The routes answer until `app.close()` returns, so a post after the flush above
+      // would otherwise sit in an unref'd debounce timer and never reach disk.
+      agentInboxPersistence.flush();
+    }
   }
 }
 
@@ -4691,9 +4767,19 @@ export async function startWebServer(
   host: string = '127.0.0.1',
   titleHostname?: string,
   allowUnauthenticatedNetwork: boolean = false,
-  basePath: string = ''
+  basePath: string = '',
+  allowUnauthenticatedTunnel: boolean = false
 ): Promise<WebServer> {
-  const server = new WebServer(port, https, testMode, host, titleHostname, allowUnauthenticatedNetwork, basePath);
+  const server = new WebServer(
+    port,
+    https,
+    testMode,
+    host,
+    titleHostname,
+    allowUnauthenticatedNetwork,
+    basePath,
+    allowUnauthenticatedTunnel
+  );
   await server.start();
   return server;
 }

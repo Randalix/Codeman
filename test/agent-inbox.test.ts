@@ -1,430 +1,279 @@
 /**
- * @fileoverview The agent inbox store (src/web/agent-inbox.ts): bounds, non-destructive
- * reads, ack semantics, long-poll release paths, and the persistence round trip.
+ * @fileoverview The agent inbox store (src/web/agent-inbox.ts), pure: no routes, no IO.
+ *
+ * Each block pins one rule from discussion #558: read until ack, seen only for the
+ * receiver, byte and count caps that refuse instead of dropping, a TTL counted from
+ * each message's own timestamp, and a snapshot that survives malformed input.
  */
-
-import { describe, expect, it, vi } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import {
   AgentInbox,
+  MAX_INBOX_BYTES,
+  MAX_MESSAGE_BYTES,
   MAX_MESSAGES_PER_INBOX,
-  MAX_TEXT_LENGTH,
-  WAITING_GRACE_MS,
-  clampWait,
+  MESSAGE_TTL_MS,
 } from '../src/web/agent-inbox.js';
-import { MIN_WAIT_MS, MAX_WAIT_MS, DEFAULT_WAIT_MS } from '../src/config/agent-wait.js';
 
-const A = 'aaaaaaaa-0000-4000-8000-000000000000';
-const B = 'bbbbbbbb-0000-4000-8000-000000000000';
+const RX = 'receiver-session';
 
-function make(): { inbox: AgentInbox; tick: (ms: number) => void } {
-  let t = 1_000;
-  const inbox = new AgentInbox(() => t);
-  return { inbox, tick: (ms) => (t += ms) };
-}
+describe('AgentInbox', () => {
+  let now: number;
+  let inbox: AgentInbox;
 
-describe('unseen', () => {
-  it('lists pending mail no non-peek read has handed out, and keeps later posts unseen', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'one');
-    await inbox.read(A, undefined, undefined, { peek: true });
-    expect(inbox.unseen(A).map((m) => m.text)).toEqual(['one']); // peek marks nothing
-    await inbox.read(A);
-    inbox.post(A, B, 'two');
-    expect(inbox.unseen(A).map((m) => m.text)).toEqual(['two']);
-    expect(inbox.unseen(B)).toEqual([]);
-  });
-});
-
-describe('post / list / ack', () => {
-  it('stores in order, reads are non-destructive, ack removes only the named ids', () => {
-    const { inbox } = make();
-    const first = inbox.post(A, B, 'one');
-    const second = inbox.post(A, 'label', 'two');
-    expect(first.ok && second.ok).toBe(true);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['one', 'two']);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['one', 'two']); // still there
-    expect(inbox.pendingCount(A)).toBe(2);
-    if (!first.ok) throw new Error('unreachable');
-    expect(inbox.ack(A, [first.message.id, 'unknown-id'])).toBe(1);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['two']);
-    expect(inbox.list(B)).toEqual([]); // inboxes are per session
+  beforeEach(() => {
+    now = 1_000_000;
+    inbox = new AgentInbox(() => now);
   });
 
-  it('refuses instead of dropping the oldest when the inbox is full', () => {
-    const { inbox } = make();
-    for (let i = 0; i < MAX_MESSAGES_PER_INBOX; i++) expect(inbox.post(A, B, `m${i}`).ok).toBe(true);
-    expect(inbox.post(A, B, 'overflow')).toEqual({ ok: false, reason: 'full' });
-    expect(inbox.list(A)[0].text).toBe('m0'); // nothing was evicted
+  const post = (text: string, from: string | null = 'sender') => {
+    const r = inbox.post(RX, from, text);
+    if (!r.ok) throw new Error(`post refused: ${r.reason}`);
+    return r.message;
+  };
+
+  describe('read until ack', () => {
+    it('a read removes nothing; the same messages come back until acked', () => {
+      const a = post('first');
+      const b = post('second');
+      expect(inbox.read(RX, { receiver: true }).messages.map((m) => m.id)).toEqual([a.id, b.id]);
+      expect(inbox.read(RX, { receiver: true }).messages.map((m) => m.id)).toEqual([a.id, b.id]);
+      expect(inbox.pendingCount(RX)).toBe(2);
+      expect(inbox.ack(RX, [a.id])).toBe(1);
+      expect(inbox.read(RX, { receiver: true }).messages.map((m) => m.id)).toEqual([b.id]);
+    });
+
+    it('ack is idempotent: an id that is already gone or never existed is not an error', () => {
+      const a = post('x');
+      expect(inbox.ack(RX, [a.id])).toBe(1);
+      expect(inbox.ack(RX, [a.id])).toBe(0);
+      expect(inbox.ack(RX, ['no-such-id'])).toBe(0);
+      expect(inbox.ack('no-such-session', [a.id])).toBe(0);
+    });
+
+    it('ack removes only the given ids, never a message posted after the read', () => {
+      const a = post('read me');
+      inbox.read(RX, { receiver: true });
+      const late = post('arrived after the read');
+      inbox.ack(RX, [a.id]);
+      expect(inbox.read(RX, { receiver: false }).messages.map((m) => m.id)).toEqual([late.id]);
+    });
+
+    it('keeps multi-line text byte for byte', () => {
+      const text = 'line one\nline two\r\n\ttabbed\n';
+      post(text);
+      expect(inbox.read(RX, { receiver: true }).messages[0].text).toBe(text);
+    });
   });
 
-  it('bounds text and from, and refuses empty text', () => {
-    const { inbox } = make();
-    expect(inbox.post(A, B, '')).toEqual({ ok: false, reason: 'text-empty' });
-    expect(inbox.post(A, B, 'x'.repeat(MAX_TEXT_LENGTH + 1))).toEqual({ ok: false, reason: 'text-too-long' });
-    expect(inbox.post(A, 'f'.repeat(129), 'ok')).toEqual({ ok: false, reason: 'from-too-long' });
-    expect(inbox.post(A, B, 'x'.repeat(MAX_TEXT_LENGTH)).ok).toBe(true);
+  describe('seen belongs to the receiver', () => {
+    it('a receiver read marks seen; the flag on each message is the state BEFORE this read', () => {
+      post('m');
+      const first = inbox.read(RX, { receiver: true });
+      expect(first.messages[0].seen).toBe(false);
+      expect(first.unseen).toBe(0);
+      const second = inbox.read(RX, { receiver: true });
+      expect(second.messages[0].seen).toBe(true);
+    });
+
+    it('a peek changes nothing: unseen stays unseen', () => {
+      post('m');
+      const peek = inbox.read(RX, { receiver: false });
+      expect(peek.messages[0].seen).toBe(false);
+      expect(peek.unseen).toBe(1);
+      expect(inbox.unseenCount(RX)).toBe(1);
+      expect(inbox.summary().get(RX)).toMatchObject({ pending: 1, unseen: 1 });
+    });
+
+    it('a message posted after a receiver read is unseen again', () => {
+      post('a');
+      inbox.read(RX, { receiver: true });
+      expect(inbox.unseenCount(RX)).toBe(0);
+      post('b');
+      expect(inbox.unseenCount(RX)).toBe(1);
+    });
   });
 
-  it('fires onMessage with the pending count and onChange on every mutation', () => {
-    const { inbox } = make();
-    const onMessage = vi.fn();
-    const onChange = vi.fn();
-    inbox.onMessage = onMessage;
-    inbox.onChange = onChange;
-    const r = inbox.post(A, B, 'hi');
-    expect(onMessage).toHaveBeenCalledWith(A, expect.objectContaining({ text: 'hi', from: B }), 1);
-    expect(onChange).toHaveBeenCalledTimes(1);
-    if (!r.ok) throw new Error('unreachable');
-    inbox.ack(A, [r.message.id]);
-    expect(onChange).toHaveBeenCalledTimes(2);
-    inbox.ack(A, ['nothing']); // no-op mutation: no change event
-    expect(onChange).toHaveBeenCalledTimes(2);
-    inbox.post(A, B, 'x');
-    inbox.clear(A);
-    expect(onChange).toHaveBeenCalledTimes(4);
-  });
-});
+  describe('caps refuse, never drop the oldest', () => {
+    it(`refuses message ${MAX_MESSAGES_PER_INBOX + 1} and keeps the first one`, () => {
+      const first = post('0');
+      for (let i = 1; i < MAX_MESSAGES_PER_INBOX; i++) post(String(i));
+      expect(inbox.post(RX, null, 'one too many')).toEqual({ ok: false, reason: 'inbox-full-count' });
+      const ids = inbox.read(RX, { receiver: false }).messages.map((m) => m.id);
+      expect(ids).toHaveLength(MAX_MESSAGES_PER_INBOX);
+      expect(ids[0]).toBe(first.id);
+    });
 
-describe('seen / ackSeen — reading no longer acknowledges', () => {
-  it('read marks exactly the returned messages as seen; ackSeen removes them', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'one');
-    inbox.post(A, B, 'two');
-    await inbox.read(A);
-    expect(inbox.pendingCount(A)).toBe(2); // a plain read is non-destructive
-    expect(inbox.ackSeen(A)).toBe(2);
-    expect(inbox.pendingCount(A)).toBe(0);
-  });
+    it('counts the per-message cap in UTF-8 bytes, not characters', () => {
+      // 'é' is 2 bytes: half the byte budget in characters already fills it.
+      expect(inbox.post(RX, null, 'é'.repeat(MAX_MESSAGE_BYTES / 2)).ok).toBe(true);
+      expect(inbox.post(RX, null, 'é'.repeat(MAX_MESSAGE_BYTES / 2 + 1))).toEqual({
+        ok: false,
+        reason: 'message-too-large',
+      });
+    });
 
-  it('ackSeen never removes a message that arrived after the read', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'order');
-    await inbox.read(A);
-    inbox.post(A, B, 'please stop'); // the sender posts again while the receiver works
-    expect(inbox.ackSeen(A)).toBe(1);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['please stop']);
-  });
+    it('refuses a post that would cross the per-inbox byte cap', () => {
+      const chunk = 'x'.repeat(MAX_MESSAGE_BYTES);
+      const fit = Math.floor(MAX_INBOX_BYTES / MAX_MESSAGE_BYTES);
+      for (let i = 0; i < fit; i++) post(chunk);
+      expect(inbox.post(RX, null, 'x'.repeat(MAX_INBOX_BYTES - fit * MAX_MESSAGE_BYTES + 1))).toEqual({
+        ok: false,
+        reason: 'inbox-full-bytes',
+      });
+      expect(inbox.pendingCount(RX)).toBe(fit);
+    });
 
-  it('peek marks nothing, so ackSeen leaves the message in place', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'order');
-    await inbox.read(A, 60_000, undefined, { peek: true });
-    expect(inbox.ackSeen(A)).toBe(0);
-    expect(inbox.pendingCount(A)).toBe(1);
+    it('an ack makes room again', () => {
+      const ids: string[] = [];
+      for (let i = 0; i < MAX_MESSAGES_PER_INBOX; i++) ids.push(post(String(i)).id);
+      inbox.ack(RX, [ids[0]]);
+      expect(inbox.post(RX, null, 'now it fits').ok).toBe(true);
+    });
+
+    it('refuses empty text', () => {
+      expect(inbox.post(RX, null, '')).toEqual({ ok: false, reason: 'empty' });
+    });
   });
 
-  it('a second read of the same message stays seen; an empty ackSeen is a no-op with no change event', async () => {
-    const { inbox } = make();
-    const onChange = vi.fn();
-    inbox.onChange = onChange;
-    inbox.post(A, B, 'x'); // one change event
-    await inbox.read(A);
-    await inbox.read(A);
-    expect(inbox.ackSeen(A)).toBe(1); // exactly one removal
-    expect(onChange).toHaveBeenCalledTimes(2);
-    expect(inbox.ackSeen(A)).toBe(0); // nothing seen anymore: no mutation
-    expect(onChange).toHaveBeenCalledTimes(2);
+  describe('TTL from the message timestamp', () => {
+    it('a message older than the TTL is gone, read or not', () => {
+      post('old');
+      now += MESSAGE_TTL_MS / 2;
+      const fresh = post('fresh');
+      now += MESSAGE_TTL_MS / 2 + 1;
+      expect(inbox.read(RX, { receiver: false }).messages.map((m) => m.id)).toEqual([fresh.id]);
+    });
+
+    it('a restore keeps createdAt, so a restart does not restart the clock', () => {
+      post('m');
+      const snap = JSON.parse(JSON.stringify(inbox.snapshot()));
+      now += MESSAGE_TTL_MS - 1000;
+      const restarted = new AgentInbox(() => now);
+      expect(restarted.restore(snap)).toBe(1);
+      now += 1001;
+      expect(restarted.pendingCount(RX)).toBe(0);
+    });
+
+    it('does not restore a message that expired while the server was down', () => {
+      post('m');
+      const snap = inbox.snapshot();
+      now += MESSAGE_TTL_MS + 1;
+      expect(new AgentInbox(() => now).restore(snap)).toBe(0);
+    });
+
+    it('sweeps an expired message that is not first (clock stepped back)', () => {
+      const late = post('posted first, stamped later');
+      now -= 1000; // the clock steps back
+      const early = post('posted second, stamped earlier');
+      now += MESSAGE_TTL_MS + 1000 - (late.createdAt - early.createdAt) / 2;
+      // `early` is past the TTL, `late` is not, and `early` sits behind `late`.
+      expect(inbox.read(RX, { receiver: false }).messages.map((m) => m.id)).toEqual([late.id]);
+    });
+
+    it('expiry fires onChange so the snapshot catches up', () => {
+      post('m');
+      let changes = 0;
+      inbox.onChange = () => changes++;
+      now += MESSAGE_TTL_MS + 1;
+      inbox.summary();
+      expect(changes).toBe(1);
+    });
   });
 
-  it('clear() and drop() forget the seen set so stale ids cannot acknowledge a later message', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'x');
-    await inbox.read(A);
-    inbox.clear(A);
-    inbox.post(A, B, 'y');
-    expect(inbox.ackSeen(A)).toBe(0);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['y']);
+  describe('summary', () => {
+    it('reports counts and the oldest unseen time, never text', () => {
+      const a = post('secret one');
+      now += 10;
+      post('secret two');
+      inbox.read(RX, { receiver: true });
+      now += 10;
+      const c = post('secret three');
+      const row = inbox.summary().get(RX);
+      expect(row).toEqual({ pending: 3, unseen: 1, oldestUnseenAt: c.createdAt });
+      expect(JSON.stringify(row)).not.toContain('secret');
+      expect(a.createdAt).toBeLessThan(c.createdAt);
+    });
 
-    inbox.drop(A);
-    inbox.post(A, B, 'z');
-    await inbox.read(A);
-    expect(inbox.ackSeen(A)).toBe(1);
+    it('leaves out sessions with an empty inbox', () => {
+      const a = post('m');
+      inbox.ack(RX, [a.id]);
+      expect(inbox.summary().has(RX)).toBe(false);
+    });
   });
 
-  it('an explicit ack removes the id from the seen set too', async () => {
-    const { inbox } = make();
-    const r = inbox.post(A, B, 'x');
-    if (!r.ok) throw new Error('unreachable');
-    await inbox.read(A);
-    expect(inbox.ack(A, [r.message.id])).toBe(1);
-    expect(inbox.ackSeen(A)).toBe(0); // already acked, no double count
-  });
-});
+  describe('lifecycle', () => {
+    it('drop discards the inbox and fires onChange', () => {
+      post('m');
+      let changes = 0;
+      inbox.onChange = () => changes++;
+      inbox.drop(RX);
+      expect(inbox.pendingCount(RX)).toBe(0);
+      expect(changes).toBe(1);
+    });
 
-describe('read with wait', () => {
-  it('answers at once when something is pending, without waiting', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'ready');
-    const result = await inbox.read(A, 60_000);
-    expect(result.messages.map((m) => m.text)).toEqual(['ready']);
-    expect(result.waitedMs).toBe(0);
-    expect(result.timedOut).toBe(false);
-  });
-
-  it('a post releases a pending wait', async () => {
-    const { inbox } = make();
-    const pending = inbox.read(A, 5_000);
-    expect(inbox.waiterCount(A)).toBe(1);
-    inbox.post(A, B, 'arrived');
-    const result = await pending;
-    expect(result.messages.map((m) => m.text)).toEqual(['arrived']);
-    expect(result.timedOut).toBe(false);
-    expect(inbox.waiterCount(A)).toBe(0);
+    it('pruneExcept drops only inboxes of sessions not kept', () => {
+      inbox.post('keep-me', null, 'a');
+      inbox.post('gone', null, 'b');
+      expect(inbox.pruneExcept(['keep-me'])).toBe(1);
+      expect(inbox.pendingCount('keep-me')).toBe(1);
+      expect(inbox.pendingCount('gone')).toBe(0);
+    });
   });
 
-  it('a post to ANOTHER inbox does not release the wait', async () => {
-    vi.useFakeTimers();
-    try {
-      const { inbox, tick } = make();
-      const pending = inbox.read(A, MIN_WAIT_MS);
-      inbox.post(B, A, 'not for you');
-      tick(MIN_WAIT_MS);
-      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
-      const result = await pending;
-      expect(result.messages).toEqual([]);
-      expect(result.timedOut).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
+  describe('snapshot / restore', () => {
+    it('round-trips messages, senders and the seen state', () => {
+      const a = post('from a session', 'sender-1');
+      post('from the user', null);
+      inbox.read(RX, { receiver: true });
+      const c = post('unseen');
+      const restored = new AgentInbox(() => now);
+      expect(restored.restore(JSON.parse(JSON.stringify(inbox.snapshot())))).toBe(3);
+      const read = restored.read(RX, { receiver: false });
+      expect(read.messages.map((m) => [m.id, m.from, m.seen])).toEqual([
+        [a.id, 'sender-1', true],
+        [expect.any(String), null, true],
+        [c.id, 'sender', false],
+      ]);
+    });
 
-  it('detach() releases waiters but KEEPS the mail; drop() discards it', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'while away');
-    const waiting = inbox.read(B, 5_000);
-    inbox.detach(B);
-    expect((await waiting).timedOut).toBe(false);
-    inbox.detach(A);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['while away']); // still there after re-adoption
-    inbox.drop(A);
-    expect(inbox.list(A)).toEqual([]);
-  });
+    it('skips malformed entries and files instead of throwing', () => {
+      const restored = new AgentInbox(() => now);
+      expect(restored.restore(null)).toBe(0);
+      expect(restored.restore({ version: 2, inboxes: {} })).toBe(0);
+      expect(restored.restore({ version: 1, inboxes: { s: 'nope' } })).toBe(0);
+      const good = { id: 'g', from: null, text: 'ok', createdAt: now, seenAt: null };
+      expect(
+        restored.restore({
+          version: 1,
+          inboxes: {
+            s: [
+              good,
+              { id: 1 },
+              { ...good, id: 'big', text: 'x'.repeat(MAX_MESSAGE_BYTES + 1) },
+              { ...good, text: '' },
+            ],
+          },
+        })
+      ).toBe(1);
+    });
 
-  it('pruneExcept() drops inboxes of sessions that did not come back, once, with one change event', () => {
-    const { inbox } = make();
-    inbox.post(A, 'x', 'keep');
-    inbox.post(B, 'x', 'orphan');
-    const onChange = vi.fn();
-    inbox.onChange = onChange;
-    expect(inbox.pruneExcept([A])).toBe(1);
-    expect(inbox.list(A)).toHaveLength(1);
-    expect(inbox.list(B)).toEqual([]);
-    expect(onChange).toHaveBeenCalledTimes(1);
-    expect(inbox.pruneExcept([A])).toBe(0);
-    expect(onChange).toHaveBeenCalledTimes(1); // nothing to prune → no write
-  });
+    it('restores oldest first whatever the file order, so the caps keep the oldest', () => {
+      const msg = (id: string, createdAt: number) => ({ id, from: null, text: 'x', createdAt, seenAt: null });
+      const restored = new AgentInbox(() => now);
+      restored.restore({ version: 1, inboxes: { s: [msg('new', now - 10), msg('old', now - 20)] } });
+      expect(restored.read('s', { receiver: false }).messages.map((m) => m.id)).toEqual(['old', 'new']);
+    });
 
-  it('timedOut names the release path, not a clock comparison', async () => {
-    vi.useFakeTimers();
-    try {
-      // The clock never advances, so a wall-clock check would say "not a timeout".
-      const inbox = new AgentInbox(() => 42);
-      const pending = inbox.read(A, MIN_WAIT_MS);
-      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
-      expect((await pending).timedOut).toBe(true);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('drop() and stop() release waiters without a timeout flag', async () => {
-    const { inbox } = make();
-    const dropped = inbox.read(A, 5_000);
-    inbox.drop(A);
-    expect((await dropped).timedOut).toBe(false);
-    const stopped = inbox.read(B, 5_000);
-    inbox.stop();
-    expect((await stopped).timedOut).toBe(false);
-    expect(inbox.post(B, A, 'late')).toEqual({ ok: false, reason: 'stopped' });
-  });
-
-  it('an aborted wait gives its slot back at once and answers without a timeout flag', async () => {
-    const { inbox } = make();
-    const controller = new AbortController();
-    const pending = inbox.read(A, 5_000, controller.signal);
-    expect(inbox.waiterCount(A)).toBe(1);
-    controller.abort();
-    const result = await pending;
-    expect(result.timedOut).toBe(false);
-    expect(result.messages).toEqual([]);
-    expect(inbox.waiterCount(A)).toBe(0);
-    // An already-aborted signal never registers a waiter.
-    const dead = await inbox.read(A, 5_000, controller.signal);
-    expect(dead.waitedMs).toBe(0);
-    expect(inbox.waiterCount(A)).toBe(0);
-  });
-
-  it('clamps the wait like the wait primitives', () => {
-    expect(clampWait(undefined)).toBe(DEFAULT_WAIT_MS);
-    expect(clampWait(1)).toBe(MIN_WAIT_MS);
-    expect(clampWait(MAX_WAIT_MS * 10)).toBe(MAX_WAIT_MS);
-    expect(clampWait(5_000)).toBe(5_000);
-  });
-});
-
-describe('quiet mail (IDLE digest, w3c 2026-10-11)', () => {
-  const C = 'cccccccc-0000-4000-8000-000000000000';
-
-  it('a quiet post does not release a wait; the next loud post brings both', async () => {
-    const { inbox } = make();
-    const pending = inbox.read(A, 5_000);
-    inbox.post(A, B, '[codeman watch] IDLE b', { quiet: true });
-    expect(inbox.waiterCount(A)).toBe(1);
-    inbox.post(A, C, 'result');
-    const result = await pending;
-    expect(result.messages.map((m) => [m.text, m.quiet === true])).toEqual([
-      ['[codeman watch] IDLE b', true],
-      ['result', false],
-    ]);
-  });
-
-  it('a wait that finds only quiet mail keeps waiting, and hands it out when it runs out', async () => {
-    vi.useFakeTimers();
-    try {
-      const { inbox, tick } = make();
-      inbox.post(A, B, '[codeman watch] IDLE b', { quiet: true });
-      const pending = inbox.read(A, MIN_WAIT_MS);
-      expect(inbox.waiterCount(A)).toBe(1);
-      tick(MIN_WAIT_MS);
-      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
-      const result = await pending;
-      expect(result.timedOut).toBe(true);
-      expect(result.messages.map((m) => m.text)).toEqual(['[codeman watch] IDLE b']);
-      // Handed out, so ack takes it like any other message.
-      expect(inbox.ackSeen(A)).toBe(1);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('a plain read (no wait) returns quiet mail at once', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'status', { quiet: true });
-    expect((await inbox.read(A)).messages.map((m) => m.text)).toEqual(['status']);
-  });
-
-  it('replaceQuiet keeps one current line per sender, never touching seen, loud or other senders', async () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'b old (seen)', { quiet: true });
-    await inbox.read(A); // hands out 'b old (seen)'
-    inbox.post(A, B, 'b loud');
-    inbox.post(A, C, 'c status', { quiet: true });
-    inbox.post(A, B, 'b status 1', { quiet: true, replaceQuiet: true });
-    inbox.post(A, B, 'b status 2', { quiet: true, replaceQuiet: true });
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['b old (seen)', 'b loud', 'c status', 'b status 2']);
-    expect(inbox.withdrawQuiet(A, B)).toBe(1);
-    expect(inbox.list(A).map((m) => m.text)).toEqual(['b old (seen)', 'b loud', 'c status']);
-  });
-
-  it('the quiet flag survives a restart', () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'status', { quiet: true });
-    inbox.post(A, B, 'loud');
-    const restored = new AgentInbox();
-    expect(restored.restore(JSON.parse(JSON.stringify(inbox.snapshot())))).toBe(2);
-    expect(restored.list(A).map((m) => m.quiet)).toEqual([true, undefined]);
-    // A malformed flag is refused like any malformed entry.
-    const bad = { version: 1, inboxes: { [A]: [{ id: 'x', from: B, text: 't', createdAt: 1, quiet: 'yes' }] } };
-    expect(new AgentInbox().restore(bad)).toBe(0);
-  });
-});
-
-describe('summary — who is waiting for whom', () => {
-  // The state that cost a planner/builder pair 26 minutes: one side parked on its
-  // inbox, the other idle with nothing to read. The store records since WHEN a
-  // session has been waiting; the CLI folds it into `ls`.
-  it('reports pending counts and a wait that began with the first waiter', async () => {
-    const { inbox, tick } = make();
-    inbox.post(B, A, 'unread');
-    expect(inbox.summary().get(B)).toEqual({ pending: 1, waiting: false, waitingSince: null });
-
-    const pending = inbox.read(A, 5_000);
-    const since = 1_000;
-    expect(inbox.summary().get(A)).toEqual({ pending: 0, waiting: true, waitingSince: since });
-    tick(4_000);
-    expect(inbox.summary().get(A)?.waitingSince).toBe(since); // still the first one
-
-    inbox.post(A, B, 'here you go');
-    await pending;
-    // Released by a post: the wait is over.
-    expect(inbox.summary().get(A)).toEqual({ pending: 1, waiting: false, waitingSince: null });
-  });
-
-  it('keeps the wait clock across the timeout slices of a looping long-poll', async () => {
-    // `inbox --wait 590000` in a Monitor loops: each slice ends in a timeout and the
-    // next request follows within milliseconds. Resetting on every slice would make
-    // `ls` say "waiting since just now" every ten minutes.
-    vi.useFakeTimers();
-    try {
-      let t = 10_000;
-      const inbox = new AgentInbox(() => t);
-      const first = inbox.read(A, MIN_WAIT_MS);
-      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
-      t += MIN_WAIT_MS;
-      expect((await first).timedOut).toBe(true);
-      // Between slices: still waiting, inside the grace.
-      expect(inbox.summary().get(A)).toEqual({ pending: 0, waiting: true, waitingSince: 10_000 });
-      t += 50;
-      const second = inbox.read(A, MIN_WAIT_MS);
-      expect(inbox.summary().get(A)?.waitingSince).toBe(10_000);
-      inbox.post(A, B, 'x');
-      await second;
-      expect(inbox.summary().get(A)?.waiting).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('forgets a wait whose last waiter left longer ago than the grace', async () => {
-    vi.useFakeTimers();
-    try {
-      let t = 10_000;
-      const inbox = new AgentInbox(() => t);
-      const pending = inbox.read(A, MIN_WAIT_MS);
-      await vi.advanceTimersByTimeAsync(MIN_WAIT_MS);
-      t += MIN_WAIT_MS;
-      await pending;
-      t += WAITING_GRACE_MS + 1;
-      expect(inbox.summary().get(A)).toBeUndefined(); // no mail, no waiter: not listed at all
-      // A NEW wait after the grace starts a new clock.
-      const later = inbox.read(A, MIN_WAIT_MS);
-      expect(inbox.summary().get(A)?.waitingSince).toBe(t);
-      inbox.drop(A);
-      await later;
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('an aborted wait counts as left, a drop as over', async () => {
-    const { inbox, tick } = make();
-    const controller = new AbortController();
-    const pending = inbox.read(A, 5_000, controller.signal);
-    controller.abort();
-    await pending;
-    expect(inbox.summary().get(A)?.waiting).toBe(true); // inside the grace
-    tick(WAITING_GRACE_MS + 1);
-    expect(inbox.summary().get(A)).toBeUndefined();
-
-    const other = inbox.read(B, 5_000);
-    inbox.drop(B);
-    await other;
-    expect(inbox.summary().get(B)).toBeUndefined();
-  });
-});
-
-describe('persistence', () => {
-  it('snapshot → restore round-trips and skips malformed entries', () => {
-    const { inbox } = make();
-    inbox.post(A, B, 'keep');
-    const snap = inbox.snapshot();
-    const fresh = new AgentInbox();
-    expect(fresh.restore(snap)).toBe(1);
-    expect(fresh.list(A).map((m) => m.text)).toEqual(['keep']);
-    expect(fresh.restore({ version: 1, inboxes: { [A]: [{ id: 'x' }, 'junk', null] } })).toBe(0);
-    expect(fresh.list(A)).toEqual([]);
-    expect(fresh.restore(null)).toBe(0);
-    expect(fresh.restore({ version: 2, inboxes: {} })).toBe(0);
-    expect(fresh.restore('garbage')).toBe(0);
+    it('holds the count cap on restore', () => {
+      const many = Array.from({ length: MAX_MESSAGES_PER_INBOX + 5 }, (_, i) => ({
+        id: `m${i}`,
+        from: null,
+        text: 'x',
+        createdAt: now,
+        seenAt: null,
+      }));
+      const restored = new AgentInbox(() => now);
+      expect(restored.restore({ version: 1, inboxes: { s: many } })).toBe(MAX_MESSAGES_PER_INBOX);
+    });
   });
 });

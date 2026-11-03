@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -22,7 +22,13 @@ describe('remote claude --model survives every shell layer', () => {
     // ssh <opts…> user@host '<remote command>': run the last argument in a shell.
     script('ssh', 'for last; do :; done\nexec sh -c "$last"');
     // tmux … new-session -A -s <name> -c <dir> '<command>' \; set …: run the command.
-    script('tmux', 'while [ "$#" -gt 0 ]; do if [ "$1" = -c ]; then exec sh -c "$3"; fi; shift; done\nexit 9');
+    // In ~/.local/bin: `withRemoteTmuxPath` puts that (and /usr/bin) ahead of the
+    // inherited PATH, so a stand-in anywhere else would lose to the real tmux.
+    mkdirSync(join(dir, '.local', 'bin'), { recursive: true });
+    script(
+      join('.local', 'bin', 'tmux'),
+      'while [ "$#" -gt 0 ]; do if [ "$1" = -c ]; then exec sh -c "$3"; fi; shift; done\nexit 9'
+    );
     // One argv element per line, so a split or globbed argument shows.
     script('claude', `printf '%s\\n' "$@" > '${dir}/argv'`);
     // The login shell (`-i -l`) resets PATH from /etc/profile, then reads ~/.profile —

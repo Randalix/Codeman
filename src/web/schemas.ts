@@ -24,6 +24,7 @@ import { MIN_MATCH_LENGTH, MAX_MATCH_LENGTH } from '../config/agent-wait.js';
 import { MAX_WAKE_MACS } from '../config/remote-wake-limits.js';
 import { MAX_INPUT_LENGTH } from '../config/terminal-limits.js';
 import { AGENT_API_URL_PATTERN } from '../remote-agent-cli.js';
+import { MAX_MESSAGE_BYTES } from './agent-inbox.js';
 import { enabledCliIds, enabledClis } from '../config/cli-registry/registry.js';
 import type { SessionMode } from '../types.js';
 import { isAdvisorModel } from '../types/session.js';
@@ -1316,29 +1317,6 @@ export const ApprovalAnswerSchema = z
   })
   .strict();
 
-/**
- * Agent inbox (`/api/sessions/:id/inbox`, web/agent-inbox.ts). Caps mirror
- * MAX_TEXT_LENGTH / MAX_FROM_LENGTH there; `wait` follows the agent-wait grammar
- * (positive integer ms, clamped in the store, anything else a 400 — never "0 means
- * forever").
- */
-export const InboxPostSchema = z
-  .object({
-    text: z.string().min(1).max(16_384),
-    from: z.string().min(1).max(128).optional(),
-    /** false: store only, never type a nudge into the receiver (see web/inbox-nudger). */
-    nudge: z.boolean().optional(),
-  })
-  .strict();
-
-export const InboxAckSchema = z
-  .object({
-    // Omitted/empty = acknowledge everything this session has read (`ackSeen`); explicit
-    // ids stay for callers that need to acknowledge a subset.
-    ids: z.array(z.string().min(1).max(64)).min(1).max(200).optional(),
-  })
-  .strict();
-
 /** GET /api/agent-watch */
 export const AgentWatchQuerySchema = z
   .object({
@@ -1367,14 +1345,6 @@ export const ReportMuteSchema = z
       .int()
       .nonnegative()
       .max(24 * 60 * 60_000),
-  })
-  .strict();
-
-export const InboxReadQuerySchema = z
-  .object({
-    wait: z.coerce.number().int().positive().optional(),
-    // 1 = mark nothing as seen (a monitor's non-consuming peek).
-    peek: z.coerce.number().int().min(0).max(1).optional(),
   })
   .strict();
 
@@ -1565,6 +1535,19 @@ export const SettingsUpdateSchema = z
     /** Hours after the last real prompt during which keep-alives are sent (default 2, DEFAULT_KEEP_WARM_MAX_HOURS). */
     promptCacheKeepWarmMaxHours: z.number().min(0.5).max(24).optional(),
     /**
+     * Git fetch on an interval (src/git-fetch-scheduler.ts): `git fetch` for the repositories the Git panel
+     * lists, run on a timer instead of only on the panel's Fetch click. SYNCED, default OFF, because the
+     * server is what runs it: `git fetch` is the only git command the Git panel runs that writes (cloning
+     * and worktree management write too, but only when the user asked for them at the moment they asked), and
+     * the only one that can run later by itself, on a timer, and the only one that can run a repository's own
+     * hooks (`reference-transaction`, `pre-auto-gc` through the automatic maintenance a fetch triggers, config
+     * commands such as `credential.helper`), so nothing runs on a timer until the user turns this on. Cap in seconds between runs (30 to 3600, default 300). A
+     * session can override both in Session Options → Git; `null` there clears the override, and sessions
+     * sharing one folder are fetched by one run.
+     */
+    gitFetchEnabled: z.boolean().optional(),
+    gitFetchIntervalSeconds: z.number().int().min(30).max(3600).optional(),
+    /**
      * Spawned tabs follow their parent: a session created by another one keeps
      * following its parent's tab (into its group, moving with it) until moved by
      * hand. SYNCED, default OFF, because the server does the placement:
@@ -1615,6 +1598,19 @@ export const SettingsUpdateSchema = z
     /** Also drop snapshots older than this many days; 0 = no age limit. */
     configBackupKeepDays: z.number().int().min(0).max(3650).optional(),
     /**
+     * Agent inbox snapshot on disk (src/web/agent-inbox-persistence.ts). SYNCED, default OFF:
+     * off means no file is written, and switching it off deletes the snapshot (the in-memory
+     * inboxes stay). On, pending messages between agents survive a server restart.
+     */
+    agentInboxPersistEnabled: z.boolean().optional(),
+    /**
+     * Experimental agent coordination (src/web/routes/agent-session-routes.ts): bounded
+     * inspection and the guarded stage/submit routes behind `codeman agent inspect|stage|submit`.
+     * SYNCED, default OFF: the routes are labeled experimental and may change in a minor or
+     * patch release, so automation has to opt in. While OFF, all three routes answer 403.
+     */
+    agentCoordinationEnabled: z.boolean().optional(),
+    /**
      * Read My Mind predictor model override. Empty/absent = the AI-checker
      * default (opus: prediction quality is the product and it runs only on an
      * explicit press). Shell-safety is validated again at spawn time.
@@ -1624,7 +1620,7 @@ export const SettingsUpdateSchema = z
     // Action field (NOT persisted): explicit per-request acknowledgment that the
     // operator accepts exposing an UNAUTHENTICATED public tunnel (no CODEMAN_PASSWORD).
     // Lets the UI enable a tunnel after a confirm dialog without the
-    // CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK env var. Stripped before persisting.
+    // CODEMAN_ALLOW_UNAUTHENTICATED_TUNNEL opt-in. Stripped before persisting.
     acknowledgeUnauthTunnel: z.boolean().optional(),
     tabTwoRows: z.boolean().optional(),
     /**
@@ -1913,6 +1909,44 @@ export const SessionWaitOutputQuerySchema = z.object({
   timeout: z.coerce.number().int().positive().optional(),
 });
 
+// ========== Agent Inbox Routes ==========
+
+/**
+ * Body for `POST /api/sessions/:id/inbox`. The byte cap (`MAX_MESSAGE_BYTES`) is the
+ * store's, checked there in UTF-8 bytes; this bound is only the outer fence so a
+ * multi-megabyte body never reaches it. It is 4× the byte cap in characters (a UTF-8
+ * character is at most 4 bytes), so every over-size message gets the store's answer,
+ * which tells the sender what to do instead. Multi-line text is fine: it is stored and
+ * handed back as data, never typed.
+ */
+export const InboxPostSchema = z
+  .object({
+    text: z
+      .string()
+      .min(1, 'text must not be empty')
+      .max(4 * MAX_MESSAGE_BYTES),
+    /** Downstream: false stores only, never types a nudge into the receiver (web/inbox-nudger). */
+    nudge: z.boolean().optional(),
+  })
+  .strict();
+
+/** Query for `GET /api/sessions/:id/inbox`. `wait` follows the wait routes' `timeout`: clamped, never a 400 for size. */
+export const InboxReadQuerySchema = z.object({
+  wait: z.coerce.number().int().positive().optional(),
+  /** Downstream: 1 = read as a peek even when the caller is the receiver (a monitor loop). */
+  peek: z.coerce.number().int().min(0).max(1).optional(),
+});
+
+/**
+ * Body for `POST /api/sessions/:id/inbox/ack`: the ids a read handed out. Downstream:
+ * omitted acknowledges every message a receiver read has handed out (`ackSeen`).
+ */
+export const InboxAckSchema = z
+  .object({
+    ids: z.array(z.string().min(1).max(64)).min(1).max(200).optional(),
+  })
+  .strict();
+
 // ========== Session Mutation Routes ==========
 
 /** PUT /api/sessions/:id/name */
@@ -1980,6 +2014,15 @@ export const AutoResumeSchema = z.object({
 
 /** `POST /api/sessions/:id/keep-warm`: `null` clears the session's choice so the app-wide default applies. */
 export const KeepWarmSchema = z.object({ enabled: z.boolean().nullable() });
+
+/**
+ * `POST /api/sessions/:id/git-fetch-settings`: `null` clears the session's choice so the app-wide default
+ * applies. Both fields are optional, so a row that saves on its own does not clear the other.
+ */
+export const GitFetchSettingsSchema = z.object({
+  enabled: z.boolean().nullable().optional(),
+  intervalSeconds: z.number().int().min(30).max(3600).nullable().optional(),
+});
 
 /** POST /api/sessions/:id/pin (COD-139) — explicit pin state for idempotency. */
 export const PinSessionSchema = z.object({
@@ -2082,6 +2125,21 @@ export const LinkCaseSchema = z.object({
   name: z.string().regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format'),
   path: safePathSchema,
 });
+
+/** POST /api/cases/:name/rename */
+export const RenameCaseSchema = z
+  .object({
+    newName: z
+      .string()
+      .min(1)
+      .max(100)
+      .regex(/^[a-zA-Z0-9_-]+$/, 'Invalid case name format. Use only letters, numbers, hyphens, underscores.'),
+    /** Linked cases only: also rename the real folder on disk (a case under the cases directory always moves). */
+    renameFolder: z.boolean().optional(),
+    /** Stop the live sessions that have the folder open, instead of refusing with the list of them. */
+    stopSessions: z.boolean().optional(),
+  })
+  .strict();
 
 /** PUT /api/cases/order */
 export const CaseOrderSchema = z.object({
@@ -2448,3 +2506,15 @@ export const CustomModelSelectionSchema = z.union([
   }),
   z.object({ clear: z.literal(true) }),
 ]);
+
+/** Agent inspection bounds are bytes of evidence, independent of the JSON envelope. */
+export const AgentInspectQuerySchema = z
+  .object({
+    maxBytes: z.coerce.number().int().min(1).max(65536).default(8192),
+    since: z.string().uuid().optional(),
+  })
+  .strict();
+export const AgentStageSchema = z.object({ message: z.string().min(1).max(8192) }).strict();
+export const AgentSubmitSchema = z
+  .object({ stageId: z.string().uuid(), confirmSha: z.string().regex(/^[a-f0-9]{64}$/) })
+  .strict();

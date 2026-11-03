@@ -178,6 +178,30 @@
             </div>
             <span class="stat-value" id="statMem">--</span>
           </div>
+          <div class="stat-item stat-item--host" id="statGpuItem" hidden>
+            <span class="stat-ring" id="statGpuRing" aria-hidden="true"></span>
+            <span class="stat-label">GPU</span>
+            <div class="stat-bar">
+              <div class="stat-bar-fill stat-bar-cpu" id="statGpuBar"></div>
+            </div>
+            <span class="stat-value" id="statGpu">--%</span>
+          </div>
+          <div class="stat-item stat-item--host" id="statVramItem" hidden>
+            <span class="stat-ring" id="statVramRing" aria-hidden="true"></span>
+            <span class="stat-label">VRAM</span>
+            <div class="stat-bar">
+              <div class="stat-bar-fill stat-bar-cpu" id="statVramBar"></div>
+            </div>
+            <span class="stat-value" id="statVram">--%</span>
+          </div>
+          <div class="stat-item stat-item--host stat-item--ringless" id="statGpuMhzItem" hidden>
+            <span class="stat-label">GPU</span>
+            <span class="stat-value" id="statGpuMhz">-- MHz</span>
+          </div>
+          <div class="stat-item stat-item--host stat-item--ringless" id="statCpuMhzItem" hidden>
+            <span class="stat-label">CPU</span>
+            <span class="stat-value" id="statCpuMhz">-- MHz</span>
+          </div>
         </div>
         <button class="btn-icon-header btn-redraw-terminal btn-redraw-terminal--hidden" onclick="app.restoreTerminalSize()" title="Redraw terminal to fit current screen (Ctrl+Shift+R)" aria-label="Redraw terminal"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><polyline points="23 20 23 14 17 14"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg></button>
         <button class="btn-icon-header btn-response-viewer-header btn-response-viewer-header--hidden" onclick="app.toggleResponseViewer()" title="View last response" aria-label="View last response"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
@@ -615,6 +639,7 @@
         <span class="git-status-title">Git <span class="git-status-branch" id="gitStatusBranch" data-i18n-skip></span></span>
         <div class="git-status-actions">
           <button class="btn-icon-sm" onclick="app.refreshGitStatusNow()" title="Refresh" aria-label="Refresh git status">&#x21BB;</button>
+          <button class="btn-icon-sm" id="gitStatusFetchBtn" onclick="app.fetchGitStatusNow()" title="Fetch" aria-label="Fetch git status">&#x2913;</button>
           <button class="btn-icon-sm" onclick="app.closeGitStatusPanel()" title="Close" aria-label="Close git status">&times;</button>
         </div>
       </div>
@@ -1346,6 +1371,13 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><polyline points="7 14 11 10 14 13 20 7"/></svg>
                 <span>Summary</span>
               </button>
+              <!-- Git is last: the section shows for every local session, but until the interval feature is
+                   in use it holds one toggle and a status row that has never run, so it earns its place at the
+                   end of the rail rather than among the tabs a session uses every day. -->
+              <button type="button" class="set-rail-item" data-tab="git" onclick="app.switchOptionsTab('git')">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 3v12"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+                <span>Git</span>
+              </button>
             </div>
             <p class="set-rail-foot">These options belong to the selected session and save as you change them.</p>
           </nav>
@@ -1734,6 +1766,54 @@
                 </div>
               </div>
             </section>
+
+            <!-- ══ Git ══════════════════════════════════════════════════════ -->
+            <section class="set-section hidden" id="git-tab" data-label="Git">
+              <div class="set-section-head">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M6 3v12"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>
+                <h2>Git</h2>
+              </div>
+              <p class="set-section-blurb">Whether Codeman fetches this session's repositories on a timer.</p>
+
+              <div class="set-group">
+                <div class="set-group-head"><h4>Fetch on an interval</h4></div>
+                <p class="set-group-hint">Fetching is the only git command the Git panel runs that writes, and the only one Codeman runs on a timer, so nothing runs until you turn it on (here, or in App Settings &rarr; Bottom bar). Cloning and worktree management write too, but only when you asked for them at the moment you asked. The panel's Fetch button is always just a click.</p>
+                <div class="set-group-body">
+                  <!-- Live from the session's own last run (session-ui.js: updateGitFetchStatus), which is the
+                       run its folder got: several sessions on one folder share one run and read the same row. -->
+                  <div class="set-row">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Status</span>
+                      <span class="set-row-desc" id="gitFetchStatus" data-i18n-skip hidden></span>
+                    </div>
+                  </div>
+                  <div class="set-row">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Follow the app setting</span>
+                      <span class="set-row-desc">Uses the app-wide switch and interval for this session. Switch it off to pick your own.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="modalGitFetchFollow" checked onchange="app.autoSaveGitFetch()"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" id="gitFetchEnabledRow">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Fetch this session</span>
+                      <span class="set-row-desc">Runs on its own even while the app-wide switch is off: a session that turned itself on means exactly that. Sessions sharing one folder share one run, and each sees that run's result.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="modalGitFetchEnabled" onchange="app.autoSaveGitFetch()"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" id="gitFetchIntervalRow">
+                    <div class="set-row-text">
+                      <span class="set-row-label">How often</span>
+                      <span class="set-row-desc">30 sec to 1 hr, timed from the start of a run, so a slow repository does not push the next one out.</span>
+                    </div>
+                    <div class="set-row-actions">
+                      <input type="number" id="modalGitFetchInterval" class="set-num set-num-wide" value="300" min="30" max="3600" step="30" onchange="app.autoSaveGitFetch()">
+                      <span class="set-unit">sec</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
         </div>
       </div>
@@ -1959,6 +2039,13 @@
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsLocalEcho"><span class="slider"></span></label>
                   </div>
+                  <div class="set-row" data-search="keyboard hold rows resize redraw mobile">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Keep Size Under Keyboard</span>
+                      <span class="set-row-desc">For local Claude sessions, opening the on-screen keyboard keeps the session's size and scrolls the view instead, so Claude does not reprint its screen and lose transcript lines. Full-screen interfaces (Codex, Claude's fullscreen mode) are resized as before.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsKeyboardHoldsRows"><span class="slider"></span></label>
+                  </div>
                   <div class="set-row" data-search="cjk input ime chinese japanese korean">
                     <div class="set-row-text">
                       <span class="set-row-label">CJK Input</span>
@@ -2136,6 +2223,8 @@
                   <div class="set-chips" data-search="header buttons plan usage font stats lifecycle response file viewer attachments monitor session away cron redraw split tiles">
                     <label class="set-chip" data-preview="header" data-preview-order="1" data-preview-text="A+"><input type="checkbox" id="appSettingsShowFontControls"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 20 10 5l6 15"/><path d="M6.5 15h7"/><path d="M18 12h4M20 10v4"/></svg><span>Font Size</span></label>
                     <label class="set-chip" data-preview="header" data-preview-order="2" data-preview-text="CPU 12%"><input type="checkbox" id="appSettingsShowSystemStats" checked><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12h4l2.5-7 4 14L16 12h5"/></svg><span>System Stats</span></label>
+                    <label class="set-chip" data-preview="header" data-preview-order="2" data-preview-text="GPU 8%"><input type="checkbox" id="appSettingsShowGpuStats"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="7" width="18" height="10" rx="2"/><path d="M7 21v-4M12 21v-4M17 21v-4M7 7V3M17 7V3"/></svg><span>GPU Stats</span></label>
+                    <label class="set-chip" data-preview="header" data-preview-order="2" data-preview-text="3400 MHz"><input type="checkbox" id="appSettingsShowCpuMhz"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg><span>CPU MHz</span></label>
                     <label class="set-chip" data-preview="header" data-preview-order="3"><input type="checkbox" id="appSettingsShowRedrawButton"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><polyline points="23 20 23 14 17 14"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"/></svg><span>Redraw Terminal</span></label>
                     <label class="set-chip" data-preview="header" data-preview-order="4"><input type="checkbox" id="appSettingsShowResponseViewer"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg><span>Response Viewer</span></label>
                     <label class="set-chip" data-preview="header" data-preview-order="5"><input type="checkbox" id="appSettingsShowAwayDigestButton"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/></svg><span>Away Digest</span></label>
@@ -2185,6 +2274,20 @@
                     <label class="set-chip" data-preview="header" data-preview-order="12"><input type="checkbox" id="appSettingsShowUltracodeAgents"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="6" r="2.5"/><circle cx="6" cy="18" r="2.5"/><circle cx="18" cy="12" r="2.5"/><path d="M8.2 7.2 15.6 11M8.2 16.8 15.6 13"/></svg><span>Ultracode Agents</span></label>
                     <label class="set-chip" data-preview="float" data-preview-order="1"><input type="checkbox" id="appSettingsUltracodeFloatingWindows"><svg class="set-chip-ico" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/><circle cx="6" cy="6.5" r="0.6"/></svg><span>Ultracode Windows</span></label>
                   </div>
+                  <div class="set-row" data-search="agent inbox messages persist restart disk codeman agent post">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Keep agent inbox across restarts</span>
+                      <span class="set-row-desc">Saves pending <code>codeman agent post</code> messages to <code>agent-inbox.json</code> in the data dir (readable by you only), so they survive a server restart. Off by default; turning it off deletes the file. Messages expire after 12 hours either way.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentInboxPersist"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="experimental agent coordination inspect stage submit codeman agent guarded input">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Experimental agent coordination</span>
+                      <span class="set-row-desc">Lets agents read another session's output in bounded pages and type a prompt into a local Codex composer, then press Enter once after checking it is unchanged (the inspect, stage and submit commands). Experimental: the commands and their HTTP routes may change in any release. Off by default; while off those routes refuse every request.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentCoordination"><span class="slider"></span></label>
+                  </div>
                 </div>
               </div>
 
@@ -2203,7 +2306,7 @@
                   <div class="set-row" data-search="git status uncommitted unpushed commit push indicator bottom bar toolbar">
                     <div class="set-row-text">
                       <span class="set-row-label">Git status <span class="set-scope">device</span></span>
-                      <span class="set-row-desc">Shows, at the right of the bottom bar, when the active session's repository (or each repository inside its folder, up to two levels down) has uncommitted files or commits that are not pushed. Click it for the list. Read-only: Codeman never fetches or changes the repository. Not shown for Docker or remote sessions. Off by default.</span>
+                      <span class="set-row-desc">Shows, at the right of the bottom bar, when the active session's repository (or each repository inside its folder, up to two levels down) has uncommitted files or commits that are not pushed. Click it for the list. Read-only apart from Fetch: Codeman never commits or changes the repository, and `git fetch` runs only when you click Fetch in that window, or on the interval below if you turned it on. It is the only git command the Git window runs that writes, and the only one Codeman runs on a timer (cloning and worktree management write too, but only when you asked for them at the moment you asked). Not shown for Docker or remote sessions. Off by default.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsShowGitStatus"><span class="slider"></span></label>
                   </div>
@@ -2227,6 +2330,20 @@
                       <span class="set-row-desc">Seconds one git command may run before that repository is reported as unreadable (5 to 120, default 30). Raise it for repositories on a slow network share.</span>
                     </div>
                     <input type="number" id="appSettingsGitStatusTimeout" class="set-num" value="30" min="5" max="120" step="1">
+                  </div>
+                  <div class="set-row" data-search="git fetch interval timer behind remote tracking refs poll run automatically">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Git fetch on an interval <span class="set-scope">synced</span></span>
+                      <span class="set-row-desc">Runs `git fetch` for the repositories the Git window lists on a timer, so the "behind" number is current without a click. Off by default: this is the only git command the Git panel runs that writes, and the only one Codeman runs on a timer (cloning and worktree management write too, but only when you asked for them at the moment you asked), so nothing runs until you turn it on. A session can override both the switch and the interval in Session Options → Git.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsGitFetchEnabled"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="git fetch how often seconds between runs interval case override session options">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Git fetch: how often <span class="set-scope">synced</span></span>
+                      <span class="set-row-desc">Seconds between runs for a session that has no override of its own (30 to 3600, default 300). Only a session that is on (here, or in Session Options → Git) is fetched, and sessions sharing one folder are fetched by one run.</span>
+                    </div>
+                    <input type="number" id="appSettingsGitFetchIntervalSeconds" class="set-num" value="300" min="30" max="3600" step="1">
                   </div>
                 </div>
               </div>
@@ -2419,6 +2536,13 @@
                       <span class="set-row-desc">Open a session in its own window from the tab.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsShowTabDetachButton"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="new session plus add tab same case group cli">
+                    <div class="set-row-text">
+                      <span class="set-row-label">New Session Button on Tabs</span>
+                      <span class="set-row-desc">A + on the tab that starts a session in the same case and group, in any installed CLI.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsShowTabNewButton"><span class="slider"></span></label>
                   </div>
                   <div class="set-row" id="appSettingsTileDetachItem" data-search="detach tiles tile pop out window drag move another window">
                     <div class="set-row-text">
@@ -3832,6 +3956,35 @@
       </div>
     </div>
 
+    <!-- Rename a case (and its folder): opened by the Manage tab's pencil button, see renameCase() in session-ui.js.
+         Placed after the case modal so it stacks above it. -->
+    <div class="modal" id="renameCaseModal">
+      <div class="modal-backdrop" onclick="app.closeRenameCase()"></div>
+      <div class="modal-content modal-sm">
+        <div class="modal-header">
+          <h3>Rename case</h3>
+          <button class="modal-close" onclick="app.closeRenameCase()" aria-label="Cancel">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-row">
+            <label for="renameCaseInput" id="renameCaseLabel">New name</label>
+            <input type="text" id="renameCaseInput" class="set-input" maxlength="100" autocomplete="off" spellcheck="false"
+                   placeholder="letters, numbers, - and _" onkeydown="if (event.key === 'Enter') app.submitRenameCase()">
+          </div>
+          <div class="form-row hidden" id="renameCaseFolderRow">
+            <label class="checkbox-row"><input type="checkbox" id="renameCaseFolder"> Also rename the folder on disk</label>
+            <span class="form-hint" id="renameCaseFolderHint" data-i18n-skip></span>
+          </div>
+          <p class="form-hint" id="renameCaseNote">A case under the cases folder is renamed together with its folder.</p>
+          <p class="form-hint hidden" id="renameCaseError" role="alert" style="color: var(--danger, #e5534b);"></p>
+        </div>
+        <div class="modal-footer">
+          <button class="btn-toolbar" onclick="app.closeRenameCase()">Cancel</button>
+          <button class="btn-toolbar btn-primary" id="renameCaseSubmit" onclick="app.submitRenameCase()">Rename</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Mobile Case Picker (Bottom Sheet) -->
     <div class="modal mobile-case-picker" id="mobileCasePickerModal">
       <div class="modal-backdrop" onclick="app.closeMobileCasePicker()"></div>
@@ -4385,6 +4538,7 @@
   <script defer src="tab-layout-browser.js"></script>
   <script defer src="app.js"></script>
   <script defer src="tab-rail-resize.js"></script>
+  <script defer src="header-divider.js"></script>
   <script defer src="terminal-ui.js"></script>
   <script defer src="terminal-tile.js"></script>
   <script defer src="terminal-split.js"></script>
