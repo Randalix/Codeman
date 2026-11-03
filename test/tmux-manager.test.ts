@@ -28,6 +28,20 @@ import type { MuxSession } from '../src/mux-interface.js';
 // ============================================================================
 
 // Mock child_process
+/**
+ * Runs a captured `… respawn-pane … bash -c <arg>` line through a real local sh (with a
+ * foreign HOME/PATH) and returns the string bash would get, i.e. what ssh sends on.
+ */
+async function bashArgAfterLocalShell(respawnCmd: string): Promise<string> {
+  const real = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  const at = respawnCmd.indexOf(' bash -c ');
+  expect(at).toBeGreaterThan(0);
+  return real.execFileSync('/bin/sh', ['-c', `printf '%s' ${respawnCmd.slice(at + ' bash -c '.length)}`], {
+    env: { HOME: '/local-home-xyz', PATH: '/local-path-xyz:/usr/bin:/bin' },
+    encoding: 'utf8',
+  });
+}
+
 vi.mock('node:child_process', async () => {
   const actual = await vi.importActual('node:child_process');
   return {
@@ -1002,6 +1016,12 @@ describe('TmuxManager (unit)', () => {
           .find((cmd) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
         expect(launch).toContain('ssh ');
         expect(launch).toContain('--model haiku --session-id abc12345-1234-5678-90ab-cdef12345679');
+        // The remote PATH bootstrap must reach ssh unexpanded (Hufflepuff, 2026-11-03).
+        const sent = await bashArgAfterLocalShell(launch as string);
+        expect(sent).toContain('export PATH="$HOME/.opencode/bin:$HOME/.local/bin');
+        expect(sent).toContain(':$PATH"; tmux ');
+        expect(sent).not.toContain('local-home-xyz');
+        expect(sent).not.toContain('local-path-xyz');
       } finally {
         nonTestManager.destroy();
       }
@@ -1119,6 +1139,9 @@ describe('TmuxManager (unit)', () => {
           .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
         expect(respawnCall?.[0]).toContain('ssh ');
         expect(respawnCall?.[0]).toContain('--model haiku --session-id respawnremote1');
+        const sent = await bashArgAfterLocalShell(respawnCall?.[0] as string);
+        expect(sent).toContain('export PATH="$HOME/.opencode/bin:$HOME/.local/bin');
+        expect(sent).not.toContain('local-home-xyz');
       } finally {
         nonTestManager.destroy();
       }
