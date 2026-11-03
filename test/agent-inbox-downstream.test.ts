@@ -146,6 +146,14 @@ describe('inbox routes — downstream layer', () => {
   const post = (payload: Record<string, unknown>, caller?: string) =>
     app.inject({ method: 'POST', url: `/api/sessions/${RX}/inbox`, payload, headers: as(caller) });
 
+  it('accepts the legacy body field `from` of a pre-1.47 CLI but takes the sender from the header only', async () => {
+    const res = await post({ text: 'old cli', from: 'spoofed-sender' }, TX);
+    expect(res.statusCode).toBe(200);
+    const mail = agentInbox.read(RX, { receiver: false }).messages;
+    expect(mail.map((m) => [m.text, m.from])).toEqual([['old cli', TX]]);
+    expect((await post({ text: 'x', fromm: TX }, TX)).statusCode).toBe(400); // still strict otherwise
+  });
+
   it('a stored post hands the nudger receiver, sender (or "user") and the opt-out; a refused one does not', async () => {
     await post({ text: 'hi' }, TX);
     await post({ text: 'quiet please', nudge: false });

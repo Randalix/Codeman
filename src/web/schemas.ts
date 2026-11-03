@@ -1927,6 +1927,13 @@ export const InboxPostSchema = z
       .max(4 * MAX_MESSAGE_BYTES),
     /** Downstream: false stores only, never types a nudge into the receiver (web/inbox-nudger). */
     nudge: z.boolean().optional(),
+    /**
+     * Downstream: accepted and IGNORED. The pre-1.47 downstream CLI sent its own id here;
+     * a remote host keeps that CLI until its next spawn re-installs it, and `.strict()`
+     * turned every one of its posts into a 400. The sender still comes only from the
+     * X-Codeman-Parent-Session header (which that CLI sends too), never from this field.
+     */
+    from: z.string().max(128).optional(),
   })
   .strict();
 

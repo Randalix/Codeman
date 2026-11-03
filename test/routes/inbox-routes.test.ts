@@ -92,13 +92,22 @@ describe('agent inbox routes', () => {
       expect(data(await post(RX, 'c', TX.slice(0, 7))).message.from).toBeNull();
     });
 
-    it('a body field cannot set it: the schema rejects unknown keys', async () => {
+    it('a body field cannot set it', async () => {
+      // Downstream: `from` is accepted for the pre-1.47 CLI and ignored (schemas.ts), so the
+      // post lands, but without the header it has no sender. Other unknown keys stay a 400.
       const res = await h.app.inject({
         method: 'POST',
         url: `/api/sessions/${RX}/inbox`,
         payload: { text: 'x', from: TX },
       });
-      expect(res.statusCode).toBe(400);
+      expect(res.statusCode).toBe(200);
+      expect(agentInbox.read(RX, { receiver: false }).messages.map((m) => m.from)).not.toContain(TX);
+      const other = await h.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${RX}/inbox`,
+        payload: { text: 'x', sender: TX },
+      });
+      expect(other.statusCode).toBe(400);
     });
 
     it('multi-user, non-admin: a session the caller cannot see never resolves as the sender', async () => {
