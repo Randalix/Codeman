@@ -1141,6 +1141,37 @@ describe('agent post / inbox (mailbox)', () => {
     expect(timeout.err.join('')).toMatch(/wait timed out, exit 2/);
   });
 
+  it('--wait longer than the server cap asks again with what is left until mail arrives', async () => {
+    // The server answers timedOut at its own 600 s cap; the CLI keeps waiting (2026-11-04).
+    let now = 1_700_000_000_000;
+    const answers = [
+      ok({ messages: [], pending: 0, unseen: 0, wait: { timedOut: true } }),
+      ok({ messages: [], pending: 0, unseen: 0, wait: { timedOut: true } }),
+      ok({ receiver: true, messages: [{ id: 'm1', from: OTHER, text: 'late', createdAt: now, seen: false }] }),
+    ];
+    const deps = fakeDeps(() => {
+      const next = answers.shift()!;
+      now += 600_000;
+      return next;
+    });
+    deps.now = () => now;
+    expect(await agentInboxRead(deps, { waitMs: 1_500_000 })).toBe(EXIT.ok);
+    expect(deps.calls.map((c) => c.query?.wait)).toEqual([1_500_000, 900_000, 300_000]);
+    expect(deps.out.join('\n')).toMatch(/late/);
+  });
+
+  it('--wait stops at its own budget: a timeout with under a second left is exit 2', async () => {
+    let now = 1_700_000_000_000;
+    const deps = fakeDeps(() => {
+      now += 600_000;
+      return ok({ messages: [], pending: 0, unseen: 0, wait: { timedOut: true } });
+    });
+    deps.now = () => now;
+    expect(await agentInboxRead(deps, { waitMs: 1_200_500 })).toBe(EXIT.timeout);
+    expect(deps.calls.map((c) => c.query?.wait)).toEqual([1_200_500, 600_500]);
+    expect(deps.err.join('')).toMatch(/wait timed out, exit 2/);
+  });
+
   it('agentAck with no ids acknowledges everything seen; with ids it acknowledges exactly those', async () => {
     const all = fakeDeps([ok({ removed: 2, pending: 0 })]);
     expect(await agentAck(all, { ids: [] })).toBe(EXIT.ok);

@@ -1823,6 +1823,9 @@ export function inboxWaitArgs(
   return { id: wait, waitMs: parsePositiveInt(timeout, DEFAULT_WAIT_MS, '--timeout') };
 }
 
+/** A remaining inbox budget (or a server wait) shorter than this ends the --wait loop. */
+const INBOX_WAIT_MIN_SLICE_MS = 1000;
+
 /** True only when the session list was read and does not contain `id`. */
 async function sessionIsGone(deps: AgentDeps, id: string): Promise<boolean> {
   try {
@@ -1851,12 +1854,29 @@ function age(createdAt: number, now: number): string {
 export async function agentInboxRead(deps: AgentDeps, options: InboxReadOptions): Promise<number> {
   const target = await resolveSessionId(deps, options.id ?? deps.ctx.selfId);
   if ('error' in target) return fail(deps, target.error, target.code);
-  const res = await deps.request(deps.ctx, {
-    method: 'GET',
-    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
-    query: { wait: options.waitMs, peek: options.peek ? 1 : undefined },
-    timeoutMs: options.waitMs !== undefined ? options.waitMs + 10_000 : undefined,
-  });
+  // The server caps one wait (`clampWaitMs`, 600 s by default) and answers `timedOut`
+  // at its cap, not at ours: `--wait 3600000` came back after 10 min (downstream,
+  // 2026-11-04). config/agent-wait.ts documents the client-side loop over short waits,
+  // so ask again with what is left until our own budget is spent or mail arrives.
+  const clock = deps.now ?? Date.now;
+  const deadline = options.waitMs !== undefined ? clock() + options.waitMs : undefined;
+  let res: ApiResponse;
+  for (;;) {
+    const askedAt = clock();
+    const waitMs = deadline !== undefined ? Math.max(1, deadline - askedAt) : undefined;
+    res = await deps.request(deps.ctx, {
+      method: 'GET',
+      path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
+      query: { wait: waitMs, peek: options.peek ? 1 : undefined },
+      timeoutMs: waitMs !== undefined ? waitMs + 10_000 : undefined,
+    });
+    if (deadline === undefined || !res.json?.success) break;
+    const timedOut = (res.json.data as { wait?: { timedOut?: boolean } } | undefined)?.wait?.timedOut;
+    // A timeout that came back at once means the server is not holding the wait (it
+    // refused or capped it to nothing): never spin on it, report it as exit 2.
+    const tookMs = clock() - askedAt;
+    if (!timedOut || tookMs < INBOX_WAIT_MIN_SLICE_MS || deadline - clock() < INBOX_WAIT_MIN_SLICE_MS) break;
+  }
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as
     | {
