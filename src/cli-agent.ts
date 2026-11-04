@@ -1742,7 +1742,9 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}`,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
-  const unlinked = await unlinkTempCase(deps, rows, target.id);
+  // The session is gone: from here on nothing may turn `rm` into a failure, or a caller
+  // retries a delete that already happened. A lost connection only leaves the case behind.
+  const unlinked = await unlinkTempCase(deps, rows, target.id).catch(() => undefined);
   if (deps.json)
     emitJson(deps, {
       ...((res.json.data as object | undefined) ?? {}),
@@ -1768,9 +1770,9 @@ function remoteOf(row: SessionRow): { hostId: string; remotePath: string } | und
 
 /**
  * After `agent rm`: unlink the remote case the removed session ran in — only when `spawn
- * --temp` made it (`ephemeral`) and no OTHER session still runs in that directory. Best
- * effort: a failure leaves the case (the delete itself already succeeded) and says nothing
- * louder than the leftover case. Returns the unlinked case name.
+ * --temp` made it (`ephemeral`) and no OTHER session still runs in that directory. A refused
+ * call leaves the case and returns undefined; a lost connection rejects, and `agentRm` treats
+ * that the same way. Returns the unlinked case name.
  */
 async function unlinkTempCase(deps: AgentDeps, rows: SessionRow[], removedId: string): Promise<string | undefined> {
   const removed = rows.find((r) => r.id === removedId);

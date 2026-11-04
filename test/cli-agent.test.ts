@@ -303,6 +303,20 @@ describe('agent rm / keep and temporary remote cases', () => {
     expect(deleted(deps)).toEqual([`/api/v1/sessions/${OTHER}`]);
   });
 
+  it.each([
+    ['listing the cases', 'GET', '/api/v1/cases'],
+    ['unlinking the case', 'DELETE', '/api/v1/cases/hufflepuff-wt-a'],
+  ])('a connection lost while %s still reports the finished delete', async (_label, method, path) => {
+    const deps = fakeDeps((o) => {
+      if (o.method === method && o.path === path) throw new Error('ECONNRESET');
+      if (o.method === 'GET' && o.path === '/api/v1/sessions') return ok([{ id: OTHER, remote: WT }]);
+      if (o.method === 'GET' && o.path === '/api/v1/cases') return ok(CASES(true));
+      return ok({});
+    });
+    expect(await agentRm(deps, { id: OTHER })).toBe(EXIT.ok);
+    expect(deps.out.join('\n')).toContain(`deleted ${OTHER}`);
+  });
+
   it('agentKeep posts to the keep route', async () => {
     const deps = fakeDeps([ok({ name: 'hufflepuff-wt-a', ephemeral: false })]);
     expect(await agentKeep(deps, { caseName: 'hufflepuff-wt-a' })).toBe(EXIT.ok);
