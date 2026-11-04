@@ -697,6 +697,8 @@ export interface SpawnOptions {
   workingDir?: string;
   /** A remote host id (`agent hosts`): `cwd` is then an absolute path ON that host, reached through a remote case. */
   host?: string;
+  /** With `host`: a case created for this directory is marked ephemeral (a throwaway worktree). An existing case is left as it is. */
+  temp?: boolean;
   /** Model for this worker only; absent = the standard model (app default, else the CLI's own). */
   model?: string;
   mode: string;
@@ -955,6 +957,13 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
       EXIT.refused
     );
   }
+  if (options.temp && options.host === undefined) {
+    return fail(
+      deps,
+      'refusing: --temp only applies with --host (it marks the remote case this spawn creates)',
+      EXIT.refused
+    );
+  }
   let extras: Record<string, unknown>;
   try {
     extras = buildSpawnExtras(options);
@@ -1053,6 +1062,8 @@ interface CaseRow {
   name: string;
   location?: string;
   remote?: { hostId: string; path: string };
+  /** A remote case made by `spawn --temp`: `rm` of its last session unlinks it. */
+  ephemeral?: boolean;
 }
 
 /** `/a/b/` → `/a/b`, `/a//b/./c` → `/a/b/c`: the form a remote case is matched and stored in. */
@@ -1131,7 +1142,7 @@ async function resolveRemoteCase(
   const linked = await deps.request(deps.ctx, {
     method: 'POST',
     path: '/api/v1/cases/remote-link',
-    body: { name, hostId, remotePath },
+    body: { name, hostId, remotePath, ...(options.temp ? { ephemeral: true } : {}) },
     // ssh probes (tmux, directory) after a possible wake: give it the wake budget.
     timeoutMs: REMOTE_LINK_TIMEOUT_MS,
   });
@@ -1723,13 +1734,76 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
   // to me only if the list is lying, but a delete is the one call worth the paranoia.
   const resolvedRefusal = deleteRefusal(deps.ctx.selfId, target.id);
   if (resolvedRefusal) return fail(deps, resolvedRefusal, EXIT.refused);
+  // Read BEFORE the delete: afterwards the session is gone and so is its remote block.
+  const before = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
+  const rows = before.json?.success ? ((before.json.data as SessionRow[] | undefined) ?? []) : [];
   const res = await deps.request(deps.ctx, {
     method: 'DELETE',
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}`,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
+  const unlinked = await unlinkTempCase(deps, rows, target.id);
+  if (deps.json)
+    emitJson(deps, {
+      ...((res.json.data as object | undefined) ?? {}),
+      ...(unlinked ? { unlinkedCase: unlinked } : {}),
+    });
+  else {
+    deps.io.out(palette.ok(`${GLYPH.ok} deleted ${target.id} (its case directory stays on disk)`));
+    if (unlinked)
+      deps.io.err(
+        `case ${unlinked} (spawned with --temp) unlinked; the directory stays. Keep it next time: agent keep <case>`
+      );
+  }
+  return EXIT.ok;
+}
+
+/** The `{ hostId, remotePath }` a session row carries for a remote session, else undefined. */
+function remoteOf(row: SessionRow): { hostId: string; remotePath: string } | undefined {
+  const r = row.remote as { hostId?: unknown; remotePath?: unknown } | undefined;
+  return r && typeof r.hostId === 'string' && typeof r.remotePath === 'string'
+    ? { hostId: r.hostId, remotePath: normalizeRemotePath(r.remotePath) }
+    : undefined;
+}
+
+/**
+ * After `agent rm`: unlink the remote case the removed session ran in — only when `spawn
+ * --temp` made it (`ephemeral`) and no OTHER session still runs in that directory. Best
+ * effort: a failure leaves the case (the delete itself already succeeded) and says nothing
+ * louder than the leftover case. Returns the unlinked case name.
+ */
+async function unlinkTempCase(deps: AgentDeps, rows: SessionRow[], removedId: string): Promise<string | undefined> {
+  const removed = rows.find((r) => r.id === removedId);
+  const where = removed ? remoteOf(removed) : undefined;
+  if (!where) return undefined;
+  const stillUsed = rows.some((r) => {
+    if (r.id === removedId) return false;
+    const o = remoteOf(r);
+    return o?.hostId === where.hostId && o.remotePath === where.remotePath;
+  });
+  if (stillUsed) return undefined;
+  const cases = await fetchCases(deps);
+  if ('error' in cases) return undefined;
+  const temp = cases.find(
+    (c) => c.ephemeral && c.remote?.hostId === where.hostId && normalizeRemotePath(c.remote.path) === where.remotePath
+  );
+  if (!temp) return undefined;
+  const del = await deps.request(deps.ctx, {
+    method: 'DELETE',
+    path: `/api/v1/cases/${encodeURIComponent(temp.name)}`,
+  });
+  return del.json?.success ? temp.name : undefined;
+}
+
+/** `agent keep <case>` — make a `spawn --temp` case permanent (idempotent). */
+export async function agentKeep(deps: AgentDeps, options: { caseName: string }): Promise<number> {
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/cases/${encodeURIComponent(options.caseName)}/keep`,
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
   if (deps.json) emitJson(deps, res.json.data ?? {});
-  else deps.io.out(palette.ok(`${GLYPH.ok} deleted ${target.id} (its case directory stays on disk)`));
+  else deps.io.out(palette.ok(`${GLYPH.ok} case ${options.caseName} is permanent`));
   return EXIT.ok;
 }
 
@@ -2737,6 +2811,10 @@ export function registerAgentCommands(program: Command): Command {
       '--host <id>',
       'Run the worker on that remote host (`agent hosts`); --cwd is then an absolute path THERE. Reuses the case for that directory or creates one; wakes a sleeping host'
     )
+    .option(
+      '--temp',
+      'With --host: mark a case created for this directory as temporary (a throwaway worktree) — `agent rm` of its last session unlinks it again; the directory stays. `agent keep <case>` makes it permanent'
+    )
     .option('-n, --name <name>', 'Session name shown in the UI')
     .option('--no-ready', 'Return as soon as the session exists, without the readiness wait')
     .option('-t, --timeout <ms>', 'Readiness budget in ms', String(DEFAULT_WAIT_MS))
@@ -2768,6 +2846,7 @@ export function registerAgentCommands(program: Command): Command {
           cwd?: string;
           workingDir?: string;
           host?: string;
+          temp?: boolean;
           name?: string;
           ready: boolean;
           timeout?: string;
@@ -2784,6 +2863,7 @@ export function registerAgentCommands(program: Command): Command {
             cwd: options.cwd,
             workingDir: options.workingDir,
             host: options.host,
+            temp: options.temp,
             model: options.model,
             mode: options.mode,
             name: options.name,
@@ -2795,6 +2875,14 @@ export function registerAgentCommands(program: Command): Command {
             subscribe: options.subscribe,
           });
         })
+    );
+
+  agent
+    .command('keep <case>')
+    .description('Make a case made by `spawn --host … --temp` permanent, so `agent rm` no longer unlinks it')
+    .option('--json', 'Machine-readable output')
+    .action((caseName: string, options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentKeep(deps, { caseName }))
     );
 
   agent

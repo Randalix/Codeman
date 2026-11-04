@@ -412,6 +412,36 @@ describe('case-routes', () => {
       );
     });
 
+    it('an ephemeral remote case is flagged in the list and `keep` makes it permanent', async () => {
+      setupRemoteConfigStore();
+      mockedReaddir.mockRejectedValue(new Error('ENOENT'));
+      await harness.app.inject({
+        method: 'POST',
+        url: '/api/remote-hosts',
+        payload: { id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' },
+      });
+      await harness.app.inject({
+        method: 'POST',
+        url: '/api/cases/remote-link',
+        payload: { name: 'gpu-wt', hostId: 'gpu-box', remotePath: '/home/ubuntu/wt', ephemeral: true },
+      });
+      const listed = async () =>
+        (
+          JSON.parse((await harness.app.inject({ method: 'GET', url: '/api/cases' })).body).data as Array<{
+            name: string;
+            ephemeral?: boolean;
+          }>
+        ).find((c) => c.name === 'gpu-wt');
+      expect(await listed()).toMatchObject({ ephemeral: true });
+
+      const keep = await harness.app.inject({ method: 'POST', url: '/api/cases/gpu-wt/keep' });
+      expect(JSON.parse(keep.body)).toMatchObject({ success: true, data: { ephemeral: false } });
+      expect((await listed())?.ephemeral).toBeUndefined();
+
+      const missing = await harness.app.inject({ method: 'POST', url: '/api/cases/nope/keep' });
+      expect(JSON.parse(missing.body)).toMatchObject({ success: false });
+    });
+
     describe('remote-link wakes the host and checks the directory', () => {
       const HOST = { id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', wakeCommand: '/bin/wake' };
       const LINK = { name: 'gpu-work', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' };

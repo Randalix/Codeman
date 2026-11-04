@@ -952,6 +952,8 @@ export const RemoteCaseLinkSchema = z.object({
     .max(2000)
     .regex(/^\//, 'Remote path must be absolute')
     .regex(NO_SHELL_META, 'Invalid characters in remote path'),
+  /** `agent spawn --temp`: the case goes away with the last agent-removed session in it. */
+  ephemeral: z.boolean().optional(),
 });
 
 // ========== Docker cases ==========

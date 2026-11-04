@@ -157,6 +157,8 @@ export interface CaseInfo {
   location?: 'local' | 'linked-local' | 'remote' | 'docker';
   /** Whether this is a linked local folder */
   linked?: boolean;
+  /** Remote case made by `agent spawn --temp`; unlinked when its last agent-removed session goes. */
+  ephemeral?: boolean;
   /**
    * The case folder did not answer (an unreachable network mount, or an error other
    * than "no such file"), or its probe was refused because folders on other unreachable

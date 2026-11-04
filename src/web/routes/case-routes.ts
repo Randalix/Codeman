@@ -366,6 +366,7 @@ export function registerCaseRoutes(
         path: remoteDisplayPath({ username: host.username, host: host.host, path: remoteCase.remotePath }),
         hasClaudeMd: false,
         location: 'remote',
+        ...(remoteCase.ephemeral ? { ephemeral: true } : {}),
         remote: {
           hostId: host.id,
           host: host.host,
@@ -935,6 +936,27 @@ export function registerCaseRoutes(
     await writeRemoteCases(CODEMAN_CONFIG_DIR, [...remoteCases, remoteCase]);
     ctx.broadcast(SseEvent.CaseLinked, { name: remoteCase.name, path: remoteCase.remotePath, type: 'remote' });
     return { success: true, data: { case: remoteCase } };
+  });
+
+  // Makes a `--temp` case permanent. Idempotent; 404 for a case that is not a remote case the
+  // caller may touch (same owner fold as DELETE /api/cases/:name).
+  app.post('/api/cases/:name/keep', async (req): Promise<ApiResponse<{ name: string; ephemeral: false }>> => {
+    const { name } = req.params as { name: string };
+    const user = getAuthUser(req);
+    const remoteCases = await readRemoteCases(CODEMAN_CONFIG_DIR);
+    const found = remoteCases.find((item) => item.name === name && canAccessOwned(user, item.owner));
+    if (!found) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote case not found');
+    if (found.ephemeral) {
+      await writeRemoteCases(
+        CODEMAN_CONFIG_DIR,
+        remoteCases.map((item) => {
+          if (item !== found) return item;
+          const { ephemeral: _dropped, ...rest } = item;
+          return rest;
+        })
+      );
+    }
+    return { success: true, data: { name, ephemeral: false } };
   });
 
   // ========== Docker hosts + docker cases (COD-Docker) ==========

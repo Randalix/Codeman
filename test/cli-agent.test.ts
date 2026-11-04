@@ -25,6 +25,7 @@ import {
   modelCell,
   agentRestore,
   agentRm,
+  agentKeep,
   agentSend,
   agentSpawn,
   isLoopbackApiUrl,
@@ -245,10 +246,67 @@ describe('rm fails closed', () => {
   });
 
   it('agentRm deletes a foreign id plainly (killMux default, no query)', async () => {
-    const deps = fakeDeps([ok({})]);
+    const deps = fakeDeps([ok([]), ok({})]);
     expect(await agentRm(deps, { id: OTHER })).toBe(EXIT.ok);
-    expect(deps.calls[0]).toMatchObject({ method: 'DELETE', path: `/api/v1/sessions/${OTHER}` });
-    expect(deps.calls[0].query).toBeUndefined();
+    const del = deps.calls.find((c) => c.method === 'DELETE');
+    expect(del).toMatchObject({ method: 'DELETE', path: `/api/v1/sessions/${OTHER}` });
+    expect(del?.query).toBeUndefined();
+  });
+});
+
+describe('agent rm / keep and temporary remote cases', () => {
+  const WT = { hostId: 'hufflepuff', remotePath: '/mnt/build/wt-a' };
+  const CASES = (ephemeral: boolean) => [
+    {
+      name: 'hufflepuff-wt-a',
+      location: 'remote',
+      remote: { hostId: 'hufflepuff', path: '/mnt/build/wt-a' },
+      ...(ephemeral ? { ephemeral: true } : {}),
+    },
+  ];
+  function rmDeps(sessions: unknown[], cases: unknown[]) {
+    return fakeDeps((o) => {
+      if (o.method === 'GET' && o.path === '/api/v1/sessions') return ok(sessions);
+      if (o.method === 'GET' && o.path === '/api/v1/cases') return ok(cases);
+      return ok({});
+    });
+  }
+  const deleted = (d: ReturnType<typeof rmDeps>) => d.calls.filter((c) => c.method === 'DELETE').map((c) => c.path);
+
+  it('unlinks the ephemeral case when its last session goes', async () => {
+    const deps = rmDeps([{ id: OTHER, remote: WT }], CASES(true));
+    expect(await agentRm(deps, { id: OTHER })).toBe(EXIT.ok);
+    expect(deleted(deps)).toEqual([`/api/v1/sessions/${OTHER}`, '/api/v1/cases/hufflepuff-wt-a']);
+  });
+
+  it('keeps a permanent case', async () => {
+    const deps = rmDeps([{ id: OTHER, remote: WT }], CASES(false));
+    await agentRm(deps, { id: OTHER });
+    expect(deleted(deps)).toEqual([`/api/v1/sessions/${OTHER}`]);
+  });
+
+  it('keeps the ephemeral case while another session still runs in the directory', async () => {
+    const deps = rmDeps(
+      [
+        { id: OTHER, remote: WT },
+        { id: '11111111-2222-3333-4444-555555555555', remote: WT },
+      ],
+      CASES(true)
+    );
+    await agentRm(deps, { id: OTHER });
+    expect(deleted(deps)).toEqual([`/api/v1/sessions/${OTHER}`]);
+  });
+
+  it('a local session never touches cases', async () => {
+    const deps = rmDeps([{ id: OTHER, workingDir: '/home/joe/x' }], CASES(true));
+    await agentRm(deps, { id: OTHER });
+    expect(deleted(deps)).toEqual([`/api/v1/sessions/${OTHER}`]);
+  });
+
+  it('agentKeep posts to the keep route', async () => {
+    const deps = fakeDeps([ok({ name: 'hufflepuff-wt-a', ephemeral: false })]);
+    expect(await agentKeep(deps, { caseName: 'hufflepuff-wt-a' })).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({ method: 'POST', path: '/api/v1/cases/hufflepuff-wt-a/keep' });
   });
 });
 
@@ -2488,6 +2546,49 @@ describe('agent spawn --host: a worker on another machine', () => {
     );
     expect(quickStart(deps)?.body).toMatchObject({ caseName: 'hufflepuff-hbottle-2' });
     expect(deps.err.join('')).toMatch(/new case hufflepuff-hbottle-2/);
+  });
+
+  it('--temp marks the case it creates as ephemeral; an existing case is not touched', async () => {
+    const deps = remoteDeps();
+    await agentSpawn(deps, {
+      host: 'hufflepuff',
+      cwd: '/mnt/build/wt-a',
+      temp: true,
+      mode: 'claude',
+      ready: false,
+      timeoutMs: 1000,
+    });
+    expect(deps.calls.find((c) => c.path === '/api/v1/cases/remote-link')?.body).toMatchObject({ ephemeral: true });
+    const again = remoteDeps();
+    await agentSpawn(again, {
+      host: 'hufflepuff',
+      cwd: '/mnt/caches/huffwork/heval',
+      temp: true,
+      mode: 'claude',
+      ready: false,
+      timeoutMs: 1000,
+    });
+    expect(again.calls.some((c) => c.path === '/api/v1/cases/remote-link')).toBe(false);
+  });
+
+  it('without --temp the link body carries no ephemeral flag', async () => {
+    const deps = remoteDeps();
+    await agentSpawn(deps, {
+      host: 'hufflepuff',
+      cwd: '/mnt/build/wt-b',
+      mode: 'claude',
+      ready: false,
+      timeoutMs: 1000,
+    });
+    expect(deps.calls.find((c) => c.path === '/api/v1/cases/remote-link')?.body).not.toHaveProperty('ephemeral');
+  });
+
+  it('--temp without --host is refused before any request', async () => {
+    const deps = remoteDeps();
+    expect(await agentSpawn(deps, { cwd: '/tmp', temp: true, mode: 'claude', ready: false, timeoutMs: 1000 })).toBe(
+      EXIT.refused
+    );
+    expect(deps.calls).toEqual([]);
   });
 
   it('--json reports host, path and whether the case was created', async () => {

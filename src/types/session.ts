@@ -153,6 +153,12 @@ export interface RemoteCase {
   owner?: string;
   hostId: string;
   remotePath: string;
+  /**
+   * Created by `agent spawn --host … --temp` for a throwaway directory (a worker worktree).
+   * `agent rm` of the last session in it unlinks the case again (the directory stays);
+   * `agent keep` / `POST /api/cases/:name/keep` clears the flag. Absent = permanent.
+   */
+  ephemeral?: boolean;
 }
 
 export interface SessionRemote extends RemoteSshOptions {
