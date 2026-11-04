@@ -75,7 +75,10 @@ it you hear nothing unless you `wait`, `watch` or subscribe later).
 and the directories that already have a remote case; `codeman agent spawn --host <id>
 --cwd <absolute path on that host>` reuses the case for that directory or creates one,
 wakes a sleeping host (wake-on-LAN), and refuses a directory that does not exist there.
-Everything after the spawn (mailbox, `send`, `wait`, `read`, `watch`, `rm`) is the same;
+For a throwaway directory (a worker worktree) add `--temp`: a case created for it is
+unlinked again when `agent rm` removes the last session in that directory (the directory
+stays); `codeman agent keep <case>` makes it permanent. Without `--temp` nothing is ever
+unlinked. Everything after the spawn (mailbox, `send`, `wait`, `read`, `watch`, `rm`) is the same;
 `agent ls` shows each session's `HOST` and `MODEL` (as reported, following `/model`; a
 remote claude's catches up at its next turn end; `opus*` = only the start value so far;
 `-` = unknown). Files the worker writes stay on its host:
