@@ -3,7 +3,7 @@
  * nudger must never type over (its line plus Enter would submit a human's draft).
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Session } from '../src/session.js';
 
 describe('Session.hasDraft', () => {
@@ -29,5 +29,73 @@ describe('Session.hasDraft', () => {
     s.write('draft');
     s.markPromptSubmitted();
     expect(s.hasDraft()).toBe(false);
+  });
+});
+
+describe('Session.hasDraft against the pane', () => {
+  const FRAME = '─'.repeat(40);
+  const pane = (row: string) => [FRAME, row, FRAME, '  Opus 5.5  ctx:13%', '  bypass permissions on'].join('\n');
+  const EMPTY = pane('\u001b[39m❯\u00a0');
+  const PLACEHOLDER = pane('\u001b[39m❯\u00a0\u001b[2mTry "write a test for <filepath>"\u001b[0m');
+  const TYPED = pane('\u001b[39m❯\u00a0hello world');
+
+  function session(capture: () => string | null) {
+    return new Session({
+      workingDir: '/tmp',
+      mode: 'claude',
+      mux: { isAvailable: () => true, capturePaneText: capture },
+      muxSession: { muxName: 'codeman-test', sessionId: 'test', createdAt: 1, pid: 1 },
+    } as unknown as ConstructorParameters<typeof Session>[0]);
+  }
+  /** A draft whose last key went in `ms` ago. */
+  function drafted(s: Session, ms = 5000) {
+    vi.useFakeTimers();
+    s.write('abc', { fromUser: true });
+    s.write('\u007f\u007f\u007f', { fromUser: true });
+    vi.advanceTimersByTime(ms);
+  }
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it.each([
+    ['an empty composer', EMPTY],
+    ['the dimmed placeholder', PLACEHOLDER],
+  ])('backspaced to %s: the latch goes', (_label, screen) => {
+    const s = session(() => screen);
+    drafted(s);
+    expect(s.hasDraft()).toBe(false);
+  });
+
+  it('a draft on screen keeps the latch', () => {
+    const s = session(() => TYPED);
+    drafted(s);
+    expect(s.hasDraft()).toBe(true);
+  });
+
+  it('asks the pane for styles, or the placeholder would read as text', () => {
+    const capture = vi.fn(() => EMPTY);
+    const s = session(capture);
+    drafted(s);
+    s.hasDraft();
+    expect(capture).toHaveBeenCalledWith('codeman-test', undefined, { styles: true });
+  });
+
+  it('does not trust a frame right after a key: it may predate the keystroke', () => {
+    const s = session(() => EMPTY);
+    drafted(s, 500);
+    expect(s.hasDraft()).toBe(true);
+  });
+
+  it('a failed capture proves nothing', () => {
+    const s = session(() => null);
+    drafted(s);
+    expect(s.hasDraft()).toBe(true);
+  });
+
+  it('no draft, no capture', () => {
+    const capture = vi.fn(() => EMPTY);
+    expect(session(capture).hasDraft()).toBe(false);
+    expect(capture).not.toHaveBeenCalled();
   });
 });

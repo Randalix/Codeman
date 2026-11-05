@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { stripAnsi } from './utils/regex-patterns.js';
 import { visibleWidth } from './tui/tui-ansi.js';
 import { compileVersionRegex } from './config/cli-registry/patterns.js';
+import { COMPOSER_FRAME_ROW } from './session-activity.js';
 import type { CliEntry } from './config/cli-registry/types.js';
 
 /**
@@ -69,7 +70,7 @@ const POPUP_WINDOW_ROWS = 12;
 /** Blank rows a popup can leave between itself and the composer row (the composer's own top padding, plus a popup's). */
 const POPUP_GAP_ROWS = 3;
 const escapeRegex = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const composerRow = (chrome: GuardedComposerChrome) =>
+const composerRow = (chrome: Pick<GuardedComposerChrome, 'promptGlyph'>) =>
   new RegExp(String.raw`^\s*${escapeRegex(chrome.promptGlyph)}(?:\s|$)`);
 export const STAGE_MAX_BYTES = 8192;
 export const promptSha256 = (text: string): string => createHash('sha256').update(text).digest('hex');
@@ -151,7 +152,11 @@ export function readGuardedComposer(screen: string, chrome: GuardedComposerChrom
   if (below.length === 0 || below.length > 3 || below.some((line) => !chrome.footerLine.test(line))) return null;
   if (chrome.popupLine && popupAbove(lines, last.index, chrome.popupLine)) return null;
   // Preserve exact printable content; only SGR-dim placeholder/suggestion text is excluded.
-  const raw = screen.split('\n')[last.index];
+  return composerInput(screen.split('\n')[last.index], chrome.promptGlyph).trimEnd();
+}
+
+/** A composer row without its prefix and its SGR-dim runs: what was typed, not a placeholder. */
+function composerInput(raw: string, promptGlyph: string): string {
   let dim = false;
   let visible = '';
   // eslint-disable-next-line no-control-regex
@@ -171,8 +176,33 @@ export function readGuardedComposer(screen: string, chrome: GuardedComposerChrom
   // The glyph and the one space after it are the prefix, not input.
   return stripAnsi(visible)
     .trimStart()
-    .slice(chrome.promptGlyph.length + 1)
-    .trimEnd();
+    .slice(promptGlyph.length + 1);
+}
+
+/**
+ * Does this styled frame PROVE the composer holds nothing? The one thing that may
+ * overrule the keystroke-based draft latch, so anything short of proof is false: a
+ * wrong false only delays a nudge, a wrong true types over a draft. A CLI with declared
+ * chrome is read through it. Otherwise (claude, whose status rows are the user's own and
+ * so cannot be a `composerFooterLine`) the last glyph row must sit between two frame
+ * rows with nothing undimmed on it: a dialog option has text and no frame, a second
+ * composer row breaks the frame below.
+ *
+ * @param screen `capture-pane -e` text: without styles a placeholder reads as a draft
+ */
+export function composerProvenEmpty(screen: string, entry: CliEntry | undefined): boolean {
+  const promptGlyph = entry?.capabilities.workDetect?.promptGlyph;
+  if (!promptGlyph) return false;
+  const chrome = guardedComposerChrome(entry);
+  if (chrome) return readGuardedComposer(screen, chrome) === '';
+  const raw = screen.split('\n');
+  const rows = raw.map((line) => stripAnsi(line));
+  const isComposer = composerRow({ promptGlyph });
+  let index = rows.length - 1;
+  while (index >= 0 && !isComposer.test(rows[index])) index--;
+  if (index < 1 || index + 1 >= rows.length) return false;
+  if (!COMPOSER_FRAME_ROW.test(rows[index - 1]) || !COMPOSER_FRAME_ROW.test(rows[index + 1])) return false;
+  return composerInput(raw[index], promptGlyph).trim() === '';
 }
 
 /**

@@ -132,6 +132,7 @@ import { EXEC_TIMEOUT_MS } from './config/exec-timeout.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { SubmitVerifier } from './session-submit-verifier.js';
 import {
+  composerProvenEmpty,
   guardedComposerChrome,
   promptSha256,
   readGuardedSnapshotDetails,
@@ -192,6 +193,13 @@ const MUX_STARTUP_DELAY_MS = 300;
 
 /** Delay before declaring session idle after last output (2 seconds) */
 const IDLE_DETECTION_DELAY_MS = 2000;
+
+/**
+ * Quiet time after the last key before the pane may overrule the draft latch. Measured
+ * repaints come 30 to 60 ms after input (see STAGE_SETTLE_TIMEOUT_MS); this is far above
+ * that on purpose, because a late proof only delays a nudge by one cooldown.
+ */
+const DRAFT_PROOF_QUIET_MS = 2000;
 
 // How long after construction a RECOVERED session's wire activity stamp keeps
 // its restored previous-run value. Recovery attaches every pane at boot and the
@@ -5160,12 +5168,28 @@ export class Session extends EventEmitter {
    * Since when printable text went in through Codeman's write path without an Enter
    * after it (0 = none): someone has a half-typed prompt in the composer. The inbox
    * nudger never types over it — its line and `\r` would submit the draft. Escape
-   * sequences (arrows, ESC) do not count; any submit clears it.
+   * sequences (arrows, ESC) do not count; any submit clears it, and so does a pane that
+   * proves the composer empty (see hasDraft).
    */
   private _draftSince = 0;
 
+  /**
+   * Keys alone cannot end a draft that was deleted (Backspace, Ctrl+U) or that was never
+   * one (the digit answering a dialog): the latch then stood for hours while mail went
+   * unannounced. So a standing latch is checked against the pane, and only a composer
+   * proven empty clears it. Not while keys may still be landing: a CLI repaints after its
+   * input, so a fresh frame can predate the keystroke.
+   */
   hasDraft(): boolean {
-    return this._draftSince > 0;
+    if (this._draftSince === 0) return false;
+    if (Date.now() - Math.max(this._draftSince, this._lastHumanInputAt) < DRAFT_PROOF_QUIET_MS) return true;
+    const screen =
+      this._mux && this._muxSession
+        ? this._mux.capturePaneText?.(this._muxSession.muxName, undefined, { styles: true })
+        : null;
+    if (!screen || !composerProvenEmpty(screen, getCli(this.mode))) return true;
+    this._draftSince = 0;
+    return false;
   }
 
   /**

@@ -7,6 +7,7 @@ import {
   STAGE_SETTLE_INTERVAL_MS,
   STAGE_SETTLE_TIMEOUT_MS,
   SUBMIT_QUIET_MS,
+  composerProvenEmpty,
   composerTriggerRefusal,
   guardedComposerChrome,
   readGuardedComposer,
@@ -376,5 +377,46 @@ describe("the quiet time before Enter (codex's 120 ms paste-burst window turns E
       /changed; nothing submitted/
     );
     expect(writes).toEqual(['hello']);
+  });
+});
+
+describe('composerProvenEmpty', () => {
+  const CLAUDE = getCli('claude');
+  const FRAME = '─'.repeat(40);
+  const framed = (...rows: string[]) => [FRAME, ...rows, FRAME, '  Opus 5.5  ctx:13%'].join('\n');
+
+  it.each([
+    ['nothing behind the glyph', framed('\u001b[39m❯\u00a0')],
+    ['a plain space', framed('❯ ')],
+    ['a dimmed placeholder', framed('❯\u00a0\u001b[2mTry "write a test"\u001b[0m')],
+    ['an inverse caret cell', framed('❯\u00a0\u001b[7m \u001b[27m')],
+  ])('claude, %s: empty', (_label, screen) => {
+    expect(composerProvenEmpty(screen, CLAUDE)).toBe(true);
+  });
+
+  it.each([
+    ['typed text', framed('❯\u00a0hello')],
+    ['text after a placeholder reset', framed('❯\u00a0\u001b[2mdim\u001b[0m real')],
+    ['a paste chip', framed('❯\u00a0[Pasted text #1 +39 lines]')],
+    ['a second composer row', framed('❯\u00a0', '  second line')],
+    ['a dialog option', ['Pick one', '❯ 1. Yes', '  2. No'].join('\n')],
+    ['an empty glyph row outside a frame', ['some output', '❯ ', 'more output'].join('\n')],
+    ['no composer on screen', 'just output'],
+  ])('claude, %s: not proven', (_label, screen) => {
+    expect(composerProvenEmpty(screen, CLAUDE)).toBe(false);
+  });
+
+  it('reads the LAST glyph row: a transcript echo above an active draft proves nothing', () => {
+    expect(composerProvenEmpty(['❯ old prompt', framed('❯\u00a0hello')].join('\n'), CLAUDE)).toBe(false);
+  });
+
+  it('codex goes through its declared chrome', () => {
+    const codex = getCli('codex');
+    expect(composerProvenEmpty('› \n  GPT-6-Luna default · ~/case', codex)).toBe(true);
+    expect(composerProvenEmpty('› hello\n  GPT-6-Luna default · ~/case', codex)).toBe(false);
+  });
+
+  it('an unknown CLI proves nothing', () => {
+    expect(composerProvenEmpty(framed('❯ '), undefined)).toBe(false);
   });
 });

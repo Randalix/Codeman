@@ -240,7 +240,7 @@ export function isBlockedScreen(
 export const AWAITING_SEARCH_ROWS = 6;
 
 /** A row that opens with a box-drawing character is the composer's frame, not transcript. */
-const COMPOSER_FRAME_ROW = /^[─-╿]/;
+export const COMPOSER_FRAME_ROW = /^[─-╿]/;
 
 /**
  * Whether the pane's newest turn ended by handing off to workers the CLI will wait for,
