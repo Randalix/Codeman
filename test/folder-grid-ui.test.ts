@@ -86,7 +86,7 @@ describe('folder links are routed to the grid', () => {
     // Path provider: upstream's activateFilePath (folder → grid), a brace set → its grid.
     expect(src).toMatch(/if \(folder\) \{\s*self\.openFolderGrid\(target, sessionId\);/);
     expect(src).toMatch(
-      /if \(braces\) self\.openPathSet\(text, getSessionId\(\)\);\s*else activateFilePath\(text, folder\);/
+      /if \(braces\) return self\.openPathSet\(text, getSessionId\(\)\);\s*return activateFilePath\(text, folder\);/
     );
     // OSC 8 file links: the same rule through _openTerminalPathLink.
     expect(src).toMatch(/if \(folder\) \{\s*this\.openFolderGrid\(target, sessionId\);/);
