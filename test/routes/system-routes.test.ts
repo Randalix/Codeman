@@ -367,19 +367,6 @@ describe('system-routes', () => {
       expect(runStaleSessionCleanup).toHaveBeenCalledOnce();
     });
 
-    it('deletes the edit history of every session it cleaned (diffs can hold secrets)', async () => {
-      harness.ctx.tabLayouts.runStaleSessionCleanup = vi.fn(async () => ({
-        count: 2,
-        cleaned: [
-          { id: 'stale-1', name: 'a' },
-          { id: 'stale-2', name: 'b' },
-        ],
-      })) as never;
-      const res = await harness.app.inject({ method: 'POST', url: '/api/cleanup-state' });
-      expect(JSON.parse(res.body).cleanedSessions).toBe(2);
-      expect(vi.mocked(harness.ctx.forgetEditHistory).mock.calls).toEqual([['stale-1'], ['stale-2']]);
-    });
-
     it('drops the agent inbox of every record it removes, and only those', async () => {
       agentInbox.resetForTests();
       agentInbox.post('stale-detached', null, 'mail for a detached session');
@@ -432,6 +419,19 @@ describe('system-routes', () => {
       } finally {
         agentInbox.resetForTests();
       }
+    });
+
+    it('deletes the edit history of every session it cleaned (diffs can hold secrets)', async () => {
+      harness.ctx.tabLayouts.runStaleSessionCleanup = vi.fn(async () => ({
+        count: 2,
+        cleaned: [
+          { id: 'stale-1', name: 'a' },
+          { id: 'stale-2', name: 'b' },
+        ],
+      })) as never;
+      const res = await harness.app.inject({ method: 'POST', url: '/api/cleanup-state' });
+      expect(JSON.parse(res.body).cleanedSessions).toBe(2);
+      expect(vi.mocked(harness.ctx.forgetEditHistory).mock.calls).toEqual([['stale-1'], ['stale-2']]);
     });
   });
 

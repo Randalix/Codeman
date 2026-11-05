@@ -10,7 +10,7 @@
  * yields a CANDIDATE: the image-looking paths in its command and output, with the call's
  * start and end time. Whether a candidate file was actually produced by the call (its
  * mtime falls inside that window) is decided later by whoever can stat it, locally or on
- * the remote host — this module does no IO.
+ * the remote host: this module does no IO.
  *
  * Chunked input: a transcript is read in byte ranges, so a Bash `tool_use` and its result
  * can land in different chunks. Unanswered calls are handed back as `pending` and passed
@@ -50,7 +50,7 @@ export interface EditHunk {
 }
 
 export interface EditRecord {
-  /** The `tool_use_id` of the edit — unique per edit, used to deduplicate. */
+  /** The `tool_use_id` of the edit: unique per edit, used to deduplicate. */
   id: string;
   /** ms since epoch, from the result line's `timestamp` (0 when missing). */
   ts: number;
@@ -103,14 +103,21 @@ const EXT_END = '(?![\\w-])(?!\\.\\w)';
 const TOKEN_CHAR = '[^\\s\'"`<>|;&()=,:*?]';
 const PATH_TOKEN_RE = new RegExp(
   [
-    // 1. file:// URL (Codex: `Saved to: file:///…`) — may contain spaces up to the extension.
-    `file://(/[^\\n]*?\\.${IMAGE_EXT})${EXT_END}`,
+    // 1. file:// URL (Codex: `Saved to: file:///…`), which may contain spaces up to the extension.
+    //    The lazy scan stops at the next `file://`: otherwise it runs to the line end from
+    //    every `file://` of a line that repeats it (quadratic). `:` stays allowed, so a
+    //    timestamped name (`plot-12:30.png`) is still found.
+    `file://(/(?:(?!file://)[^\\n])*?\\.${IMAGE_EXT})${EXT_END}`,
     // 2./3. Quoted paths, spaces allowed.
     `"([^"\\n]*\\.${IMAGE_EXT})"`,
     `'([^'\\n]*\\.${IMAGE_EXT})'`,
-    // 4. Unquoted token. The lookbehind keeps a match from starting inside a URL, a glob
-    //    or a longer name; the name before the extension must not be empty.
-    `(?<![\\w:/.~*?$-])((?:${TOKEN_CHAR}*/)?[^\\s'"\`<>|;&()=,:*?/]+\\.${IMAGE_EXT})${EXT_END}`,
+    // 4. Unquoted token. A match starts only at a token boundary (line start or a character
+    //    that ends a token), never inside a URL (`:` is not a boundary), a glob or a longer
+    //    name. Anchoring at boundaries keeps this linear: a lookbehind that only excluded
+    //    some characters let a match start at every other character of a long token
+    //    (`####…`, a base64 blob) and rescan the token from each, quadratic in the line
+    //    length. The name before the extension must not be empty.
+    `(?<=^|[\\s'"\`<>|;&()=,*?])((?:${TOKEN_CHAR}*/)?[^\\s'"\`<>|;&()=,:*?/]+\\.${IMAGE_EXT})${EXT_END}`,
   ].join('|'),
   'gi'
 );

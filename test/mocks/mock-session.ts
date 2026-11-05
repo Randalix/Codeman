@@ -101,7 +101,7 @@ export class MockSession extends EventEmitter {
   /** The per-session CLAUDE_CONFIG_DIR override that Session.claudeConfigDir() reads. */
   claudeConfigDirOverride: string | undefined = undefined;
 
-  /** Mirrors Session.claudeConfigDir — the override, trimmed; undefined when unset. */
+  /** Mirrors Session.claudeConfigDir: the override, trimmed; undefined when unset. */
   claudeConfigDir(): string | undefined {
     return this.claudeConfigDirOverride?.trim() || undefined;
   }
@@ -490,6 +490,9 @@ export class MockSession extends EventEmitter {
     }
   );
   restartCli = vi.fn(async () => true);
+  /** Mirrors Session.envOverrideValue; no override map here, so the custom-model
+   *  real-home lookup defaults to "session says nothing" (overridable per test). */
+  envOverrideValue = vi.fn((_key: string): string | undefined => undefined);
   getCustomModelForPersist = vi.fn(() => this._mockCustomModel);
   /** Mirrors Session.noteReportedModel: the statusline route records the CLI's model. */
   reportedModel: { model: string; source: 'statusline' | 'screen' } | null = null;

@@ -132,11 +132,16 @@ export function unsupportedReason(session: EditHistorySession): string | undefin
   return undefined;
 }
 
+/** One turn of the event loop, between synchronous parses of up to one budget each. */
+function breathe(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 /**
  * Bash candidates whose probed file is a regular file with an mtime inside the call's window
  * (files claude sent to the user skip the window: they exist and were shown on purpose).
  * A candidate whose file version is already recorded is skipped: `known(path)` is the newest
- * entry time for that path, and an entry at or after `mtime − slack` saw this version — the
+ * entry time for that path, and an entry at or after `mtime − slack` saw this version: the
  * `ls *.png` right after the render, or a Write followed by a listing. Candidates are taken
  * in call order so a batch dedupes itself the same way.
  */
@@ -413,13 +418,18 @@ export class EditHistorySync {
     const requested = new Set(requests.map((r) => r.relPath));
     let more = false;
     const candidates: ImageCandidate[] = [];
+    let parsed = false;
     for (const f of res.files) {
+      // Each file is up to one budget (8 MiB) of synchronous parsing: yield between them.
+      if (parsed) await breathe();
+      if (store.isRemoved()) break;
       // A requested file reads on from its cursor, a new one its tail.
       const available = requested.has(f.relPath) ? f.size - f.startOffset : f.size;
       if (f.chunk.length < Math.min(this.budget, available)) {
         more = true;
         continue;
       }
+      parsed = true;
       const r = store.apply({
         transcriptId: res.transcriptId,
         source: f.relPath,
@@ -470,8 +480,13 @@ export class EditHistorySync {
     this.dropMissing(store, requests, res);
     const wanted = new Set(requests.map((r) => r.relPath));
     const candidates: ImageCandidate[] = [];
+    let parsed = false;
     for (const f of res.files) {
       if (!wanted.has(f.relPath)) continue;
+      // Each file is up to one budget (8 MiB) of synchronous parsing: yield between them.
+      if (parsed) await breathe();
+      parsed = true;
+      if (slot.gone) return true;
       const r = store.applyOlder({
         transcriptId: res.transcriptId,
         source: f.relPath,
@@ -497,7 +512,8 @@ export class EditHistorySync {
     candidates: readonly ImageCandidate[]
   ): Promise<void> {
     const paths = [...new Set(candidates.flatMap((c) => c.paths))];
-    if (paths.length === 0) return;
+    // A removed store keeps nothing: do not probe agent-printed paths for it.
+    if (paths.length === 0 || store.isRemoved()) return;
     let probes: Array<PathProbe | null>;
     try {
       probes = await this.deps.probe(session, paths);

@@ -248,6 +248,24 @@ describe('EditHistorySync', () => {
     ]);
   });
 
+  it('a removal during a read stops it: no further parsing, no probe of printed paths', async () => {
+    const probe = vi.fn(async (_session: unknown, paths: readonly string[]) => paths.map(() => null));
+    let removal: Promise<void> | undefined;
+    const ctx = setup({
+      probe,
+      readSources: async (_session, path, req, budget, opts) => {
+        const res = await ctx.host.read(path, req, budget, opts);
+        removal = ctx.sync.remove('s1'); // the session is deleted while this read is out
+        return res;
+      },
+    });
+    ctx.host.append('main', bashPair('b1', T0, T0 + 5000, 'render out/a.png'));
+    ctx.host.append('subagents/agent-a1.jsonl', bashPair('b2', T0, T0 + 5000, 'render out/b.png'));
+    await ctx.sync.sync(local);
+    await removal;
+    expect(probe).not.toHaveBeenCalled();
+  });
+
   it('keeps the edits when only the image probe fails', async () => {
     const { host, sync } = setup({
       probe: async () => {
@@ -474,17 +492,23 @@ describe('EditHistorySync', () => {
     host.append('main', editLine('t1', T0, '/w/a.ts'));
     const orig = host.read;
     let first = true;
+    let inRead!: () => void;
+    const reachedRead = new Promise<void>((r) => (inRead = r));
     host.read = async (...a) => {
       // Hold only the read of s1 (readSources records its session just before this call). "The
       // first read" is not enough: the stores load from disk, so under load another session's
       // read could arrive first, block on the gate and wait for a release() that comes after it.
       if (first && readers[readers.length - 1] === 's1') {
         first = false;
+        inRead();
         await gate;
       }
       return orig(...a);
     };
     const slow = sync.sync(local);
+    // Only once s1 holds the gate: the sessions load their stores independently, so a later one
+    // could reach the read first, take the gate and hang the loop below before `release()`.
+    await reachedRead;
     for (let i = 1; i <= MAX_LOADED_STORES + 1; i++) await sync.sync({ ...local, id: `s1-${i}` });
     release();
     expect(await slow).toEqual({ state: 'ok' });

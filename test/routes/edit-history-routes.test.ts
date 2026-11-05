@@ -185,12 +185,18 @@ describe('GET /api/sessions/:id/edits', () => {
   it.each([
     ['docker', { docker: { image: 'x' } }],
     ['mode', { mode: 'shell' }],
-  ])('answers unsupported (%s) without reading', async (reason, patch) => {
-    const { app, read } = await setup();
+  ])('answers unsupported (%s) without reading or loading a store', async (reason, patch) => {
+    const loadStore = vi.fn(async (id: string) => EditHistoryStore.load(id, { dir, debounceMs: 0 }));
+    const { app, read } = await setup({ loadStore });
     Object.assign(session, patch);
-    const data = (await app.inject({ method: 'GET', url: `${URL}?sync=1` })).json().data;
-    expect(data).toMatchObject({ state: 'unsupported', reason });
+    const empty = { state: 'unsupported', reason, backfillTruncated: false, agents: {}, entries: [] };
+    for (const url of [URL, `${URL}?sync=1`]) {
+      expect((await app.inject({ method: 'GET', url })).json().data).toEqual(empty);
+    }
+    expect((await app.inject({ method: 'POST', url: `${URL}/older` })).json().data).toEqual(empty);
+    expect((await app.inject({ method: 'GET', url: `${URL}/t1` })).statusCode).toBe(404);
     expect(read).not.toHaveBeenCalled();
+    expect(loadStore).not.toHaveBeenCalled();
   });
 
   it('404s an unknown session', async () => {

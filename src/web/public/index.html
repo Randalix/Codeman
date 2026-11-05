@@ -1072,6 +1072,20 @@
         </div>
         <div class="modal-body">
           <p class="form-hint" id="customModelPickHint"></p>
+          <!-- Case-insensitive filter over the rendered rows (app.filterCustomModelPick):
+               a display layer only, the rows themselves are never re-rendered. Reset on every
+               open and focused only on non-touch devices, same in-memory rule as the rail's
+               search box. -->
+          <input type="search" id="customModelPickSearch" class="session-sidebar-filter-input custom-model-pick-search"
+            placeholder="Search models" aria-label="Search models"
+            autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="search"
+            oninput="app.filterCustomModelPick(this.value)">
+          <p class="form-hint custom-model-pick-no-matches" id="customModelPickNoMatches" role="status" hidden>No models match</p>
+          <!-- Shown only when no row carries a loaded/in-use/last-used mark AND the
+               running-status probe answered `isLlamaSwap: false` (see
+               _openCustomModelPickModal): it says out loud WHY nothing is marked, in the user's language, rather than leaving an
+               alphabetical wall that looks like the question was ignored. -->
+          <p class="form-hint custom-model-pick-unknown" id="customModelPickUnknown" role="status" hidden>Nothing is marked: this endpoint did not report which model it has loaded, and none of your running sessions uses one. Pick the model to launch.</p>
           <div id="customModelPickList" class="run-mode-custom-models"></div>
         </div>
       </div>
@@ -2832,6 +2846,10 @@
                         <input type="text" id="customModelHostBaseUrl" class="set-input" placeholder="http://192.168.1.50:8080">
                       </div>
                       <div class="set-row has-field">
+                        <div class="set-row-text"><span class="set-row-label">Default context length (tokens)</span><span class="set-row-desc">Used for models whose size cannot be discovered. The model's whole window; the Claude floor check divides it by any stored slot count. Leave empty to let each CLI assume its own default.</span></div>
+                        <input type="number" id="customModelHostDefaultContextLength" class="set-input" min="1" max="100000000" step="1" placeholder="131072">
+                      </div>
+                      <div class="set-row has-field">
                         <div class="set-row-text"><span class="set-row-label">API key</span><span class="set-row-desc">Optional. Left blank on edit keeps the existing key.</span></div>
                         <input type="password" id="customModelHostApiKey" class="set-input" autocomplete="new-password">
                       </div>
@@ -3274,6 +3292,97 @@
                   <div id="webhookResult" class="set-note" style="display:none" data-i18n-skip></div>
                 </div>
               </div>
+              <div class="set-group" id="discordGroup" style="display:none">
+                <div class="set-group-head"><h4>Discord (two-way, one thread per tab)</h4><span class="set-scope">server</span></div>
+                <div class="set-group-body">
+                  <div class="set-row" data-search="discord bot thread reply phone notification blocked">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Talk to your sessions from Discord</span>
+                      <span class="set-row-desc">Posts alerts into a thread per tab and types your reply in that thread into the tab. Only the user IDs listed below can reply. Setup (bot, least-privilege permissions) is in docs/discord-bridge.md. This group has its own Save button.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="discordEnabled"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Bot token</span>
+                      <span class="set-row-desc" id="discordTokenHint">Nothing saved yet.</span>
+                    </div>
+                    <input type="password" id="discordToken" class="set-input" autocomplete="off" spellcheck="false" placeholder="Bot token from the Developer Portal">
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">Guild (server) ID</span></div>
+                    <input type="text" id="discordGuildId" class="set-input" autocomplete="off" spellcheck="false" inputmode="numeric">
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">Parent channel ID</span><span class="set-row-desc">Threads are created inside this channel.</span></div>
+                    <input type="text" id="discordParentChannelId" class="set-input" autocomplete="off" spellcheck="false" inputmode="numeric">
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">Allowed user IDs</span><span class="set-row-desc">Comma separated. Only these Discord users can reply into a session.</span></div>
+                    <input type="text" id="discordAllowedUserIds" class="set-input" autocomplete="off" spellcheck="false">
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">Create threads</span></div>
+                    <select id="discordThreadCreation" class="set-select">
+                      <option value="lazy">On the first alert</option>
+                      <option value="onSessionStart">For every new tab</option>
+                    </select>
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">When a tab is deleted</span><span class="set-row-desc">Deleting a thread needs the Manage Threads permission on the channel.</span></div>
+                    <select id="discordOnSessionDelete" class="set-select">
+                      <option value="keep">Keep the thread</option>
+                      <option value="archive">Archive the thread</option>
+                      <option value="delete">Delete the thread</option>
+                    </select>
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">Stale threads</span><span class="set-row-desc">Threads this bot made that no tab uses any more, checked after startup and then daily. This includes threads that &quot;When a tab is deleted&quot; kept or archived. Threads under an hour old are skipped. Use one channel per Codeman.</span></div>
+                    <select id="discordStaleThreads" class="set-select">
+                      <option value="keep">Leave them</option>
+                      <option value="archive">Archive them</option>
+                      <option value="delete">Delete them</option>
+                    </select>
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text"><span class="set-row-label">@ ping</span></div>
+                    <select id="discordPingMode" class="set-select">
+                      <option value="off">Never</option>
+                      <option value="critical">Critical events only</option>
+                      <option value="all">Every post</option>
+                    </select>
+                  </div>
+                  <div class="set-row">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Tell Claude how to reach you</span>
+                      <span class="set-row-desc">Adds a short note about the codeman notify command to Claude's system prompt at launch, for when it is blocked on something only you can do. Nothing appears in the conversation. Local tabs only: remote and Docker tabs have no codeman command.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="discordStartupHint"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row has-field">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Which events</span>
+                      <span class="set-row-desc">"Needs attention" skips the routine "response complete" message.</span>
+                    </div>
+                    <select id="discordScope" class="set-select">
+                      <option value="attention">Needs attention</option>
+                      <option value="all">Everything</option>
+                    </select>
+                  </div>
+                  <div class="set-row">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Save and test</span>
+                      <span class="set-row-desc">Send test saves first, then posts to the parent channel.</span>
+                    </div>
+                    <span>
+                      <button class="btn-toolbar btn-sm btn-primary" id="discordSaveBtn" onclick="app.saveDiscord()">Save</button>
+                      <button class="btn-toolbar btn-sm" id="discordTestBtn" onclick="app.testDiscord()">Send test</button>
+                      <button class="btn-toolbar btn-sm" id="discordClearBtn" onclick="app.clearDiscord()" style="display:none">Remove token</button>
+                    </span>
+                  </div>
+                  <div id="discordResult" class="set-note" style="display:none" data-i18n-skip></div>
+                </div>
+              </div>
             </section>
 
             <!-- ══ Voice ════════════════════════════════════════════════════ -->
@@ -3694,7 +3803,19 @@
             <div class="form-row">
               <label>Case Name</label>
               <input type="text" id="cloneCaseName" placeholder="repo" pattern="[a-zA-Z0-9_-]+" autocomplete="off" autocapitalize="off" spellcheck="false" oninput="app.onCloneNameEdited()">
-              <span class="form-hint">Filled in from the URL. Cloned into ~/codeman-cases/&lt;name&gt;, so deleting the case deletes this working tree.</span>
+              <span class="form-hint" id="cloneCaseNameHint">Filled in from the URL. Cloned into ~/codeman-cases/&lt;name&gt;, so deleting the case deletes this working tree.</span>
+            </div>
+            <div class="form-row" id="cloneCustomPathToggleRow">
+              <label class="checkbox-row"><input type="checkbox" id="cloneCustomPathToggle" onchange="app.toggleCloneCustomPath()"> 📁 Clone into a custom folder</label>
+              <span class="form-hint">By default the clone goes under ~/codeman-cases. Choose a folder and the repository is cloned into that folder itself (an empty folder, or one that does not exist yet); it is listed like any other case, and deleting the case only unlinks it (your files stay).</span>
+            </div>
+            <div class="form-row" id="cloneCustomPathRow" style="display:none">
+              <label>Folder</label>
+              <div class="path-input-group">
+                <input type="text" id="cloneCasePath" placeholder="~/projects" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" oninput="app.updateCloneCasePathPreview()">
+                <button type="button" class="btn path-input-browse" onclick="app.openCloneCasePathPicker()">Browse&hellip;</button>
+              </div>
+              <span class="form-hint" id="cloneCasePathPreview">Pick an empty folder, or one that does not exist yet, to clone into.</span>
             </div>
             <div class="form-row">
               <label>Branch or Tag (optional)</label>

@@ -46,6 +46,8 @@ import { rebootRestoreRegistry } from './reboot-restore-registry.js';
 import { runBootRemoteReattach } from './reboot-remote-reattach.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
+import { DiscordBridge, screenTail } from '../discord-bridge.js';
+import { isExternalCliTranscriptMode } from './response-viewer-transcript.js';
 import { stopHostSensors } from '../host-sensors.js';
 import type { WebhookUrgency } from '../types/push.js';
 import { webviewFetch } from './webview-egress.js';
@@ -81,8 +83,13 @@ import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment
 import { folderGrants } from '../folder-listing.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
-import { readCustomModelHosts } from '../custom-model-hosts.js';
-import { applyCustomModelInjection, customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
+import { readCustomModelHosts, resolveCustomModelContextLength } from '../custom-model-hosts.js';
+import {
+  applyCustomModelInjection,
+  customModelConfigDir,
+  removeConfigDir,
+  type AppliedCustomModel,
+} from '../custom-model-injection-apply.js';
 import type { CustomModelBookkeeping } from '../types/session.js';
 import { registerGeneratedArtifactAttachment } from '../generated-artifact-attachments.js';
 import {
@@ -257,6 +264,7 @@ import {
   registerConfigBackupRoutes,
   runConfigBackup,
   registerWebhookRoutes,
+  registerDiscordRoutes,
   registerDoctorRoutes,
   registerCustomModelRoutes,
   refreshAllCustomModelHosts,
@@ -625,6 +633,27 @@ export class WebServer extends EventEmitter {
   private pushStore: PushSubscriptionStore = new PushSubscriptionStore();
   /** ntfy / Slack / Discord / generic webhook for the push events; config in webhook.json (0600). */
   private webhookNotifier = new WebhookNotifier(() => readWebhookConfig(getDataDir()), webviewFetch);
+  /** Two-way Discord bridge (thread per tab); config in discord.json (0600). Idle until enabled in Settings. */
+  /** Set by the session routes when they register (see SessionPort). */
+  lastResponseFor?: (session: Session, context?: string) => Promise<{ text: string; timestamp?: string }>;
+  private discordBridge = new DiscordBridge({
+    configDir: getDataDir(),
+    fetchImpl: webviewFetch,
+    sendInput: async (sessionId, text) => {
+      const session = this.sessions.get(sessionId);
+      if (!session) return false;
+      // A Discord reply is a person's own input, so it names the tab like any other prompt.
+      if (await session.writeViaMux(text, { fromUser: true }).catch(() => false)) return true;
+      return session.write(text, { fromUser: true });
+    },
+    agentExited: (id) => !!this.sessions.get(id)?.paneExit,
+    awaitingChoice: (id) => approvalInbox.listPending().some((item) => item.sessionId === id && item.kind !== 'idle'),
+    // Remote (ssh) sessions keep their folder on another host, so received files have nowhere local to go.
+    sessionDir: (sessionId) => {
+      const session = this.sessions.get(sessionId);
+      return session && !session.remote ? session.workingDir : undefined;
+    },
+  });
   private teamWatcher: TeamWatcher = new TeamWatcher();
   private _orchestratorLoop: import('../orchestrator-loop.js').OrchestratorLoop | null = null;
   private readonly titleHostname: string;
@@ -1433,6 +1462,8 @@ export class WebServer extends EventEmitter {
     // cleanup path and resolves in-flight wakes on shutdown. Registered before the case
     // routes, whose remote-link (a user request) wakes a sleeping host through it.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
+    // The routes' ctx is a separate object: take the last-response reader they registered on it (Discord alerts).
+    this.lastResponseFor = (ctx as { lastResponseFor?: WebServer['lastResponseFor'] }).lastResponseFor;
     registerCaseRoutes(this.app, ctx, { remoteWake: this.remoteWake });
     registerWorktreeRoutes(this.app, ctx);
     registerAgentSessionRoutes(this.app, ctx);
@@ -1447,12 +1478,23 @@ export class WebServer extends EventEmitter {
     registerWebviewRoutes(this.app, ctx, this.basePath);
     registerTabLayoutRoutes(this.app, ctx);
     registerMcpSyncRoutes(this.app);
-    registerConfigBackupRoutes(this.app);
+    registerConfigBackupRoutes(this.app, { reloadDiscord: () => this.discordBridge.reload() });
     registerWebhookRoutes(this.app, {
       notifier: this.webhookNotifier,
       configDir: getDataDir(),
       hostTitle: () => this.windowTitle,
     });
+    registerDiscordRoutes(this.app, {
+      bridge: this.discordBridge,
+      configDir: getDataDir(),
+      ctx,
+      hostTitle: () => this.windowTitle,
+    });
+    if (!this.testMode) {
+      // The gateway waits for restoreMuxSessions(): a reply during restore would be told the tab is gone.
+      this.discordBridge.hold();
+      void this.discordBridge.ensureLoaded().catch(() => undefined);
+    }
     registerDoctorRoutes(this.app);
     registerCustomModelRoutes(this.app);
     registerCliRegistryRoutes(this.app);
@@ -1577,7 +1619,7 @@ export class WebServer extends EventEmitter {
   private async _rebuildCustomModelEnv(
     session: Session,
     saved: CustomModelBookkeeping
-  ): Promise<Record<string, string> | undefined> {
+  ): Promise<AppliedCustomModel | undefined> {
     const entry = getCli(session.mode);
     if (!entry) return undefined;
     const endpoint = (await readCustomModelHosts(getDataDir())).find((h) => h.id === saved.endpointId);
@@ -1588,17 +1630,54 @@ export class WebServer extends EventEmitter {
       return undefined;
     }
     try {
+      // Boot recovery omits both `workingDir` (no reason to re-answer a trust dialog that
+      // already fired once) and the session-env real-home lookup: the injected VALUES are
+      // never persisted, so after a real restart the session can no longer carry its
+      // allowlisted `DSH_HOME` either (`getEnvOverridesForPersist()` keeps only
+      // `CLAUDE_CODE_*`/`CLAUDE_CONFIG_DIR`): the lookup could only ever hit on the first
+      // apply in-process. Real-home resolution therefore falls back to the SERVER's
+      // `DSH_HOME` or the recipe's `realHomeFallback` (~/.dsh).
       return applyCustomModelInjection(
         entry,
         endpoint,
         saved.modelId,
         session.id,
-        endpoint.modelContextLengths?.[saved.modelId]
-      )?.envOverrides;
+        resolveCustomModelContextLength(endpoint, saved.modelId)
+      );
     } catch (err) {
       console.warn('[WebServer] Failed to rebuild custom-model env on recovery:', err);
       return undefined;
     }
+  }
+
+  /**
+   * Restore one persisted custom-model selection (both boot-recovery paths). The rebuilt
+   * bookkeeping must come from the CURRENT recipe, not from the saved record: this is the
+   * first feature where a shipped recipe changed KIND (deepseek: env redirect -> per-session
+   * patch home), so a selection saved by an old build restores with e.g. no `configDir`
+   * while the new recipe writes one, and clearing it later could then never delete the
+   * generated dir. `envKeys` is the UNION of saved and applied keys: the tmux session may
+   * still carry `setenv`s from both, and a clear has to unset every one.
+   */
+  private async _restoreCustomModel(session: Session, saved: CustomModelBookkeeping): Promise<void> {
+    const applied = await this._rebuildCustomModelEnv(session, saved);
+    if (!applied) {
+      // Endpoint gone or CLI unregistered: restore the bookkeeping exactly as saved, which
+      // is what a later clear needs.
+      session.setCustomModel(saved);
+      return;
+    }
+    session.setCustomModel(
+      {
+        ...saved,
+        // Prefer the current recipe's dir; keep the saved one when the recipe writes none,
+        // so a clear can still delete a directory an older recipe created.
+        configDir: applied.configDir ?? saved.configDir,
+        launchModel: applied.launchModel,
+        envKeys: [...new Set([...saved.envKeys, ...applied.envKeys])],
+      },
+      applied.envOverrides
+    );
   }
 
   /** Persists full session state including respawn config to state.json */
@@ -1903,7 +1982,11 @@ export class WebServer extends EventEmitter {
     // detach: mail posted before that is still there when the session is re-attached
     // (while detached, the routes answer 404, so nothing new arrives). Before
     // cancelAll, so a reader released by it reads an empty inbox.
-    if (killMux) agentInbox.drop(sessionId);
+    if (killMux) {
+      agentInbox.drop(sessionId);
+      // A real delete only: a detach (killMux=false) leaves the session running and re-attachable.
+      void this.discordBridge.sessionDeleted(sessionId).catch(() => undefined);
+    }
     sessionWaits.notifySignal(sessionId, 'exit');
     sessionWaits.cancelAll(sessionId);
     approvalInbox.resolveForSession(sessionId, 'session_ended');
@@ -2861,6 +2944,23 @@ export class WebServer extends EventEmitter {
     // Multi-user: derive an ownership routing hint so an event only reaches the
     // clients entitled to it (no-op in single-user — hint stays undefined).
     this.sse.broadcast(event, data, isMultiUserMode() ? this.deriveSseHint(event, data) : undefined);
+    this.bridgeSessionEvent(event, data);
+  }
+
+  /** Keep the Discord thread in step with the tab: created, renamed, deleted. Never throws. */
+  private bridgeSessionEvent(event: string, data: unknown): void {
+    // Deletion is NOT handled here: `session:deleted` also fires for a detach (killMux=false), where the
+    // session keeps running and can be re-attached. The real delete calls the bridge from the cleanup path.
+    if (event !== SseEvent.SessionCreated && event !== SseEvent.SessionUpdated) return;
+    const d = (data ?? {}) as { id?: string; name?: string; session?: { id?: string; name?: string } };
+    const s = d.session ?? d;
+    if (!s.id) return;
+    const id = s.id;
+    const run =
+      event === SseEvent.SessionCreated
+        ? this.discordBridge.sessionCreated(id, s.name).then(() => this.discordBridge.sessionRenamed(id, s.name))
+        : this.discordBridge.sessionRenamed(id, s.name);
+    void run.catch(() => undefined);
   }
 
   /**
@@ -3044,13 +3144,24 @@ export class WebServer extends EventEmitter {
   private applyPaneExits(): void {
     const getPaneExit = this.mux.getPaneExit?.bind(this.mux);
     if (!getPaneExit) return;
+    const getPaneCurrentPath = this.mux.getPaneCurrentPath?.bind(this.mux);
     for (const session of this.sessions.values()) {
       const muxName = session.muxName;
       // No pane, so nothing to report — and `setPaneExit()` would force UNKNOWN
       // for such a session anyway.
       if (!muxName) continue;
-      if (!session.setPaneExit(getPaneExit(muxName))) continue;
-      this.persistSessionState(session);
+      // The pane's live directory rides the same read: it is the base a relative
+      // path printed in the terminal resolves against. The manager's answer is
+      // applied as given, `undefined` included: it keeps its map across a failed
+      // or empty read and carries a blank `#{pane_current_path}` forward, so an
+      // `undefined` here means an authoritative read listed no single directory
+      // for the session (split into several panes, or gone from the socket).
+      const paneCwdChanged = getPaneCurrentPath ? session.setPaneCwd(getPaneCurrentPath(muxName)) : false;
+      if (session.setPaneExit(getPaneExit(muxName))) {
+        this.persistSessionState(session);
+      } else if (!paneCwdChanged) {
+        continue;
+      }
       this.broadcastSessionStateDebounced(session.id);
     }
     this.closeCleanlyExitedSessions();
@@ -3166,6 +3277,27 @@ export class WebServer extends EventEmitter {
       })
       .catch(() => undefined);
 
+    // Discord: same event, same independence from Web Push. It adds the tail of what the CLI printed,
+    // so the person reading the thread can see what is being asked without opening the tab.
+    const dcSession = sessionId ? this.sessions.get(sessionId) : undefined;
+    // A question or permission dialog lives on the screen, so it keeps the screen tail (its options are
+    // there); a finished turn posts the CLI's whole last message instead, from its transcript.
+    const dialogEvent = event === SseEvent.HookPermissionPrompt || event === SseEvent.HookElicitationDialog;
+    void this.discordBridge
+      .notify({
+        event,
+        title: template.title,
+        body,
+        urgency: template.urgency as WebhookUrgency,
+        sessionId: sessionId || undefined,
+        sessionName: sessionName || undefined,
+        // A function, so the screen is only read (a synchronous tmux exec) once the bridge has decided to post.
+        tail: dcSession ? () => this.discordTail(dcSession, !dialogEvent) : undefined,
+        fullText: dcSession && !dialogEvent ? () => this.discordFullText(dcSession) : undefined,
+        host: this.windowTitle,
+      })
+      .catch(() => undefined);
+
     const subscriptions = this.pushStore.getAll();
     if (subscriptions.length === 0) return;
 
@@ -3245,6 +3377,34 @@ export class WebServer extends EventEmitter {
         }
       });
     }
+  }
+
+  /**
+   * What the person would see on the tab right now, for a Discord alert: the rendered tmux screen
+   * (`capture-pane -p`), never the raw output stream, which a full-screen UI repaints in place and
+   * reads as garbage. A session with no pane falls back to its plain text output, else nothing.
+   */
+  private discordTail(session: Session, cutComposer: boolean): string {
+    const pane = session.muxName ? (this.mux.capturePaneText?.(session.muxName) ?? null) : null;
+    // The composer row and the status lines under it are screen chrome, not what the CLI said.
+    const glyph = cutComposer ? getCli(session.mode)?.capabilities.workDetect?.promptGlyph : undefined;
+    return screenTail(pane ?? session.textOutput ?? '', 14, 900, glyph);
+  }
+
+  /**
+   * The CLI's whole last message from the response viewer's reader (the CLI's own transcript, or the pane
+   * segmented into turns for the CLIs that keep none); undefined for a shell, which has no turns, and the
+   * screen tail stands in whenever the reader finds nothing.
+   */
+  private async discordFullText(session: Session): Promise<{ text: string; version?: string } | undefined> {
+    if (!this.lastResponseFor) return undefined;
+    // A CLI with a transcript reader, or whose pane the viewer segments into turns; a shell has neither.
+    if (getCli(session.mode)?.capabilities.transcript === 'none' && !isExternalCliTranscriptMode(session.mode)) {
+      return undefined;
+    }
+    const r = await this.lastResponseFor(session);
+    // The turn it came from: the transcript's stamp, else when the person last submitted (a pane has no stamp).
+    return { text: r.text, version: r.timestamp || String(session.lastSubmitAt ?? '') };
   }
 
   /** The notification body for an event (shared by Web Push and the webhook channel). */
@@ -3388,6 +3548,20 @@ export class WebServer extends EventEmitter {
       if (restoredMail > 0) console.log(`[AgentInbox] restored ${restoredMail} pending message(s)`);
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
+      void this.discordBridge
+        .release()
+        .then(async () => {
+          // Only after a successful restore, like the agent inbox prune and the tab layout reconciliation, and
+          // with the same keep set: a reboot-restore rebuild reuses the old id.
+          if (!restored) return;
+          await this.discordBridge.prune([
+            ...this.sessions.keys(),
+            ...Object.keys(this.store.getSessions()),
+            ...rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId),
+          ]);
+        })
+        .then(() => this.discordBridge.startStaleSweep())
+        .catch(() => undefined);
 
       // Remote sessions the reboot cut off reattach without a click when their
       // remote pane survived. Not awaited: one ssh per host must not hold up the
@@ -3863,7 +4037,7 @@ export class WebServer extends EventEmitter {
       // bookkeeping survives a restart and the values are re-derived here.
       const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
       if (savedCustomModel) {
-        session.setCustomModel(savedCustomModel, await this._rebuildCustomModelEnv(session, savedCustomModel));
+        await this._restoreCustomModel(session, savedCustomModel);
       }
       if (saved.niceEnabled !== undefined || saved.niceValue !== undefined) {
         session.setNice({ enabled: saved.niceEnabled, niceValue: saved.niceValue });
@@ -3999,6 +4173,9 @@ export class WebServer extends EventEmitter {
     } catch (err) {
       console.warn(`[Server] releasing the tab layout slot failed: ${getErrorMessage(err)}`);
     }
+    // Per-tab bridge state only: a reboot-restore rebuild reuses the old id and stays on offer for a
+    // retry, so its thread must survive the discard.
+    this.discordBridge.forgetTab(sessionId);
     // Any `session:updated` the half-built session emitted before it failed left a
     // tab on every other open board, and the client's handler is an upsert.
     this.broadcast(SseEvent.SessionDeleted, { id: sessionId });
@@ -4165,7 +4342,7 @@ export class WebServer extends EventEmitter {
             // the isolated config dir; an endpoint that has since been deleted still gets
             // the bookkeeping restored, which is what a later clear needs to unset.
             if (savedCustomModel) {
-              session.setCustomModel(savedCustomModel, await this._rebuildCustomModelEnv(session, savedCustomModel));
+              await this._restoreCustomModel(session, savedCustomModel);
             }
 
             // Update session name if it was a "Restored:" placeholder or doesn't match saved name
@@ -4578,6 +4755,9 @@ export class WebServer extends EventEmitter {
     // Same teardown rule: the per-endpoint llama-swap log tails are otherwise closed
     // only by the periodic idle sweep, whose interval is disposed just below.
     closeAllLlamaSwapLogTails();
+
+    // Close the Discord gateway socket and its heartbeat, and clear the bridge's per-tab maps.
+    this.discordBridge.stop();
 
     // Dispose all managed timers (intervals + resettable timeouts)
     this.cleanup.dispose();

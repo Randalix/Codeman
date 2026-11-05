@@ -87,7 +87,10 @@ detected at once would fork ten multi-minute converter processes.
 
 File paths in a session are links. That works in two places:
 
-- **In the terminal**, on any absolute path an agent prints.
+- **In the terminal**, on any path an agent or a command prints. A relative path (`src/app.ts`,
+  `../notes.md`) resolves against the directory the session's pane is in now, so after a `cd`
+  in a shell it opens the file there; until the pane reports a directory, and always for remote
+  SSH and Docker cases, it resolves against the session's working directory.
 - **In the response viewer**, where paths are usually written as prose or in backticks. They
   render as underlined monospace links. A Markdown link whose target is a path
   (`[report](/tmp/run/report.json)`, the way Codex cites files) opens the same way.
@@ -167,6 +170,11 @@ quick way to the file an agent just wrote), with folders always ahead of files; 
 choice is remembered per device. The picker inserts the path into your prompt
 **without** pressing Enter, so nothing is submitted by accident. Its sibling **⌫ All**
 key clears the unsent prompt, and never sends the agent's `/clear` command.
+
+In **Link Existing**'s picker, **+📁** (New folder) makes a folder inside the folder you
+are viewing and selects it. Names use letters, numbers, spaces and `_ - . ~` (not starting
+with a dot or `~`). The cases folder is refused, since every folder there is already a
+case: use **Add Case → New Case** instead.
 
 This is a separate file-serving surface from the viewer, with its own rules: it allowlists
 your home directory, the cases directory, and anything in `CODEMAN_FILE_PICKER_ROOTS`, and

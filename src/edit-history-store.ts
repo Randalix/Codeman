@@ -4,8 +4,8 @@
  *
  * Sources are the main transcript (`main`) and each subagent transcript
  * (`subagents/agent-<id>.jsonl`). Each has a cursor:
- *   - `offset` — the next byte to read forward; always a line boundary.
- *   - `floor`  — the lowest byte already parsed; > 0 while older lines are unread
+ *   - `offset`: the next byte to read forward; always a line boundary.
+ *   - `floor`: the lowest byte already parsed; > 0 while older lines are unread
  *                ("ältere laden" reads `[floor − budget, floor)`, see `olderRange`).
  * The reader (`edit-history-local-source.ts`) reads forward from each `offset` of the
  * current conversation, a file without one from `budget` bytes before its end, and hands the
@@ -29,8 +29,8 @@
  * ⚠️ The file holds secrets: a diff carries whatever the agent wrote, keys and `.env`
  * contents included. So, like `intents.json`, it is written 0600 via tmp+rename, bounded,
  * deleted with the session (`remove()`; `sweep()` at startup removes files no session owns),
- * never fed to `/api/search`, and blocked from the file routes by `isSensitivePath`
- * (`web/sensitive-path.ts`). `load()` takes the file as untrusted: past
+ * never fed to `/api/search`, and refused by the attachment, folder and download routes through
+ * `isSensitivePath` (`web/sensitive-path.ts`). `load()` takes the file as untrusted: past
  * {@link MAX_FILE_BYTES} it is not parsed, and every part is rebuilt under the same bounds.
  *
  * Persisted as JSON under `dataPath('edit-history', '<sessionId>.json')`, written debounced.
@@ -574,6 +574,11 @@ export class EditHistoryStore {
     const run = (this.writing ?? Promise.resolve()).then(() => this.write());
     this.writing = run.catch(() => undefined);
     await run;
+  }
+
+  /** True once {@link remove} ran: the store ignores every later write. */
+  isRemoved(): boolean {
+    return this.removed;
   }
 
   /**
