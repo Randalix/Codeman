@@ -129,6 +129,7 @@ export interface RebootRestoreRejection {
     | 'agent-exited'
     | 'respawn-blocked'
     | 'remote-or-docker'
+    | 'adopted'
     | 'unsupported-mode'
     | 'no-working-dir'
     | 'workspace-missing'
@@ -231,6 +232,15 @@ export function planRebootRestore(
       // The container's tmux went down with the host, and rebuilding it means
       // re-creating the container's launch context, which this pass does not do.
       skipped.push({ sessionId, reason: 'remote-or-docker' });
+      continue;
+    }
+    if (state.adopt) {
+      // ⚠️ Same family as the rule above, different reason. Codeman never started the
+      // process this session wrapped: all it ever had was an attach command. Replaying
+      // that builds a connection to a foreign session that a reboot has almost certainly
+      // taken with it, and, worse, the rebuilt tab would present whatever the attach
+      // lands on as a session we restored, passing someone else's work off as ours.
+      skipped.push({ sessionId, reason: 'adopted' });
       continue;
     }
     if (state.remote) {

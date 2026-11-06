@@ -12,7 +12,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { execFileSync } from 'node:child_process';
+import { exec, execFileSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -29,15 +29,20 @@ import { tmpdir } from 'node:os';
 import {
   RemoteFileAccessError,
   buildRemoteClaudeEditSourcesCommand,
+  buildRemoteEditHistoryCommand,
   buildRemoteClaudeTranscriptLocateCommand,
   isRemoteClaudeTranscriptPath,
   parseRemoteClaudeEditSources,
   parseRemoteClaudeTranscriptLocate,
+  planRemoteEditSourceRounds,
+  readRemoteEditSourceRounds,
   remoteEditSourcesTimeoutMs,
   remoteLocateClaudeTranscript,
   remoteReadClaudeEditSources,
 } from '../src/remote-files.js';
 import { readClaudeEditSources, type EditSourceRequest } from '../src/edit-history-local-source.js';
+import { EditHistoryStore } from '../src/edit-history-store.js';
+import { EditHistorySync, type EditHistorySession } from '../src/web/edit-history-sync.js';
 import type { SessionRemote } from '../src/types/session.js';
 
 let home: string;
@@ -59,6 +64,12 @@ function runSh(command: string, env: Record<string, string> = {}): { code: numbe
     const e = err as { status: number; stdout: Buffer };
     return { code: e.status, stdout: e.stdout };
   }
+}
+
+/** Runs a read command the way a {@link readRemoteEditSourceRounds} runner does, here on `sh`. */
+async function runRead(command: string): Promise<Buffer | null> {
+  const { code, stdout } = runSh(command);
+  return code === 0 ? stdout : null;
 }
 
 /** One edit-source record in the script's wire format. */
@@ -153,17 +164,32 @@ describe('the transcript lookup on a real shell', () => {
 
   describe('after a /clear: the conversation the pane’s claude writes now', () => {
     // Fake tmux (pane pid 100) and ps (100 → 200 wrapper → 300 claude); claude's own
-    // ~/.claude/sessions/<pid>.json names the current conversation.
+    // ~/.claude/sessions/<pid>.json names the current conversation. tmux sits in the temp
+    // $HOME/.local/bin, which withRemoteTmuxPath() puts ahead of the system dirs, so a real
+    // tmux on this machine is never asked.
     let bin: string;
     const pane = { socket: 'codeman-remote', sessionName: 'codeman-ssh-conv1abc' };
     beforeAll(() => {
       bin = mkdtempSync(join(tmpdir(), 'codeman-fake-tmux-'));
+      const localBin = join(home, '.local', 'bin');
+      mkdirSync(localBin, { recursive: true });
+      // Only the exact `=name:` target reaches the pane. Real tmux (3.4, measured) reads `=name`
+      // without the colon as a window target too, so it also answers for a window of that name
+      // or a session the name is a prefix of: the second pattern is that second case.
       writeFileSync(
-        join(bin, 'tmux'),
-        '#!/bin/sh\ncase "$*" in *"=codeman-ssh-conv1abc"*) echo 100 ;; *) echo "no such session" >&2; exit 1 ;; esac\n'
+        join(localBin, 'tmux'),
+        [
+          '#!/bin/sh',
+          'for a; do',
+          '  case "$a" in =codeman-ssh-conv1abc:|=codeman-ssh-conv1) echo 100; exit 0 ;; esac',
+          'done',
+          'echo "no such session" >&2',
+          'exit 1',
+          '',
+        ].join('\n')
       );
       writeFileSync(join(bin, 'ps'), '#!/bin/sh\nprintf "  1     0\\n100     1\\n200   100\\n300   200\\n"\n');
-      chmodSync(join(bin, 'tmux'), 0o755);
+      chmodSync(join(localBin, 'tmux'), 0o755);
       chmodSync(join(bin, 'ps'), 0o755);
       mkdirSync(join(home, '.claude', 'sessions'), { recursive: true });
     });
@@ -178,12 +204,27 @@ describe('the transcript lookup on a real shell', () => {
       expect(locateIn(pane)).toBe(join(projects(), 'old', 'solo.jsonl'));
     });
 
+    it('finds the pane with tmux only under $HOME/.local/bin, on a PATH that does not list it', () => {
+      // A host where tmux is a per-user install: sshd's non-interactive PATH has no such dir.
+      const PATH = `${bin}:/usr/bin:/bin`;
+      expect(PATH).not.toContain('.local/bin');
+      expect(existsSync(join(bin, 'tmux'))).toBe(false);
+      session('{"pid":300,"sessionId":"solo"}');
+      expect(locate(['conv-1'], pane, { PATH })).toBe(join(projects(), 'old', 'solo.jsonl'));
+    });
+
     it('falls back to the stored ids without a pane, for an unknown session, or a live id with no transcript', () => {
       session('{"pid":300,"sessionId":"solo"}');
       expect(locateIn(undefined)).toBe(join(projects(), 'new', 'conv-1.jsonl'));
       expect(locateIn({ ...pane, sessionName: 'codeman-ssh-other' })).toBe(join(projects(), 'new', 'conv-1.jsonl'));
       session('{"pid":300,"sessionId":"gone"}');
       expect(locateIn(pane)).toBe(join(projects(), 'new', 'conv-1.jsonl'));
+    });
+
+    it('never takes the pane of another tmux session whose name starts with this one', () => {
+      // codeman-ssh-conv1 is gone, codeman-ssh-conv1abc is alive: its conversation is not ours.
+      session('{"pid":300,"sessionId":"solo"}');
+      expect(locateIn({ ...pane, sessionName: 'codeman-ssh-conv1' })).toBe(join(projects(), 'new', 'conv-1.jsonl'));
     });
 
     it('reads the live id from the sessions dir under CLAUDE_CONFIG_DIR', () => {
@@ -242,6 +283,59 @@ describe('buildRemoteClaudeEditSourcesCommand', () => {
     expect(command).toContain('agent-ok.jsonl');
     expect(command).toContain('r 7 3');
     expect(command).not.toContain('r 99');
+  });
+});
+
+describe('planRemoteEditSourceRounds', () => {
+  const agents = (...ids: string[]): EditSourceRequest[] =>
+    ids.map((id) => ({ relPath: `subagents/agent-${id}.jsonl`, offset: 1 }));
+
+  it('keeps a read that fits one script in one round trip, with no name range', () => {
+    const requests = [{ relPath: 'main', offset: 5 }, ...agents('b', 'a')];
+    expect(planRemoteEditSourceRounds(requests, 2)).toEqual([{ requests, main: true, after: '', upTo: '' }]);
+    expect(planRemoteEditSourceRounds([], 2)).toEqual([{ requests: [], main: true, after: '', upTo: '' }]);
+  });
+
+  it('cuts more requests by name: ranges that join up, main in the first, every request once', () => {
+    const main = { relPath: 'main', offset: 5 };
+    const rounds = planRemoteEditSourceRounds([...agents('e', 'c'), main, ...agents('a', 'd', 'b')], 2);
+    expect(rounds.map((r) => [r.main, r.after, r.upTo, r.requests.map((q) => q.relPath)])).toEqual([
+      [true, '', 'agent-b.jsonl', ['main', 'subagents/agent-a.jsonl', 'subagents/agent-b.jsonl']],
+      [false, 'agent-b.jsonl', 'agent-d.jsonl', ['subagents/agent-c.jsonl', 'subagents/agent-d.jsonl']],
+      [false, 'agent-d.jsonl', '', ['subagents/agent-e.jsonl']],
+    ]);
+  });
+
+  it('counts only valid requests, the first per relPath', () => {
+    const rounds = planRemoteEditSourceRounds(
+      [
+        ...agents('a'),
+        { relPath: 'subagents/agent-a.jsonl', offset: 9 },
+        { relPath: '../../etc/passwd', offset: 0 },
+        { relPath: 'subagents/agent-neg.jsonl', offset: -1 },
+      ],
+      1
+    );
+    expect(rounds).toEqual([{ requests: agents('a'), main: true, after: '', upTo: '' }]);
+  });
+
+  it('keeps every ssh line under the 128 KiB argv limit, longest names and offsets included', () => {
+    // 255 bytes is the longest file name a filesystem allows; a request without `len` is the
+    // longer one, because its `''` costs 16 bytes per quote once escaped and encoded.
+    const requests: EditSourceRequest[] = Array.from({ length: 5000 }, (_, i) => ({
+      relPath: `subagents/agent-${String(i).padStart(6, '0')}${'x'.repeat(237)}.jsonl`,
+      offset: Number.MAX_SAFE_INTEGER,
+    }));
+    const mainPath = `/${'p/'.repeat(2000)}conv-1.jsonl`;
+    const line = (reqs: EditSourceRequest[], round?: { main: boolean; after: string; upTo: string }) =>
+      Buffer.byteLength(
+        buildRemoteEditHistoryCommand(REMOTE, buildRemoteClaudeEditSourcesCommand(mainPath, reqs, 1000, { round }))
+      );
+    const ARGV_LIMIT = 128 * 1024;
+    expect(line(requests)).toBeGreaterThan(ARGV_LIMIT);
+    const rounds = planRemoteEditSourceRounds(requests);
+    expect(rounds.length).toBeGreaterThan(1);
+    for (const round of rounds) expect(line(round.requests, round)).toBeLessThan(ARGV_LIMIT);
   });
 });
 
@@ -402,6 +496,8 @@ describe('the transcript read on a real shell', () => {
       const local = await readClaudeEditSources(path, requests, budget, { onlyRequested });
       const { code, stdout } = runSh(buildRemoteClaudeEditSourcesCommand(path, requests, budget, { onlyRequested }));
       const remote = code === 0 ? parseRemoteClaudeEditSources(stdout) : null;
+      // The same read cut into several round trips must come out the same.
+      const split = await readRemoteEditSourceRounds(path, requests, budget, { onlyRequested }, runRead, ri(1, 3));
       const shape = (r: typeof local) =>
         r && {
           transcriptId: r.transcriptId,
@@ -410,11 +506,252 @@ describe('the transcript read on a real shell', () => {
         };
       try {
         expect(shape(remote)).toEqual(shape(local));
+        expect(shape(split)).toEqual(shape(local));
       } catch {
         failures.push(`seed ${seed}: ${JSON.stringify({ requests, budget, onlyRequested })}`);
       }
     }
     expect(failures).toEqual([]);
+  });
+});
+
+describe('a read too large for one ssh line', () => {
+  // `ssh` is a fake that runs the remote command on `sh`, so the whole ssh line really goes
+  // through the local `sh -c` argv: what must not hit E2BIG.
+  let bin: string;
+  beforeAll(() => {
+    bin = mkdtempSync(join(tmpdir(), 'codeman-fake-ssh-read-'));
+    writeFileSync(join(bin, 'ssh'), '#!/bin/sh\nfor arg; do :; done\nexec sh -c "$arg"\n');
+    chmodSync(join(bin, 'ssh'), 0o755);
+  });
+  afterAll(() => rmSync(bin, { recursive: true, force: true }));
+
+  /** A runner that goes through the fake ssh, counting its round trips. */
+  function overSsh(): { run: (command: string, maxBytes: number) => Promise<Buffer | null>; trips: () => number } {
+    let trips = 0;
+    return {
+      trips: () => trips,
+      run: async (command, maxBytes) => {
+        trips++;
+        try {
+          return execFileSync('sh', ['-c', buildRemoteEditHistoryCommand(REMOTE, command)], {
+            env: { ...process.env, HOME: home, PATH: `${bin}:${process.env.PATH}` },
+            cwd: home,
+            maxBuffer: maxBytes,
+          });
+        } catch (err) {
+          if ((err as { status?: number }).status === 3) return null;
+          throw err;
+        }
+      },
+    };
+  }
+
+  const shape = (r: Awaited<ReturnType<typeof readClaudeEditSources>>) =>
+    r && {
+      transcriptId: r.transcriptId,
+      metas: r.metas,
+      files: r.files.map((f) => [f.relPath, f.size, f.startOffset, f.chunk.toString('hex')]),
+    };
+
+  describe('as a read', () => {
+    const project = () => join(home, '.claude', 'projects', 'many');
+    const main = () => join(project(), 'conv-many.jsonl');
+    const sub = () => join(project(), 'conv-many', 'subagents');
+    const id = (i: number) => `a${String(i).padStart(4, '0')}`;
+    /** A cursor for each of 1500 subagents; only every 100th still has a file. */
+    const requests: EditSourceRequest[] = [
+      { relPath: 'main', offset: 2 },
+      ...Array.from({ length: 1500 }, (_, i) => ({ relPath: `subagents/agent-${id(i)}.jsonl`, offset: 1 })),
+    ];
+
+    beforeAll(() => {
+      mkdirSync(sub(), { recursive: true });
+      writeFileSync(main(), 'main transcript\n');
+      for (let i = 0; i < 1500; i += 100) writeFileSync(join(sub(), `agent-${id(i)}.jsonl`), `subagent ${i}\n`);
+      // New files in the first, a middle and the last name range: each read once, with its meta.
+      for (const name of ['agent-0first', 'agent-a0750new', 'agent-zlast']) {
+        writeFileSync(join(sub(), `${name}.jsonl`), `${name}\n`);
+        writeFileSync(join(sub(), `${name}.meta.json`), `{"description":"${name}"}`);
+      }
+    });
+
+    it.each([0, 40, 8 * 1024 * 1024])('reads what the local reader reads, budget %i', async (budget) => {
+      const ssh = overSsh();
+      const read = await readRemoteEditSourceRounds(main(), requests, budget, {}, ssh.run);
+      expect(shape(read)).toEqual(shape(await readClaudeEditSources(main(), requests, budget)));
+      expect(ssh.trips()).toBe(5);
+    });
+
+    it('is null when the transcript goes away during the read', async () => {
+      let trips = 0;
+      const read = readRemoteEditSourceRounds(main(), requests, 100, {}, async (command) => {
+        return ++trips === 2 ? null : runRead(command);
+      });
+      await expect(read).resolves.toBeNull();
+      expect(trips).toBe(2);
+    });
+
+    it('fails as a whole on broken output from a later round trip', async () => {
+      let trips = 0;
+      const read = readRemoteEditSourceRounds(main(), requests, 100, {}, async (command) => {
+        return ++trips === 2 ? Buffer.from('\0other-conversation\0') : runRead(command);
+      });
+      await expect(read).rejects.toBeInstanceOf(RemoteFileAccessError);
+      expect(trips).toBe(2);
+    });
+
+    it('gives a later round trip the meta budget the earlier ones left', async () => {
+      const commands: string[] = [];
+      await readRemoteEditSourceRounds(
+        main(),
+        requests,
+        1000,
+        {},
+        async (command) => {
+          commands.push(command);
+          return runRead(command);
+        },
+        900
+      );
+      const budgets = commands.map((c) => Number(/mbudget=(\d+)/.exec(c)?.[1]));
+      expect(budgets).toHaveLength(2);
+      // `agent-0first` sorts before every request, so its meta went with the first round trip.
+      expect(budgets[0] - budgets[1]).toBe(
+        Buffer.byteLength('{"description":"agent-0first"}') + Buffer.byteLength('{"description":"agent-a0750new"}')
+      );
+    });
+  });
+
+  describe('through the sync', () => {
+    const project = () => join(home, '.claude', 'projects', 'long-history');
+    const sub = () => join(project(), 'conv-old', 'subagents');
+    const edit = (id: string, path: string) =>
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-10-15T20:00:00.000Z',
+        cwd: '/w',
+        message: { role: 'user', content: [{ tool_use_id: id, type: 'tool_result', content: 'ok' }] },
+        toolUseResult: {
+          filePath: path,
+          oldString: 'a',
+          newString: 'b',
+          structuredPatch: [{ oldStart: 1, oldLines: 1, newStart: 1, newLines: 1, lines: ['-a', '+b'] }],
+        },
+      }) + '\n';
+
+    it('keeps a conversation with 1200 subagents available, and a /clear gets past them', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'codeman-edit-store-'));
+      try {
+        mkdirSync(sub(), { recursive: true });
+        const oldMain = join(project(), 'conv-old.jsonl');
+        const newMain = join(project(), 'conv-new.jsonl');
+        writeFileSync(oldMain, '{}\n');
+        // Ids as long as claude's own: with these, 1200 requests do not fit one ssh line.
+        const name = (i: number) => `agent-a${String(i).padStart(16, '0')}`;
+        for (let i = 0; i < 1200; i++) writeFileSync(join(sub(), `${name(i)}.jsonl`), '{}\n');
+
+        const ssh = overSsh();
+        let path = oldMain;
+        const sync = new EditHistorySync({
+          transcriptPath: async () => path,
+          readSources: (_session, mainPath, requests, budget, opts) =>
+            readRemoteEditSourceRounds(mainPath, requests, budget, opts ?? {}, ssh.run),
+          probe: async () => [],
+          loadStore: (id) => EditHistoryStore.load(id, { dir, debounceMs: 0 }),
+          deleteStore: async () => {},
+          sweepStores: async () => 0,
+        });
+        const session: EditHistorySession = {
+          id: 's1',
+          mode: 'claude',
+          remote: REMOTE,
+          claudeSessionId: 'conv-old',
+        };
+        // The cursors of a history that was read before, one per file at its end.
+        const store = await sync.getStore('s1');
+        const seed = (source: string) =>
+          store.apply({ transcriptId: 'conv-old', source, startOffset: 0, chunk: Buffer.from('{}\n'), size: 3 });
+        seed('main');
+        for (let i = 0; i < 1200; i++) seed(`subagents/${name(i)}.jsonl`);
+        expect(store.knownSources()).toHaveLength(1201);
+
+        // Past the argv limit: one script would not even start.
+        const all = store.knownSources().map((relPath) => ({ relPath, offset: 3 }));
+        const line = buildRemoteEditHistoryCommand(REMOTE, buildRemoteClaudeEditSourcesCommand(oldMain, all, 1000));
+        expect(() => execFileSync('sh', ['-c', line])).toThrow(/E2BIG/);
+
+        // A known file that grew in the last name range, a new one in the middle.
+        writeFileSync(join(sub(), `${name(1199)}.jsonl`), `{}\n${edit('late', '/w/late.ts')}`);
+        const fresh = `${name(600)}new`;
+        writeFileSync(join(sub(), `${fresh}.jsonl`), edit('fresh', '/w/fresh.ts'));
+        writeFileSync(join(sub(), `${fresh}.meta.json`), '{"description":"new one","agentType":"Explore"}');
+        expect(await sync.sync(session)).toEqual({ state: 'ok' });
+        expect(ssh.trips()).toBe(4);
+        expect(
+          store
+            .list()
+            .map((e) => e.path)
+            .sort()
+        ).toEqual(['/w/fresh.ts', '/w/late.ts']);
+        expect(store.getAgents()[fresh.slice('agent-'.length)]).toMatchObject({ description: 'new one' });
+        expect(store.knownSources()).toHaveLength(1202); // no cursor lost
+
+        // /clear: the stored conversation is read to its end first, then the new one.
+        writeFileSync(newMain, edit('after', '/w/after.ts'));
+        path = newMain;
+        expect(await sync.sync(session)).toEqual({ state: 'ok' });
+        expect(store.getTranscriptId()).toBe('conv-new');
+        expect(
+          store
+            .list()
+            .map((e) => e.path)
+            .sort()
+        ).toEqual(['/w/after.ts', '/w/fresh.ts', '/w/late.ts']);
+        await store.remove();
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 60_000);
+  });
+});
+
+describe('a timeout ends ssh itself', () => {
+  // Node's timeout signals the local `sh -c`. On dash that shell stays the parent of a plain
+  // command, so only `exec` makes the signal reach ssh. The fake ssh records its pid and then
+  // waits; the test sends the timeout's SIGTERM itself, once that pid is there, so a slow
+  // machine cannot kill the fake before it wrote it.
+  it('kills the ssh process, not only the shell around it', async () => {
+    const bin = mkdtempSync(join(tmpdir(), 'codeman-fake-ssh-'));
+    const pidFile = join(bin, 'pid');
+    try {
+      writeFileSync(
+        join(bin, 'ssh'),
+        `#!/bin/sh\necho $$ > '${pidFile}.tmp'\nmv '${pidFile}.tmp' '${pidFile}'\nexec sleep 30\n`
+      );
+      chmodSync(join(bin, 'ssh'), 0o755);
+      const command = buildRemoteEditHistoryCommand(REMOTE, buildRemoteClaudeTranscriptLocateCommand(['conv-1']));
+      expect(command).toMatch(/^exec ssh /);
+      const child = exec(command, { env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+      await expect.poll(() => existsSync(pidFile), { timeout: 10_000 }).toBe(true);
+      const pid = Number(readFileSync(pidFile, 'utf8'));
+      child.kill();
+      const alive = (): boolean => {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      try {
+        await expect.poll(alive, { timeout: 3000 }).toBe(false);
+      } finally {
+        if (alive()) process.kill(pid, 'SIGKILL');
+      }
+    } finally {
+      rmSync(bin, { recursive: true, force: true });
+    }
   });
 });
 

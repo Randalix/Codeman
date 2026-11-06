@@ -184,9 +184,19 @@ function resolveGatesPassed(entry: CliEntry, resolveVersion: () => string | null
 export function launchGatePasses(mode: string, gate: string, claudeCliVersion?: string | null): boolean {
   const entry = getCli(mode);
   if (!entry?.capabilities.gates[gate]) return false;
-  return resolveGatesPassed(entry, () =>
-    claudeCliVersion !== undefined ? claudeCliVersion : resolveSessionCliVersion(entry.id)
-  ).has(gate);
+  return resolveGatesPassed(entry, () => gateVersion(entry, claudeCliVersion)).has(gate);
+}
+
+/**
+ * The version a gate of `entry` is measured against: the caller's explicit value (tests, or
+ * null for "known unknown"), else THIS entry's own local CLI via resolveSessionCliVersion.
+ * ⚠️ Never `getClaudeCliVersion()` for every entry, which is what this used to do: codex's
+ * `noDaemonFlag` gate (0.162.0) would then have passed on any claude 2.x and handed an older
+ * codex a flag it exits on. resolveSessionCliVersion still routes claude to its own probe
+ * policy (`retryOnTransientFailure`), so a claude launch is unchanged.
+ */
+function gateVersion(entry: CliEntry, explicit: string | null | undefined): string | null {
+  return explicit !== undefined ? explicit : resolveSessionCliVersion(entry.id);
 }
 
 /**
@@ -253,15 +263,12 @@ export function buildSpawnCommandFromRegistry(entry: CliEntry, options: SpawnBri
   // `startupHint` setting are on. Claude-only in practice, like the settings object above.
   engineValues.appendSystemPrompt = getDiscordStartupHint();
 
-  // An explicit `claudeCliVersion` (tests; `null` = "known to be unresolvable", must not
-  // probe) wins. Otherwise the probe asks for THIS entry's version — it used to ask claude's
-  // for every entry, which would have evaluated codex's `noDaemon` gate against claude
-  // 2.1.x and always passed it. resolveSessionCliVersion keeps claude's own retrying probe
-  // and is null under vitest. The probe only ever runs from resolveGatesPassed, and only for
-  // an entry that actually declares a gate.
-  const gatesPassed = resolveGatesPassed(entry, () =>
-    options.claudeCliVersion !== undefined ? options.claudeCliVersion : resolveSessionCliVersion(entry.id)
-  );
+  // Preserves buildSpawnCommand's original fallback: an EXPLICIT `undefined` probes the
+  // entry's own local CLI (gateVersion: claude's probe for claude, the registry resolver for
+  // the rest, both null under vitest); an explicit `null` means "known to be unresolvable"
+  // and must not probe. The probe only ever runs from resolveGatesPassed, and only for an
+  // entry that actually declares a gate, so a CLI with none never spawns a `--version`.
+  const gatesPassed = resolveGatesPassed(entry, () => gateVersion(entry, options.claudeCliVersion));
 
   return renderLaunch(entry.launch, params, engineValues, gatesPassed);
 }

@@ -70,9 +70,12 @@ describe('configDir real-home linking (linkFromRealHome / realHomeFallback)', ()
     // and bare `.` IS that home: linking through it would expose the whole tree
     // unshielded instead of just the declared segments.
     for (const bad of ['../x', '.dsh/evil', '/.dsh', '..', '.']) {
-      expectRejectedOnDeepSeek((r) => {
-        r.realHomeFallback = bad;
-      }, `realHomeFallback ${JSON.stringify(bad)}`);
+      expectRejectedOnDeepSeek(
+        (r) => {
+          r.realHomeFallback = bad;
+        },
+        `realHomeFallback ${JSON.stringify(bad)}`
+      );
     }
   });
 
@@ -450,7 +453,7 @@ describe('cross-field integrity', () => {
     // shipped entry must be on the param side of that line.
     const codex = STOCK_CLIS.find((e) => (e.id as string) === 'codex');
     expect(codex).toBeDefined();
-    expect(codex!.capabilities.privilegedParams.map((c) => c.param)).toEqual(['bypassApprovals']);
+    expect(codex!.capabilities.privilegedParams.map((c) => c.param)).toEqual(['bypassApprovals', 'networkAccess']);
     expect(codex!.launch.legacyConfigAliases?.bypassApprovals).toBe('dangerouslyBypassApprovals');
 
     const wrong = baseEntry('codex');
@@ -633,7 +636,7 @@ describe('capability shapes', () => {
 
   it('declares which CLIs get the wheel forwarded, and whether a version gates it', () => {
     // Claude forwards from 2.1.187 (fullscreen only); tracked Codex and Copilot
-    // forward without a version gate, and so does pi (1.4.0 measured). Unmeasured entries stay 'never'.
+    // forward without a version gate, and so does pi. Unmeasured entries stay 'never'.
     const mode = (id: string) => STOCK_CLIS.find((e) => (e.id as string) === id)?.capabilities.wheelForward;
     expect(mode('copilot')).toEqual({ mode: 'always' });
     expect(mode('claude')).toEqual({ mode: 'version-gated', minVersion: '2.1.187' });
@@ -645,10 +648,12 @@ describe('capability shapes', () => {
   });
 
   it('declares transcriptPageKeys for exactly the CLIs measured to page on PageUp/PageDown', () => {
-    // claude (repaint mode), codex, opencode, copilot and pi (all on the alternate screen) were
+    // claude (repaint mode), codex, opencode and copilot (all on the alternate screen) were
     // measured paging their own transcript on PageUp/PageDown; no other stock entry has been.
+    // pi pages too when fullscreen, and stays out on purpose: in `tuiMode: regular` the same keys
+    // move the caret of a multi-line draft.
     const paging = STOCK_CLIS.filter((e) => e.capabilities.transcriptPageKeys === true).map((e) => e.id as string);
-    expect(paging.sort()).toEqual(['claude', 'codex', 'copilot', 'opencode', 'pi']);
+    expect(paging.sort()).toEqual(['claude', 'codex', 'copilot', 'opencode']);
   });
 });
 

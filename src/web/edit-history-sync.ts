@@ -33,8 +33,9 @@
  *
  * WHICH SESSIONS. Claude sessions, local and remote. Docker and non-claude sessions answer
  * `unsupported` and are never read. The deps get the session and read a remote one over ssh
- * (`remote-files.ts`): one round trip to find its transcript, one per read. A remote read never
- * wakes its host; a sleeping one is a connect timeout (`unavailable`, stored entries kept).
+ * (`remote-files.ts`): one round trip to find its transcript, one per read (more for a
+ * conversation with hundreds of subagents). A remote read never wakes its host; a sleeping one
+ * is a connect timeout (`unavailable`, stored entries kept).
  *
  * IMAGES. A Bash candidate counts only when the file's mtime lies in the call's window
  * (start − 2 s … end + 2 s), so `ls *.png` lists nothing. Transcript times and mtimes come
@@ -78,6 +79,8 @@ export interface EditHistorySession {
   mode: string;
   remote: SessionRemote | undefined;
   docker?: unknown;
+  /** Set on a wrapper around a foreign tmux session: Codeman holds no transcript id for what runs there. */
+  adopt?: unknown;
   claudeSessionId: string | null;
   /** The session's own `CLAUDE_CONFIG_DIR` (Codeman env override), if it has one. */
   claudeConfigDir?: string;
@@ -128,6 +131,7 @@ export function remoteTranscriptIds(session: EditHistorySession, storedTranscrip
 /** Why a session has no edit history, or undefined when it can have one. */
 export function unsupportedReason(session: EditHistorySession): string | undefined {
   if (session.docker) return 'docker';
+  if (session.adopt) return 'adopted';
   if (getCli(session.mode)?.capabilities.transcript !== 'claude-jsonl') return 'mode';
   return undefined;
 }
