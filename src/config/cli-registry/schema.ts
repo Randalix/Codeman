@@ -314,6 +314,8 @@ const capabilitiesSchema = z
     // Keep the PTY's rows while a phone keyboard is up (inline renderers only).
     // Optional: absent means the keyboard resizes, the safe default.
     keyboardHold: z.literal('inline').optional(),
+    // Spare the CLI's own detached daemon (another process group) when a pane is killed.
+    sharedDaemon: z.boolean().optional(),
     keyboardAccessory: z.enum(['agent', 'shell']),
     privilegedCommandGate: z.boolean(),
     startMode: z.enum(['interactive', 'shell']),
@@ -325,6 +327,15 @@ const capabilitiesSchema = z
     // A closed list on purpose: it decides where the server WRITES, and this file is
     // user-editable, so it can never be a free path (`..`, absolute).
     agentSkillDir: z.enum(AGENT_SKILL_DIRS).optional(),
+    // The hook module Codeman installs for a CLI whose hooks are files, not a settings
+    // block (omp). Not a closed list like `agentSkillDir`: any bare `.ts` file name is
+    // taken, and nothing else. The name is written into the user's workspace, so a path
+    // (`../../evil.ts`, an absolute one) must be refused by the schema rather than by
+    // whatever calls the writer.
+    approvalHookFile: z
+      .string()
+      .regex(/^[A-Za-z0-9._-]+\.ts$/)
+      .optional(),
     statusLineTelemetry: z.boolean(),
     // How many columns this CLI indents its transcript body by, so a copy can take
     // that much off the clipboard. Bounded, because it is the whole strip: a copy

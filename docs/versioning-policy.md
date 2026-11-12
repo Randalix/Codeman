@@ -86,6 +86,30 @@ covered like any other stable behavior. Other agent commands and API routes keep
 their existing guarantees. Promotion to stable requires an explicit documented
 decision.
 
+### Experimental local model routes
+
+`GET /api/v1/local-model`, `POST /api/v1/local-model/install`, `/use`, `/cancel`,
+`/resume`, `/runtime` and `/agent`, `DELETE /api/v1/local-model` and
+`DELETE /api/v1/local-model/models` (and their `/api` aliases) are
+labeled experimental, so item 3 above applies to them: their paths, their payloads
+(the hardware facts, the verdicts and reasons, the candidate fields, the `install`
+object with its states, steps, error codes and actions, its `library`, `store` and
+`harnesses` lists, the 409 conflict shape and
+every English sentence) and their behavior may change or be removed in a MINOR or
+PATCH release. They look at the Mac the server runs on, say which local model fits,
+install, start, stop and remove one, keep a library of installed models to switch
+between or delete, and install one more coding agent beside an installed model
+([local-models.md](local-models.md)).
+
+They are not behind a setting. Reading changes nothing; an install starts only on an
+explicit request that carries the size the person confirmed. All of them are admin
+only in multi-user mode. What an install leaves behind is ordinary, stable state: one
+saved model endpoint with the id `local-ollama` and the `customModelEndpointsEnabled`
+setting switched on, both of which the stable custom model endpoint routes read like
+any other endpoint. On-disk state (`local-model.json`, the `local-model/` folder) is
+internal, as for every other file in the data directory. Promotion to stable requires
+an explicit documented decision.
+
 ## Deprecation policy
 
 When we need to change a covered surface:

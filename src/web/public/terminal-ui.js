@@ -926,7 +926,9 @@ Object.assign(CodemanApp.prototype, {
       // Route through our paste trap which handles both images and text.
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 'v' && ev.type === 'keydown') {
         if (this.activeSessionId && this._handleImagePaste) {
-          this._handleImagePaste();
+          // The trap cancels this keydown itself when execCommand('paste')
+          // already delivered the clipboard (Firefox), so pass the event in.
+          this._handleImagePaste({ keyEvent: ev });
         }
         return false;
       }
@@ -2515,7 +2517,13 @@ Object.assign(CodemanApp.prototype, {
           }
           // An HTML file renders as a page in the preview, never as source
           // in the log viewer (markdown is in FILE_PREVIEW_EXTENSIONS).
-          if (previewsInFileViewer(target) || rendersAsPage(target) || self._isExternalPreviewPath(target, sessionId)) {
+          // The log viewer's tail-file stays confined to workingDir, so a path in a worktree outside it previews.
+          if (
+            previewsInFileViewer(target) ||
+            rendersAsPage(target) ||
+            self._isExternalPreviewPath(target, sessionId) ||
+            self._isOutsideWorktreePath(target, sessionId)
+          ) {
             self.openFilePreview(target, sessionId);
             return;
           }
@@ -3133,6 +3141,10 @@ Object.assign(CodemanApp.prototype, {
       // up (stopped in hideWelcome), see foreign-sessions.js.
       this.wireForeignSessions?.();
       this.startForeignPolling?.();
+      // The "Run a local model" button (local-model-ui.js). One request, at most
+      // once a minute, no timer here: only its open window polls, and closing
+      // that window stops it, so there is nothing to stop in hideWelcome.
+      this.loadLocalModel?.();
     }
     // Home screen has no input target — hide the CJK textarea (activeSessionId
     // is null by the time we get here). Guarded: defined on the app object.

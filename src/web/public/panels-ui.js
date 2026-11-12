@@ -570,7 +570,7 @@ Object.assign(CodemanApp.prototype, {
     const caseName = this._commandPaletteCaseName(query);
     const agent = this._commandPaletteAgent(caseName);
     const mode = agent?.id || this.runMode || this._runMode || 'claude';
-    const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', grok: 'Grok', deepseek: 'DeepSeek', omp: 'OMP', copilot: 'Copilot' };
+    const labels = { claude: 'Claude', opencode: 'OpenCode', codex: 'Codex', gemini: 'Gemini', antigravity: 'Antigravity', pi: 'Pi', grok: 'Grok', deepseek: 'DeepSeek', omp: 'OMP', copilot: 'Copilot', jcode: 'jcode' };
     return {
       id: 'new-session',
       type: 'new-session',
@@ -1974,7 +1974,16 @@ Object.assign(CodemanApp.prototype, {
 
       // Show in a modal or new window
       const content = data.data.formatted.join('\n');
-      const win = window.open('', '_blank', 'width=800,height=600');
+      // This open runs after the fetch above, so a pop-up blocker that wants a
+      // click can refuse it, and the Codeman desktop app always refuses an
+      // empty window. Both return null; say so instead of throwing into the
+      // catch below, whose 'Failed to load transcript' would be wrong.
+      let win = null;
+      try { win = window.open('', '_blank', 'width=800,height=600'); } catch {}
+      if (!win) {
+        this.showToast('Could not open the transcript window: pop-up windows are blocked here', 'error');
+        return;
+      }
       win.document.write(`
         <html>
           <head>
@@ -3295,6 +3304,8 @@ Object.assign(CodemanApp.prototype, {
         filter: typeof this.fileBrowserFilter === 'string' ? this.fileBrowserFilter : '',
         // The person asked for the session folder while the agent is in a worktree (#765).
         sessionRootPinned: false,
+        // The worktree on screen when the pin was set: a pinned listing omits an outside worktree.
+        pinnedWorktree: null,
       };
     }
     return this._fileBrowserState;
@@ -3318,6 +3329,7 @@ Object.assign(CodemanApp.prototype, {
     state.filter = '';
     state.view = 'normal';
     state.sessionRootPinned = false;
+    state.pinnedWorktree = null;
     this.fileBrowserData = null;
     this.fileBrowserFilter = '';
     this.fileBrowserExpandedDirs?.clear?.();
@@ -3362,6 +3374,7 @@ Object.assign(CodemanApp.prototype, {
     state.filter = '';
     state.view = 'normal';
     state.sessionRootPinned = false;
+    state.pinnedWorktree = null;
     this.fileBrowserData = null;
     this.fileBrowserFilter = '';
     this.fileBrowserExpandedDirs?.clear?.();
@@ -3475,49 +3488,58 @@ Object.assign(CodemanApp.prototype, {
   _renderFileBrowserRoot(data) {
     const strip = this.$?.('fileBrowserRoot');
     if (!strip) return;
-    const worktree = data?.worktree;
+    const worktree =
+      data?.worktree ?? (this._fileBrowserState?.sessionRootPinned ? this._fileBrowserState.pinnedWorktree : null);
     if (typeof worktree?.path !== 'string' || typeof worktree?.name !== 'string') {
       strip.hidden = true;
       return;
     }
-    const inWorktree = data.root === worktree.path;
+    const inWorktree = data?.root === worktree.path;
     const label = this.$?.('fileBrowserRootLabel');
     const name = this.$?.('fileBrowserRootName');
     const button = this.$?.('fileBrowserRootSwitch');
     if (label) label.textContent = inWorktree ? 'Worktree' : 'Session folder';
     if (name) name.textContent = inWorktree ? worktree.name : '';
     if (button) button.textContent = inWorktree ? 'Session folder' : 'Back to worktree';
-    strip.title = typeof data.root === 'string' ? data.root : '';
+    strip.title = typeof data?.root === 'string' ? data.root : '';
     strip.hidden = false;
   },
 
   // The `root` parameter of a listing or search. The server ignores it while the pane is not in
   // a worktree, so the panel always asks unless the person chose the session folder.
   _fileBrowserRootParam() {
-    return this._ensureFileBrowserState().sessionRootPinned ? '' : '&root=live';
+    return this._ensureFileBrowserState().sessionRootPinned ? '' : '&root=live-any';
   },
 
   toggleFileBrowserRoot() {
     const state = this._ensureFileBrowserState();
     state.sessionRootPinned = !state.sessionRootPinned;
+    const shown = this.fileBrowserData?.worktree;
+    state.pinnedWorktree =
+      state.sessionRootPinned && typeof shown?.path === 'string' && typeof shown?.name === 'string'
+        ? { name: shown.name, path: shown.path }
+        : null;
     return this._reloadFileBrowserKeepingQuery();
   },
 
   // Called on every session update of the active session. Compares with what the listing on
   // screen reported rather than with the previous update, so a load already in flight when the
-  // pane moved is corrected by the next update, and an answer that matches ends it: a listing
-  // always reports the session's worktree, whichever folder it walked, so this cannot loop.
+  // pane moved is corrected by the next update, and an answer that matches ends it. A listing
+  // reports the session's worktree whichever folder it walked, except that a listing without
+  // root=live-any omits an outside worktree. While the person has pinned the session folder, the
+  // panel compares with the worktree it pinned away from, so this cannot loop.
   _followFileBrowserWorktree(session) {
     const state = this._fileBrowserState;
     if (!state || state.ownerSessionId !== session.id) return;
     if (this.$?.('fileBrowserPanel')?.classList.contains('visible') !== true) return;
     const normal = state.normalState;
     if (normal?.phase !== 'ready' || normal.sessionId !== session.id) return;
-    const live = session.liveWorktree?.path ?? null;
-    const listed = normal.data?.worktree?.path ?? null;
+    const live = (session.liveWorktree ?? session.outsideWorktree)?.path ?? null;
+    const listed = (normal.data?.worktree ?? (state.sessionRootPinned ? state.pinnedWorktree : null))?.path ?? null;
     if (live === listed) return;
     // The pin was about the worktree the agent has just left.
     state.sessionRootPinned = false;
+    state.pinnedWorktree = null;
     this._reloadFileBrowserKeepingQuery();
   },
 
@@ -3766,6 +3788,7 @@ Object.assign(CodemanApp.prototype, {
     }
 
     const html = [];
+    const canDelete = this._fileBrowserCanDelete(owner);
 
     const renderNode = (node, depth) => {
       const isDir = node.type === 'directory';
@@ -3788,6 +3811,13 @@ Object.assign(CodemanApp.prototype, {
       const downloadBtn = !isDir
         ? `<a class="file-tree-download" href="${escapeHtml(CodemanBase.url(`/api/sessions/${encodeURIComponent(owner)}/file-raw?path=${encodeURIComponent(node.path)}&download=true`))}" title="Download" onclick="event.stopPropagation()">&#x2B07;</a>`
         : '';
+      // No inline handler: the path is a workspace file name, which an agent or a cloned repo
+      // chose, and `encodeURIComponent` leaves `'` alone, so a quoted string in an onclick ran
+      // whatever a file name like `x'-alert(1)-'.txt` held (#529's review). The click is bound
+      // below from the row's already-escaped `data-path`.
+      const deleteBtn = !isDir && canDelete
+        ? `<button type="button" class="file-tree-delete" title="Delete" aria-label="Delete ${escapeHtml(node.name)}">&times;</button>`
+        : '';
 
       html.push(`
         <div class="file-tree-item" data-path="${escapeHtml(node.path)}" data-type="${escapeHtml(node.type)}" data-depth="${depth}">
@@ -3796,6 +3826,7 @@ Object.assign(CodemanApp.prototype, {
           <span class="${nameClass}">${escapeHtml(node.name)}</span>
           ${sizeStr}
           ${downloadBtn}
+          ${deleteBtn}
         </div>
       `);
 
@@ -3831,7 +3862,19 @@ Object.assign(CodemanApp.prototype, {
           this.openFilePreview(path, owner);
         }
       });
+      item.querySelector('.file-tree-delete')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.deleteFileFromBrowser(owner, item.dataset.path);
+      });
     });
+  },
+
+  // The delete button is offered only where the route can act: never for a remote (SSH) session,
+  // whose files live on another host, nor for an adopted one, whose folder is not a workspace of
+  // ours (`session.remote` is undefined on an adopted session, so both are tested).
+  _fileBrowserCanDelete(sessionId) {
+    const session = this.sessions?.get?.(sessionId);
+    return !session?.remote && !session?.adopt;
   },
 
   toggleFileBrowserFolder(path) {
@@ -3959,6 +4002,7 @@ Object.assign(CodemanApp.prototype, {
       treeEl.innerHTML = `<div class="file-browser-empty">${escapeHtml('No matches')}</div>`;
     } else {
       const ownerPath = encodeURIComponent(ownerSessionId);
+      const canDelete = this._fileBrowserCanDelete(ownerSessionId);
       treeEl.innerHTML = matches
         .map(match => {
           const isDir = match.type === 'directory';
@@ -3970,6 +4014,10 @@ Object.assign(CodemanApp.prototype, {
           const downloadBtn = !isDir
             ? `<a class="file-tree-download" href="${escapeHtml(CodemanBase.url(`/api/sessions/${ownerPath}/file-raw?path=${encodeURIComponent(match.path)}&download=true`))}" title="Download" onclick="event.stopPropagation()">&#x2B07;</a>`
             : '';
+          // Bound below from `data-path`, never an inline handler (see renderFileBrowserTree).
+          const deleteBtn = !isDir && canDelete
+            ? `<button type="button" class="file-tree-delete" title="Delete" aria-label="Delete ${escapeHtml(match.name)}">&times;</button>`
+            : '';
           return `
             <div class="file-tree-item" data-path="${escapeHtml(match.path)}" data-type="${escapeHtml(match.type)}" data-owner="${escapeHtml(ownerSessionId)}">
               <span class="file-tree-expand"></span>
@@ -3977,6 +4025,7 @@ Object.assign(CodemanApp.prototype, {
               <span class="${nameClass}">${escapeHtml(match.name)}</span>
               ${sizeStr}
               ${downloadBtn}
+              ${deleteBtn}
             </div>
           `;
         })
@@ -3992,6 +4041,10 @@ Object.assign(CodemanApp.prototype, {
           this.openFilePreview(path, ownerSessionId);
         }
       });
+      item.querySelector('.file-tree-delete')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.deleteFileFromBrowser(ownerSessionId, item.dataset.path);
+      });
     });
 
     const statusEl = this.$('fileBrowserStatus');
@@ -3999,6 +4052,33 @@ Object.assign(CodemanApp.prototype, {
       const count = data.matchCount === undefined ? matches.length : data.matchCount;
       statusEl.textContent = `${count} ${count === 1 ? 'match' : 'matches'}${data.truncated ? ' (truncated)' : ''}`;
     }
+  },
+
+  // The Files panel's delete button (DELETE .../files?path=): asks first, in the same native
+  // dialog the panel's other destructive actions use, then reloads the listing. With a search in
+  // the box the reload re-runs it, so the deleted row leaves the results too; a plain reload
+  // would refresh the tree behind them and leave the row on screen.
+  async deleteFileFromBrowser(sessionId, filePath) {
+    if (!sessionId || !filePath) return;
+    if (!confirm(`Delete the file ${filePath}? This cannot be undone.`)) return;
+    let result = null;
+    try {
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sessionId)}/files?path=${encodeURIComponent(filePath)}`,
+        { method: 'DELETE' },
+      );
+      result = await response.json().catch(() => null);
+      if (!response.ok || result?.success !== true) {
+        throw new Error(result?.error || `HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.error('File browser delete failed:', error);
+      this.showToast(`Delete failed: ${error?.message || 'network error'}`, 'error');
+      return;
+    }
+    this.showToast(`File deleted: ${filePath}`, 'success');
+    const state = this._ensureFileBrowserState();
+    if (state.ownerSessionId === sessionId) await this._reloadFileBrowserKeepingQuery();
   },
 
   _findFileBrowserDirectory(nodes, targetPath, ancestors = []) {
@@ -4258,10 +4338,12 @@ Object.assign(CodemanApp.prototype, {
   /**
    * Whether a path is absolute and provably OUTSIDE this session's workspace.
    *
-   * `file-content` / `file-raw` resolve every path against `workingDir` and
-   * refuse anything that escapes it, so an absolute path elsewhere on the host
-   * (an agent's `/tmp` scratchpad capture, a screenshot, another checkout) can
-   * only ever 404 there — it has to go through the attachment routes instead.
+   * `file-content` / `file-raw` serve paths inside `workingDir` and, as a second
+   * root, an absolute path inside a followed worktree outside it
+   * (`outsideWorktree`). They refuse every other path that escapes
+   * `workingDir`, so an absolute path elsewhere on the host (an agent's `/tmp`
+   * scratchpad capture, a screenshot, another checkout) can only ever 404 there
+   * — it has to go through the attachment routes instead.
    *
    * A string compare is enough for ROUTING; the real containment decision stays
    * server-side (realpath + guard) on whichever route the request lands on. An
@@ -4275,7 +4357,24 @@ Object.assign(CodemanApp.prototype, {
     const workingDir = this.sessions.get(sessionId)?.workingDir;
     if (!workingDir) return false;
     const root = workingDir.endsWith('/') ? workingDir : `${workingDir}/`;
-    return filePath !== workingDir && !filePath.startsWith(root);
+    if (filePath === workingDir || filePath.startsWith(root)) return false;
+    // A worktree outside `workingDir` that the agent is in (#765) is a second root the file
+    // routes serve, so a path inside it previews (and edits) like a workspace path.
+    return this._isOutsideWorktreePath(filePath, sessionId) !== true;
+  },
+
+  /**
+   * Whether an absolute path lies inside the worktree OUTSIDE `workingDir` that the session's agent
+   * is in (`outsideWorktree`, #765). The file routes serve it as a second root, while the log
+   * viewer's `tail-file` stays confined to `workingDir`, so the terminal opens such a path in the
+   * file preview.
+   */
+  _isOutsideWorktreePath(filePath, sessionId) {
+    if (typeof filePath !== 'string' || !filePath.startsWith('/')) return false;
+    const worktree = this.sessions.get(sessionId)?.outsideWorktree;
+    if (worktree?.outside !== true || typeof worktree.path !== 'string' || !worktree.path) return false;
+    const root = worktree.path.endsWith('/') ? worktree.path : `${worktree.path}/`;
+    return filePath === worktree.path || filePath.startsWith(root);
   },
 
   /**
@@ -5308,6 +5407,13 @@ Object.assign(CodemanApp.prototype, {
   _rebaseFilePreviewMarkdownRefs(root, { sessionId, filePath, attachmentId }) {
     const dir = filePath.includes('/') ? filePath.slice(0, filePath.lastIndexOf('/') + 1) : '';
     const unresolvable = !!attachmentId && !filePath.startsWith('/');
+    // A root-relative ref (`/docs/x.png`) resolves from the workspace root, as on GitHub, or from
+    // the top of the worktree outside the workspace that the agent is in (#765).
+    const worktree = this.sessions.get(sessionId)?.outsideWorktree;
+    const rootPrefix =
+      worktree?.outside === true && this._isOutsideWorktreePath(filePath, sessionId)
+        ? `${worktree.path.replace(/\/+$/, '')}/`
+        : '';
     // Workspace ref = no scheme, not protocol-relative (//host), not a fragment.
     const isWorkspaceRef = (ref) =>
       !!ref && !/^[a-z][a-z0-9+.-]*:/i.test(ref) && !ref.startsWith('//') && !ref.startsWith('#');
@@ -5327,7 +5433,7 @@ Object.assign(CodemanApp.prototype, {
         /* malformed escape: keep the ref as written */
       }
       const parts = [];
-      for (const seg of (rel.startsWith('/') ? rel.slice(1) : dir + rel).split('/')) {
+      for (const seg of (rel.startsWith('/') ? rootPrefix + rel.slice(1) : dir + rel).split('/')) {
         if (seg === '.' || (seg === '' && parts.length)) continue;
         if (seg === '..' && parts.length && parts[parts.length - 1] !== '..' && parts[parts.length - 1] !== '') parts.pop();
         else parts.push(seg);
@@ -6168,6 +6274,7 @@ Object.assign(CodemanApp.prototype, {
       CodemanBase.url(`/api/sessions/${sessionId}/tail-file?path=${encodeURIComponent(filePath)}&lines=50`)
     );
 
+    let connected = false;
     eventSource.onmessage = (e) => {
       const data = JSON.parse(e.data);
       const body = document.getElementById(`log-viewer-body-${windowId}`);
@@ -6175,6 +6282,7 @@ Object.assign(CodemanApp.prototype, {
 
       switch (data.type) {
         case 'connected':
+          connected = true;
           body.innerHTML = '';
           break;
         case 'data':
@@ -6194,6 +6302,7 @@ Object.assign(CodemanApp.prototype, {
           this.updateLogViewerStatus(windowId, 'disconnected', 'ended');
           break;
         case 'error':
+          if (!connected) eventSource.close();
           body.innerHTML += `<div class="log-error">${escapeHtml(data.error)}</div>`;
           this.updateLogViewerStatus(windowId, 'error', 'error');
           break;

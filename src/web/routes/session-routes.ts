@@ -81,6 +81,7 @@ import {
   CustomModelSelectionSchema,
 } from '../schemas.js';
 import { readCustomModelHosts, resolveCustomModelContextLength } from '../../custom-model-hosts.js';
+import { getLocalModelService } from '../../local-model/install-job.js';
 import { applyCustomModelInjection, removeConfigDir } from '../../custom-model-injection-apply.js';
 import { buildCustomModelInjection } from '../../custom-model-injection.js';
 import {
@@ -154,6 +155,7 @@ import {
   seedAgentSessionPreamble,
   applyWorkspaceHooks,
   refreshStaleCodemanHooks,
+  applyApprovalHookFile,
 } from '../../hooks-config.js';
 import { generateClaudeMd } from '../../templates/claude-md.js';
 import { imageWatcher } from '../../image-watcher.js';
@@ -988,8 +990,8 @@ export function _paneDeathWatcherCount(): number {
  *
  * `applyAgentSkill` declines two shapes rather than writing through them ('foreign':
  * an unmarked skills/codeman the user authored; 'symlink': the skill dir or its
- * parent is a link). Both were silent: the user flips `agentSkillEnabled` on, nothing
- * appears in the case, and there is nowhere to look for why. The ordinary outcomes
+ * parent is a link). Both were silent: `agentSkillEnabled` is on (the default since
+ * 1.50.0), nothing appears in the case, and there is nowhere to look for why. The ordinary outcomes
  * ('installed'/'refreshed'/'unchanged') stay unlogged since they would print on every
  * single session create.
  *
@@ -1013,7 +1015,7 @@ async function injectAgentSkill(casePath: string, dir: AgentSkillDir): Promise<v
       );
     } else if (result === 'symlink') {
       console.warn(
-        `[agent-skill] not injected: ${skillDir} (or its parent) is a symlink, refusing to write through it. Replace it with a real directory to let Codeman install the skill.`
+        `[agent-skill] not injected: ${skillDir}, its parent or its reference folder is a symlink, refusing to write through it. Replace it with a real directory to let Codeman install the skill.`
       );
     }
   } catch (err: unknown) {
@@ -1078,6 +1080,19 @@ export function registerSessionRoutes(
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): RemoteWakeRegistry {
+  /**
+   * Install the approval hook MODULE a CLI declares (`capabilities.approvalHookFile`,
+   * omp) into a LOCAL workspace, so its approval dialogs raise an alert. Shared by
+   * POST /api/sessions and POST /api/quick-start so the two cannot drift; callers own
+   * the remote/Docker/named-workspace conditions and call it only after the launch
+   * pre-flight. Gated on `workspaceHooksEnabled` like Claude's block. Best-effort: a
+   * failure here must not fail the create.
+   */
+  const installApprovalHook = async (mode: SessionMode, workspace: string): Promise<void> => {
+    const fileName = getCli(mode)?.capabilities.approvalHookFile;
+    if (!fileName || !(await ctx.getWorkspaceHooksEnabled())) return;
+    await applyApprovalHookFile(workspace, fileName).catch(() => {});
+  };
   // Wake-on-LAN for sleeping remote hosts (see remote-wake.ts). One registry per
   // route registration (= one web server) — the same shape as the process-wide
   // `sessionWaits` singleton, but without the global.
@@ -1345,6 +1360,13 @@ export function registerSessionRoutes(
       }
     }
 
+    // Approval hook module (omp): after the pre-flight, like the agent skill below, so a
+    // CLI that cannot start leaves nothing in the workspace. Same remote and
+    // named-workingDir conditions as the hooks above.
+    if (!remote && body.workingDir) {
+      await installApprovalHook(body.mode ?? 'claude', workingDir);
+    }
+
     // Agent skill (docs/agent-control-plan.md §2): ADD-ONLY on create, same shared-
     // workspace rationale as the statusLine above: a create must never remove the
     // skill from under other live sessions in the repo. Marker-guarded, so a user's
@@ -1455,6 +1477,8 @@ export function registerSessionRoutes(
       piConfig: mode === 'pi' ? gatedPiConfig : undefined,
       grokConfig: mode === 'grok' ? gatedGrokConfig : undefined,
       copilotConfig: mode === 'copilot' ? gatedCopilotConfig : undefined,
+      // No bypass switch to clamp (jcode has no approval prompts), so the body's own config.
+      jcodeConfig: mode === 'jcode' ? launchBody.jcodeConfig : undefined,
       deepSeekConfig: mode === 'deepseek' ? gatedDeepSeekConfig : undefined,
       ompConfig: resolveOmpConfigForCreate(mode, workingDir, launchBody.ompConfig),
       resumeSessionId: validatedResumeId,
@@ -1777,6 +1801,11 @@ export function registerSessionRoutes(
     if (!endpoint) {
       return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
     }
+    // The model Codeman runs on this Mac: only while its own runtime is up, and only the model
+    // that was installed, with the digest stored then (undefined for every other endpoint).
+    // Before anything is written or restarted.
+    const localModelRefusal = await getLocalModelService().launchRefusalMessage(endpoint.id, body.modelId);
+    if (localModelRefusal) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, localModelRefusal);
     // Discovery's per-model figure wins; the endpoint's user-set default covers models
     // whose size discovery could not determine (a gateway that states none, say). With
     // neither, the existing "no override, CLI assumes its own default" behaviour stands.
@@ -3255,6 +3284,21 @@ export function registerSessionRoutes(
       return parsed;
     }
 
+    // An external CLI with no transcript reader that the pane segmenter cannot read either
+    // (jcode: a repainting alternate-screen TUI, whose segmented stream served its welcome
+    // banner as "the answer", measured) has nothing honest to return. Empty, "nothing said
+    // yet", like the DeepSeek reader above: the Claude scan below would otherwise go looking
+    // in ~/.claude/projects and could adopt a Claude conversation from the same folder.
+    // `codeman agent read --source terminal` / MCP `read_output` still read the screen.
+    {
+      const caps = getCli(session.mode)?.capabilities;
+      if (caps?.external && caps.transcript === 'none') {
+        return context === 'full' || context === 'turn'
+          ? { text: '', timestamp: '', messages: [] }
+          : { text: '', timestamp: '' };
+      }
+    }
+
     // Scan ~/.claude/projects/*/ for the transcript file
     const projectsDir = join(process.env.HOME || '/tmp', '.claude', 'projects');
 
@@ -4314,6 +4358,7 @@ export function registerSessionRoutes(
       piConfig,
       grokConfig,
       copilotConfig,
+      jcodeConfig,
       deepSeekConfig,
       ompConfig,
       envOverrides,
@@ -4405,6 +4450,7 @@ export function registerSessionRoutes(
         piConfig ||
         grokConfig ||
         copilotConfig ||
+        jcodeConfig ||
         deepSeekConfig ||
         ompConfig ||
         openCodeConfig ||
@@ -4477,6 +4523,7 @@ export function registerSessionRoutes(
         piConfig ||
         grokConfig ||
         copilotConfig ||
+        jcodeConfig ||
         deepSeekConfig ||
         ompConfig ||
         openCodeConfig ||
@@ -4578,6 +4625,7 @@ export function registerSessionRoutes(
             piConfig,
             grokConfig,
             copilotConfig,
+            jcodeConfig,
             deepSeekConfig,
           } as unknown as Record<string, unknown>)
         );
@@ -4665,7 +4713,7 @@ export function registerSessionRoutes(
         writeFileSync(join(resolvedCasePath, 'CLAUDE.md'), claudeMd);
 
         // Write .claude/settings.local.json with hooks for desktop notifications
-        // (Claude-specific — OpenCode, Codex, Gemini, Antigravity, Pi, Grok, DeepSeek and OMP use their own systems)
+        // (Claude-specific — OpenCode, Codex, Gemini, Antigravity, Pi, Grok, DeepSeek, OMP and jcode use their own systems)
         if (
           mode !== 'opencode' &&
           mode !== 'codex' &&
@@ -4673,7 +4721,8 @@ export function registerSessionRoutes(
           mode !== 'antigravity' &&
           mode !== 'pi' &&
           mode !== 'grok' &&
-          mode !== 'omp'
+          mode !== 'omp' &&
+          mode !== 'jcode'
         ) {
           await writeHooksConfig(resolvedCasePath);
         }
@@ -4714,6 +4763,13 @@ export function registerSessionRoutes(
       } else {
         await refreshStaleCodemanHooks(workspacePath).catch(() => {});
       }
+    }
+
+    // Approval hook module (omp), for a new AND an existing case. The launch pre-flight
+    // above has passed. Local only: a remote case path lives on another host, and a Docker
+    // pane cannot reach the loopback API (`approvalHookAvailableForMode()` answers no there).
+    if (!remote && !docker) {
+      await installApprovalHook(mode, workspacePath);
     }
 
     // Agent skill injection (docs/agent-control-plan.md §2): ADD-ONLY on create,
@@ -4781,6 +4837,7 @@ export function registerSessionRoutes(
       piConfig,
       grokConfig,
       copilotConfig,
+      jcodeConfig,
       deepSeekConfig,
       ompConfig,
     };
@@ -4842,7 +4899,6 @@ export function registerSessionRoutes(
     // would hide them, and giving setCustomModel() that set would put
     // CLAUDE_CODE_EFFORT_LEVEL back after the constructor stripped it.
     let qsCustomModelAppliedEnvOverrides: Record<string, string> | undefined;
-    let qsCustomModelLaunchModel: string | undefined;
     let qsCustomModelSessionId: string | undefined;
     let qsCustomModelSwapInProgress = false;
     let qsCustomModelBookkeeping:
@@ -4865,6 +4921,11 @@ export function registerSessionRoutes(
       const cmHosts = await readCustomModelHosts(CODEMAN_CONFIG_DIR);
       const cmEndpoint = cmHosts.find((h) => h.id === customModel.endpointId);
       if (!cmEndpoint) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Model endpoint not found');
+      // See the dedicated route: the model Codeman runs on this Mac is launched only while its
+      // own runtime is up and its digest is the one stored at install time. Before any
+      // confirmation is asked for and before a session exists.
+      const cmLocalModelRefusal = await getLocalModelService().launchRefusalMessage(cmEndpoint.id, customModel.modelId);
+      if (cmLocalModelRefusal) return createErrorResponse(ApiErrorCode.OPERATION_FAILED, cmLocalModelRefusal);
       // Per-model discovery figure first, user-set endpoint default second, nothing third
       // (see the dedicated route's own comment above).
       const cmContextLength = resolveCustomModelContextLength(cmEndpoint, customModel.modelId);
@@ -4958,7 +5019,6 @@ export function registerSessionRoutes(
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `${mode} has no known custom-model mechanism`);
       }
       qsCustomModelAppliedEnvOverrides = cmApplied.envOverrides;
-      qsCustomModelLaunchModel = cmApplied.launchModel;
       qsCustomModelBookkeeping = {
         endpointId: cmEndpoint.id,
         modelId: customModel.modelId,
@@ -4997,6 +5057,7 @@ export function registerSessionRoutes(
       piConfig: mode === 'pi' ? qsGatedPiConfig : undefined,
       grokConfig: mode === 'grok' ? qsGatedGrokConfig : undefined,
       copilotConfig: mode === 'copilot' ? qsGatedCopilotConfig : undefined,
+      jcodeConfig: mode === 'jcode' ? qsLaunchConfigs.jcodeConfig : undefined,
       deepSeekConfig: mode === 'deepseek' ? qsGatedDeepSeekConfig : undefined,
       ompConfig: qsResolvedOmpConfig,
       envOverrides: qsGatedEnvOverrides,
@@ -5008,30 +5069,15 @@ export function registerSessionRoutes(
       tmuxHistoryLimit: qsTerminalHistoryConfig.tmuxHistoryLimit,
       parentSessionId: qsParentSessionId,
     };
-    // Force the custom-model selection's launchModel (pi/omp `custom/<id>`, grok's
-    // `[model.<name>]` block name) onto whichever config field the registry says the
-    // CLI's `model` launch param lives in — mirrors Session._withCustomModelLaunchModel,
-    // which the restart-in-place path already uses, rather than a hardcoded per-CLI
-    // branch here that a CLI landing its injection recipe later would silently miss.
-    if (qsCustomModelLaunchModel !== undefined) {
-      const qsCustomModelField = getCli(mode)?.launch.legacyConfigField;
-      if (qsCustomModelField) {
-        const qsSessionOptionsBag = qsSessionOptions as unknown as Record<string, unknown>;
-        qsSessionOptionsBag[qsCustomModelField] = {
-          ...((qsSessionOptionsBag[qsCustomModelField] as Record<string, unknown>) ?? {}),
-          model: qsCustomModelLaunchModel,
-        };
-      } else {
-        qsSessionOptions.model = qsCustomModelLaunchModel;
-      }
-    }
     const session = new Session(qsSessionOptions);
 
     // Records the selection for session.customModel/getCustomModelForPersist() and future
-    // clear/switch calls, and merges the injected env, which the launch below reads along
-    // with the launch-model config set above (piConfig/grokConfig/ompConfig.model). Nothing
-    // has started yet, so this is never a restart: setCustomModel() is synchronous state,
-    // no tmux IO of its own (see its own doc comment in session.ts).
+    // clear/switch calls, and merges the injected env. The launch below reads both: the
+    // selection's launchModel is forced onto the launch options, never onto the stored
+    // config above, because that config is what a later clear falls back to
+    // (Session._withCustomModelLaunchModel). Nothing has started yet, so this is never a
+    // restart: setCustomModel() is synchronous state, no tmux IO of its own (see its own
+    // doc comment in session.ts).
     if (qsCustomModelBookkeeping) {
       session.setCustomModel(qsCustomModelBookkeeping, qsCustomModelAppliedEnvOverrides);
     }

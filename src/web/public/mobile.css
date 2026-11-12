@@ -13,6 +13,7 @@
 html.mobile-init .header-font-controls,
 html.mobile-init .header-system-stats,
 html.mobile-init .header-tokens,
+html.mobile-init .btn-file-viewer,
 html.mobile-init .monitor-panel,
 html.mobile-init .subagents-panel,
 html.mobile-init .project-insights-panel,
@@ -574,18 +575,31 @@ html.mobile-init .file-browser-panel {
     height: 18px;
   }
 
-  /* Hide header settings gear, lifecycle log, away digest, session manager, and
-     file viewer on mobile - settings moved to toolbar; the others are secondary /
+  /* File Viewer is off by default on phones, but honors an explicit opt-in.
+     Give its header entry the same minimum touch target as the home button. */
+  .btn-icon-header.btn-file-viewer {
+    width: 44px;
+    height: 44px;
+    /* Tighten the visible icon spacing without shrinking the touch target. */
+    padding-inline-end: 12px;
+  }
+
+  .btn-icon-header.btn-file-viewer svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  /* Hide header settings gear, lifecycle log, away digest, and session manager
+     on mobile - settings moved to toolbar; the others are secondary /
      desktop-oriented controls that don't belong on the cramped phone header (the
      session manager stays reachable via the Ctrl+K palette's "Browse all sessions"
-     item; the file viewer button is opt-in but its panel is desktop-sized).
+     item).
      (The attachments button is opt-in / default-hidden everywhere via its own
      --hidden marker, so it needs no mobile-specific rule here.) */
   .btn-icon-header.btn-settings,
   .btn-icon-header.btn-lifecycle-log,
   .btn-icon-header.btn-away-digest,
   .btn-icon-header.btn-session-manager,
-  .btn-icon-header.btn-file-viewer,
   /* Edit history: a desktop panel; phones never show the button (opt-in, default OFF anyway). */
   .btn-icon-header.btn-edit-history,
   /* Approvals bell: phones answer from the overview's NEEDS YOU rows instead
@@ -1279,6 +1293,20 @@ html.mobile-init .file-browser-panel {
     border-color: rgba(163, 113, 247, 0.5) !important;
   }
 
+  /* jcode mode colors on mobile. Same `!important` rationale as the pi/grok/deepseek/omp blocks above. */
+  .btn-toolbar.btn-run.mode-jcode,
+  .btn-toolbar.btn-run-gear.mode-jcode {
+    background: #78350f !important;
+    border-color: rgba(245, 158, 11, 0.3) !important;
+    color: #fffbeb !important;
+  }
+
+  .btn-toolbar.btn-run.mode-jcode:active,
+  .btn-toolbar.btn-run-gear.mode-jcode:active {
+    background: #b45309 !important;
+    border-color: rgba(245, 158, 11, 0.5) !important;
+  }
+
   /* Run mode dropdown menu — positioned above toolbar on mobile */
   .run-mode-menu {
     bottom: 100%;
@@ -1776,6 +1804,27 @@ html.mobile-init .file-browser-panel {
     max-height: 92dvh;
   }
 
+  .response-viewer-header {
+    gap: 8px;
+    padding: 12px;
+  }
+
+  .response-viewer-header > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .response-viewer-actions {
+    flex-shrink: 0;
+    gap: 4px;
+  }
+
+  .response-viewer-more {
+    padding: 3px 7px;
+  }
+
   .response-viewer-body {
     font-size: 14.5px;
     line-height: 1.65;
@@ -1847,14 +1896,49 @@ html.mobile-init .file-browser-panel {
     margin-bottom: 0.75rem;
   }
 
-  .welcome-ralph-link {
-    display: block;
-    margin: 0.75rem auto 0;
-  }
-
   .welcome-hint {
     font-size: 0.7rem;
     margin-top: 0.75rem;
+  }
+
+  /* Run a model on this Mac (local-model-ui.js). The welcome button is only
+     reached with the phone overview switched off; it takes the chips' finger
+     size from `.welcome-chip` above. The window is full-screen like every
+     modal here: its own width rule in styles.css is more specific than the
+     full-screen `.modal-content` rule above, so the size is restated. */
+  .modal-content.local-model-window {
+    width: 100%;
+    max-width: 100%;
+    height: 100%;
+    max-height: 100%;
+  }
+
+  .local-model-window > .lm-body {
+    padding: 1rem;
+  }
+
+  /* The window fills the screen, so its actions sit at the bottom, under the thumb. */
+  .local-model-window > .lm-foot-slot {
+    padding: 0 1rem calc(1rem + var(--safe-area-bottom));
+  }
+
+  /* The short screens (progress, paused, a failure, installed, nothing fits)
+     hold a few lines. On a screen this tall they sit right above the buttons,
+     where the eye and the thumb already are, not at the top with half a
+     screen of nothing between the two. */
+  .local-model-window > .lm-body:is(
+      [data-screen='progress'],
+      [data-screen='paused'],
+      [data-screen='failed'],
+      [data-screen='installed'],
+      [data-screen='none']
+    ) {
+    justify-content: flex-end;
+  }
+
+  /* A screen with the list of models scrolls from its top. */
+  .local-model-window > .lm-body[data-long='true'] {
+    justify-content: flex-start;
   }
 
   /* Ralph wizard responsive */
@@ -3407,6 +3491,12 @@ html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="cat
   color: #ffffff;
 }
 
+html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="catppuccin-latte"], [data-skin="rose-pine-dawn"]) :is(.btn-toolbar.btn-run.mode-jcode, .btn-toolbar.btn-run-gear.mode-jcode) {
+  background: linear-gradient(135deg, #92400e, #d97706);
+  border-color: #78350f;
+  color: #ffffff;
+}
+
 html:is([data-skin="paper-gray"], [data-skin="solarized-light"], [data-skin="catppuccin-latte"], [data-skin="rose-pine-dawn"]) .btn-toolbar.btn-run-gear {
   border-left-color: var(--control-border-hover) !important;
 }
@@ -4259,5 +4349,125 @@ html[data-session-list="sidebar"] .session-sidebar .session-tab .tab-close {
     min-height: 55vh;
     -webkit-overflow-scrolling: touch;
     touch-action: pan-x pan-y;
+  }
+}
+
+/* Run a model on this Mac (local-model-ui.js), under 560px: each model row
+   becomes two lines (name and tag, then speed and download size), the bar
+   stays full width and the buttons go full width under the foot's sentence. */
+@media (max-width: 559px) {
+  .lm-list {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    column-gap: 0.7rem;
+  }
+
+  .lm-caption-speed,
+  .lm-caption-size {
+    display: none;
+  }
+
+  .lm-model {
+    row-gap: 0.1rem;
+    padding-top: 0.5rem;
+    padding-bottom: 0.5rem;
+  }
+
+  .lm-radio {
+    grid-row: 1;
+    grid-column: 1;
+  }
+
+  .lm-model-name {
+    grid-row: 1;
+    grid-column: 2;
+  }
+
+  .lm-model-tag {
+    grid-row: 1;
+    grid-column: 3;
+    justify-content: flex-end;
+  }
+
+  .lm-model-speed {
+    grid-row: 2;
+    grid-column: 2;
+    text-align: start;
+  }
+
+  .lm-model-size {
+    grid-row: 2;
+    grid-column: 3;
+  }
+
+  /* The models on this Mac: the name and its size, then the state and what can be done. */
+  .lm-lib-list {
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 0.7rem;
+  }
+
+  .lm-lib-caption-label {
+    grid-column: 1;
+  }
+
+  .lm-lib-caption-size {
+    grid-column: 2;
+  }
+
+  .lm-lib-row {
+    row-gap: 0.15rem;
+    padding-top: 0.45rem;
+    padding-bottom: 0.45rem;
+  }
+
+  .lm-lib-name {
+    grid-row: 1;
+    grid-column: 1;
+    padding: 0;
+  }
+
+  .lm-lib-size {
+    grid-row: 1;
+    grid-column: 2;
+  }
+
+  .lm-lib-tag {
+    grid-row: 2;
+    grid-column: 1;
+  }
+
+  .lm-lib-actions {
+    grid-row: 2;
+    grid-column: 2;
+  }
+
+  .lm-lib-ask {
+    margin-inline: 0.7rem;
+  }
+
+  .lm-lib-foot {
+    flex-wrap: wrap;
+  }
+
+  /* A row's buttons keep their own size: they sit in the row, not under the thumb. */
+  .local-model-window .wt-btn.lm-btn.lm-btn-row {
+    min-height: 36px;
+    font-size: 0.8rem;
+  }
+
+  .lm-foot {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.8rem;
+  }
+
+  /* The main action on top, the way back under it. */
+  .lm-buttons {
+    flex-direction: column-reverse;
+    margin-inline-start: 0;
+  }
+
+  .local-model-window .wt-btn.lm-btn {
+    min-height: 44px;
+    font-size: 0.88rem;
   }
 }

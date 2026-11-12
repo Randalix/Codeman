@@ -58,6 +58,7 @@ import {
   type PiConfig,
   type GrokConfig,
   type CopilotConfig,
+  type JcodeConfig,
   type DeepSeekConfig,
   type OmpConfig,
   type SessionRemote,
@@ -525,6 +526,18 @@ export class GuardedInputBusyError extends Error {
 }
 
 /**
+ * The session's launch guard refused the start of a new agent process
+ * (`Session.setLaunchGuard()`). Its message is the sentence for the user. A typed error, so a
+ * start that was refused is told apart from a tmux failure and never falls back to a direct PTY.
+ */
+export class LaunchRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'LaunchRefusedError';
+  }
+}
+
+/**
  * Whether a programmatic write leaves the keep-alive turn running: the nudge itself, or a bare
  * Enter (which submits nothing new). Anything else carrying an Enter starts a turn of its own.
  */
@@ -872,6 +885,8 @@ export class Session extends EventEmitter {
   private _grokConfig: GrokConfig | undefined;
   // GitHub Copilot configuration (only for mode === 'copilot')
   private _copilotConfig: CopilotConfig | undefined;
+  // jcode configuration (only for mode === 'jcode')
+  private _jcodeConfig: JcodeConfig | undefined;
 
   // DeepSeek Harness configuration (only for mode === 'deepseek')
   private _deepSeekConfig: DeepSeekConfig | undefined;
@@ -899,6 +914,12 @@ export class Session extends EventEmitter {
   // previous injection (remove exactly the env keys it added, delete a previous isolated
   // config dir) without guessing what it once wrote. Persisted disk-only (`__customModel`).
   private _customModel: CustomModelBookkeeping | undefined;
+
+  // Asked right before a NEW agent process is started for this session (a fresh pane, the
+  // respawn of a dead one, a restart in place), never for an attach to an agent that runs.
+  // Resolves with the sentence that refuses the start, or undefined. Set by the web layer
+  // (`WebServer.setupSessionListeners()`); this file does not know who asks or why.
+  private _launchGuard: (() => Promise<string | undefined>) | null = null;
 
   // Env keys a retired custom-model selection injected that the NEXT respawn must
   // `tmux setenv -u`. Deleting a key from `_envOverrides` alone does nothing to the
@@ -1005,6 +1026,8 @@ export class Session extends EventEmitter {
       /** Grok configuration (only for mode === 'grok') */
       grokConfig?: GrokConfig;
       copilotConfig?: CopilotConfig;
+      /** jcode configuration (only for mode === 'jcode') */
+      jcodeConfig?: JcodeConfig;
       /** DeepSeek Harness configuration (only for mode === 'deepseek') */
       deepSeekConfig?: DeepSeekConfig;
       /** OMP configuration (only for mode === 'omp') */
@@ -1197,6 +1220,11 @@ export class Session extends EventEmitter {
     // Apply GitHub Copilot configuration
     if (config.copilotConfig) {
       this._copilotConfig = config.copilotConfig;
+    }
+
+    // Apply jcode configuration
+    if (config.jcodeConfig) {
+      this._jcodeConfig = config.jcodeConfig;
     }
 
     // Apply env overrides (exported at spawn, not persisted to disk).
@@ -1675,10 +1703,13 @@ export class Session extends EventEmitter {
   }
 
   /**
-   * The linked git worktree inside `workingDir` that {@link paneCwd} is in, when there is one
-   * (`live-worktree.ts`). The Files panel lists it instead of the main checkout. Runtime-only and
-   * never a confinement root, like `paneCwd`: it is judged lexically when the pane moves, and the
-   * listing route re-checks the real folder on every request.
+   * The git worktree that {@link paneCwd} is in, when there is one (`live-worktree.ts`): a linked
+   * worktree inside `workingDir`, or, for an outside answer, a linked worktree or the repository's
+   * main worktree (from a session started in a linked one).
+   * The Files panel lists it instead of the main checkout. Runtime-only, like `paneCwd`. One inside
+   * `workingDir` is never a confinement root: it is judged lexically when the pane moves, and the
+   * listing route re-checks the real folder on every request. One outside it (`outside: true`) is
+   * a second root for the file routes, re-checked on every request the same way.
    */
   get liveWorktree(): LiveWorktree | undefined {
     return this._liveWorktree;
@@ -2170,6 +2201,22 @@ export class Session extends EventEmitter {
     }
   }
 
+  /**
+   * Sets what is asked before a new agent process is started for this session (see
+   * `_launchGuard`). The first user is the model Codeman runs on this Mac: an agent is not
+   * started on it while its runtime is down or its model changed. `null` removes it.
+   */
+  setLaunchGuard(guard: (() => Promise<string | undefined>) | null): void {
+    this._launchGuard = guard;
+  }
+
+  /** Throws the guard's sentence (`LaunchRefusedError`) when a new agent process must not be started now. */
+  private async _assertLaunchAllowed(): Promise<void> {
+    if (!this._launchGuard) return;
+    const refusal = await this._launchGuard();
+    if (refusal) throw new LaunchRefusedError(refusal);
+  }
+
   // Custom Model Endpoint Profiles (docs/custom-model-endpoints-plan.md) — public-safe
   // subset only (never envKeys/configDir/launchModel, the bookkeeping for setCustomModel).
   get customModel(): CustomModelSelection | undefined {
@@ -2525,7 +2572,9 @@ export class Session extends EventEmitter {
       status: this._status,
       workingDir: this.workingDir,
       paneCwd: this._paneCwd,
-      liveWorktree: this._liveWorktree,
+      // The wire keeps `liveWorktree` inside `workingDir` only; an outside answer rides its own field.
+      liveWorktree: this._liveWorktree?.outside ? undefined : this._liveWorktree,
+      outsideWorktree: this._liveWorktree?.outside ? this._liveWorktree : undefined,
       remote: this._remote,
       docker: this._docker,
       adopt: this._adopt,
@@ -2581,6 +2630,7 @@ export class Session extends EventEmitter {
       piConfig: this._piConfig,
       grokConfig: this._grokConfig,
       copilotConfig: this._copilotConfig,
+      jcodeConfig: this._jcodeConfig,
       deepSeekConfig: this._deepSeekConfig,
       ompConfig: this._ompConfig,
       resumeSessionId: this._resumeSessionId,
@@ -2745,6 +2795,8 @@ export class Session extends EventEmitter {
     let respawnedResumeId: string | undefined;
     if (this._muxSession && mux.isPaneDead(this._muxSession.muxName)) {
       console.log('[Session] Dead pane detected, respawning:', this._muxSession.muxName);
+      // A new agent process: asked first (see `_launchGuard`). A refusal leaves the pane as it is.
+      await this._assertLaunchAllowed();
       // Confirmed dead — safe to resolve/pin now (see `_pinOmpRespawnId()`).
       // `options.respawnPaneOptions` was built eagerly before this dead-pane
       // check ran, so it still carries the pre-pin ompConfig; rebuild it.
@@ -2799,6 +2851,8 @@ export class Session extends EventEmitter {
           this._resumeSessionId = pinned;
         }
       }
+      // A new agent process: asked first (see `_launchGuard`).
+      await this._assertLaunchAllowed();
       this._muxSession = await mux.createSession(options.createSessionOptions);
       console.log('[Session] Created mux session:', this._muxSession.muxName);
       // No extra sleep — createSession() already waits for tmux readiness
@@ -2921,6 +2975,9 @@ export class Session extends EventEmitter {
       return false;
     }
 
+    // A new agent process: asked first (see `_launchGuard`). A refusal rejects, and the pane
+    // keeps what runs in it.
+    await this._assertLaunchAllowed();
     this._pinOmpRespawnId();
     const newPid = await mux.respawnPane(await this._buildRespawnPaneOptionsWithResumePin());
     if (!newPid) {
@@ -2960,6 +3017,7 @@ export class Session extends EventEmitter {
       piConfig: this._piConfig,
       grokConfig: this._grokConfig,
       copilotConfig: this._copilotConfig,
+      jcodeConfig: this._jcodeConfig,
       deepSeekConfig: this._deepSeekConfig,
       // OMP resolution/pinning does NOT happen here. This object is built
       // EAGERLY — including on every boot-recovery reattach, before anyone
@@ -3103,13 +3161,13 @@ export class Session extends EventEmitter {
    * launch param. Where that param
    * lives is registry DATA — the entry's `legacyConfigField` (`piConfig`, `grokConfig`,
    * ...) or the top-level `model` for an entry that declares none — so this stays a
-   * generic reader rather than a branch per CLI. Applied on the OPTIONS only: the stored
-   * `<Mode>Config` keeps whatever model the user chose at create, which is exactly what a
-   * later clear must fall back to.
+   * generic reader rather than a branch per CLI. Applied on the OPTIONS only, on both the
+   * respawn and the create path: the stored `<Mode>Config` keeps whatever model the user
+   * chose at create, which is exactly what a later clear must fall back to.
    */
-  private _withCustomModelLaunchModel(
-    options: import('./mux-interface.js').RespawnPaneOptions
-  ): import('./mux-interface.js').RespawnPaneOptions {
+  private _withCustomModelLaunchModel<
+    T extends import('./mux-interface.js').RespawnPaneOptions | import('./mux-interface.js').CreateSessionOptions,
+  >(options: T): T {
     const launchModel = this._customModel?.launchModel;
     if (!launchModel) return options;
     const entry = getCli(this.mode);
@@ -3461,7 +3519,7 @@ export class Session extends EventEmitter {
         const { isRestored, respawnedResumeId, respawnedDeadPane } = await this._setupOrAttachMuxSession({
           // Single source of truth shared with reattachRemote() (COD-108).
           respawnPaneOptions: this._buildRespawnPaneOptions(),
-          createSessionOptions: {
+          createSessionOptions: this._withCustomModelLaunchModel({
             sessionId: this.id,
             workingDir: this.workingDir,
             mode: this.mode,
@@ -3478,6 +3536,7 @@ export class Session extends EventEmitter {
             piConfig: this._piConfig,
             grokConfig: this._grokConfig,
             copilotConfig: this._copilotConfig,
+            jcodeConfig: this._jcodeConfig,
             deepSeekConfig: this._deepSeekConfig,
             ompConfig: this._ompConfig,
             resumeSessionId: this._resumeSessionId,
@@ -3491,7 +3550,7 @@ export class Session extends EventEmitter {
             docker: this._docker,
             adopt: this._adopt,
             owner: this._owner,
-          },
+          }),
           spawnErrLabel: 'mux attachment',
         });
 
@@ -3574,6 +3633,9 @@ export class Session extends EventEmitter {
           this._armPaneSettle(true);
         }
       } catch (err) {
+        // A refused launch is an answer, not a tmux failure: it must not fall through to
+        // the direct PTY below, which would start the very process that was refused.
+        if (err instanceof LaunchRefusedError) throw err;
         if (this._adopt) this._failAdoptedStart(err);
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
@@ -3595,6 +3657,8 @@ export class Session extends EventEmitter {
         throw new Error(`${getModeLabel(this.mode)} sessions require tmux. Direct PTY fallback is not supported.`);
       }
       if (this._adopt) this._failAdoptedStart(new Error('tmux is not available'));
+      // A new agent process on this path too: asked first (see `_launchGuard`).
+      await this._assertLaunchAllowed();
       try {
         // Pass --session-id to use the SAME ID as the Codeman session
         // This ensures subagents can be directly matched to the correct tab.
@@ -4057,6 +4121,7 @@ export class Session extends EventEmitter {
       piConfig: this._piConfig,
       grokConfig: this._grokConfig,
       copilotConfig: this._copilotConfig,
+      jcodeConfig: this._jcodeConfig,
       deepSeekConfig: this._deepSeekConfig,
       ompConfig: this._ompConfig,
     };
@@ -4603,6 +4668,8 @@ export class Session extends EventEmitter {
           }, 100);
         }
       } catch (err) {
+        // As in startInteractive(): a refused launch never falls back to a direct PTY.
+        if (err instanceof LaunchRefusedError) throw err;
         if (this._adopt) this._failAdoptedStart(err);
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;

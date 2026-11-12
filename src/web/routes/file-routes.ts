@@ -1,9 +1,11 @@
 /**
  * @fileoverview File browser and streaming routes.
  * Provides directory listing, file content preview, raw file serving, tail
- * streaming, and the File Viewer edit-mode write path (edit=1 read +
+ * streaming, the File Viewer edit-mode write path (edit=1 read +
  * PUT /api/sessions/:id/file-content; policy in src/config/file-editing.ts,
- * design in docs/file-viewer-edit-plan.md).
+ * design in docs/file-viewer-edit-plan.md), and the Files panel's delete
+ * (DELETE /api/sessions/:id/files?path=: one regular file, the edit route's
+ * confinement and guards, symbolic links refused).
  */
 
 import { FastifyInstance, type FastifyReply } from 'fastify';
@@ -19,6 +21,7 @@ import type {
   FilesystemBrowseEntry,
   FilesystemBrowseRoot,
   FilesystemPreviewKind,
+  FileDeleteData,
   FileWriteData,
 } from '../../types.js';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
@@ -50,7 +53,13 @@ import {
 import { generateFirstPageThumbnail } from '../../document-thumbnailer.js';
 import { getOfficePreviewPdfPath, getPreviewPdfDownloadName } from '../../document-preview-cache.js';
 import { sanitizeAttachmentHistoryItem } from '../../session-attachment-history.js';
-import { isBlockedAttachmentPath, isUnderTree, loadAttachmentGuardConfig } from '../../config/attachment-guard.js';
+import {
+  isBlockedAttachmentDirectory,
+  isBlockedAttachmentPath,
+  isOutsideWorktreeRootRefused,
+  isUnderTree,
+  loadAttachmentGuardConfig,
+} from '../../config/attachment-guard.js';
 import { isMultiUserMode, userSpacePath } from '../../config/multiuser.js';
 import {
   CASES_DIR,
@@ -59,11 +68,13 @@ import {
   getAuthUser,
   parseBody,
   resolveCasesDir,
+  validateLocalSessionFilePath,
   validateSessionFilePath,
   validateSessionFilePathLexical,
 } from '../route-helpers.js';
 import type { FastifyRequest } from 'fastify';
 import type { SessionAttachmentHistoryItem, SessionRemote, SessionState } from '../../types/session.js';
+import type { LiveWorktree } from '../../live-worktree.js';
 import {
   RemoteFileAccessError,
   remoteCreateReadStream,
@@ -575,6 +586,11 @@ function getKnownSessionWorkingDir(
 /** Where a session's files live: this host, or a host reachable over ssh. */
 interface SessionFileScope {
   workingDir: string;
+  /**
+   * A live local session's worktree (#765). Only one with `outside` set changes anything here: it
+   * is a second root that ABSOLUTE paths inside it are confined to (`validateLocalSessionFilePath`).
+   */
+  liveWorktree?: LiveWorktree;
   remote?: SessionRemote;
   /** The session runs inside a Docker case: a local session for these routes, but `~` is the container's. */
   docker?: boolean;
@@ -607,7 +623,12 @@ function getKnownSessionFileScope(
   const user = getAuthUser(req);
   const liveSession = ctx.sessions.get(sessionId);
   if (liveSession && canAccessOwned(user, liveSession.owner)) {
-    return { workingDir: liveSession.workingDir, remote: liveSession.remote, docker: !!liveSession.docker };
+    return {
+      workingDir: liveSession.workingDir,
+      liveWorktree: liveSession.liveWorktree,
+      remote: liveSession.remote,
+      docker: !!liveSession.docker,
+    };
   }
 
   const stored = ctx.store.getSession(sessionId);
@@ -650,6 +671,19 @@ type FileTargetResolution =
     };
 
 /**
+ * The scope with an outside worktree (#765) dropped when the attachment guard refuses its root
+ * right now. `findOutsideWorktree()` judged the guard when the pane moved, and an admin can turn
+ * on workspace confinement or block the folder afterwards, so every request judges it again. A
+ * scope without an outside worktree comes back unchanged and reads no settings.
+ */
+async function withGuardedOutsideWorktree<T extends { liveWorktree?: LiveWorktree }>(scope: T): Promise<T> {
+  const worktree = scope.liveWorktree;
+  if (!worktree?.outside) return scope;
+  if (!isOutsideWorktreeRootRefused(worktree.path, await loadAttachmentGuardConfig())) return scope;
+  return { ...scope, liveWorktree: undefined };
+}
+
+/**
  * Resolve a request's `?path=` against the session's file scope.
  *
  * Never throws: a transport failure comes back as `status: 502` with the remote
@@ -658,7 +692,7 @@ type FileTargetResolution =
  */
 async function resolveFileTarget(scope: SessionFileScope, filePath: string): Promise<FileTargetResolution> {
   if (!scope.remote) {
-    const validated = validateSessionFilePath(scope.workingDir, filePath);
+    const validated = validateLocalSessionFilePath(await withGuardedOutsideWorktree(scope), filePath);
     if (!validated) {
       return {
         ok: false,
@@ -877,6 +911,22 @@ async function canWalkLiveWorktree(workingDir: string, worktreePath: string): Pr
   }
 }
 
+/**
+ * Whether a `root=live-any` listing may start at a worktree OUTSIDE `workingDir` (`outside: true`,
+ * published as `outsideWorktree`).
+ * `findOutsideWorktree()` recorded its real path, and a symlink can take the folder's place, or a
+ * parent's, without moving the pane, so the folder must still resolve to exactly that path. Probed
+ * first (#516).
+ */
+async function canWalkOutsideWorktree(worktreePath: string): Promise<boolean> {
+  if ((await probePathKind(worktreePath, { pastCap: true })) !== 'directory') return false;
+  try {
+    return (await fs.realpath(worktreePath)) === worktreePath;
+  } catch {
+    return false;
+  }
+}
+
 function findMatchingPickerRoot(roots: FilesystemBrowseRoot[], candidate: string): FilesystemBrowseRoot | undefined {
   return roots
     .filter((root) => isPathWithinRoot(root.path, candidate))
@@ -945,11 +995,7 @@ function resolveCandidateRootPaths(candidates: ReadonlyArray<{ path: string }>):
 }
 
 function isBlockedPickerPath(path: string, blockedTrees: readonly string[], directory = false): boolean {
-  if (isBlockedAttachmentPath(path, blockedTrees)) return true;
-  // The shared sensitive-path matcher describes file locations such as
-  // ~/.ssh/<key>. Probe a child path as well so the directory itself cannot be
-  // opened and used to enumerate those filenames.
-  return directory && isBlockedAttachmentPath(join(path, '__codeman_path_picker_probe__'), blockedTrees);
+  return directory ? isBlockedAttachmentDirectory(path, blockedTrees) : isBlockedAttachmentPath(path, blockedTrees);
 }
 
 function extraConfiguredPickerRoots(): Array<{ label: string; path: string }> {
@@ -1155,10 +1201,14 @@ function throwRouteError(statusCode: number, code: ApiErrorCode, message: string
  * Gate a resolved workspace file for edit-mode read/write. Throws a structured
  * error when the file may not be edited; returns void when it may. Order
  * matters for the message a user sees: confinement (the caller's 404) →
- * sensitive/blocked (403) → .git (403) → extension allowlist (400).
+ * sensitive/blocked (403) → .git (403) → extension allowlist (400). Dotenv is
+ * the one sensitive family the editor may open (`allowDotenv`): the plain
+ * preview already serves it to the same user. Keep this and the `editable`
+ * advertisement in the read route in step.
  */
 function assertEditableTarget(resolvedPath: string, relativePath: string, blockedTrees: readonly string[]): void {
-  if (isSensitivePath(resolvedPath) || isBlockedAttachmentPath(resolvedPath, blockedTrees)) {
+  // isBlockedAttachmentPath includes the sensitive-path check.
+  if (isBlockedAttachmentPath(resolvedPath, blockedTrees, { allowDotenv: true })) {
     throwFileEditError(403, ApiErrorCode.FORBIDDEN, 'Editing this file is blocked');
   }
   if (isDeniedEditRelativePath(relativePath)) {
@@ -1709,11 +1759,28 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     // `workingDir`, so file-content, file-raw and the edit route need nothing new and judge these
     // paths against the same root as any other. Only the search predicate reads a path relative
     // to the listing, since that is the tree the person is looking at.
-    const liveWorktree = session.liveWorktree;
-    const walkRoot =
-      root === 'live' && liveWorktree && (await canWalkLiveWorktree(workingDir, liveWorktree.path))
-        ? liveWorktree.path
-        : workingDir;
+    // A worktree OUTSIDE `workingDir` (the session's `outsideWorktree` on the wire) is a second
+    // root, and walking it is opt-in: only `root=live-any` does. `root=live` never walks it (every
+    // `path` stays relative to `workingDir`), so with an outside worktree it walks `workingDir`. The outside
+    // walk happens only while the folder still resolves to the real path recorded for it, and it
+    // lists ABSOLUTE `path`s, since a relative one resolves against `workingDir` on every other
+    // route. Those routes confine an absolute path inside it to it (`validateLocalSessionFilePath`).
+    const liveWorktree = (await withGuardedOutsideWorktree({ liveWorktree: session.liveWorktree })).liveWorktree;
+    const walksOutside =
+      root === 'live-any' && !!liveWorktree?.outside && (await canWalkOutsideWorktree(liveWorktree.path));
+    const walksInside =
+      (root === 'live' || root === 'live-any') &&
+      !!liveWorktree &&
+      !liveWorktree.outside &&
+      (await canWalkLiveWorktree(workingDir, liveWorktree.path));
+    const walkRoot = liveWorktree && (walksOutside || walksInside) ? liveWorktree.path : workingDir;
+    // Only `root=live-any` reports an outside worktree: it is the client that opted in to it.
+    // A listing keeps reporting a worktree the guard refuses to walk, or the panel would reload on
+    // every session update.
+    const sessionWorktree = session.liveWorktree;
+    const reportedWorktree =
+      sessionWorktree && (!sessionWorktree.outside || root === 'live-any') ? sessionWorktree : undefined;
+    const nodePath = (fullPath: string): string => (walksOutside ? fullPath : fullPath.slice(workingDir.length + 1));
     // null for an empty/whitespace query, which is what keeps the default
     // tree response byte-identical when no search is requested.
     const matcher = compileFileQuery(q ?? '');
@@ -1803,7 +1870,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
           while (cursor.index < endIndex && totalFiles + totalDirectories < maxFiles && matches.length < maxMatches) {
             const entry = cursor.entries[cursor.index++];
             const fullPath = join(cursor.dirPath, entry.name);
-            const relativePath = relative(workingDir, fullPath);
+            const relativePath = walksOutside ? fullPath : relative(workingDir, fullPath);
             const listedPath = relative(walkRoot, fullPath);
 
             if (entry.isDirectory()) {
@@ -1841,7 +1908,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         success: true,
         data: {
           root: walkRoot,
-          ...(liveWorktree && { worktree: liveWorktree }),
+          ...(reportedWorktree && { worktree: reportedWorktree }),
           tree: [],
           matches,
           totalFiles,
@@ -1894,7 +1961,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         while (cursor.index < endIndex && totalFiles + totalDirectories < maxFiles) {
           const entry = cursor.entries[cursor.index++];
           const fullPath = join(cursor.dirPath, entry.name);
-          const relativePath = fullPath.slice(workingDir.length + 1);
+          const relativePath = nodePath(fullPath);
           if (entry.isDirectory()) {
             totalDirectories++;
             const node: FileTreeNode = {
@@ -1932,13 +1999,110 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       success: true,
       data: {
         root: walkRoot,
-        ...(liveWorktree && { worktree: liveWorktree }),
+        ...(reportedWorktree && { worktree: reportedWorktree }),
         tree,
         totalFiles,
         totalDirectories,
         truncated,
       },
     };
+  });
+
+  // The Files panel's delete button: remove ONE regular file from the session's workspace (or from
+  // its outside worktree, for an absolute path inside it). A write surface like the edit route
+  // above, so it takes that route's confinement and guards whole (ownership, realpath + workspace boundary, sensitive and blocked trees, `.git`), and adds
+  // its own rule for links: a symbolic link is REFUSED, never followed. The confinement check
+  // returns the link's realpath, which is its TARGET, so an `unlink` of that path deletes the file
+  // the link points at and leaves the link dangling (#529's review: `AGENTS.md -> CLAUDE.md`
+  // deleted CLAUDE.md). The final component is therefore read with `lstat` on the path as the
+  // client named it, and only a path whose last part is a plain file goes on; `unlink` never
+  // follows a final symlink, so a link swapped in after that check is removed rather than its
+  // target, and the inode is compared again right before the unlink.
+  app.delete('/api/sessions/:id/files', async (req): Promise<ApiResponse<FileDeleteData>> => {
+    const { id } = req.params as { id: string };
+    const { path: filePath } = req.query as { path?: string };
+    const session = findSessionOrFail(ctx, id, req);
+    // Ahead of any path check, as on the edit route: the validation below resolves against the
+    // LOCAL filesystem, so a same-named local directory would take the delete.
+    if (session.remote) {
+      throwRouteError(400, ApiErrorCode.INVALID_INPUT, 'Deleting is not supported for remote (SSH) sessions');
+    }
+    // An adopted session has no workspace of ours: its folder is the neutral `/tmp`. The older
+    // file surfaces keep serving it as a standing exception (root CLAUDE.md, Adopted tmux
+    // sessions), which is not copied to a new surface, least of all one that deletes.
+    if (session.isAdopted) {
+      throwRouteError(400, ApiErrorCode.INVALID_INPUT, 'Deleting is not supported for adopted sessions');
+    }
+    // A repeated `?path=` arrives as an array.
+    if (typeof filePath !== 'string' || !filePath) {
+      throwRouteError(400, ApiErrorCode.INVALID_INPUT, 'Missing path parameter');
+    }
+    // #516: the confinement check below runs realpathSync, which freezes the server on a mount
+    // that stopped answering. Probe the folders it will touch first, bounded.
+    const scope = await withGuardedOutsideWorktree({
+      workingDir: session.workingDir,
+      liveWorktree: session.liveWorktree,
+    });
+    const worktreeRoot = scope.liveWorktree?.outside && isAbsolute(filePath) ? scope.liveWorktree.path : null;
+    for (const folder of worktreeRoot ? [session.workingDir, worktreeRoot] : [session.workingDir]) {
+      if ((await probePathKind(folder, { pastCap: true })) === 'unknown') {
+        throwRouteError(
+          422,
+          ApiErrorCode.OPERATION_FAILED,
+          describeUnknownPath('Workspace', folder, { pastCap: true })
+        );
+      }
+    }
+    const validated = validateLocalSessionFilePath(scope, filePath);
+    if (!validated) {
+      // Missing files, traversal and symlink escapes alike, as on every other file route.
+      throwRouteError(404, ApiErrorCode.NOT_FOUND, 'File not found');
+    }
+    const { resolvedPath, relativePath } = validated;
+    // The path as the client named it: `resolve` keeps an absolute (outside worktree) path as is.
+    const namedPath = resolve(session.workingDir, filePath);
+    const guard = await loadAttachmentGuardConfig();
+    if (
+      isSensitivePath(resolvedPath) ||
+      isSensitivePath(namedPath) ||
+      isBlockedAttachmentPath(resolvedPath, guard.blockedTrees) ||
+      isBlockedAttachmentPath(namedPath, guard.blockedTrees)
+    ) {
+      throwRouteError(403, ApiErrorCode.FORBIDDEN, 'Deleting this file is blocked');
+    }
+    // Both spellings: a `.git` reached through a linked folder, and a linked `.git`.
+    if (isDeniedEditRelativePath(relativePath) || isDeniedEditRelativePath(relative(session.workingDir, namedPath))) {
+      throwRouteError(403, ApiErrorCode.FORBIDDEN, 'Files under .git cannot be deleted');
+    }
+    const named = await fs.lstat(namedPath).catch(() => undefined);
+    if (!named) {
+      throwRouteError(404, ApiErrorCode.NOT_FOUND, 'File not found');
+    }
+    if (named.isSymbolicLink()) {
+      throwRouteError(
+        400,
+        ApiErrorCode.INVALID_INPUT,
+        'Symbolic links are not deleted from the Files panel (deleting one here would remove the file it points to)'
+      );
+    }
+    if (!named.isFile()) {
+      throwRouteError(400, ApiErrorCode.INVALID_INPUT, 'Only regular files can be deleted');
+    }
+    // The same file the checks were made on: realpath of a path whose last part is no link names
+    // the same inode. A change in between (the file replaced) refuses rather than guesses.
+    const real = await fs.lstat(resolvedPath).catch(() => undefined);
+    if (!real || !real.isFile() || real.ino !== named.ino || real.dev !== named.dev) {
+      throwRouteError(409, ApiErrorCode.CONFLICT, 'The file changed while it was being deleted; reload and try again');
+    }
+    try {
+      await fs.unlink(resolvedPath);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') throwRouteError(404, ApiErrorCode.NOT_FOUND, 'File not found');
+      // The errno text names the resolved path, so only its code goes back.
+      throwRouteError(500, ApiErrorCode.OPERATION_FAILED, `Failed to delete the file (${code ?? 'error'})`);
+    }
+    return { success: true, data: { path: filePath } };
   });
 
   // Get file content for preview (File Browser)
@@ -1959,7 +2123,10 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     // Validate path is within working directory (security: resolve symlinks to prevent traversal)
     // For a remote (SSH) case the same boundary is resolved on the remote host (#415),
     // where the path actually lives.
-    const resolution = await resolveFileTarget({ workingDir: session.workingDir, remote: session.remote }, filePath);
+    const resolution = await resolveFileTarget(
+      { workingDir: session.workingDir, liveWorktree: session.liveWorktree, remote: session.remote },
+      filePath
+    );
     if (!resolution.ok) {
       // An unreachable remote is thrown so the shared handler answers a real 502 (and
       // the test can assert it); a refusal keeps this route's historical returned
@@ -2170,8 +2337,7 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         editable =
           isEditableFileName(pathBasename(target.resolvedPath)) &&
           !isDeniedEditRelativePath(relativePath) &&
-          !isSensitivePath(target.resolvedPath) &&
-          !isBlockedAttachmentPath(target.resolvedPath, guard.blockedTrees) &&
+          !isBlockedAttachmentPath(target.resolvedPath, guard.blockedTrees, { allowDotenv: true }) &&
           stat.size <= MAX_EDITABLE_BYTES &&
           Buffer.from(content, 'utf8').equals(buf);
       }
@@ -2231,7 +2397,10 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
         throwFileEditError(413, ApiErrorCode.INVALID_INPUT, `Content too large (${MAX_EDITABLE_BYTES / 1024}KB limit)`);
       }
 
-      const validated = validateSessionFilePath(session.workingDir, body.path);
+      const validated = validateLocalSessionFilePath(
+        await withGuardedOutsideWorktree({ workingDir: session.workingDir, liveWorktree: session.liveWorktree }),
+        body.path
+      );
       if (!validated) {
         // Covers missing files, traversal, and symlink escapes alike — a write
         // target that fails confinement is reported identically to a missing
@@ -2287,6 +2456,13 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       // masked by the process umask; fsync so the rename never publishes a
       // partially-durable file. Trade-off (same as vim's default): the inode
       // changes, so hardlinks keep the old content.
+      //
+      // The new file would also take this process's own user and group, so a
+      // `.env` shared by group (you:www-data, 0640) came back you:you and the
+      // web server lost it. fchown puts both back where the account may: the
+      // owner can give a file to a group they belong to, and only root can set
+      // the user. Best effort, since a save that cannot keep the group is still
+      // the save the user asked for.
       const fileMode = stat.mode & 0o777;
       const tmpPath = join(
         dirname(resolvedPath),
@@ -2295,6 +2471,12 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       let handle;
       try {
         handle = await fs.open(tmpPath, 'wx', fileMode);
+        const tmpHandle = handle;
+        await tmpHandle
+          .chown(stat.uid, stat.gid)
+          .catch(() => tmpHandle.chown(-1, stat.gid))
+          .catch(() => {});
+        // After the chown: changing the owner can clear mode bits.
         await handle.chmod(fileMode);
         await handle.writeFile(outBuf);
         await handle.sync();
@@ -2334,7 +2516,10 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
 
     // Validate path is within working directory (security: resolve symlinks to prevent traversal)
-    const resolution = await resolveFileTarget({ workingDir: session.workingDir, remote: session.remote }, filePath);
+    const resolution = await resolveFileTarget(
+      { workingDir: session.workingDir, liveWorktree: session.liveWorktree, remote: session.remote },
+      filePath
+    );
     if (!resolution.ok) {
       reply.code(resolution.status).send(createErrorResponse(resolution.errorCode, resolution.message));
       return;
@@ -3004,7 +3189,10 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
     }
 
     const session = findSessionOrFail(ctx, sessionId, req);
-    const validated = validateSessionFilePath(session.workingDir, filePath);
+    const validated = validateLocalSessionFilePath(
+      await withGuardedOutsideWorktree({ workingDir: session.workingDir, liveWorktree: session.liveWorktree }),
+      filePath
+    );
     if (!validated) {
       reply.code(404).send(createErrorResponse(ApiErrorCode.NOT_FOUND, 'File not found'));
       return;

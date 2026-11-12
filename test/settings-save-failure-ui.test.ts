@@ -159,7 +159,7 @@ async function boot(
        };
        var KeyboardHandler = {}, SwipeHandler = {}, DeepgramProvider = {}, NotificationManager = function () {};
        var KeyboardAccessoryBar = { setMode() {} };
-       var VoiceInput = { _getDeepgramConfig: () => ({}), _saveDeepgramConfig() {}, refreshClaudeStatus: () => Promise.resolve() };
+       var VoiceInput = { SILENCE_TIMEOUT_SECONDS: [0, 3, 6, 15, 30], _getDeepgramConfig: () => ({}), _saveDeepgramConfig() {}, refreshClaudeStatus: () => Promise.resolve() };
        var FocusTrap = function () { this.activate = () => {}; this.deactivate = () => {}; };
        var DEFAULT_VOICE_KEYTERMS = '';`,
       read('constants.js'),
@@ -525,6 +525,10 @@ describe('the new toasts in zh-CN', () => {
       [
         'Saved on this device, not on the server: the server could not be reached',
         '已保存到本设备，但未保存到服务器：无法连接到服务器',
+      ],
+      [
+        'Options for "demo" (until the next sync) saved on this device, not on the server: HTTP 500',
+        '案例“demo”的选项已保存到本设备（同步前有效），但未保存到服务器：HTTP 500',
       ],
       [`Tunnel not stopped: ${TORN}`, `隧道未停止：${TORN}`],
     ];

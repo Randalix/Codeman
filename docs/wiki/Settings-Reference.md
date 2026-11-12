@@ -193,6 +193,26 @@ attached.
 section to the Run dropdown, for pointing a harness at your own OpenAI-compatible server
 instead of its native cloud backend. See [Custom Model Endpoints](Custom-Model-Endpoints).
 
+**Model on this Mac** is not a setting: it is the state of a model Codeman can run for you
+on the Mac the server runs on, with a button that opens the local model window. The same
+window opens from the **Run a local model** button on the welcome screen. It shows that
+Mac's chip, memory and free disk space, a bar for how much of the memory the selected model
+takes, and the models that fit, each with one tag (Best fit, Tight, Slow, Small model, or
+"Tested on a Mac like this"), a speed and a download size. **Install on this Mac** asks you
+to confirm the sizes once, then downloads a model runtime and the model into
+`~/.codeman/local-model`, checks that the model loads and can call a tool, installs the
+coding agent if it is missing, and ends on **Start a session**. No account, no API key and
+no administrator password. You can close the window while it downloads, cancel and continue
+later; after a Codeman restart an unfinished install waits for you to press Continue. Once a
+model is installed the window offers Start a session, Stop or Start, and Remove. Installing
+switches **Custom model endpoints** on and saves one endpoint named "This Mac"; Remove takes
+the endpoint away again and switches the setting back off if nothing else uses it. A Mac
+that can only run a small model is told so in plain words, and a Mac with too little memory,
+too little free disk space or an Intel processor is told why nothing is offered. The group
+is not shown when the server runs on Linux or Windows, and in multi-user mode only an admin
+sees it. The "Mac" is always the machine the server runs on, not the device you are reading
+on. Details: [Custom Model Endpoints](Custom-Model-Endpoints#a-model-that-runs-on-this-mac).
+
 ### Agents & CLIs
 
 | Setting                          | Notes                                                                                        |
@@ -202,7 +222,7 @@ instead of its native cloud backend. See [Custom Model Endpoints](Custom-Model-E
 | Ralph / Todo Tracker             | Enables the Ralph loop surfaces.                                                               |
 | Agent Teams                      | Experimental teams. Also needs the CLI's own environment flag.                                 |
 | Pin tab names on the CLI         | Launches every Claude session with `--name` set to its tab name, so Claude Code's prompt label and `/resume` list match your tabs. Claude then stops generating its own titles for those sessions, and a rename in Codeman holds only until the next turn. Synced, off by default; applies from the next session start or respawn. |
-| Codeman Agent Skill              | Under **All agent CLIs**. Injects the agent skill into each new session's case, where that session's CLI looks for skills (every CLI except Pi and a plain shell). Off by default. See [The Codeman Skill](Codeman-Skill). |
+| Codeman Agent Skill              | Under **All agent CLIs**. Injects the agent skill into each new session's case, where that session's CLI looks for skills (every CLI except Pi, GitHub Copilot and a plain shell). On by default since 1.50.0; existing installs that stored off are switched on once at the first 1.50.0 start, and turning it off afterwards sticks. The copy ignores itself in git, so your repository never lists it. Off stops new copies but removes none (`codeman skill uninstall --case <name>` does). See [The Codeman Skill](Codeman-Skill). |
 | Remote auto-reconnect            | Reattaches dropped remote SSH sessions. On by default.                                         |
 | Nice priority / value            | Runs agent processes at a lower CPU priority.                                                  |
 | Default Codex model              | Model for new local Codex sessions; empty uses Codex's own config. Letters, digits, `.` `_` `-` `/` only. |
@@ -227,8 +247,9 @@ Discord group for the two-way bot (token, IDs, thread and ping options; see
 ### Voice
 
 Active provider and the engine behind it, insert mode, language, domain keywords to bias
-recognition, the Deepgram API key, and the opt-in switch for transcribing through this
-server's Claude login, with its live credential status. See
+recognition, **Stop after silence** (provider default, 3, 6, 15 or 30 seconds, or Manual),
+the Deepgram API key, and the opt-in switch for transcribing through this server's Claude
+login, with its live credential status. See
 [Input And Voice](Input-And-Voice).
 
 ### Shortcuts
@@ -238,7 +259,7 @@ Rebinding for the shortcut registry. See [Keyboard Shortcuts](Keyboard-Shortcuts
 ### System
 
 `CLAUDE.md` template for new cases, default working directory, the image watcher, the prompt-cache keep-warm default (**Keep prompt caches warm**, off) and its cap (**Keep warm for at most**, 2 hours after a session's last prompt; see [Keeping Agents Running](Keeping-Agents-Running)), and
-Cloudflare tunnel controls including the tunnel URL. The **Diagnostics** group runs
+Cloudflare tunnel controls including the tunnel URL. **Sync cases across devices** (under Paths, off by default): Keeps each case's **Agent Teams** and **Opus 1M** options on the server (`caseSettings` in `settings.json`) and, when you return to a tab, switches it to the case you last chose on another device. Synced, off by default. Without it each browser keeps its own options for a case (the case list itself is always shared). The case names are stored in the shared settings file, so a non-admin in multi-user mode neither reads, writes nor follows them. Each save sends only that case and the server merges it, so devices saving different cases never overwrite each other; a case renamed in Codeman keeps its options, and deleting or unlinking it removes them. A save the server refuses leaves the choice on that device only until the next sync, which brings the server's copy back, and says so. Only a case picked in a case picker is followed, not one a quick-start or an agent's spawned worker used. If another device turns this off, this one stops following, and the server ignores case options sent while it is off. Turning it off leaves the stored options in `settings.json`, so turning it back on brings them back. A device that already has options for a case keeps them until a device changes that case's options while this is on. The **Diagnostics** group runs
 `codeman doctor` on the server and lists the agent CLIs, tmux, Node and the optional office
 tools with their versions and install hints (admin only in multi-user mode). In multi-user
 mode, the **Users** administration entry is injected here.

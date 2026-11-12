@@ -8,7 +8,7 @@
  * - SessionConfig — creation-time config (id, workingDir, createdAt)
  * - SessionOutput — captured stdout/stderr/exitCode
  * - SessionStatus — 'idle' | 'busy' | 'stopped' | 'error'
- * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot' (which CLI backend)
+ * - SessionMode — 'claude' | 'shell' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot' | 'jcode' (which CLI backend)
  * - ClaudeMode — CLI permission mode ('dangerously-skip-permissions' | 'auto' | 'normal' | 'allowedTools')
  * - SessionColor — visual differentiation color
  * - OpenCodeConfig — OpenCode-specific settings (model, autoAllowTools, continueSession)
@@ -19,6 +19,7 @@
  * - GrokConfig — Grok Build CLI (xAI `grok`) settings (model, alwaysApprove, resume/continue)
  * - CopilotConfig — GitHub Copilot CLI settings (model, allowAll, resume/continue)
  * - DeepSeekConfig — DeepSeek Harness (`dsh`) settings (profile, permissionMode, resume, status bridge)
+ * - JcodeConfig: jcode settings (model, resume)
  *
  * Cross-domain relationships:
  * - SessionState.respawnConfig embeds RespawnConfig (respawn domain)
@@ -60,7 +61,8 @@ export type SessionMode =
   | 'grok'
   | 'deepseek'
   | 'omp'
-  | 'copilot';
+  | 'copilot'
+  | 'jcode';
 
 /**
  * Who owns a session's name. `placeholder`: Codeman's own `w<n>-<case>` (or no
@@ -82,7 +84,18 @@ export interface SessionWriteOptions {
 
 export type RemoteCommandMode = Extract<
   SessionMode,
-  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot'
+  | 'shell'
+  | 'claude'
+  | 'opencode'
+  | 'codex'
+  | 'gemini'
+  | 'antigravity'
+  | 'pi'
+  | 'grok'
+  | 'deepseek'
+  | 'omp'
+  | 'copilot'
+  | 'jcode'
 >;
 
 /**
@@ -232,7 +245,18 @@ export interface RemoteSessionInfo {
 /** Which CLI backends a Docker case can run (same set as remote). */
 export type DockerCommandMode = Extract<
   SessionMode,
-  'shell' | 'claude' | 'opencode' | 'codex' | 'gemini' | 'antigravity' | 'pi' | 'grok' | 'deepseek' | 'omp' | 'copilot'
+  | 'shell'
+  | 'claude'
+  | 'opencode'
+  | 'codex'
+  | 'gemini'
+  | 'antigravity'
+  | 'pi'
+  | 'grok'
+  | 'deepseek'
+  | 'omp'
+  | 'copilot'
+  | 'jcode'
 >;
 
 /** Container engine. Docker and Podman differ in the uid/userns + host-gateway alias. */
@@ -647,6 +671,24 @@ export interface CopilotConfig {
 }
 
 /**
+ * jcode (1jehuang/jcode) session configuration.
+ *
+ * jcode has no approval prompts and no bypass flag, so there is nothing
+ * privileged to configure; the provider and its login come from jcode's own
+ * `~/.jcode/config.toml`. Verified against jcode 0.98.1.
+ */
+export interface JcodeConfig {
+  /** Model ID passed via --model (e.g. "claude-opus-4-8", "gpt-5.5"). */
+  model?: string;
+  /**
+   * Resume a jcode session (--resume): its id (`session_fox_<ms>_<hex>`) or its
+   * short name (`fox`), as ONE plain word starting with a letter or digit, since
+   * --resume's value is optional and a leading `-` would make it its own flag.
+   */
+  resumeSessionId?: string;
+}
+
+/**
  * DeepSeek Harness (`dsh`) session configuration.
  *
  * Two things make this config shaped unlike every sibling above it.
@@ -949,20 +991,31 @@ export interface SessionState {
    * from disk, so a restart starts blank. Absent for remote and docker sessions
    * (their local pane runs the ssh / docker-exec client) and for direct-PTY or
    * rediscovered sessions. NOT a confinement root: the file routes stay confined
-   * to `workingDir`, and a path resolved outside it goes through the attachment
-   * routes like any other out-of-workspace path.
+   * to `workingDir`, except for an absolute path inside an
+   * {@link outsideWorktree}. Any other path resolved outside `workingDir` goes
+   * through the attachment routes like any other out-of-workspace path.
    */
   paneCwd?: string;
   /**
    * The linked git worktree inside `workingDir` that the pane is in NOW, when there is one:
    * Claude Code's `.claude/worktrees/<name>`, or any other worktree of the repository under
    * the session's folder. Derived from {@link paneCwd} by `live-worktree.ts`, so it is
-   * runtime-only and absent wherever `paneCwd` is, and absent for a worktree outside
-   * `workingDir`: the file routes never serve those. NOT a confinement root; the Files panel
-   * only starts its listing here, after `GET .../files` has checked that the real folder still
-   * lies inside `workingDir`, since a symlink can replace it without moving the pane.
+   * runtime-only and absent wherever `paneCwd` is, and always a folder strictly below
+   * `workingDir`: a worktree elsewhere is reported in {@link outsideWorktree}, never here. NOT a
+   * confinement root; the Files panel only starts its listing here, after `GET .../files` has
+   * checked that the real folder still lies inside `workingDir`, since a symlink can replace it
+   * without moving the pane.
    */
   liveWorktree?: LiveWorktree;
+  /**
+   * The worktree of the session's repository outside `workingDir` that the pane is in NOW, when
+   * there is one: a linked worktree, or the repository's main worktree for a session started in a
+   * linked one. It carries `outside: true`, and its `path` is a real path that the repository
+   * itself vouched for. The file routes serve absolute paths inside it as a second root while it
+   * still resolves to that same path. Runtime-only, like {@link liveWorktree}; at most one of
+   * the two fields is set.
+   */
+  outsideWorktree?: LiveWorktree;
   /** Remote execution metadata, present when this session runs over SSH through local tmux */
   remote?: SessionRemote;
   /** Docker execution metadata, present when this session runs inside a container via local tmux + docker exec */
@@ -1112,6 +1165,8 @@ export interface SessionState {
   deepSeekConfig?: DeepSeekConfig;
   /** OMP-specific configuration (only for mode === 'omp') */
   ompConfig?: OmpConfig;
+  /** jcode configuration (only for mode === 'jcode') */
+  jcodeConfig?: JcodeConfig;
   /** Claude conversation session ID to resume after reboot (set by restore script) */
   resumeSessionId?: string;
   /** Claude CLI effort level (soft default via --settings, switchable in-session via /effort) */

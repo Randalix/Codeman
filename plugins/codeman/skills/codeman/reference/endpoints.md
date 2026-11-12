@@ -216,7 +216,10 @@ you typed matches the moment it is typed.
 generic marker (`BUILD OK`) matched against stale text, either from `from=buffer`
 scanning an earlier run or from tmux replaying old screen content as fresh output on an
 attach/resize/redraw. A unique-per-call token (`DONE_$RANDOM`) makes both `from` modes
-safe.
+safe. ⚠️ In a fan-out put something of the WORKER into it too (its id, the loop index): zsh,
+the shell Claude Code runs on a Mac, hands every subshell the same `$RANDOM` until the
+parent shell reads it, so `( … $RANDOM … ) &` twice draws one number. `sendmark` adds six
+characters of the worker's id for that reason.
 
 ### 6. `jq` parse error instead of an `errorCode`
 
@@ -242,7 +245,7 @@ minutes, never retry the credential.
 flushed slightly *after* the `stop` hook fires, so a read taken the instant the wait
 returns is too early (verified live: empty on the first call, full prose seconds later).
 It is also `""` before the worker's first completed turn, and permanently `""` for
-`shell`, `opencode`, `gemini`, `antigravity`, `pi`, `grok`, `omp` and `copilot`, which write no transcript at
+`shell`, `opencode`, `gemini`, `antigravity`, `pi`, `grok`, `omp`, `copilot` and `jcode`, which write no transcript at
 all. `deepseek` is NOT one of those — it is read from `$DSH_HOME/sessions/**` and lags
 for the same reason claude does (the harness finalizes the assistant message just after
 it reports `idle`), so poll it the same way.
@@ -346,7 +349,7 @@ ESC=$(printf '\033')
 
 `POST /api/v1/quick-start` body (all optional):
 `{"caseName":"worker-1","mode":"claude","sessionName":"auth-worker","effort":"high"}`
-,  `mode` ∈ `claude|shell|opencode|codex|gemini|antigravity|pi|grok|deepseek|omp|copilot`; response is
+,  `mode` ∈ `claude|shell|opencode|codex|gemini|antigravity|pi|grok|deepseek|omp|copilot|jcode`; response is
 `.data.{sessionId, caseName, casePath}`. Creates the case directory (a real directory
 on the user's disk) if missing, do not retry it in a loop, and remember the name.
 
@@ -361,9 +364,10 @@ a soft default the worker can change with `/advisor`. Remote and docker cases re
 `OPERATION_FAILED`; it never falls back to claude. Probe first whenever you did not pick
 the mode yourself: `GET /api/v1/claude/status`, `GET /api/v1/opencode/status`,
 `GET /api/v1/codex/status`, `GET /api/v1/gemini/status`, `GET /api/v1/antigravity/status`, `GET /api/v1/grok/status`, `GET /api/v1/deepseek/status`,
-`GET /api/v1/pi/status`, `GET /api/v1/omp/status` and `GET /api/v1/copilot/status` each return `.data.{available, path}` (no session needed).
-Pi's, grok's, OMP's and Copilot's also carry `.data.version`, because `pi` is a short generic name,
-`grok` is a name with npm squatters, and `omp` is a similarly short name, and `copilot` is a generic one, so an unrelated
+`GET /api/v1/pi/status`, `GET /api/v1/omp/status`, `GET /api/v1/copilot/status` and `GET /api/v1/jcode/status` each return `.data.{available, path}` (no session needed).
+Pi's, grok's, OMP's, Copilot's and jcode's also carry `.data.version`, because `pi` is a short generic name,
+`grok` is a name with npm squatters, `omp` is a similarly short name, `copilot` is a generic one, and an
+unrelated npm package is also called `jcode`, so an unrelated
 binary on `$PATH` can shadow any of them: the resolver rejects one whose `--version` is
 not version-shaped, so `available:false` there can mean "a different program of the same
 name is in front" rather than "nothing is installed". `shell` has no CLI to probe.
@@ -492,8 +496,8 @@ Quirks that will bite you:
 - ⚠️ **`active-tools` proves presence, never absence.** It is fed by the BashToolParser,
   which reads Claude's rendered `● Bash(…)` lines, and `_processExpensiveParsers`
   returns early for every external CLI mode (`session.ts:~2225`), so it is permanently
-  `[]` on `opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`deepseek`/`omp`/`copilot`. ⚠️ **`shell` is NOT one of those**
-  (`isExternalCliMode`, `session.ts:176-187`, lists only those seven), so the parser does
+  `[]` on `opencode`/`codex`/`gemini`/`antigravity`/`pi`/`grok`/`deepseek`/`omp`/`copilot`/`jcode`. ⚠️ **`shell` is NOT one of those**
+  (`isExternalCliMode` covers only those external CLIs), so the parser does
   run on a shell worker, and `TEXT_COMMAND_PATTERN` (`bash-tool-parser.ts:89`) matches
   bare `tail|cat|head|less|grep|watch|multitail <path>` lines with no `● Bash(` wrapper:
   a shell worker running `cat build.log` really does populate this. In practice it stays
@@ -657,7 +661,7 @@ Three bounded long-polls. Shared semantics:
 | `idle` | output stabilized + prompt detected, heuristic, can flap mid-turn | every mode |
 | `working` | session started producing output | every mode |
 | `stop` | Claude Code `stop` hook, the definitive end-of-turn | `claude`; also `deepseek`, whose harness reports its own end of turn while its status bridge is on |
-| `blocked` | `permission_prompt` / `elicitation_dialog` hook, the worker needs an answer | `claude`; also `deepseek` (its harness reports its dialogs, same condition), and `codex`, whose approval, question and trust dialogs Codeman reads off its screen (answer both in the terminal, never through the inbox) |
+| `blocked` | `permission_prompt` / `elicitation_dialog` hook, the worker needs an answer | `claude`; also `deepseek` (its harness reports its dialogs, same condition), `codex`, whose approval, question and trust dialogs Codeman reads off its screen, and a local `omp` session, whose tool approval dialogs a hook module in its workspace reports (answer all three in the terminal, never through the inbox) |
 | `exit` | PTY exited or session deleted | every mode |
 
 ⚠️ **`claude` mode is necessary for `stop`/`blocked`, not sufficient. The real

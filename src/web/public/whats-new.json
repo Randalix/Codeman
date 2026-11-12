@@ -1,13 +1,13 @@
 {
-  "version": "1.49.0",
+  "version": "1.51.0",
   "highlights": [
-    "Open the tmux sessions you started yourself (#510)",
-    "Install without administrator rights (#768)",
-    "Docker Compose starts in two commands (#573)",
-    "Codex sessions can drive other sessions (#753)",
-    "Persian, Arabic and Hebrew read right to left (#715)",
-    "Edit history for remote sessions (#766)",
-    "The Files panel follows the agent into a git worktree (#772, #765)",
-    "One big folder no longer hides the rest (#614)"
+    "Local models: a library, more models, and the coding agent you choose (#803, #804, #806, #807, #808)",
+    "Mac app: With the Lid Closed no longer asks for a password",
+    "Auto-compact and auto-clear see the whole context (#777)",
+    "jcode as a run mode (#650)",
+    "The File Viewer edits `.env` files (#796, #797)",
+    "Response viewer: a Copy Markdown button (#810)",
+    "Firefox no longer pastes twice on Ctrl+V (#799)",
+    "An omp pane that asks for a tool approval alerts (#798)"
   ]
 }

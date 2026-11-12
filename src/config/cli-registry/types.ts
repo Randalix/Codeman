@@ -508,8 +508,11 @@ export interface CliCapabilities {
    * Whether `stop`/`blocked` wait signals can ever fire for this CLI.
    *
    * ⚠️ A TRI-STATE, not a boolean, because for one CLI this is a per-SESSION question:
-   *   'none'       — no hook signals, ever (every external CLI, and `shell`).
-   *   'always'     — the CLI installs Codeman's hooks (claude).
+   *   'none'       — no hook signals, ever (every external CLI, and `shell`). A CLI can
+   *                  still report approval dialogs alone through `approvalHookFile` below.
+   *   'always'     — the CLI installs Codeman's hooks (claude). Every consumer reads this
+   *                  as Claude's FULL hook set: `stop`, `idle_prompt`, answerable inbox
+   *                  items, and a `.claude/settings.local.json` block in the workspace.
    *   'supervised' — the CLI REPORTS its own idle/working/blocked state to a supervisor
    *                  over a generic env-gated contract, and Codeman is that supervisor
    *                  (deepseek, via deepseek-status-shim.ts). Definitive rather than
@@ -523,6 +526,21 @@ export interface CliCapabilities {
    * timeout the predicate exists to prevent.
    */
   hooks: 'none' | 'always' | 'supervised';
+  /**
+   * The hook MODULE Codeman installs into the workspace of a CLI that reports its
+   * approval dialogs, and nothing else, through hooks. Independent of `hooks` above.
+   *
+   * omp is the case that exists today: it loads `<cwd>/.claude/hooks/pre/*.ts`, and the
+   * installed module forwards `tool_approval_requested`/`tool_approval_resolved` to
+   * `/api/hook-event` as `permission_prompt`/`elicitation_complete`. What that earns
+   * (`approvalHookAvailableForMode()`): the `blocked` wait signal, a tab alert, a
+   * notification and an ALERT-ONLY inbox item (`answerInTerminal`). Never `stop`, never
+   * `idle_prompt`, never Approve/Deny keystrokes.
+   *
+   * Declared as data, not a branch on the id, so both create paths can ask
+   * "does this CLI need a hook file installed?" (see cli-registry-no-id-branching).
+   */
+  approvalHookFile?: string;
   /**
    * Which transcript reader, if any, understands this CLI's on-disk history.
    *
@@ -622,6 +640,19 @@ export interface CliCapabilities {
    * losing lines, so it resizes as before), and for remote and docker sessions.
    */
   keyboardHold?: 'inline';
+  /**
+   * The CLI's TUI is a CLIENT of a per-user daemon that its first client starts and every
+   * later session of the CLI shares (jcode). The daemon detaches into its own session and
+   * process group, but stays a descendant of that first pane by parent pid, so a session
+   * kill signals only the descendants still in the pane's process group
+   * (`descendantsInPaneGroup()`, proc-tree.ts). Without it, closing the tab that happened
+   * to start the daemon took it down and cut every other session of the CLI off.
+   *
+   * The flip side is that processes the agent started through that daemon (its tools run
+   * there, not in the pane) outlive the tab; stopping them is the CLI's own business
+   * (`jcode server stop`). Absent = every descendant is killed, as for every other CLI.
+   */
+  sharedDaemon?: boolean;
   keyboardAccessory: 'agent' | 'shell';
   /** Multi-user: this CLI is a raw shell, so its commands need the privileged gate. */
   privilegedCommandGate: boolean;

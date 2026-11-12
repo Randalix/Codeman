@@ -965,6 +965,7 @@ describe('terminal link tap', () => {
     app.openFilePreview = vi.fn();
     app.openLogViewerWindow = vi.fn();
     app._isExternalPreviewPath = () => false;
+    app._isOutsideWorktreePath = () => false;
     windowRef.open = vi.fn();
     app.registerFilePathLinkProvider();
     return { app, windowRef, sent };
@@ -1570,6 +1571,7 @@ describe('terminal wrapped-line handling', () => {
     app.openFilePreview = vi.fn();
     app.openLogViewerWindow = vi.fn();
     app._isExternalPreviewPath = () => false;
+    app._isOutsideWorktreePath = () => false;
     windowRef.open = vi.fn();
     app.registerFilePathLinkProvider();
     return { app, windowRef, select: app.terminal.select as ReturnType<typeof vi.fn> };

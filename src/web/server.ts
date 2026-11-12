@@ -35,7 +35,7 @@ import fastifyWebsocket from '@fastify/websocket';
 import fastifyMultipart from '@fastify/multipart';
 import { pasteImageDirInUseByOtherSession, startPasteImageGc, uploadDirs } from './paste-image-gc.js';
 import { CLEAN_EXIT_CLOSE_REASON, shouldCloseCleanlyExitedSession } from '../pane-exit-sweep.js';
-import { findLiveWorktree } from '../live-worktree.js';
+import { findLiveWorktree, type OutsideWorktreeOptions } from '../live-worktree.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { existsSync, mkdirSync, readFileSync, chmodSync, statSync, writeFileSync, renameSync } from 'node:fs';
@@ -81,7 +81,8 @@ import {
 import { imageWatcher } from '../image-watcher.js';
 import { workflowRunWatcher, summarizeRun } from '../workflow-run-watcher.js';
 import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment } from '../attachment-registry.js';
-import { folderGrants } from '../folder-listing.js';
+import { folderAllowedForUser, folderGrants } from '../folder-listing.js';
+import { isOutsideWorktreeRootRefused, loadAttachmentGuardConfig } from '../config/attachment-guard.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
 import { readCustomModelHosts, resolveCustomModelContextLength } from '../custom-model-hosts.js';
@@ -158,6 +159,7 @@ import {
   remoteReadClaudeTranscriptTail,
 } from '../remote-files.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
+import { getLocalModelService } from '../local-model/install-job.js';
 import {
   wireRespawnListeners,
   setupTimedRespawn,
@@ -207,6 +209,7 @@ import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
 import { MAX_ROUTE_PARAM_LENGTH } from './route-helpers.js';
 import { mutateSettingsFile } from './settings-writer.js';
+import { migrateAgentSkillDefault } from './agent-skill-default-migration.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage, setLatestCopilotPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -225,7 +228,7 @@ import {
   sendLostWebviewFramePage,
 } from './middleware/auth.js';
 import { isMultiUserMode } from '../config/multiuser.js';
-import { bootstrapInitialAdmin, hasUsers, resolveClaudeModeForUsername } from '../user-store.js';
+import { bootstrapInitialAdmin, findUser, hasUsers, resolveClaudeModeForUsername } from '../user-store.js';
 import { installRouteErrorHandler } from './route-error-handler.js';
 import { installEmptyApiPostParser } from './request-body-parser.js';
 import { isExplicitlyEnabled, isLoopbackBindHost, buildHostPolicy, type HostPolicy } from './network-auth-policy.js';
@@ -277,6 +280,7 @@ import {
   pruneIdleLlamaSwapLogTails,
   tryWebviewRefererFallback,
   registerCliRegistryRoutes,
+  registerLocalModelRoutes,
 } from './routes/index.js';
 import { isLostWebviewFrameNavigation } from './webview-proxy.js';
 import { CronService } from '../cron/cron-service.js';
@@ -1502,6 +1506,7 @@ export class WebServer extends EventEmitter {
     registerDoctorRoutes(this.app);
     registerCustomModelRoutes(this.app);
     registerCliRegistryRoutes(this.app);
+    registerLocalModelRoutes(this.app, ctx);
 
     // Cron: build the service from the same context, recompute
     // due times for any persisted jobs, then expose it to its routes.
@@ -2294,6 +2299,17 @@ export class WebServer extends EventEmitter {
     // First keep-warm evaluation: publishes the effective opt-in for the Session Options
     // readout even before any cache report arrives.
     void this.keepWarmService.schedule(session.id);
+    // Before every start of a NEW agent process the session asks this (a fresh pane, the
+    // respawn of a dead one, a restart in place; never an attach to an agent that runs).
+    // The model Codeman runs on this Mac is the one endpoint with something to say: no agent
+    // is started on it while its runtime is down or its model is not the one that was
+    // installed. Every other session, and every other endpoint, is answered `undefined`.
+    // Set on every call, above the idempotency return: it holds no state of its own.
+    session.setLaunchGuard(async () => {
+      const selection = session.customModel;
+      if (!selection) return undefined;
+      return getLocalModelService().launchRefusalMessage(selection.endpointId, selection.modelId);
+    });
     // Idempotent: the wiring exit handler detaches ALL listeners on every PTY exit
     // (removeSessionListenerRefs), so the re-attach routes (/interactive,
     // /interactive-respawn, /shell) call this again to restore observability
@@ -2556,11 +2572,15 @@ export class WebServer extends EventEmitter {
     return resolveTerminalHistoryConfig(settings);
   }
 
-  // Whether the Codeman agent skill is injected into cases on Claude session create
-  // (synced `agentSkillEnabled` setting, default OFF; docs/agent-control-plan.md §2).
+  // Whether the Codeman agent skill is injected into a session's workspace on create
+  // (synced `agentSkillEnabled` setting; docs/agent-control-plan.md §2). Default ON
+  // since 1.50.0, like `workspaceHooksEnabled` below: an absent key means a user who
+  // has never touched the switch, and only an explicit false turns it off. The copy
+  // ignores itself in git (`.gitignore` of `*`, see installAgentSkillInto), so the
+  // default leaves a user's `git status` clean.
   private async getAgentSkillEnabled(): Promise<boolean> {
     const settings = await this.readSettings();
-    return settings.agentSkillEnabled === true;
+    return settings.agentSkillEnabled !== false;
   }
 
   // Whether pending agent-inbox mail is snapshotted to disk (synced
@@ -3197,9 +3217,43 @@ export class WebServer extends EventEmitter {
    */
   private async refreshLiveWorktree(session: Session): Promise<void> {
     const cwd = session.paneCwd;
-    const worktree = await findLiveWorktree(session.workingDir, cwd);
+    const worktree = await findLiveWorktree(session.workingDir, cwd, this.outsideWorktreeOptions(session));
     if (session.paneCwd !== cwd) return;
     if (session.setLiveWorktree(worktree)) this.broadcastSessionStateDebounced(session.id);
+  }
+
+  /**
+   * The rules a worktree OUTSIDE the session's folder must pass to be followed (#765 follow-up):
+   *
+   * - none in a Docker case workspace (the list is read only when a candidate needs it, and an
+   *   unreadable list follows nothing);
+   * - none while attachment workspace confinement is on (`attachmentConfineToWorkspace` /
+   *   `CODEMAN_ATTACHMENT_CONFINE`), since an outside worktree is a second served root;
+   * - none at, inside or around an attachment blocked tree (`attachmentBlockedPaths` /
+   *   `CODEMAN_ATTACHMENT_BLOCKED_PATHS`, plus the defaults), or at a sensitive path;
+   * - in multi-user mode, only inside the owner's space or `workingDir`.
+   *
+   * Codeman judges these rules when the pane moves. The file routes judge the two guard rules
+   * again on every request (`isOutsideWorktreeRootRefused()`), so a setting changed later applies
+   * at once. The Docker and multi-user rules are judged only when the pane moves. Undefined for a remote, Docker or
+   * adopted session, whose pane directory is not a path the agent works in on this host (an
+   * adopted session's pane runs our tmux attach client). None of the three gets a `paneCwd`
+   * either (`paneExitApplies`), so this is belt and braces; an adopted session needs its own
+   * test because `session.remote` and `session.docker` are undefined on one.
+   */
+  private outsideWorktreeOptions(session: Session): OutsideWorktreeOptions | undefined {
+    if (session.remote || session.docker || session.isAdopted) return undefined;
+    return {
+      dockerWorkspaces: defaultDockerWorkspaces,
+      allowRoot: async (root: string): Promise<boolean> => {
+        if (isOutsideWorktreeRootRefused(root, await loadAttachmentGuardConfig())) return false;
+        if (!isMultiUserMode()) return true;
+        const owner = session.owner ? await findUser(session.owner) : undefined;
+        return folderAllowedForUser(root, owner ? { username: owner.username, role: owner.role } : undefined, {
+          workingDir: session.workingDir,
+        });
+      },
+    };
   }
 
   /**
@@ -3573,6 +3627,14 @@ export class WebServer extends EventEmitter {
       reconcileUpdateOnBoot();
     }
 
+    // One-time, once per data dir: a stored `agentSkillEnabled: false` written by the switch's
+    // old default (up to 1.49.0) becomes true, so the 1.50.0 default reaches installs that ever
+    // saved App Settings (agent-skill-default-migration.ts). Before the restore below reads
+    // settings (2 s cache) and before listen, so no session create can see the old value.
+    if (!this.testMode && (await migrateAgentSkillDefault()) === 'switched-on') {
+      this._settingsCache = null;
+    }
+
     // Restore mux sessions BEFORE accepting connections
     // This prevents race conditions where clients connect before state is ready
     // CRITICAL: Skip in test mode to prevent tests from picking up user sessions
@@ -3640,6 +3702,14 @@ export class WebServer extends EventEmitter {
       this.restoreReportSubscriptions();
       this.restoreReportMutes();
       this.unsubscribeCoordinatorReports = turnWatch.subscribe((id) => this.coordinatorReports.notify(id));
+    }
+
+    // The model Codeman runs on this Mac (src/local-model/): a job a restart interrupted comes
+    // back paused and waits for a click, and an installed runtime that was not stopped is
+    // started again (an own orphan on its port is adopted or replaced). Off the startup path:
+    // boot() never throws, and nothing waits for a runtime to answer. Not in tests.
+    if (!this.testMode) {
+      void getLocalModelService().boot();
     }
 
     // Sweep agent preamble caches whose sessions are gone (see
@@ -4304,6 +4374,7 @@ export class WebServer extends EventEmitter {
               piConfig: muxSession.mode === 'pi' ? savedState?.piConfig : undefined,
               grokConfig: muxSession.mode === 'grok' ? savedState?.grokConfig : undefined,
               copilotConfig: muxSession.mode === 'copilot' ? savedState?.copilotConfig : undefined,
+              jcodeConfig: muxSession.mode === 'jcode' ? savedState?.jcodeConfig : undefined,
               deepSeekConfig: muxSession.mode === 'deepseek' ? savedState?.deepSeekConfig : undefined,
               ompConfig: muxSession.mode === 'omp' ? savedState?.ompConfig : undefined,
               envOverrides: savedEnvOverrides,
@@ -4798,6 +4869,13 @@ export class WebServer extends EventEmitter {
     // port against the next start — the exact EADDRINUSE this feature already
     // got wrong once.
     void stopDeepSeekWeb();
+
+    // The local model runtime is a non-detached child, but a child is not ended by its
+    // parent's exit: it gets SIGTERM here, and an install job in flight is interrupted (the
+    // next start reads it as paused). An orphan a hard kill leaves is adopted at the next boot.
+    if (!this.testMode) {
+      void getLocalModelService().shutdown();
+    }
 
     // The header's GPU / CPU clock sampler is a Windows child process under WSL, and its idle sweep a timer.
     stopHostSensors();

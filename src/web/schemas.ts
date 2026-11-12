@@ -495,6 +495,30 @@ const CopilotConfigSchema = z
   .optional();
 
 /**
+ * Schema for jcode (1jehuang/jcode)-specific configuration.
+ *
+ * jcode has no approval prompts and no bypass flag, so there is nothing for the
+ * multi-user clamp to touch.
+ */
+const JcodeConfigSchema = z
+  .object({
+    model: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9._\-/]+$/)
+      .optional(),
+    // A session id (`session_fox_<ms>_<hex>`) or short name (`fox`). Leading
+    // alphanumeric: --resume's value is optional, so a value starting with `-`
+    // would be parsed as a flag of its own.
+    resumeSessionId: z
+      .string()
+      .max(100)
+      .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/)
+      .optional(),
+  })
+  .optional();
+
+/**
  * Schema for OMP CLI-specific configuration.
  */
 const OmpConfigSchema = z
@@ -655,6 +679,7 @@ export const CreateSessionSchema = z.object({
   piConfig: PiConfigSchema,
   grokConfig: GrokConfigSchema,
   copilotConfig: CopilotConfigSchema,
+  jcodeConfig: JcodeConfigSchema,
   deepSeekConfig: DeepSeekConfigSchema,
   ompConfig: OmpConfigSchema,
   /** Resume a previous Claude conversation by its session ID (used for reboot recovery) */
@@ -875,6 +900,7 @@ const RemoteCommandOverridesSchema = z
     deepseek: z.string().min(1).max(300).optional(),
     omp: z.string().min(1).max(300).optional(),
     copilot: z.string().min(1).max(300).optional(),
+    jcode: z.string().min(1).max(300).optional(),
   })
   .strict()
   .optional();
@@ -1277,6 +1303,7 @@ export const QuickStartSchema = z.object({
   piConfig: PiConfigSchema,
   grokConfig: GrokConfigSchema,
   copilotConfig: CopilotConfigSchema,
+  jcodeConfig: JcodeConfigSchema,
   deepSeekConfig: DeepSeekConfigSchema,
   ompConfig: OmpConfigSchema,
   envOverrides: safeEnvOverridesSchema,
@@ -1510,6 +1537,18 @@ export const SettingsUpdateSchema = z
     defaultClaudeMdPath: z.string().max(500).optional(),
     defaultWorkingDir: z.string().max(500).optional(),
     lastUsedCase: z.string().max(200).optional(),
+    /** The case a person last picked in a case picker; what other devices follow while `syncCaseState` is on. */
+    lastPickedCase: z.string().max(200).optional(),
+    /**
+     * Opt-in, SYNCED, default OFF: per-case run options (Agent Teams, Opus 1M) are kept here instead of
+     * only in each browser, and a device follows the selected case another device chose.
+     */
+    syncCaseState: z.boolean().optional(),
+    /** Per-case run options, by case name; read and written only while `syncCaseState` is on. */
+    caseSettings: z
+      .record(z.string().max(200), z.object({ agentTeams: z.boolean(), opusContext1m: z.boolean() }).strict())
+      .refine((m) => Object.keys(m).length <= 500, 'too many cases')
+      .optional(),
     // Feature toggles
     ralphTrackerEnabled: z.boolean().optional(),
     subagentTrackingEnabled: z.boolean().optional(),
@@ -1520,11 +1559,13 @@ export const SettingsUpdateSchema = z
     ultracodeFloatingWindows: z.boolean().optional(),
     imageWatcherEnabled: z.boolean().optional(),
     /**
-     * Inject the Codeman agent skill (`skills/codeman`) into `<case>/.claude/skills/`
-     * on Claude session create, so an agent inside the session can drive the API
-     * (see docs/agent-control-plan.md §2). SYNCED, default OFF: every skill's
-     * name+description costs context on every turn, so it is opt-in. Injection is
-     * add-only at create; a marker keeps user-authored copies untouched.
+     * Inject the Codeman agent skill (`skills/codeman`) into each new session's case, in
+     * the directory its CLI scans for skills (`capabilities.agentSkillDir`), so an agent
+     * inside the session can drive the API (see docs/agent-control-plan.md §2). SYNCED,
+     * default ON since 1.50.0: an absent key is on, only an explicit false is off, and a
+     * false stored by 1.49.0 or earlier is switched on once at the first 1.50.0 start
+     * (agent-skill-default-migration.ts). Injection is add-only at create; a marker keeps
+     * user-authored copies untouched.
      */
     agentSkillEnabled: z.boolean().optional(),
     /**
@@ -1830,6 +1871,8 @@ export const SettingsUpdateSchema = z
         language: z.string().max(20).optional(),
         keyterms: z.string().max(500).optional(),
         insertMode: z.string().max(20).optional(),
+        /** Silence timeout in seconds; 0 disables automatic stopping. Omitted keeps provider defaults. */
+        silenceTimeout: z.union([z.literal(0), z.literal(3), z.literal(6), z.literal(15), z.literal(30)]).optional(),
       })
       .optional(),
     // Run mode preference (cross-device sync)
@@ -2542,6 +2585,58 @@ export const CustomModelHostSchema = z.object({
   // discovery never writes it. Same bound as the modelContextLengths values above.
   defaultContextLength: z.number().int().positive().max(MAX_DISCOVERED_CONTEXT_TOKENS).optional(),
 });
+
+// ---------- Local model install (src/web/routes/local-model-routes.ts) ----------
+
+/**
+ * A model id as the local model catalogue writes it: `name:tag`, lowercase, no slash. The
+ * same pattern as `LOCAL_MODEL_ID_PATTERN` in config/local-model-catalog.ts, repeated here as
+ * a request-shape check: without a slash an id can never name another registry host. The
+ * real gate is the route's own lookup of the id in what the server offers.
+ */
+const localModelId = z
+  .string()
+  .max(200)
+  .regex(/^[a-z0-9][a-z0-9._-]*:[a-z0-9][a-z0-9._-]*$/, 'Invalid model id');
+
+/**
+ * A coding agent as a CLI registry id. A request-shape check only: the real gate is the
+ * service's own lookup of the id among the catalogue harnesses it offers right now.
+ */
+const localModelCli = z
+  .string()
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, 'Invalid coding agent id');
+
+/** POST /api/local-model/install: the row the person chose and the size they confirmed. */
+export const LocalModelInstallSchema = z
+  .object({
+    modelId: localModelId,
+    cli: localModelCli,
+    context: z.number().int().positive().max(MAX_DISCOVERED_CONTEXT_TOKENS),
+    acknowledgedBytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  })
+  .strict();
+
+/** POST /api/local-model/resume. The body may be empty. */
+export const LocalModelResumeSchema = z.object({ newPort: z.boolean().optional() }).strict();
+
+/** POST /api/local-model/runtime. */
+export const LocalModelRuntimeSchema = z
+  .object({ action: z.enum(['start', 'stop']), newPort: z.boolean().optional() })
+  .strict();
+
+/** DELETE /api/local-model. The body may be empty. */
+export const LocalModelRemoveSchema = z.object({ removeModel: z.boolean().optional() }).strict();
+
+/** POST /api/local-model/use: a checked model of the library to switch to. */
+export const LocalModelUseSchema = z.object({ modelId: localModelId }).strict();
+
+/** DELETE /api/local-model/models: one model of the store, by its name. Never a path. */
+export const LocalModelDeleteSchema = z.object({ modelId: localModelId }).strict();
+
+/** POST /api/local-model/agent: one more coding agent to install beside an installed model. */
+export const LocalModelAgentSchema = z.object({ cli: localModelCli }).strict();
 
 /**
  * A shell-safe bare word, mirroring `config/cli-registry/schema.ts`'s own `shellToken` —

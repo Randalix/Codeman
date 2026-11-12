@@ -6,7 +6,7 @@
 
 Codeman runs your coding agents on your own machine and puts them behind one dashboard you
 can open from any device. It spawns Claude Code, OpenCode, Codex, Antigravity, Gemini, Pi,
-Grok, DeepSeek Harness, OMP, or GitHub Copilot CLI inside persistent tmux sessions, streams the real terminal to the browser, and keeps
+Grok, DeepSeek Harness, OMP, GitHub Copilot CLI, or jcode inside persistent tmux sessions, streams the real terminal to the browser, and keeps
 working while you are away from the keyboard: it re-prompts idle agents, resumes when a
 subscription limit resets, runs jobs on a schedule, and shows every background subagent
 live.
@@ -33,7 +33,7 @@ codeman web    # then open http://localhost:3000
 
 **Already running it**
 
-- [Agent CLIs](Agent-CLIs) - the eleven run modes, their setup, and which features are Claude-only.
+- [Agent CLIs](Agent-CLIs) - the twelve run modes, their setup, and which features are Claude-only.
 - [Mobile Guide](Mobile-Guide) - phone and tablet use, QR login, the touch keyboard bar.
 - [Remote Access](Remote-Access) - Tailscale, Cloudflare tunnel, LAN plus password, QR login.
 - [Keeping Agents Running](Keeping-Agents-Running) - idle detection, respawn cycling, auto-resume on usage limits.
@@ -66,6 +66,7 @@ codeman web    # then open http://localhost:3000
 | [Tile Grid](Tile-Grid)                     | How do I watch and drive several sessions side by side?    |
 | [Agent CLIs](Agent-CLIs)                   | Which agent should this session run, and how do I set it up? |
 | [Custom Model Endpoints](Custom-Model-Endpoints) | How do I point a session at my own OpenAI-compatible endpoint? |
+| [Local Models](Local-Models) | How do I run a coding model on my own Mac, and use it next to a cloud model? |
 | [Working With Files](Working-With-Files)   | How do I read, edit, and attach files?                     |
 | [Git Worktrees](Git-Worktrees)             | How do several agents work on one repository without sharing a folder? |
 | [Input And Voice](Input-And-Voice)         | How do I talk to an agent, including by voice?             |
@@ -129,7 +130,7 @@ codeman web    # then open http://localhost:3000
 | OS           | macOS or Linux. Windows works through WSL2.                                 |
 | Node.js      | 22 or newer.                                                                |
 | tmux         | Required. Sessions live in tmux, which is what makes them survive restarts.  |
-| An agent CLI | At least one of Claude Code, OpenCode, Codex, Gemini, Antigravity, Pi, Grok Build, DeepSeek Harness, OMP, GitHub Copilot CLI. Plain shell sessions need none. |
+| An agent CLI | At least one of Claude Code, OpenCode, Codex, Gemini, Antigravity, Pi, Grok Build, DeepSeek Harness, OMP, GitHub Copilot CLI, jcode. Plain shell sessions need none. |
 | Network      | Binds to `127.0.0.1` by default. Reaching it from another device is a deliberate step: see [Remote Access](Remote-Access). |
 
 Codeman is MIT licensed, self-hosted, and sends no telemetry. Everything runs on your

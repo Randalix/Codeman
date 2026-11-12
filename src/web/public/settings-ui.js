@@ -550,12 +550,17 @@ Object.assign(CodemanApp.prototype, {
     // Assigning .checked above does not fire onchange, so the body's visibility
     // (and its lazy load) needs an explicit sync on every open, not just a save.
     this.applyCustomModelEndpointsVisibility();
+    // Model on this Mac (local-model-ui.js): a row that says where the local model stands and
+    // opens its window, not a setting. Server state, asked for at most once a minute; nothing
+    // here is loaded or saved by id.
+    this.loadLocalModel?.();
     // CLI management (docs/cli-enable-disable-plan.md): synced, default OFF.
     document.getElementById('appSettingsCliManagement').checked = settings.cliManagementEnabled === true;
     // Same reasoning as applyCustomModelEndpointsVisibility above: assigning
     // .checked fires no onchange, so the list's visibility (and lazy load)
     // needs an explicit sync on every open, not just a save.
     this.applyCliManagementVisibility();
+    document.getElementById('appSettingsSyncCaseState').checked = settings.syncCaseState === true;
     // MCP server sync: synced, default OFF; same explicit-sync reasoning as above.
     // The routes read the SAVED setting, so remember what it was on open: switching it on
     // here does nothing server-side until Save (see mcpSync()).
@@ -707,7 +712,9 @@ Object.assign(CodemanApp.prototype, {
     this._applyCodexSettingsVisibility();
     // Claude Permissions settings
     document.getElementById('appSettingsAgentTeams').checked = settings.agentTeamsEnabled ?? false;
-    document.getElementById('appSettingsAgentSkill').checked = settings.agentSkillEnabled ?? false;
+    // Default ON (since 1.50.0), like the workspace hooks below: the server reads an
+    // absent key as on, so the switch must too, or the next Save would write false.
+    document.getElementById('appSettingsAgentSkill').checked = settings.agentSkillEnabled !== false;
     // Default ON: an absent key is a user who has never seen this setting, and OFF
     // for them means no tab alerts in any workspace Codeman did not scaffold.
     document.getElementById('appSettingsWorkspaceHooks').checked = settings.workspaceHooksEnabled !== false;
@@ -804,6 +811,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('voiceKeyterms').value = voiceCfg.keyterms || DEFAULT_VOICE_KEYTERMS;
     document.getElementById('voiceInsertMode').value = voiceCfg.insertMode || 'direct';
     document.getElementById('voiceProvider').value = voiceCfg.provider || 'auto';
+    document.getElementById('voiceSilenceTimeout').value = VoiceInput.SILENCE_TIMEOUT_SECONDS.includes(voiceCfg.silenceTimeout)
+      ? String(voiceCfg.silenceTimeout) : 'default';
     document.getElementById('appSettingsClaudeVoice').checked = settings.claudeVoiceEnabled ?? false;
     // Reset key visibility to hidden
     const keyInput = document.getElementById('voiceDeepgramKey');
@@ -3133,6 +3142,7 @@ Object.assign(CodemanApp.prototype, {
       customModelEndpointsEnabled: document.getElementById('appSettingsCustomModelEndpoints').checked,
       cliManagementEnabled: document.getElementById('appSettingsCliManagement').checked,
       mcpSyncEnabled: document.getElementById('appSettingsMcpSync').checked,
+      syncCaseState: document.getElementById('appSettingsSyncCaseState').checked,
       configBackupEnabled: document.getElementById('appSettingsConfigBackup').checked,
       configBackupDir: document.getElementById('appSettingsConfigBackupDir').value.trim(),
       ...this._configBackupRetentionPayload(_prev),
@@ -3291,6 +3301,8 @@ Object.assign(CodemanApp.prototype, {
       language: document.getElementById('voiceLanguage').value,
       keyterms: document.getElementById('voiceKeyterms').value.trim(),
       insertMode: document.getElementById('voiceInsertMode').value,
+      silenceTimeout: document.getElementById('voiceSilenceTimeout').value === 'default'
+        ? undefined : Number(document.getElementById('voiceSilenceTimeout').value),
     };
     VoiceInput._saveDeepgramConfig(voiceSettings);
 
@@ -4736,10 +4748,9 @@ Object.assign(CodemanApp.prototype, {
       attachmentsBtn.classList.toggle('btn-attachments-history--hidden', !showAttachmentsButton);
     }
 
-    // File Viewer header button — opt-in, default OFF. Marker class (base is
-    // display:inline-flex !important); clicking it toggles the file browser panel.
-    // Default ON (desktop): the folder button is part of the standard header now;
-    // phones still hide it via mobile.css (btn-file-viewer in the phone-hidden set).
+    // File Viewer header button: default ON on desktop, opt-in on phones.
+    // Marker class (base is display:inline-flex !important); clicking it toggles
+    // the file browser panel on either device.
     const showFileViewerButton = settings.showFileViewerButton ?? defaults.showFileViewerButton ?? true;
     const fileViewerBtn = document.querySelector('.btn-file-viewer');
     if (fileViewerBtn) {
@@ -5237,7 +5248,7 @@ Object.assign(CodemanApp.prototype, {
       const settings = settingsPromise ? await settingsPromise : await fetch('/api/settings').then(r => r.ok ? r.json() : null).then(env => env?.success === true ? env.data : env);
       if (settings) {
         // Extract notification prefs before merging app settings
-        const { notificationPreferences, voiceSettings, respawnPresets, runMode, ...appSettings } = settings;
+        const { notificationPreferences, voiceSettings, respawnPresets, runMode, caseSettings: _sharedCases, ...appSettings } = settings;
         // Display settings are device-specific (mobile vs desktop) and must not be synced
         // from the server: see _displaySettingKeySet().
         const displayKeys = this._displaySettingKeySet();
@@ -5266,7 +5277,15 @@ Object.assign(CodemanApp.prototype, {
             merged[key] = value;
           }
         }
+        // The agent skill is a synced key that is ON when absent (since 1.50.0). A server
+        // without the key means that default, so this device's own copy goes rather than
+        // standing in for it: up to 1.49.0 the switch loaded an absent key as off, so a
+        // device whose save never reached the server still holds `false`, and its next
+        // Save would write it back. The server's one-time boot migration stores `true` for
+        // installs that had saved `false` (agent-skill-default-migration.ts).
+        if (!('agentSkillEnabled' in appSettings)) delete merged.agentSkillEnabled;
         this.saveAppSettingsToStorage(merged);
+        this._applyServerCaseSettings?.(settings);
 
         // Apply notification prefs from server if present (only if localStorage has none)
         if (notificationPreferences && this.notificationManager) {

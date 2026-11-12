@@ -8,7 +8,8 @@ until you get home.
 
 A panel that browses the active session's working directory, or the git worktree its agent
 moved into ([Git Worktrees](Git-Worktrees#when-an-agent-moves-into-a-worktree)). Its header
-button is on by default; if it is missing, re-enable it in **App Settings → Header & Panels**.
+button is on by default on a desktop and off on a phone. The setting is per device: switch it
+in **App Settings → Header & Panels** on the device you want it on.
 
 The panel and its search list up to 5,000 files and folders per load, shallow levels first and
 taking turns between folders, so one huge folder cannot use up that limit before the ones after it,
@@ -19,12 +20,19 @@ not finish shows **Not fully scanned** rather than looking empty. A folder that 
 such as a network mount that went away, is skipped rather than waited on and is marked the same way,
 so a search can miss what is inside it. The panel's Refresh button tries it again.
 
+Each file row has a download arrow and a × that deletes the file after you confirm. Both show
+when you point at the row, and always on a touch screen. Delete removes one file at a time,
+never a folder, and refuses a symbolic link (deleting one from here would remove the file it
+points to), anything under `.git`, and the sensitive files the viewer will not serve. It is not
+offered for remote (SSH) sessions or for tmux sessions opened from outside Codeman. Deleting
+from search results takes the row out of the results.
+
 It renders what it can:
 
 | Kind                     | Behaviour                                                                 |
 | ------------------------ | ------------------------------------------------------------------------- |
 | Text and code            | Plain preview with Lines (line numbers) and Wrap toggles in the header. Long files are truncated in plain preview. |
-| Markdown                 | Rendered by default: headings, tables, code blocks with copy buttons, images and links relative to the file (root-relative ones resolve from the workspace root, as on GitHub). Links to another heading of the same file (`[Install](#installation)`) scroll to it, with GitHub's heading names (lower-case, punctuation dropped, repeats numbered `-1`, `-2`), and never leave the page. Opened from an attachment card, where the file's folder is unknown, relative images show their alt text and relative links show as plain text. Persian, Arabic and Hebrew read right to left, each block following its own first letter, while code stays left to right. The MD pill in the header flips to source. |
+| Markdown                 | Rendered by default: headings, tables, code blocks with copy buttons, images and links relative to the file (root-relative ones resolve from the workspace root, as on GitHub; for a file in a worktree beside the workspace that the agent is in, they resolve from the top of that worktree). Links to another heading of the same file (`[Install](#installation)`) scroll to it, with GitHub's heading names (lower-case, punctuation dropped, repeats numbered `-1`, `-2`), and never leave the page. Opened from an attachment card, where the file's folder is unknown, relative images show their alt text and relative links show as plain text. Persian, Arabic and Hebrew read right to left, each block following its own first letter, while code stays left to right. The MD pill in the header flips to source. |
 | Images                   | Inline.                                                                    |
 | Audio and video          | Inline with a working scrub bar, because range requests are supported.     |
 | Spreadsheets (`.xlsx`)   | Read-only grid, parsed in your browser (never on the server), up to 10 MB. `.xls` and `.ods` are download only. |
@@ -69,6 +77,11 @@ convenient:
 - **`.git/` is denied outright.** Hooks are executable code, and a corrupted index looks
   unrecoverable to someone who wanted to fix a typo.
 - **Non-UTF-8 content is refused**, verified by a round-trip comparison.
+- **Dotenv files are editable, other credential files are not.** `.env`, `.env.local` and
+  `prod.env` open in the editor like any config file, and a save keeps the file's mode (a
+  `0600` file stays `0600`) and, where your account may set it, its group, so a `.env` a web
+  server reads through its group stays readable. `.npmrc`, `credentials.json`, anything under
+  `.ssh/` and Codeman's own `~/.codeman/.env` stay read-only here.
 
 ## Attachments
 
@@ -116,6 +129,8 @@ of an agent's output lands: a screenshot in `/tmp`, a capture in its own scratch
 another checkout. Those are served through the attachment routes rather than the workspace
 ones, so the same rules apply as to any other attachment: secret trees are blocked, the
 extension allowlist decides what can be opened, and symlinks are resolved before either check.
+
+One exception: while the agent works in a worktree of the session's repository beside it (see [Git Worktrees](Git-Worktrees)), a file in that worktree opens through the workspace routes like a workspace file, and you can edit it there. Two things differ from a workspace file: a text file there that you click in the terminal opens in the preview, not the live tail viewer, and secret files such as `.env` there are not served.
 
 Outside the workspace the allowlist is images, video, audio, PDF, Office documents, and text
 files, where "text" is the same list the viewer will let you edit: code, config, logs, csv,

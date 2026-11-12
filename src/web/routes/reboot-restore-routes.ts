@@ -45,6 +45,7 @@ import {
   sessionCapacityMessage,
 } from '../route-helpers.js';
 import { adoptRemoteOrphans, type AdoptOrphansDeps } from '../remote-orphans.js';
+import { getLocalModelService } from '../../local-model/install-job.js';
 import { rebootRestoreRegistry } from '../reboot-restore-registry.js';
 import {
   rejectAlreadyLive,
@@ -215,6 +216,21 @@ export function registerRebootRestoreRoutes(
           // conversation, so this is not the permanent kind of refusal.
           failures.push({ sessionId: entry.sessionId, reason: 'workspace-forbidden' });
           continue;
+        }
+        // A session that ran on the model Codeman runs on this Mac is rebuilt only while that
+        // model can be started on: its own runtime is up and its digest is the one stored at
+        // install time. Asked before anything is built, like the two session routes; the
+        // session's own launch guard would refuse the start too, but only after the session
+        // exists. Every other endpoint, and a session without one, is answered `undefined`.
+        const savedModel = (entry.state as { __customModel?: { endpointId?: string; modelId?: string } }).__customModel;
+        if (savedModel && typeof savedModel.endpointId === 'string' && typeof savedModel.modelId === 'string') {
+          const refusal = await getLocalModelService().launchRefusalMessage(savedModel.endpointId, savedModel.modelId);
+          if (refusal) {
+            console.warn(`[reboot-restore] ${entry.sessionId} is not rebuilt: ${refusal}`);
+            // Left on offer: the model can be started (or installed again) and the click repeated.
+            failures.push({ sessionId: entry.sessionId, reason: 'local-model-not-ready' });
+            continue;
+          }
         }
         const session = await rebuildRebootEntry(ctx, entry, { workspaceHooksEnabled, remoteHostsById });
         if (!session) {

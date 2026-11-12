@@ -1,5 +1,112 @@
 # aicodeman
 
+## 1.51.0
+
+### Minor Changes
+
+- 482ffe2: ### Thanks
+  - @Randalix for auto-compact and auto-clear that see the whole context (#777), and for the measurements in #585 that showed why they did not.
+  - @JDProfresh for the report and the change that lets the File Viewer edit `.env` files (#796, #797).
+  - @aakhter for the Copy Markdown button in the response viewer (#810).
+  - @DodgyBadger for the File Viewer button that follows its setting on a phone (#759, #809).
+  - @timkjr for omp tool approvals that raise an alert (#798).
+  - @irisitymichaelgrundberg for finding why Firefox still pasted twice (#799).
+
+  **Local models: a library, more models, and the coding agent you choose (#803, #804, #806, #807, #808).** Run a local model (on a Mac) now lists every model that fits instead of five, with two new ones: Muse Glimmer 30B, the first of its class a 32 GB Mac can hold, and Ornith 1.0 9B, the first model that fits a 16 GB Mac. Installed models form a library: each shows its size on disk, and you can add another, switch between them or delete one. You pick the coding agent when you start a session (OpenCode, Claude Code, Pi or DeepSeek Harness), and a missing one installs from the same screen. The codeman skill starts a local worker with the agent you name (`spawn_worker <name> local:pi`), and the wiki has a new Local Models page. Still experimental.
+
+  **Mac app: With the Lid Closed no longer asks for a password.** Codeman > Keep This Mac Awake > With the Lid Closed is a plain switch now. 1.50.1 asked for your administrator password and installed a small root helper for it. The app now does what [LogoLight](https://logolight.app) does: it turns off macOS's sleep-on-lid-close itself while your agents work, and turns it back on when they stop, when the app quits or crashes, and on battery. If you ticked With the Lid Closed in 1.50.1, it keeps working after the update, and the old helper does nothing any more. Remove it with Codeman > Keep This Mac Awake > Remove the Old Lid Helper… (that asks for your password one last time). If the Mac ever sleeps under the lid anyway, the status line in the same menu says until when.
+
+  **Auto-compact and auto-clear see the whole context (#777).** Both compared a token counter that never counted the cached part of a conversation, so on a long session they fired far too late or not at all. For Claude sessions they now read the context size Claude Code reports, and a threshold can go up to the model's window (1M with extended context). Behaviour change: a session with auto-compact or auto-clear on fires earlier than it did, because 110k and 140k now mean the real context. Other CLIs, remote and Docker sessions keep the old counter.
+
+  **jcode as a run mode (#650).** Codeman can now start [jcode](https://github.com/1jehuang/jcode) sessions from the Run menu, the phone overview and the API (`mode: "jcode"`), locally, over SSH and in Docker cases. jcode runs every session's tools in one shared background daemon, so closing a jcode tab never stops that daemon, its sessions get no Codeman agent skill, and a jcode worker's answer is read from its terminal; see `docs/jcode-integration.md`.
+
+  **The File Viewer edits `.env` files (#796, #797).** A workspace `.env`, `.env.local` or `prod.env` opened in the preview but could never be edited. It now gets the pencil like any config file, and a save keeps the file's mode and group. Other credential files (`.npmrc`, `credentials.json`, anything under `.ssh/`) and Codeman's own `~/.codeman/.env` stay read-only there, and downloads and attachments still refuse dotenv files.
+
+  **Response viewer: a Copy Markdown button (#810).** Last Response has a Copy Markdown button. It copies the raw source of the newest answer, every part of its turn, so headings, lists and code fences survive a paste. Tool and status blocks are left out, and the full view (More) copies the same answer.
+
+  **Fixes.**
+  - **Firefox no longer pastes twice on Ctrl+V (#799).** Firefox sent a second paste for the same key press, and some of the time it reached the terminal.
+  - **An omp pane that asks for a tool approval alerts (#798).** It raised no tab alert, no notification and no Approvals Inbox item. Behaviour change: Codeman writes a small hook file into `.claude/hooks/pre/` of an omp session's folder.
+  - **Phone: the File Viewer header button follows its setting (#759, #809).** Turning on File Viewer under App Settings > Header & Panels did nothing on a phone. The button now shows there once you turn it on, with a full-size touch target, and stays off until you do. Behaviour change: a desktop window or an iPad split view narrower than 600px shows the button too, where it was hidden before.
+  - **Local model: the "still using this model" refusal names every session (#804).** With a session open that an agent had started, Stop and Remove answered "Sessions are still using this model: . Close them first." Such a session has no name of its own, so the sentence now uses the name its tab shows.
+  - **Skill: two workers in one folder keep their own answers (#807).** On a Mac, where Claude Code runs zsh, two `sendmark` calls started in the same second named the same answer file, and one worker's written answer replaced the other's. Workers in folders of their own were not affected.
+
+  **Fixes applied while landing.** Auto-compact and auto-clear decide again at the moment the command goes out, so a `/clear` is not sent into a conversation Claude Code just compacted itself, into a session paused on a usage limit, or after you switched the option off (#777). The File Viewer cannot reach Codeman's own `.env` by another spelling on a case-insensitive disk (#797). An omp alert stays up until omp says its dialog closed (#798). The test gate checks again that the File Viewer button is off on a phone nobody turned it on for (#809). The Copy Markdown button is named by the words on it, so voice control can find it (#810).
+
+  **Docs and tests.** The experimental API list names the new local model routes, the wiki's Local Models page walks from install to cloud plus local, and the wiki says where the File Viewer button is on a phone and what Copy Markdown copies.
+
+## 1.50.1
+
+### Patch Changes
+
+- e06257c: ### Thanks
+  - @opticon454 for syncing case options and the picked case across devices, over five review rounds (#732).
+  - @ludovicfourrage for dictation that survives a thinking pause and the Android dictation fixes, over three review rounds (#705).
+  - @johoja12 for the log viewer reconnect fix (#720).
+  - @shenlvkang-collab for the image zoom (#608) and the Files panel delete button (#529), both carried forward in #791 and #792, and for the foldable phone report (#702).
+
+  **A MacBook keeps working with the lid closed (#795).** The Codeman app for Mac has a new menu, Codeman > Keep This Mac Awake: Off, While Agents Work (and 5 minutes after the last one stops) or Always. It only acts for a Codeman running on this Mac, and pauses on battery unless you untick Only When Plugged In. On a MacBook, With the Lid Closed… keeps a closed Mac awake on its power adapter. It asks for your administrator password once and installs a small helper; unticking it removes the helper. Behaviour change: while it keeps watch for a Codeman on this Mac, closing the Codeman window hides the app instead of quitting it, so the Mac stays awake; click the Dock icon to bring it back, and quit with Cmd+Q (#800). With no server open, or one on another machine, closing the window still quits.
+
+  **The lid logo breathes while agents work (#794).** The Apple logo blink from 1.50.0 now has one switch, View > Blink Apple Logo. It breathes while agents work, blinks for a yellow tab and flashes for a red one: the more it moves, the more it needs you. It now moves on the logo's own hardware fades, so a blink no longer writes a system setting. Styles you picked in 1.50.0 are kept.
+
+  **The logo keeps blinking with the lid closed (#801).** While the Mac stays awake behind a closed lid on its power adapter (Keep This Mac Awake > With the Lid Closed…, or an external display), the logo goes on showing your agents, and the keyboard stays dark. macOS keeps the logo dark under a closed lid, so the app tells the logo the lid is open, the way LogoLight 1.3.1 does. A line under View > Apple Logo Blink Styles says what the closed lid did last: blinking, or why not. On battery nothing changes: the Mac sleeps when you close it.
+
+  **Codeman and LogoLight take turns on the logo (#802).** With LogoLight 1.3 or later running, LogoLight steps aside while Codeman shows its agents on the logo, and takes the logo back afterwards. Until now Codeman left the logo alone whenever LogoLight ran. An older LogoLight still keeps the logo, and Codeman tells you to update it when you turn the switch on.
+
+  **Dictation survives a thinking pause (#705).** A new Voice setting, Stop after silence, sets how long a pause may last before dictation stops: the provider's default, 3, 6, 15 or 30 seconds, or Manual. Claude dictation keeps going from one sentence to the next until you press Stop, and keeps your last words. On Chrome for Android, words are no longer repeated or lost at the end. Behaviour change: on iOS Safari dictation no longer stops after 750 ms without new words; it stops at the silence deadline like everywhere else.
+
+  **Sync cases across devices (#732).** A new setting, off by default, keeps each case's Agent Teams and Opus 1M options on the server instead of in each browser. When you come back to a tab, the case picker follows the case you last picked on another device.
+
+  **Delete a file from the Files panel (#792).** File rows in the Files panel, tree and search results, have a delete button that asks first. Symbolic links, `.git`, sensitive files and remote or adopted sessions are refused.
+
+  **Zoom the path picker's image preview (#791).** Pinch and drag on a phone, the mouse wheel or a trackpad on a desktop, double-click for 2x, or the zoom buttons. A small image now shows at its own size instead of stretched.
+
+  **Fixes.**
+  - **The phone overview appears on a fold (#790).** Folding a phone, or narrowing a window below 600px, left the welcome screen up when the page had loaded wide. Refs #702.
+  - **The log viewer stops reconnecting after a startup error (#720).** A refused path, a missing or too large file, the stream limit or a failed tail made the floating log viewer reconnect every few seconds.
+  - **The local model install view no longer flashes Paused at the end.** A view read while the install job finished could show the job as paused.
+
+  **Fixes applied while landing.** #720 keeps the browser's own retry after a network error before the stream connects. The Mac app's window-close change (#800) came from checking #795 against how people quit the app. #705: the green Send button now stays up for the words saved when dictation is cut off by a reconnect, and the API reference says what a voice transcript frame holds.
+
+  **Docs and tests.** Both READMEs have a Download for Mac button at the top. The Mac app's code was reorganised into smaller modules (#789) with no change in behaviour.
+
+## 1.50.0
+
+### Minor Changes
+
+- ### Thanks
+  - @irisitymichaelgrundberg for the Files panel following an agent into a worktree outside the session's folder, and for the rules that keep that second folder narrow (#780).
+  - @Randalix for keeping two tests independent of the host's locale and git ignore file (#776).
+
+  **Codeman for Mac (#763).** A small native macOS app opens Codeman in its own window: it opens the Codeman running on this Mac, starts it when it is stopped, installs it when it is missing, or connects to Codeman on another machine, with that password kept in the Keychain. It is one universal app for Apple Silicon and Intel on macOS 11.3 or later, and a client of the web UI like a browser tab, so the server and the API do not change for it. Every release from this one carries it as `Codeman.dmg`, signed with a Developer ID and notarized, so it opens after macOS's usual question about a downloaded app ([1.50.0's copy](https://github.com/Ark0N/Codeman/releases/download/codeman@1.50.0/Codeman.dmg)). The app keeps its own version (0.1.0) and does not update itself yet.
+
+  **Your MacBook's Apple logo blinks with your agents (#781).** On a MacBook Pro with a PROLED XDR display, whose lid logo lights up, _View > Blink Apple Logo_ gives each agent state its own rhythm: one for _While Working_, one for _Waiting for You_ (a yellow tab) and one for _Needs Permission_ (a red tab), each picked from Calm, Slow, Wink, Heartbeat, Fast and Alarm. Set Heartbeat for work, Wink for a finished turn and Alarm (three sharp flashes, then a rest) for a permission dialog, and the lid tells you from across the room which one it is. All three are off until you choose one, the menu shows only on a Mac with that logo, and no style flashes more than three times a second. It uses a private macOS setting, so a macOS update can take the menu away.
+
+  **Install from the app, with no Terminal and no password (#773).** On a Mac without Codeman, the app runs the installer's no-admin route in its own window, shows the steps as a checklist and opens Codeman once it answers. If the Mac has no coding agent it offers one, and _Add a coding agent_ (also in the app menu) adds one later without touching a running Codeman. The This Mac tab now lists every Codeman of this user already running on the Mac. The install needs macOS 15 or a tmux that is already there; on an older Mac the app offers Terminal instead. For this, `install.sh` gained `preflight`, `agent <id>`, `--ai-cli` and `--progress`.
+
+  **The Files panel follows a worktree outside the session's folder (#780).** Since 1.49.0 the panel follows an agent into a worktree inside the session's folder. It now also follows one of the same repository beside it, such as `git worktree add ../feature`, when the session's own repository vouches for it, and files there preview, edit and open from terminal links like workspace files. It follows none while attachment workspace confinement is on, and none at or around a blocked or sensitive folder, in a Docker case workspace, at the home folder or above, or outside the owner's space in multi-user mode. The API stays compatible: `liveWorktree` and `root=live` keep their 1.49.0 meaning, and an outside worktree comes as the new `outsideWorktree` field, listed by `root=live-any` with absolute paths.
+
+  **A coding model that runs on your Mac (#784, experimental).** On an Apple silicon Mac, **Run a local model** on the welcome screen opens a window that shows which local coding model fits the machine and with which agent, installs a pinned Ollama runtime and the model, checks it, and ends on an agent session that runs on it through a Custom Model Endpoint. The catalogue covers every Apple silicon memory size from 8 to 512 GB, and every model carries memory figures of its own: a 9B coding model (labelled limited) from 18 GB, Qwen3.8 27B or Qwen3.6 35B-A3B from 36 GB, Ornith 1.5 122B from 128 GB, while 8 and 16 GB get a plain sentence on why nothing fits. _Recommended_ appears only for a pairing run on a Mac like yours, so far Qwen3.6 35B-A3B with OpenCode on an M5 Pro with 48 GB; every other figure is computed from the model's architecture and shown as an estimate. No account or API key is needed, and the session's prompts go to the model on this Mac rather than a cloud provider. On any other machine nothing is offered, and in multi-user mode only an admin can install. A weekly check in CI compares every catalogue model and the pinned runtime with what a Mac would download and opens one issue when something moved. The routes and their payloads may change in any release; the guide is `docs/local-models.md`.
+
+  **Claude in the cloud, a model on your Mac (#784, experimental).** The codeman skill can hand work to that local model: `local_model` says what is installed and whether it runs, `spawn_worker <name> local` starts a worker on it (and the runtime, when it is stopped), and `sendmark` gives the worker a task and reads back the answer it writes. A Claude Code session plans and reviews while the Mac does the bulk: summaries, first drafts, files that should stay on the machine.
+
+  **Ralph starts from Session Options (#783).** The start screen no longer has a Start Ralph Loop button. Behaviour change: start a Ralph loop from Session Options, Ralph / Todo. The wizard that button opened can no longer be reached.
+
+  **The Codeman agent skill is on by default (#787).** New sessions get the skill where their CLI looks for skills (`.claude/skills/codeman/` for Claude Code, `.agents/skills/codeman/` for Codex, Gemini CLI, OpenCode, Antigravity, Grok, DeepSeek and OMP; none for Pi, GitHub Copilot or a plain shell), so an agent can start and drive workers without an install step. The copy ignores itself in git (a `.gitignore` of `*` inside it, written once and never overwritten), so it never shows up as a new file in your repository, and a symlinked `reference/` folder inside it is refused. **Behaviour change:** every App Settings save on 1.49.0 or earlier stored this switch as off whether or not you touched it, so the first start of 1.50.0 switches a stored off on, once per data directory, and the startup log says when it did. Turn it off under App Settings, Agents & CLIs, All agent CLIs, **Codeman Agent Skill**: an off set after that first start stays off. Reload any tab left open from before the upgrade before you save App Settings there. Turning it off removes no copy already written; `codeman skill uninstall --case <name>` does.
+
+  **Fixes.**
+  - **No developer tools window on a Mac without Xcode (#779).** There `/usr/bin/git` is Apple's placeholder, and the server ran it on the first page load, so a 1.49.0 no-admin install opened macOS's "install the command line developer tools" window right after it finished, and again after every server start. Every git the server starts now checks first and treats that placeholder as no git, and installing the tools later needs no restart.
+  - **A new agent shows up as soon as the installer adds it (#778).** A running Codeman remembered a missing CLI for up to 5 minutes, so Run still said it was not installed after `install.sh agent <id>` or the app had added it. The installer now touches `~/.codeman/cli-installed`, and the server looks again when that file changes.
+  - **The approvals list leaves a brand-new dialog alone (#782).** In a dialog's first 3 seconds, before Claude Code has drawn it, `GET /api/approvals` could resolve it, which cleared its red tab on every device and left the push notification's Approve button with nothing to answer. The list now waits as long as the inbox does.
+  - **Custom model endpoints survive concurrent writes.** The endpoint routes and the 5-minute discovery sweep wrote `custom-model-hosts.json` through one shared temp file, so two at once could tear it or drop a record. Every write is serialized now, and a file that does not parse is refused with 409 instead of replaced. Behaviour change: the endpoint id `local-ollama` is reserved for the model Codeman runs on this Mac.
+  - **Clearing a custom endpoint relaunches on the session's own model.** A selection no longer writes its launch model into the session's stored CLI config, so a cleared session starts on the model it was created with, not on the endpoint's model id against the CLI's own backend. Only API callers could reach this.
+
+  **Fixes applied while landing.** An adopted session never follows a worktree outside its folder, like a remote or Docker session (#780). The worktree test also keeps the system gitconfig away from the code under test (#776).
+
+  The Release workflow now builds, signs, notarizes and attaches `Codeman.dmg` (`.github/workflows/desktop-dmg.yml`, #785), publishes each version to the official MCP registry (`io.github.Ark0N/codeman`) with GitHub's OIDC token, and rebuilds the GitHub release page from this changelog. Pull requests that touch `packages/desktop` run `cargo fmt`, clippy and `cargo test` on macOS.
+
+  **Docs and tests.** The README, the Chinese README and the wiki's Installation page gained a section on the Mac app (#786), the Autonomous Loops page no longer points at the removed wizard, and `docs/local-models.md` covers the local model install. Two tests no longer depend on the host's locale or git ignore file (#776).
+
 ## 1.49.0
 
 ### Minor Changes
