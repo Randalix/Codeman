@@ -60,4 +60,27 @@ describe('boot recovery and a suspended session', () => {
       await s.stop();
     }
   });
+
+  it('a suspended session whose tmux session vanished runs again and is no longer suspended', async () => {
+    const created: unknown[] = [];
+    const mux = {
+      isAvailable: () => true,
+      muxSessionExists: () => false,
+      isPaneDead: () => false,
+      setAttached: () => {},
+      respawnPane: async () => 4242,
+      createSession: async (options: unknown) => {
+        created.push(options);
+        return { muxName: 'codeman-fresh', sessionId: 'aaaa', pid: 4343 } as unknown as MuxSession;
+      },
+    } as unknown as TerminalMultiplexer;
+    const s = session(mux, { suspendedAt: 5 });
+    await s.startInteractive().catch(() => {});
+    try {
+      expect(created).toHaveLength(1);
+      expect(s.suspended).toBe(false);
+    } finally {
+      await s.stop();
+    }
+  });
 });

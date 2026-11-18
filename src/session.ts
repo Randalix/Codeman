@@ -2860,6 +2860,13 @@ export class Session extends EventEmitter {
 
     // Check if we already have a mux session (restored session)
     const isRestored = this._muxSession !== null && !needsNewSession;
+    // A suspended session whose tmux session vanished (kill-server, a tmux crash) gets a
+    // fresh pane below, and its CLI runs again: it is no longer suspended. Left set, the
+    // flag would hold every keystroke for a resume that restarts a running CLI.
+    if (!isRestored && this._suspendedAt !== null) {
+      console.log('[Session] Suspended session got a fresh pane; no longer suspended:', this.id);
+      this._suspendedAt = null;
+    }
     if (isRestored) {
       console.log('[Session] Attaching to existing mux session:', this._muxSession!.muxName);
     } else {
