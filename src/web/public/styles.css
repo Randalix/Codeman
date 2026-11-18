@@ -3160,6 +3160,19 @@ html:not(.tabs-show-new) .session-tab .tab-new {
    `.session-tab` there. The spinner ring is a pseudo-element the skin blocks
    cannot reach, so it needs hiding explicitly rather than by unsetting the
    animation. */
+/* A suspended session (session-suspend.ts): its CLI was stopped to free memory and
+   the next input resumes it. Greyed out as a whole, still clickable. */
+.session-tab.tab-suspended,
+.home-sessions-row--suspended {
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+.session-tab.tab-suspended:hover,
+.session-tab.tab-suspended.active,
+.home-sessions-row--suspended:hover {
+  opacity: 0.75;
+}
+
 .session-tab.tab-agent-exited:not(.tab-alert-action):not(.tab-alert-idle) .tab-status:not(.error) {
   background: var(--text-muted);
   opacity: 0.5;

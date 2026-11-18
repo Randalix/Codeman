@@ -46,7 +46,7 @@ for skills (`.claude/skills/` for Claude Code, `.agents/skills/` for Codex, Gemi
 OpenCode, Antigravity, Grok, DeepSeek and OMP). A **pi** or **shell** worker never gets
 it, but has the same environment: tell it *"other sessions: `codeman agent --help`"*.
 That bundled CLI (`ls`, `spawn`, `send`, `wait`, `read`, `inspect`, `stage`, `submit`,
-`interrupt`, `rm`, and the inbox verbs `post`, `inbox`, `ack`) is the same
+`interrupt`, `suspend`, `resume`, `rm`, and the inbox verbs `post`, `inbox`, `ack`) is the same
 verbs over the same endpoints, with the guards below (no control bytes, no self-delete,
 no guessed URL) enforced in code, and it is also your own way through when this
 machine has no `jq` for the preamble below. It also carries the **mailbox**:

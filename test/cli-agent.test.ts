@@ -17,6 +17,8 @@ import {
   agentInboxRead,
   inboxWaitArgs,
   agentInterrupt,
+  agentSuspend,
+  agentResume,
   agentLs,
   stalledPairLines,
   agentPost,
@@ -767,6 +769,34 @@ describe('agent pull', () => {
     const deps = fakeDeps([]);
     expect(await agentPull(deps, { id: OTHER, path: 'builds/..', dest: dir })).toBe(EXIT.error);
     expect(deps.calls).toHaveLength(0);
+  });
+});
+
+describe('agent suspend / resume', () => {
+  it('suspends another session through POST /suspend, never itself', async () => {
+    const deps = fakeDeps([ok({ suspended: true, suspendedAt: 1 })]);
+    expect(await agentSuspend(deps, { id: OTHER })).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({ method: 'POST', path: `/api/v1/sessions/${OTHER}/suspend` });
+    expect(deps.out.join('\n')).toMatch(/suspended .*resumes it/);
+    const self = fakeDeps([]);
+    expect(await agentSuspend(self, { id: SELF })).toBe(EXIT.refused);
+    expect(self.calls).toEqual([]);
+  });
+
+  it('a refusal (409) is a refused exit carrying the server message', async () => {
+    const deps = fakeDeps([apiError(409, 'CONFLICT', 'The session is working; suspend it once it is idle.')]);
+    expect(await agentSuspend(deps, { id: OTHER })).toBe(EXIT.refused);
+    expect(deps.err.join('\n')).toMatch(/working/);
+  });
+
+  it('resumes through POST /resume and says when there was nothing to do', async () => {
+    const deps = fakeDeps([ok({ suspended: false })]);
+    expect(await agentResume(deps, { id: OTHER })).toBe(EXIT.ok);
+    expect(deps.calls[0]).toMatchObject({ method: 'POST', path: `/api/v1/sessions/${OTHER}/resume` });
+    expect(deps.out.join('\n')).toMatch(/resumed/);
+    const idle = fakeDeps([ok({ suspended: false, alreadyRunning: true })]);
+    expect(await agentResume(idle, { id: OTHER })).toBe(EXIT.ok);
+    expect(idle.out.join('\n')).toMatch(/not suspended/);
   });
 });
 

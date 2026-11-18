@@ -56,6 +56,8 @@ codeman agent submit "$SID" --stage-id "$STAGE_ID" --confirm-sha "$SHA256" --jso
 codeman agent send "$SID" 'run the tests, then print WORKDONE followed by _4711'   # hook-less modes: the marker in halves …
 codeman agent wait "$SID" --match WORKDONE_4711           # … and the wait on the joined form
 codeman agent interrupt "$SID"                            # a bare ESC, conversation intact
+codeman agent suspend "$SID"                              # idle local claude: stop its CLI to free memory, keep the session
+codeman agent resume "$SID"                               # bring it back now; any send or keystroke resumes it too
 codeman agent post "$SID" 'context for later, not a prompt'   # stored in its inbox, not typed into the pane
 codeman agent inbox --wait --timeout 300000               # your own inbox: blocks while nothing is new
 codeman agent ack <msg-id>                                # remove what you handled (read never removes)

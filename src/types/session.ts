@@ -1248,6 +1248,14 @@ export interface SessionState {
    * belongs with the part of Ark0N/Codeman#446 that closes exited sessions.
    */
   paneExit?: PaneExit;
+  /**
+   * True while the session is suspended: Codeman stopped its CLI on purpose to
+   * free memory and relaunches it with the same conversation on the next input
+   * (see `session-suspend.ts`). The pane stays (remain-on-exit).
+   */
+  suspended?: boolean;
+  /** Epoch ms of the suspend; set together with `suspended`. */
+  suspendedAt?: number;
 }
 
 /**

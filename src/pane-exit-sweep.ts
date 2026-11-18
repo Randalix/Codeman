@@ -80,11 +80,18 @@ export interface CleanExitSweepCandidate {
    * (`Session.paneStartedAt`), or 0 when none has run in this process.
    */
   paneStartedAt: number;
+  /**
+   * The session is suspended: its CLI was stopped on purpose and resumes on the
+   * next input (`session-suspend.ts`). Never closed here, whatever its exit
+   * status — a CLI that answers SIGTERM with 0 would otherwise lose its row.
+   */
+  suspended?: boolean;
 }
 
 /** Should the sweep close this session now? See the file overview for the rule. */
 export function shouldCloseCleanlyExitedSession(candidate: CleanExitSweepCandidate): boolean {
   if (candidate.closing) return false;
+  if (candidate.suspended) return false;
   if (candidate.paneLifecycleInFlight) return false;
   if (!isCleanPaneExit(candidate.paneExit)) return false;
   // `at` is when this server first read the pane dead, so an exit during the

@@ -62,6 +62,8 @@ export const NUDGE_RESTART_DELAY_MS = 30_000;
 /** The slice of a Session the nudger reads. */
 export interface NudgeTarget {
   readonly id: string;
+  /** Suspended on purpose (`session-suspend.ts`): no CLI to type into; the mail waits for the resume. */
+  readonly suspended?: boolean;
   readonly mode: string;
   readonly status: string;
   readonly remote: { host: string; port?: number } | undefined;
@@ -204,6 +206,9 @@ export class InboxNudger {
 
     const session = this.deps.getSession(sessionId);
     if (!session || session.status === 'stopped' || session.status === 'error') return 'skipped';
+    // No CLI runs in a suspended pane: typing would wake nothing and the bytes would be
+    // lost. The mail stays in the inbox; the resumed agent reads it when someone writes.
+    if (session.suspended) return 'skipped';
 
     const now = this.deps.now();
     const sinceLast = now - state.lastNudgeAt;

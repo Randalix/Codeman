@@ -452,6 +452,8 @@ interface SessionRow {
   displayModel?: { model?: string; source?: string };
   /** The model the session was started with (`--model`); absent without one. */
   model?: string;
+  /** Suspended: its CLI was stopped to free memory; the next `send` resumes it (`agent suspend`). */
+  suspended?: boolean;
 }
 
 /**
@@ -653,7 +655,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       s.mode ?? '?',
       modelCell(s),
       hostCell(s),
-      s.status ?? '?',
+      s.suspended ? 'suspended' : (s.status ?? '?'),
       ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
       inbox ? inboxCell(inbox) : '?',
       inbox ? waitCell(inbox) : '?',
@@ -1340,7 +1342,14 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as
-    | { delivered?: boolean; duplicate?: boolean; buffered?: boolean; dropped?: boolean; wait?: WaitResult }
+    | {
+        delivered?: boolean;
+        duplicate?: boolean;
+        buffered?: boolean;
+        dropped?: boolean;
+        resuming?: boolean;
+        wait?: WaitResult;
+      }
     | undefined;
   if (deps.json) emitJson(deps, data ?? {});
   // Fire-and-forget to a remote session whose host is asleep (wake-on-LAN): the server
@@ -1351,7 +1360,9 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
     if (!deps.json) {
       deps.io.err(
         palette.err(
-          `${GLYPH.fail} dropped: ${target.id}'s host is waking and its input buffer is full — nothing will be typed; send again once it is back`
+          data.resuming
+            ? `${GLYPH.fail} dropped: ${target.id} is resuming from suspend and its input buffer is full — nothing will be typed; send again once it is back`
+            : `${GLYPH.fail} dropped: ${target.id}'s host is waking and its input buffer is full — nothing will be typed; send again once it is back`
         )
       );
     }
@@ -1372,6 +1383,12 @@ export async function agentSend(deps: AgentDeps, options: SendOptions): Promise<
     const noEnter = options.enter ? '' : ' (no Enter)';
     if (data?.duplicate) {
       deps.io.out(palette.warn(`${GLYPH.warn} duplicate (clientId/seq already applied): nothing typed`));
+    } else if (data?.buffered && data.resuming) {
+      deps.io.out(
+        palette.ok(
+          `${GLYPH.ok} buffered for ${target.id}${noEnter}: it was suspended; Codeman is resuming it and types this once the composer is back`
+        )
+      );
     } else if (data?.buffered) {
       deps.io.out(
         palette.ok(
@@ -1721,6 +1738,47 @@ export async function agentInterrupt(deps: AgentDeps, options: { id: string }): 
         `${GLYPH.ok} ESC sent to ${target.id} — one Esc does not always land; read the tail before the next prompt`
       )
     );
+  return EXIT.ok;
+}
+
+/**
+ * `agent suspend` — stop another session's CLI to free its memory. The session stays
+ * (greyed out in the UI) and the next input — `agent send`, a keystroke in the
+ * browser, `agent resume` — brings the same conversation back.
+ */
+export async function agentSuspend(deps: AgentDeps, options: { id: string }): Promise<number> {
+  if (isSelfSession(deps.ctx.selfId, options.id)) return fail(deps, `refusing: ${options.id} is me`, EXIT.refused);
+  const target = await resolveSessionId(deps, options.id);
+  if ('error' in target) return fail(deps, target.error, target.code);
+  if (isSelfSession(deps.ctx.selfId, target.id)) return fail(deps, `refusing: ${options.id} is me`, EXIT.refused);
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/suspend`,
+    timeoutMs: 30_000,
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res), res.status === 409 ? EXIT.refused : EXIT.error);
+  if (deps.json) emitJson(deps, res.json.data ?? {});
+  else
+    deps.io.out(
+      palette.ok(`${GLYPH.ok} suspended ${target.id} — \`agent send\` or a keystroke in the browser resumes it`)
+    );
+  return EXIT.ok;
+}
+
+/** `agent resume` — relaunch a suspended session's CLI with its conversation; waits until the composer is back. */
+export async function agentResume(deps: AgentDeps, options: { id: string }): Promise<number> {
+  const target = await resolveSessionId(deps, options.id);
+  if ('error' in target) return fail(deps, target.error, target.code);
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/resume`,
+    timeoutMs: 90_000,
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  const data = res.json.data as { alreadyRunning?: boolean } | undefined;
+  if (deps.json) emitJson(deps, data ?? {});
+  else if (data?.alreadyRunning) deps.io.out(palette.muted(`${target.id} was not suspended; nothing to do`));
+  else deps.io.out(palette.ok(`${GLYPH.ok} resumed ${target.id}`));
   return EXIT.ok;
 }
 
@@ -2781,7 +2839,7 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description(
-      'Talk to other sessions from inside one (any CLI mode): list, spawn (also on another host), hosts, send, wait, watch, subscribe, mute, read, interrupt, rm, the inbox: post, inbox, ack, todo, and the experimental, opt-in inspect, stage, submit'
+      'Talk to other sessions from inside one (any CLI mode): list, spawn (also on another host), hosts, send, wait, watch, subscribe, mute, read, interrupt, suspend, resume, rm, the inbox: post, inbox, ack, todo, and the experimental, opt-in inspect, stage, submit'
     );
 
   agent
@@ -3076,6 +3134,24 @@ export function registerAgentCommands(program: Command): Command {
     .option('--json', 'Machine-readable output')
     .action((id: string, options: { json?: boolean }) =>
       run(Boolean(options.json), (deps) => agentInterrupt(deps, { id }))
+    );
+
+  agent
+    .command('suspend <id>')
+    .description(
+      "Stop an idle session's CLI to free its memory; the session stays (greyed out) and the next send or keystroke resumes the same conversation. Local claude sessions only for now"
+    )
+    .option('--json', 'Machine-readable output')
+    .action((id: string, options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentSuspend(deps, { id }))
+    );
+
+  agent
+    .command('resume <id>')
+    .description('Bring a suspended session back now (same conversation); returns once its composer is ready')
+    .option('--json', 'Machine-readable output')
+    .action((id: string, options: { json?: boolean }) =>
+      run(Boolean(options.json), (deps) => agentResume(deps, { id }))
     );
 
   agent

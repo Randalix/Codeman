@@ -185,12 +185,18 @@ Object.assign(CodemanApp.prototype, {
    */
   _mobileOverviewExit(state, session) {
     if (state !== 'idle' && state !== 'working') return null;
-    if (typeof paneExitLabel !== 'function' || !paneExitLabel(session.paneExit)) return null;
+    if (typeof paneExitLabel !== 'function' || !paneExitLabel(session.paneExit, session.suspended)) return null;
+    // A suspended session (session-suspend.ts) has a dead pane on purpose: it says
+    // "suspended" and measures from the suspend, and its row is greyed out.
+    if (session.suspended === true) {
+      const since = Number(session.suspendedAt) || 0;
+      return { since: since ? { key: 'suspended', at: since } : null, label: 'suspended', suspended: true };
+    }
     // `at` is when this server first saw the pane dead, which is what "exited
     // 2m" should measure. A row without it shows no duration at all rather
     // than a working or idle stamp that no longer describes the pane.
     const at = Number(session.paneExit.at) || 0;
-    return { since: at ? { key: 'exited', at } : null };
+    return { since: at ? { key: 'exited', at } : null, label: 'exited' };
   },
 
   /**
@@ -246,7 +252,8 @@ Object.assign(CodemanApp.prototype, {
         // What the row's dot, accent and pill show. It differs from `state` only
         // for an exited agent, whose state still decides the section and sort.
         display: exit ? 'exited' : state,
-        pill: exit ? 'exited' : MOBILE_OVERVIEW_PILL_LABEL[state] || state,
+        pill: exit ? exit.label || 'exited' : MOBILE_OVERVIEW_PILL_LABEL[state] || state,
+        suspended: !!(exit && exit.suspended),
         // What the pane's own footer says is still running in the background ("1 monitor",
         // "2 shells"), straight off the session payload. A row that has one is quiet
         // because the agent is waiting for that, not because it is waiting for you.
@@ -889,7 +896,8 @@ Object.assign(CodemanApp.prototype, {
     const item = document.createElement('button');
     item.type = 'button';
     const display = row.display || row.state;
-    item.className = 'mobile-overview-row mobile-overview-row--' + display;
+    item.className =
+      'mobile-overview-row mobile-overview-row--' + display + (row.suspended ? ' mobile-overview-row--suspended' : '');
     item.dataset.moAction = 'session';
     item.dataset.moSession = row.id;
 

@@ -473,6 +473,29 @@ this way (`approval-routes.ts:43`).
 - The interrupted turn is still billed for the work it already did. Interrupt is
   cheaper than respawn, which runs `/clear` and destroys the conversation.
 
+### Suspending an idle worker (free its memory)
+
+An idle local claude worker can be suspended: Codeman stops its CLI (the whole pane
+process group, SIGTERM then SIGKILL after 5 s), keeps the session and its dead pane, and
+shows it greyed out. The next input brings the same conversation back
+(`claude --resume <id>`), so a coordinator can park workers it does not need right now.
+
+| Task | Call |
+|------|------|
+| suspend an idle session | `POST /api/v1/sessions/:id/suspend` → `{suspended:true, suspendedAt}`; 409 with `reason` (`busy`, `remote`, `docker`, `adopted`, `unsupported-mode`, `already-suspended`, `no-mux`), 500 `stop-failed` |
+| resume it now and wait for the composer | `POST /api/v1/sessions/:id/resume` → `{suspended:false}` (or `alreadyRunning:true`) |
+
+- **Any input resumes it.** `POST .../input` to a suspended session answers
+  `{buffered:true, resuming:true}`: the bytes are held (4 KB, oldest dropped first;
+  `dropped:true` = over the cap, gone) and typed once the composer is back. With `wait`,
+  the call awaits the resume, then writes and waits as usual. Browser keystrokes go the
+  same way.
+- **The mailbox does not resume it.** The inbox nudge skips a suspended session; the
+  post waits in its inbox until something resumes it. Send a prompt (or `resume`) when
+  it has to act.
+- Session state carries `suspended` / `suspendedAt`, and the suspend survives a server
+  restart. v1: local claude sessions only.
+
 ### Is it stuck? structured signals
 
 Two reads that answer "is this worker actually doing something" without parsing a

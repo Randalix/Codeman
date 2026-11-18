@@ -35,6 +35,7 @@ import fastifyWebsocket from '@fastify/websocket';
 import fastifyMultipart from '@fastify/multipart';
 import { pasteImageDirInUseByOtherSession, startPasteImageGc, uploadDirs } from './paste-image-gc.js';
 import { CLEAN_EXIT_CLOSE_REASON, shouldCloseCleanlyExitedSession } from '../pane-exit-sweep.js';
+import { suspendRegistryOf, type SessionSuspendRegistry } from '../session-suspend.js';
 import { findLiveWorktree, type OutsideWorktreeOptions } from '../live-worktree.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -571,6 +572,8 @@ export class WebServer extends EventEmitter {
    * but `drop`/`stop` on it.
    */
   private remoteWake: RemoteWakeRegistry | null = null;
+  /** Session suspend registry, hung on the routes' ctx by `registerSessionRoutes` (session-suspend.ts). */
+  private sessionSuspend: SessionSuspendRegistry | null = null;
   private sse: SseStreamManager;
   private store = getStore();
   private tabLayouts!: TabLayoutService;
@@ -1470,6 +1473,7 @@ export class WebServer extends EventEmitter {
     // cleanup path and resolves in-flight wakes on shutdown. Registered before the case
     // routes, whose remote-link (a user request) wakes a sleeping host through it.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
+    this.sessionSuspend = suspendRegistryOf(ctx) ?? null;
     // The routes' ctx is a separate object: take the last-response reader they registered on it (Discord alerts).
     this.lastResponseFor = (ctx as { lastResponseFor?: WebServer['lastResponseFor'] }).lastResponseFor;
     registerCaseRoutes(this.app, ctx, { remoteWake: this.remoteWake });
@@ -2015,6 +2019,8 @@ export class WebServer extends EventEmitter {
     // rather than in the two delete routes, where it left an entry behind, including up
     // to 4 KB of the user's buffered keystrokes.
     this.remoteWake?.drop(sessionId);
+    // Held keystrokes of a suspended session go with it, like the wake buffer.
+    this.sessionSuspend?.forget(sessionId);
     // The inbox itself was handled above (dropped on a delete, kept on a detach).
     // Downstream fields, `?.` like `remoteWake`: upstream's wiring tests build the server
     // without its constructor (Object.create) and only stub upstream's own members.
@@ -3300,6 +3306,7 @@ export class WebServer extends EventEmitter {
         paneLifecycleInFlight: session.paneLifecycleInFlight,
         closing: this.cleaningUp.has(session.id),
         paneStartedAt: session.paneStartedAt,
+        suspended: session.suspended,
       });
       if (!close) continue;
       const attempt = `${session.id}:${session.paneExit?.at ?? 0}`;
@@ -4405,6 +4412,7 @@ export class WebServer extends EventEmitter {
               // pane-exit watcher's own tick replaces it with a first-hand
               // reading (not the stats collector — see `startPaneExitWatcher`).
               paneExit: savedState?.paneExit,
+              suspendedAt: savedState?.suspended ? savedState?.suspendedAt : undefined,
               // The model the CLI last reported (statusline or its own footer), so a
               // tile header keeps naming it until the next report; an idle claude
               // session re-renders its statusline only on its next turn.

@@ -309,6 +309,13 @@ export interface TerminalMultiplexer extends EventEmitter {
    */
   killSession(sessionId: string): Promise<boolean>;
 
+  /**
+   * Stop the agent in a LOCAL session's pane but keep the tmux session, leaving a
+   * dead pane to respawn later (session suspend). Optional: a multiplexer without
+   * it cannot suspend. Resolves true once the pane reads dead.
+   */
+  stopPaneProcesses?(sessionId: string): Promise<boolean>;
+
   /** Clean up resources (stop stats collection, etc.) */
   destroy(): void;
 

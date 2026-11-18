@@ -44,6 +44,7 @@ import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
 import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 import { WsConnectionRegistry } from '../ws-connection-registry.js';
 import { canAccessOwned, getAuthUser } from '../route-helpers.js';
+import { suspendRegistryOf } from '../../session-suspend.js';
 
 /** Micro-batch interval for terminal output (ms). Short enough for low latency,
  *  long enough to group Ink's rapid cursor-up redraw sequences into single frames. */
@@ -195,7 +196,15 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           // and re-asserts the desktop layout after a mobile override.
           if (holdsDesktopClaim) session.noteDesktopActivity();
           // Browser keystrokes are the user's own, so they may name the tab.
-          delivered = session.write(msg.d, { fromUser: true });
+          // A suspended (or resuming) session has no CLI in its pane: the registry holds
+          // the keystrokes and resumes it (session-suspend.ts). The ACK below is its
+          // promise to deliver them, as for the wake-on-LAN buffer on POST /input.
+          const suspend = suspendRegistryOf(ctx);
+          if (suspend && suspend.isHolding(session)) {
+            delivered = suspend.handleInput(session, msg.d) === 'buffered';
+          } else {
+            delivered = session.write(msg.d, { fromUser: true });
+          }
           // A session whose PTY is gone swallows the write. ACKing anyway told
           // the client to drop the frame from its durable queue and left the seq
           // burnt, so the retry that reliable delivery exists for was rejected as

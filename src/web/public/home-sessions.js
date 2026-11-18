@@ -232,7 +232,8 @@ Object.assign(CodemanApp.prototype, {
         // What the row's dot, accent and pill show. It differs from `state` only
         // for an exited agent (Ark0N/Codeman#446), whose state still sorts it.
         display: exit ? 'exited' : state,
-        pill: exit ? 'exited' : HOME_SESSIONS_PILL_LABEL[state] || state,
+        pill: exit ? exit.label || 'exited' : HOME_SESSIONS_PILL_LABEL[state] || state,
+        suspended: !!(exit && exit.suspended),
         // What the pane's footer says is still running in the background, straight off
         // the session payload. Same field, same meaning as on the phone overview.
         watching: typeof session.watching === 'string' ? session.watching : '',
@@ -414,7 +415,8 @@ Object.assign(CodemanApp.prototype, {
     const item = document.createElement('button');
     item.type = 'button';
     const display = row.display || row.state;
-    item.className = 'home-sessions-row home-sessions-row--' + display;
+    item.className =
+      'home-sessions-row home-sessions-row--' + display + (row.suspended ? ' home-sessions-row--suspended' : '');
     item.dataset.hsAction = 'session';
     item.dataset.hsSession = row.id;
     item.title = row.dir ? `${row.name} (${row.dir})` : row.name;

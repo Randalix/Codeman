@@ -512,6 +512,15 @@ export class MockSession extends EventEmitter {
     }
   );
   restartCli = vi.fn(async () => true);
+
+  /** Session suspend (session-suspend.ts): mirrors `Session.suspended` / `setSuspended()`. */
+  suspendedAt: number | undefined = undefined;
+  get suspended(): boolean {
+    return this.suspendedAt !== undefined;
+  }
+  setSuspended(at: number | null): void {
+    this.suspendedAt = at ?? undefined;
+  }
   /** Mirrors Session.envOverrideValue; no override map here, so the custom-model
    *  real-home lookup defaults to "session says nothing" (overridable per test). */
   envOverrideValue = vi.fn((_key: string): string | undefined => undefined);

@@ -810,6 +810,13 @@ export class Session extends EventEmitter {
    */
   private _paneExit: PaneExit | null = null;
   /**
+   * Epoch ms at which this session was suspended (its CLI stopped on purpose to
+   * free memory, see `session-suspend.ts`), or null while it is not suspended.
+   * Persisted, so a suspended session stays suspended across a server restart:
+   * the dead-pane branch of {@link _setupOrAttachMuxSession} must not relaunch it.
+   */
+  private _suspendedAt: number | null = null;
+  /**
    * The pane's live directory, from the pane-exit watcher's read. Runtime-only:
    * serialized by toState() but never restored by the constructor.
    */
@@ -1058,6 +1065,8 @@ export class Session extends EventEmitter {
       claudeSessionChain?: string[];
       /** Restored agent-exit observation for this session's pane (see `paneExit`). */
       paneExit?: PaneExit;
+      /** Restored suspend time (see `suspendedAt`). */
+      suspendedAt?: number;
       /** The previous run's `displayModel`; a CLI-reported one is restored (see `displayModel`). */
       displayModel?: DisplayModel;
       /** The previous run's last prompt-cache report, restored so the readout is not blank (see `promptCache`). */
@@ -1259,6 +1268,7 @@ export class Session extends EventEmitter {
     // replaces it with a first-hand reading. NOT the stats collector, which a
     // browser panel arms and disarms — see `startPaneExitWatcher`.
     this.setPaneExit(config.paneExit);
+    this._suspendedAt = typeof config.suspendedAt === 'number' && config.suspendedAt > 0 ? config.suspendedAt : null;
     this._reportedModel = restoredReportedModel(config.displayModel) ?? null;
     // Last prompt-cache report, restored so the Session Options readout is not blank until
     // the pane's next statusline render. The readout is time-aware, so a value whose expiry
@@ -1897,6 +1907,21 @@ export class Session extends EventEmitter {
 
   setKeepWarmEnabled(enabled: boolean | undefined): void {
     this._keepWarmEnabled = enabled;
+  }
+
+  /** True while the session is suspended: its CLI was stopped on purpose and resumes on input. */
+  get suspended(): boolean {
+    return this._suspendedAt !== null;
+  }
+
+  /** When the session was suspended (epoch ms), or undefined while it is not. */
+  get suspendedAt(): number | undefined {
+    return this._suspendedAt ?? undefined;
+  }
+
+  /** Mark the session suspended (`at` = epoch ms) or, with null, no longer suspended. */
+  setSuspended(at: number | null): void {
+    this._suspendedAt = at;
   }
 
   /** What the keep-warm service last published for this session, or null before its first evaluation. */
@@ -2650,6 +2675,8 @@ export class Session extends EventEmitter {
       // it rides the existing `session:updated` broadcast and lands in state.json
       // through the same persist. `status` and `pid` above stay untouched by it.
       paneExit: this._paneExit ?? undefined,
+      suspended: this._suspendedAt !== null || undefined,
+      suspendedAt: this._suspendedAt ?? undefined,
       attachmentHistory: this.attachmentHistory.length > 0 ? this.attachmentHistory : undefined,
       lastSubmitAt: this._lastSubmitAt || undefined,
       lastRealPromptAt: this._lastRealPromptAt || undefined,
@@ -2793,7 +2820,14 @@ export class Session extends EventEmitter {
     let needsNewSession = false;
     let respawnedDeadPane = false;
     let respawnedResumeId: string | undefined;
-    if (this._muxSession && mux.isPaneDead(this._muxSession.muxName)) {
+    let keptSuspendedPane = false;
+    if (this._muxSession && this._suspendedAt !== null && mux.isPaneDead(this._muxSession.muxName)) {
+      keptSuspendedPane = true;
+      // Suspended on purpose (see `session-suspend.ts`): attach to the dead pane and
+      // leave the CLI stopped. Only a resume relaunches it. Without this, every boot
+      // recovery and every explicit start would undo the suspend.
+      console.log('[Session] Dead pane of a suspended session, not respawning:', this._muxSession.muxName);
+    } else if (this._muxSession && mux.isPaneDead(this._muxSession.muxName)) {
       console.log('[Session] Dead pane detected, respawning:', this._muxSession.muxName);
       // A new agent process: asked first (see `_launchGuard`). A refusal leaves the pane as it is.
       await this._assertLaunchAllowed();
@@ -2821,7 +2855,8 @@ export class Session extends EventEmitter {
     // recovery and an explicit start, NOT a click on an exited tab — the browser
     // re-attaches only on a null pid, and the premise of Ark0N/Codeman#446 is
     // that an exited pane keeps its pid. `restartCli()` clears separately.
-    this.clearPaneExitForNewPane();
+    // A kept suspended pane is still the old, dead command: its exit stays.
+    if (!keptSuspendedPane) this.clearPaneExitForNewPane();
 
     // Check if we already have a mux session (restored session)
     const isRestored = this._muxSession !== null && !needsNewSession;

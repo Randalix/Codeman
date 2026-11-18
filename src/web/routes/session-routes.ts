@@ -232,6 +232,7 @@ import { remoteTmuxLocation } from '../../tmux-manager.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { DEFAULT_SCREEN_TAIL_BYTES, MAX_SCREEN_HISTORY_LINES, screenTail } from '../../utils/screen-text.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
+import { SessionSuspendRegistry, attachSuspendRegistry } from '../../session-suspend.js';
 
 // Path to linked-cases registry (same file used by case-routes resolveCasePath)
 const LINKED_CASES_FILE = dataPath('linked-cases.json');
@@ -1078,8 +1079,22 @@ export function registerSessionRoutes(
   app: FastifyInstance,
   ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort & KeepWarmPort,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
-  options: { remoteWake?: RemoteWakeRegistry } = {}
+  options: { remoteWake?: RemoteWakeRegistry; suspend?: SessionSuspendRegistry } = {}
 ): RemoteWakeRegistry {
+  // Session suspend (session-suspend.ts). Hung on ctx so the WebSocket input route,
+  // registered later on the same ctx, holds keystrokes for a suspended session too.
+  const suspend =
+    options.suspend ??
+    new SessionSuspendRegistry({
+      stopPane: (sessionId) => ctx.mux.stopPaneProcesses?.(sessionId) ?? Promise.resolve(false),
+      capturePane: (muxName) => ctx.mux.capturePaneText?.(muxName) ?? null,
+      persist: (s) => persistAndBroadcastSession(ctx, s as Session),
+      now: () => Date.now(),
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+      log: (message) => console.log(message),
+    });
+  attachSuspendRegistry(ctx, suspend);
+
   /**
    * Install the approval hook MODULE a CLI declares (`capabilities.approvalHookFile`,
    * omp) into a LOCAL workspace, so its approval dialogs raise an alert. Shared by
@@ -2117,6 +2132,40 @@ export function registerSessionRoutes(
 
   // ========== Start Interactive Mode ==========
 
+  // Session suspend (session-suspend.ts): stop the CLI of an idle session to free its
+  // memory; the session stays on the board, greyed out, and the next input resumes it.
+  app.post('/api/sessions/:id/suspend', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    const result = await suspend.suspend(session);
+    if (!result.ok) {
+      const code = result.reason === 'stop-failed' ? 500 : 409;
+      return reply.code(code).send({
+        ...createErrorResponse(code === 500 ? ApiErrorCode.OPERATION_FAILED : ApiErrorCode.CONFLICT, result.message),
+        reason: result.reason,
+      });
+    }
+    return { suspended: true, suspendedAt: session.suspendedAt };
+  });
+
+  app.post('/api/sessions/:id/resume', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    if (!suspend.isHolding(session)) return { suspended: false, alreadyRunning: true };
+    const ok = await suspend.resume(session);
+    if (!ok) {
+      return reply
+        .code(500)
+        .send(
+          createErrorResponse(
+            ApiErrorCode.OPERATION_FAILED,
+            'The CLI could not be relaunched; the session stays suspended.'
+          )
+        );
+    }
+    return { suspended: false };
+  });
+
   app.post('/api/sessions/:id/interactive', async (req) => {
     const { id } = req.params as { id: string };
     // Body is optional (auto-reattach callers send none) — same idiom as /interactive-respawn.
@@ -2333,6 +2382,25 @@ export function registerSessionRoutes(
     const duplicate = tagged && !session.shouldApplyInput(clientId as string, seq as number);
     if (duplicate && !wantsWait) {
       return {};
+    }
+
+    // Session suspend (session-suspend.ts): the pane of a suspended session is dead, and
+    // a write would vanish. The input resumes it: held and delivered once the composer
+    // is back, or, for send-and-wait, the resume is awaited and the write below runs.
+    if (!duplicate && suspend.isHolding(session)) {
+      if (wantsWait) {
+        if (!(await suspend.resume(session))) {
+          return createErrorResponse(
+            ApiErrorCode.OPERATION_FAILED,
+            'The suspended session could not be resumed; nothing was sent'
+          );
+        }
+      } else {
+        const outcome = suspend.handleInput(session, inputStr);
+        return outcome === 'dropped'
+          ? { buffered: true, dropped: true, resuming: true }
+          : { buffered: true, resuming: true };
+      }
     }
 
     // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves

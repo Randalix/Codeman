@@ -1914,7 +1914,7 @@ Object.assign(CodemanApp.prototype, {
     if (!session) return null;
     const pending = this._tileAttachPending?.get(sessionId);
     if (pending && Date.now() - pending < 15000) return null;
-    const exited = typeof paneExitLabel === 'function' ? paneExitLabel(session.paneExit) : '';
+    const exited = typeof paneExitLabel === 'function' ? paneExitLabel(session.paneExit, session.suspended) : '';
     if (exited) return { text: `The agent ${exited}`, attachable: false };
     if (session.pid === null) return { text: 'Not attached', attachable: true };
     if (tile?._stoppedCode === 4009) return { text: 'The session ended', attachable: true };

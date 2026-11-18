@@ -361,7 +361,10 @@ function parseSessionPrefix(name) {
 // without reporting how (a SIGKILLed pane on tmux 3.2a reports neither). So an
 // absent status shows a bare "exited" rather than "exited (0)": a clean exit
 // and an unexplained one must not look the same.
-function paneExitLabel(paneExit) {
+// A suspended session (session-suspend.ts) has a dead pane too, stopped on purpose:
+// it reads "suspended", not as an exit, and the next input resumes it.
+function paneExitLabel(paneExit, suspended) {
+  if (suspended === true) return 'suspended';
   if (!paneExit || typeof paneExit !== 'object') return '';
   if (typeof paneExit.signal === 'number' && paneExit.signal > 0) return `exited (signal ${paneExit.signal})`;
   if (typeof paneExit.status === 'number') return `exited (${paneExit.status})`;
@@ -378,8 +381,10 @@ function paneExitAriaLabel(name, label) {
 // the render loop so it can be exercised directly: this is the only path a
 // session going live-to-exited ever takes, since that transition adds and
 // removes no tab and so never reaches the full rebuild.
-function applyPaneExitBadge(tab, paneExit) {
-  const label = paneExitLabel(paneExit);
+function applyPaneExitBadge(tab, paneExit, suspended) {
+  const label = paneExitLabel(paneExit, suspended);
+  // Greys the whole tab out: its CLI was stopped to free memory (session-suspend.ts).
+  tab.classList.toggle('tab-suspended', suspended === true);
   const existing = tab.querySelector('.tab-exited-badge');
   // Quiets the status dot too. That dot reports `status`, which stays `idle` or
   // `busy` for an exited pane by design, so without this a green or pulsing dot
@@ -6396,7 +6401,7 @@ class CodemanApp {
     return {
       state,
       exited,
-      pill: exited ? 'exited' : this._sidebarRichPillLabel(state),
+      pill: exited ? exit.label || 'exited' : this._sidebarRichPillLabel(state),
       // What the pane's own footer says is still running in the background ("1 monitor",
       // "2 shells"). A row that has one went quiet because the agent is waiting for that,
       // which is a different thing from waiting for the user — so it rides BESIDE the
@@ -6990,7 +6995,7 @@ class CodemanApp {
         // The exited-agent badge (Ark0N/Codeman#446). A session going from live
         // to exited changes no tab count, so the full rebuild below never runs
         // for it and this is the only path that ever draws the badge.
-        applyPaneExitBadge(tab, session.paneExit);
+        applyPaneExitBadge(tab, session.paneExit, session.suspended);
 
         // Rich sidebar meta ("created 3d ago · working 12m" + pill). The stamps
         // themselves move on _tickSidebarRichTimes(); this is here for the parts
@@ -7468,7 +7473,7 @@ class CodemanApp {
       // '' whenever the server said nothing about this pane's agent, which covers
       // a running pane and every session shape the field never applies to
       // (direct-PTY, remote SSH, docker). See paneExitLabel().
-      const paneExitBadge = paneExitLabel(session.paneExit);
+      const paneExitBadge = paneExitLabel(session.paneExit, session.suspended);
 
       // Which harness runs here. A shell keeps its SH pill (it is not an agent);
       // every agent CLI, claude included, shows its logo through PR #532's
@@ -7486,7 +7491,7 @@ class CodemanApp {
       // handler acts only on a focused tab, and the header strip has no row menu.
       const tabActionsHtml = `<span class="tab-actions"><span class="tab-gear" onclick="event.stopPropagation(); app.openSessionOptions(${escapeHtml(JSON.stringify(id))})" title="Session options" aria-label="Session options" tabindex="0">&#x2699;</span><span class="tab-detach" onclick="event.stopPropagation(); app.detachSession(${escapeHtml(JSON.stringify(id))})" title="Open in a new window" aria-label="Open session in a new window" tabindex="0">&#x29C9;</span><span class="tab-new" onclick="event.stopPropagation(); app.openTabNewSessionMenu(event, ${escapeHtml(JSON.stringify(id))})" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); app.openTabNewSessionMenu(event, ${escapeHtml(JSON.stringify(id))}); }" title="New session here" aria-label="New session in this tab's case" aria-haspopup="menu" tabindex="0">+</span><span class="tab-close" onclick="event.stopPropagation(); app.requestCloseSession(${escapeHtml(JSON.stringify(id))})" title="Close session" aria-label="Close session" tabindex="0">&times;</span><button type="button" class="tab-more" onclick="event.stopPropagation(); app.openTabRailActionMenu(event, ${escapeHtml(JSON.stringify(id))})" title="Session actions" aria-label="Session actions">&#x22EF;</button></span>`;
 
-      rowHtml.set(id, `<div class="session-tab ${isActive ? 'active' : ''}${alertClass}${richClass}${paneExitBadge ? ' tab-agent-exited' : ''}${loadState ? ' tab-loading' : ''}${this.hasTabDetachOverride(id) ? ' tab-show-detach' : ''}${this._tileGrid?.has(id) ? ' in-tiles' : ''}"${richData}${railOrderStyle} data-id="${id}" data-color="${color}" ${loadState ? `data-load-phase="${escapeHtml(loadState.phase)}"` : ''} onclick="app.handleSessionTabClick(event, ${escapeHtml(JSON.stringify(id))})" oncontextmenu="event.preventDefault(); app.startInlineRename(${escapeHtml(JSON.stringify(id))})" tabindex="0" role="tab" aria-selected="${isActive ? 'true' : 'false'}" aria-busy="${loadState ? 'true' : 'false'}" aria-label="${escapeHtml(paneExitAriaLabel(name, paneExitBadge))}" data-aria-source="${escapeHtml(paneExitAriaLabel(name, paneExitBadge))}" ${tabTooltip ? `title="${escapeHtml(tabTooltip)}"` : ''}>
+      rowHtml.set(id, `<div class="session-tab ${isActive ? 'active' : ''}${alertClass}${richClass}${paneExitBadge ? ' tab-agent-exited' : ''}${session.suspended ? ' tab-suspended' : ''}${loadState ? ' tab-loading' : ''}${this.hasTabDetachOverride(id) ? ' tab-show-detach' : ''}${this._tileGrid?.has(id) ? ' in-tiles' : ''}"${richData}${railOrderStyle} data-id="${id}" data-color="${color}" ${loadState ? `data-load-phase="${escapeHtml(loadState.phase)}"` : ''} onclick="app.handleSessionTabClick(event, ${escapeHtml(JSON.stringify(id))})" oncontextmenu="event.preventDefault(); app.startInlineRename(${escapeHtml(JSON.stringify(id))})" tabindex="0" role="tab" aria-selected="${isActive ? 'true' : 'false'}" aria-busy="${loadState ? 'true' : 'false'}" aria-label="${escapeHtml(paneExitAriaLabel(name, paneExitBadge))}" data-aria-source="${escapeHtml(paneExitAriaLabel(name, paneExitBadge))}" ${tabTooltip ? `title="${escapeHtml(tabTooltip)}"` : ''}>
           ${_tabIdx < 9 ? '<span class="tab-number">' + (_tabIdx + 1) + '</span>' : ''}
           ${loadState ? '<span class="tab-load-spinner" aria-hidden="true"></span>' : ''}
           <span class="tab-status ${status}" aria-hidden="true"></span>

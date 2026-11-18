@@ -170,6 +170,8 @@ function couldNudge(s: KeepWarmSessionView): boolean {
 /** What the service needs from a session; `Session` satisfies it structurally. */
 export interface KeepWarmSessionView {
   readonly id: string;
+  /** Suspended on purpose (`session-suspend.ts`): no process to keep warm. */
+  readonly suspended?: boolean;
   readonly createdAt: number;
   readonly pid: number | null;
   /** Set when the agent exited in a pane that stays open (`remain-on-exit`); the pid stays. */
@@ -362,7 +364,7 @@ export class PromptCacheKeepWarmService implements KeepWarmScheduler {
         statusLine: session.statusLineExporter,
         cache: session.promptCache,
         idle: session.isIdle() && !session.isWorking,
-        paneAlive: session.pid !== null && !session.paneExit,
+        paneAlive: session.pid !== null && !session.paneExit && !session.suspended,
         limitPaused: session.isLimitPaused,
         automationActive: this.ports.isAutomationActive(id),
         pendingApproval: this.ports.hasPendingApproval(id),

@@ -179,6 +179,8 @@ const TMUX_KILL_WAIT_MS = 200;
 
 /** How long the pane's process group gets to exit on SIGTERM before SIGKILL. Also a deadline. */
 const GRACEFUL_SHUTDOWN_WAIT_MS = 100;
+/** How long a suspend leaves the agent to exit on SIGTERM (flush its transcript) before SIGKILL. */
+const SUSPEND_GRACEFUL_WAIT_MS = 5000;
 
 /** How long killSession waits for every process it signalled to be gone before it warns. */
 const KILL_VERIFY_TIMEOUT_MS = 2000;
@@ -3329,6 +3331,75 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * Uses a 4-strategy approach (children → process group → tmux kill → SIGKILL).
    * In test mode: removes from memory only (no real kill).
    */
+  /**
+   * Stop the agent running in a session's pane and KEEP the tmux session: the pane
+   * stays as a dead pane (`remain-on-exit`), so a later `respawnPane()` relaunches
+   * the CLI in place. Used by session suspend (`session-suspend.ts`).
+   *
+   * The whole pane process group gets SIGTERM first, not just the agent: local
+   * launch commands read `claude --resume X || claude --session-id Y`, and killing
+   * only the agent would let the wrapping shell run the fallback and start it
+   * again. Descendants that left the group are collected before the signal (shared
+   * daemons excluded, see `killableDescendants`) and swept after it. Survivors get
+   * SIGKILL after `SUSPEND_GRACEFUL_WAIT_MS`, which leaves the agent time to flush
+   * its transcript.
+   *
+   * Local panes only: a remote pane is an ssh client, and killing it would leave the
+   * remote agent running. Returns true once the pane reads dead.
+   */
+  async stopPaneProcesses(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.remote || session.docker) return false;
+    if (IS_TEST_MODE) return false;
+    if (!isValidMuxName(session.muxName)) return false;
+    const panePid = await this.getPanePidAsync(session.muxName);
+    if (!panePid || panePid <= 1) return false;
+
+    const descendants = await this.killableDescendants(session.mode, panePid, await this.getChildPidsFresh(panePid));
+    console.log(
+      `[TmuxManager] Stopping pane processes of ${session.muxName} (pane PID ${panePid}, ${descendants.length} descendants)`
+    );
+    try {
+      process.kill(-panePid, 'SIGTERM');
+    } catch {
+      try {
+        process.kill(panePid, 'SIGTERM');
+      } catch {
+        // already gone
+      }
+    }
+    for (const pid of descendants) {
+      if (this.isProcessAlive(pid)) {
+        try {
+          process.kill(pid, 'SIGTERM');
+        } catch {
+          // already gone
+        }
+      }
+    }
+    await waitForProcessesExit([panePid, ...descendants], { timeoutMs: SUSPEND_GRACEFUL_WAIT_MS });
+    for (const pid of [panePid, ...descendants]) {
+      if (this.isProcessAlive(pid)) {
+        try {
+          process.kill(pid, 'SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+    }
+    try {
+      process.kill(-panePid, 'SIGKILL');
+    } catch {
+      // group empty
+    }
+    // tmux notices the exit asynchronously.
+    for (let i = 0; i < 20; i++) {
+      if (this.isPaneDead(session.muxName)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return this.isPaneDead(session.muxName);
+  }
+
   async killSession(sessionId: string): Promise<boolean> {
     const session = this.sessions.get(sessionId);
     if (!session) {

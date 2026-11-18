@@ -16,6 +16,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import WebSocket from 'ws';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
+import { SessionSuspendRegistry, attachSuspendRegistry } from '../../src/session-suspend.js';
 import { registerWsRoutes } from '../../src/web/routes/ws-routes.js';
 import { MAX_INPUT_LENGTH } from '../../src/config/terminal-limits.js';
 
@@ -206,6 +207,33 @@ describe('ws-routes', () => {
         await vi.waitFor(() => {
           expect(session.writeBuffer).toContain('ls -la\r');
         });
+      } finally {
+        ws.close();
+      }
+    });
+
+    it('a suspended session: the keystroke goes to the suspend registry, not the dead pane, and is ACKed', async () => {
+      const session = ctx._session;
+      session.setSuspended(1);
+      session.restartCli.mockResolvedValue(false); // keep it suspended: the input stays held
+      attachSuspendRegistry(
+        ctx,
+        new SessionSuspendRegistry({
+          stopPane: async () => true,
+          capturePane: () => null,
+          persist: () => {},
+          now: () => 0,
+          sleep: async () => {},
+          log: () => {},
+        })
+      );
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        ws.send(JSON.stringify({ t: 'i', d: 'wake\r', cid: 'c1', seq: 1 }));
+        expect(await nextMessage(ws)).toEqual({ t: 'ia', seq: 1 });
+        // The registry started a resume and holds the bytes; nothing went into the dead pane.
+        await vi.waitFor(() => expect(session.restartCli).toHaveBeenCalledTimes(1));
+        expect(session.writeBuffer).not.toContain('wake\r');
       } finally {
         ws.close();
       }

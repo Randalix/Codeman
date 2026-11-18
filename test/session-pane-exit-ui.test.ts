@@ -175,7 +175,7 @@ describe('the exited-agent badge in a tab', () => {
   });
 
   it('is what the incremental render path calls', () => {
-    expect(appJs).toContain('applyPaneExitBadge(tab, session.paneExit)');
+    expect(appJs).toContain('applyPaneExitBadge(tab, session.paneExit, session.suspended)');
   });
 });
 

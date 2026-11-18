@@ -3341,6 +3341,13 @@ html.mobile-init .file-browser-panel {
 
   /* An exited agent (Ark0N/Codeman#446): neutral, since nothing is running behind
      the row. The dot and the row take `--exited` too and keep their base rules. */
+  /* A suspended session (session-suspend.ts): greyed out, a tap opens it and the
+     first input resumes it. */
+  .mobile-overview-row--suspended {
+    opacity: 0.45;
+    filter: grayscale(1);
+  }
+
   .mobile-overview-pill--exited {
     border-color: var(--text-muted);
     color: var(--text-muted);
