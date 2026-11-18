@@ -116,9 +116,14 @@ export function registerInboxRoutes(
     const suspend = suspendRegistryOf(ctx);
     const resuming = nudge !== false && !!suspend?.isHolding(session);
     if (resuming) {
-      void suspend!.resume(session).then((ok) => {
-        if (ok) scheduleNudge();
-      });
+      void suspend!
+        .resume(session)
+        .then((ok) => {
+          if (ok) scheduleNudge();
+        })
+        .catch(() => {
+          // resume() logs its own failures; the mail waits for the next input
+        });
     } else {
       scheduleNudge();
     }
