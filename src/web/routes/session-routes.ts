@@ -2396,7 +2396,10 @@ export function registerSessionRoutes(
           );
         }
       } else {
-        const outcome = suspend.handleInput(session, inputStr);
+        // Written the way the live branches below would write it: a plain prompt (or an
+        // explicit useMux) through the mux, anything else raw.
+        const viaMux = useMux === true || (useMux === undefined && isPlainPromptInput(inputStr));
+        const outcome = suspend.handleInput(session, inputStr, viaMux ? 'mux' : 'raw');
         return outcome === 'dropped'
           ? { buffered: true, dropped: true, resuming: true }
           : { buffered: true, resuming: true };

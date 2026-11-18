@@ -43,6 +43,21 @@ export interface SuspendableSession {
   setSuspended(at: number | null): void;
   restartCli(): Promise<boolean>;
   writeViaMux(data: string, options?: { fromUser?: boolean }): Promise<boolean>;
+  write(data: string, options?: { fromUser?: boolean }): boolean;
+}
+
+/**
+ * How a held chunk is written once the CLI is back, the same way it would have been
+ * written to a live session: `raw` straight into the pane (browser keystrokes,
+ * `POST /input` with control bytes), `mux` through `writeViaMux` (a plain prompt:
+ * pasted, Enter pressed separately). `writeViaMux` trims whitespace, so a lone space
+ * keystroke sent that way vanishes.
+ */
+export type HeldInputMode = 'raw' | 'mux';
+
+interface HeldChunk {
+  data: string;
+  mode: HeldInputMode;
 }
 
 export interface SessionSuspendDeps {
@@ -109,7 +124,7 @@ export function paneShowsComposer(text: string | null): boolean {
 }
 
 interface SuspendState {
-  pending: string[];
+  pending: HeldChunk[];
   pendingBytes: number;
   resuming: Promise<boolean> | null;
 }
@@ -171,18 +186,20 @@ export class SessionSuspendRegistry {
    * resume, which this starts if it is not running yet. `dropped` = the chunk did not
    * fit the buffer and is gone.
    */
-  handleInput(session: SuspendableSession, data: string): 'buffered' | 'dropped' {
+  handleInput(session: SuspendableSession, data: string, mode: HeldInputMode = 'raw'): 'buffered' | 'dropped' {
     const state = this.state(session.id);
     let outcome: 'buffered' | 'dropped' = 'buffered';
     if (data.length > SUSPEND_INPUT_BUFFER_BYTES) {
       outcome = 'dropped';
     } else {
-      state.pending.push(data);
+      state.pending.push({ data, mode });
       state.pendingBytes += data.length;
       while (state.pendingBytes > SUSPEND_INPUT_BUFFER_BYTES && state.pending.length > 1) {
         const old = state.pending.shift()!;
-        state.pendingBytes -= old.length;
-        this.deps.log(`[Suspend] ${session.id.slice(0, 8)}: input buffer full, dropped ${old.length} oldest bytes`);
+        state.pendingBytes -= old.data.length;
+        this.deps.log(
+          `[Suspend] ${session.id.slice(0, 8)}: input buffer full, dropped ${old.data.length} oldest bytes`
+        );
       }
     }
     if (!state.resuming && session.suspended) {
@@ -244,9 +261,18 @@ export class SessionSuspendRegistry {
 
     while (state.pending.length > 0) {
       const chunk = state.pending.shift()!;
-      state.pendingBytes -= chunk.length;
-      const ok = await session.writeViaMux(chunk, { fromUser: true }).catch(() => false);
-      if (!ok) this.deps.log(`[Suspend] ${id8}: held input could not be written (${chunk.length} bytes)`);
+      state.pendingBytes -= chunk.data.length;
+      let ok = false;
+      if (chunk.mode === 'mux') {
+        ok = await session.writeViaMux(chunk.data, { fromUser: true }).catch(() => false);
+      } else {
+        try {
+          ok = session.write(chunk.data, { fromUser: true });
+        } catch {
+          ok = false;
+        }
+      }
+      if (!ok) this.deps.log(`[Suspend] ${id8}: held input could not be written (${chunk.data.length} bytes)`);
     }
     this.deps.log(`[Suspend] ${id8}: resumed`);
     return true;

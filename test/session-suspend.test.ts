@@ -58,6 +58,10 @@ class FakeSession implements SuspendableSession {
     return this.restartResult;
   }
   async writeViaMux(data: string): Promise<boolean> {
+    this.written.push(`mux:${data}`);
+    return true;
+  }
+  write(data: string): boolean {
     this.written.push(data);
     return true;
   }
@@ -175,6 +179,20 @@ describe('SessionSuspendRegistry: input wakes the session', () => {
     expect(s.written).toEqual(['h', 'i', '\r']);
     expect(s.suspended).toBe(false);
     expect(reg.isHolding(s)).toBe(false);
+  });
+
+  it('keystrokes go back raw, so a lone space survives; a plain prompt goes through the mux', async () => {
+    // Live 2026-11-18: typed in the browser, "Reply with exactly" arrived as
+    // "Replywithexactly" because each held keystroke went through writeViaMux, which
+    // trims whitespace.
+    const s = new FakeSession();
+    const d = deps(s);
+    const reg = new SessionSuspendRegistry(d);
+    await reg.suspend(s);
+    for (const k of ['a', ' ', 'b', '\r']) reg.handleInput(s, k);
+    reg.handleInput(s, 'next prompt\r', 'mux');
+    expect(await reg.resume(s)).toBe(true);
+    expect(s.written).toEqual(['a', ' ', 'b', '\r', 'mux:next prompt\r']);
   });
 
   it('delivers after the timeout when the composer never shows', async () => {
