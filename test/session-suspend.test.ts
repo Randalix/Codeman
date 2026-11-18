@@ -30,6 +30,7 @@ import {
   type SuspendableSession,
 } from '../src/session-suspend.js';
 import { shouldCloseCleanlyExitedSession } from '../src/pane-exit-sweep.js';
+import { Session } from '../src/session.js';
 
 const COMPOSER = 'previous answer\n\n────\n❯ \n────\n  Opus  ctx:14%\n';
 
@@ -98,6 +99,71 @@ function deps(
   };
   return out;
 }
+
+describe('background work blocks a suspend (Ark0N, #836)', () => {
+  // The real Session reader over the registry's claude patterns, on a fake pane.
+  const real = (screen: string) =>
+    new Session({
+      workingDir: '/tmp',
+      mode: 'claude',
+      mux: { isAvailable: () => true, capturePaneText: () => screen } as never,
+      muxSession: { muxName: 'codeman-test', sessionId: 'test', createdAt: Date.now() },
+    } as ConstructorParameters<typeof Session>[0]);
+  const footer = (row: string) => `answer\n╭────╮\n│ ❯  │\n╰────╯\n  ~/x [main] Opus ctx: 11%\n  ${row}\n`;
+  const MONITOR = footer('⏵⏵ bypass permissions on · 1 monitor · ← for agents');
+  const SHELLS = footer('⏵⏵ bypass permissions on · 2 shells · ← for agents');
+  const WORKFLOW = [
+    '⏺ The research is running now.',
+    '✻ Waiting for 1 dynamic workflow to finish',
+    '────',
+    '❯ ',
+    '────',
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    '',
+  ].join('\n');
+  const PLAIN = footer('⏵⏵ bypass permissions on (shift+tab to cycle)');
+
+  it('Session.backgroundWorkOnScreen reads the chip and the waiting row', () => {
+    const s = real('');
+    expect(s.backgroundWorkOnScreen(MONITOR)).toBe('1 monitor');
+    expect(s.backgroundWorkOnScreen(SHELLS)).toBe('2 shells');
+    expect(s.backgroundWorkOnScreen(WORKFLOW)).toBe('workers it is waiting for');
+    expect(s.backgroundWorkOnScreen(PLAIN)).toBeNull();
+  });
+
+  it('refuses with background-work, read fresh off the pane, and stops nothing', async () => {
+    const s = new FakeSession();
+    const reader = real('');
+    Object.assign(s, { backgroundWorkOnScreen: (t: string) => reader.backgroundWorkOnScreen(t) });
+    const d = deps(s);
+    d.screens.push(MONITOR);
+    const r = new SessionSuspendRegistry(d);
+    const result = await r.suspend(s);
+    expect(result).toMatchObject({ ok: false, reason: 'background-work' });
+    expect(!result.ok && result.message).toContain('1 monitor');
+    expect(s.events).toEqual([]);
+    expect(s.suspended).toBe(false);
+  });
+
+  it('a fresh screen without work wins over a stale cached label', async () => {
+    const s = new FakeSession();
+    const reader = real('');
+    Object.assign(s, {
+      watching: '1 monitor',
+      backgroundWorkOnScreen: (t: string) => reader.backgroundWorkOnScreen(t),
+    });
+    const d = deps(s);
+    d.screens.push(PLAIN);
+    expect((await new SessionSuspendRegistry(d).suspend(s)).ok).toBe(true);
+  });
+
+  it('an unreadable pane falls back to the cached label', async () => {
+    const s = new FakeSession();
+    Object.assign(s, { watching: '1 shell', backgroundWorkOnScreen: () => null });
+    const d = deps(s, { capturePane: () => null });
+    expect(await new SessionSuspendRegistry(d).suspend(s)).toMatchObject({ ok: false, reason: 'background-work' });
+  });
+});
 
 describe('suspendRefusal', () => {
   it('accepts an idle local claude session', () => {

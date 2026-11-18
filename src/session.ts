@@ -4262,6 +4262,20 @@ export class Session extends EventEmitter {
   }
 
   /**
+   * What `paneText` says still runs in the background: the watching chip (`1 monitor`,
+   * `2 shells`, …) or a newest turn that ended waiting for workers it started. Null when
+   * neither, or for a CLI that declares no such rows. Read fresh by callers about to end
+   * the process (session suspend), which must not trust the label cached at the last
+   * idle transition. Same registry patterns as `_readWatching`/`_paneAwaitsWorkers`.
+   */
+  backgroundWorkOnScreen(paneText: string): string | null {
+    const pattern = this._watchingLinePattern();
+    const label = pattern ? watchingLabel(paneText, pattern, this._watchingWindow) : null;
+    if (label) return label;
+    return this._paneAwaitsWorkers(paneText) ? 'workers it is waiting for' : null;
+  }
+
+  /**
    * The regex matching this CLI's background-work chip, or null for a CLI whose registry
    * entry declares none. Compiled once per session, like the working-line pattern, and
    * null rather than a fallback: no other CLI has been measured drawing such a chip, and

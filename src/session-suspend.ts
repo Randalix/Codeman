@@ -43,6 +43,10 @@ export interface SuspendableSession {
   readonly adopt?: unknown;
   readonly muxName: string | null;
   readonly suspended: boolean;
+  /** Background work label cached at the last idle transition (`Session.watching`). */
+  readonly watching?: string | null;
+  /** Background work read fresh off a pane capture (`Session.backgroundWorkOnScreen`). */
+  backgroundWorkOnScreen?(paneText: string): string | null;
   setSuspended(at: number | null): void;
   restartCli(): Promise<boolean>;
   writeViaMux(data: string, options?: { fromUser?: boolean }): Promise<boolean>;
@@ -87,6 +91,7 @@ export interface SessionSuspendDeps {
 export type SuspendRefusalReason =
   | 'already-suspended'
   | 'busy'
+  | 'background-work'
   | 'unsupported-mode'
   | 'remote-not-owned'
   | 'remote-override'
@@ -154,6 +159,12 @@ export class SessionSuspendRegistry {
 
   constructor(private readonly deps: SessionSuspendDeps) {}
 
+  private backgroundWork(session: SuspendableSession): string | null {
+    const text = session.muxName ? this.deps.capturePane(session.muxName) : null;
+    if (text !== null && session.backgroundWorkOnScreen) return session.backgroundWorkOnScreen(text);
+    return session.watching ?? null;
+  }
+
   /** Should input to this session be handed to {@link handleInput} instead of written? */
   isHolding(session: SuspendableSession): boolean {
     return session.suspended || this.states.get(session.id)?.resuming != null;
@@ -164,6 +175,17 @@ export class SessionSuspendRegistry {
     if (refusal) return { ok: false, ...refusal };
     if (this.states.get(session.id)?.resuming) {
       return { ok: false, reason: 'busy', message: 'The session is resuming right now.' };
+    }
+    // An idle session can still run monitors, background shells or workflows it started
+    // (Ark0N in #836): stopping the CLI ends them. Read off the screen now; the cached
+    // label only stands in when the pane cannot be captured.
+    const work = this.backgroundWork(session);
+    if (work) {
+      return {
+        ok: false,
+        reason: 'background-work',
+        message: `The session still runs background work (${work}); suspending would end it. Suspend it once that has finished.`,
+      };
     }
     // Marked before the stop, so the exit the pane watcher reads in the meantime meets a
     // suspended session (the clean-exit sweep and the respawn paths skip it).
