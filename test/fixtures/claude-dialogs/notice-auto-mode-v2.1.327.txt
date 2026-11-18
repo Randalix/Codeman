@@ -1,0 +1,40 @@
+ ▐▛███▛█   Claude Code v2.1.327
+▝▜██████▀  Sonnet 5.5 with medium effort · Claude Ultra
+ ▝▝   ▝▝   /…/00000000-0000-0000-0000-000000000000/scratchpad/perm-probe
+
+
+❯ Use the AskUserQuestion tool right now to ask me which color I prefer, options red and blue, each
+  with a short description. Do nothing else.
+
+● Answered Claude's questions:
+  ⎿  · Which color do you prefer? → Blue
+
+● You picked Blue.
+
+✻ Worked for 2s · done 16:25
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 2 agents
+  tmux focus-events off · add 'set -g focus-events on' to ~/.tmux.conf and reattach for focus tra…
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  Teach auto mode about your environment?
+
+  Auto mode works better when it knows your environment. Takes about a minute.
+
+  ❯ 1. Yes
+    2. Not now
+    3. Don't show again
+
+  Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
