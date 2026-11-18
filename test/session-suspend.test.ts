@@ -362,6 +362,7 @@ describe('suspend wiring guard', () => {
     expect(users).toEqual(
       [
         'session-suspend.ts', // the definition
+        join('web', 'routes', 'inbox-routes.ts'), // a post resumes the receiver (request only)
         join('web', 'routes', 'session-routes.ts'),
         join('web', 'routes', 'ws-routes.ts'),
         join('web', 'server.ts'),

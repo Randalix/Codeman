@@ -477,6 +477,9 @@
              scrolled away with the output it described and could not be acted
              on. Populated by app.js _renderHistoryTruncationBanner(). -->
         <div class="history-trunc-bar" id="historyTruncationBar" role="status" aria-live="polite" hidden></div>
+        <!-- Suspended session (session-suspend.ts): its CLI was stopped to free memory.
+             Says how to get it back; populated by app.js _renderSuspendedBar(). -->
+        <div class="suspended-session-bar" id="suspendedSessionBar" role="status" aria-live="polite" hidden></div>
         <div class="terminal-container" id="terminalContainer"></div>
         <button type="button" class="terminal-scroll-bottom" id="terminalScrollBottom"
           aria-label="Scroll to bottom" title="Scroll to bottom" hidden>

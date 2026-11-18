@@ -1109,7 +1109,10 @@ export function registerSessionRoutes(
         if (outcome === 'no-target') return (await remoteWake.checkHostReachable(remote, { force: true })) !== false;
         return true;
       },
-      onResumed: (s) => ctx.mux.unguardRemoteReconnect?.(s.id),
+      onResumed: (s) => {
+        ctx.mux.unguardRemoteReconnect?.(s.id);
+        void ctx.mux.clearSuspendedPaneNotice?.(s.id);
+      },
     });
   attachSuspendRegistry(ctx, suspend);
 

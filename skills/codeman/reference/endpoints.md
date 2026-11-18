@@ -491,9 +491,10 @@ dead pane, and shows it greyed out. The next input brings the same conversation 
   `dropped:true` = over the cap, gone) and typed once the composer is back. With `wait`,
   the call awaits the resume, then writes and waits as usual. Browser keystrokes go the
   same way.
-- **The mailbox does not resume it.** The inbox nudge skips a suspended session; the
-  post waits in its inbox until something resumes it. Send a prompt (or `resume`) when
-  it has to act.
+- **A mailbox post resumes it** (`POST .../inbox` answers `resuming:true`): the
+  session comes back, then the usual nudge tells it to read its inbox. `nudge:false`
+  (`--no-nudge`) leaves it suspended, the mail waits. Only the post request resumes;
+  the nudger's retries, the boot re-arm and coordinator reports never do.
 - Session state carries `suspended` / `suspendedAt`, and the suspend survives a server
   restart. claude only; docker and remote panes Codeman did not start are refused.
 - **Remote:** a resume wakes a sleeping host first (wake-on-LAN, when the host has a

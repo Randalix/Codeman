@@ -315,6 +315,38 @@ Object.assign(CodemanApp.prototype, {
     if (options.restoreFocus) trigger?.focus?.();
   },
 
+  // The row menu's suspend/resume item: "Wake session" for a suspended session,
+  // "Suspend session" for a claude one, nothing for other CLIs (the server would
+  // refuse them anyway; an item that always fails is noise).
+  _suspendMenuActions(sessionId) {
+    const session = this.sessions?.get?.(sessionId);
+    if (!session) return [];
+    if (session.suspended) return [{ label: 'Wake session', run: () => this.setSessionSuspended(sessionId, false) }];
+    if (session.mode !== 'claude') return [];
+    return [{ label: 'Suspend session', run: () => this.setSessionSuspended(sessionId, true) }];
+  },
+
+  // POST suspend or resume and say what happened. The tab greys out (or back)
+  // through the regular session update; the toast only reports refusals and the
+  // wait for a resume, which can take a while when a remote host has to wake.
+  async setSessionSuspended(sessionId, suspend) {
+    const action = suspend ? 'suspend' : 'resume';
+    if (!suspend) this.showToast('Waking session…', 'info');
+    const res = await this._api(`/api/sessions/${encodeURIComponent(sessionId)}/${action}`, { method: 'POST' });
+    if (res?.ok) {
+      if (suspend) this.showToast('Session suspended — type in it to resume', 'success');
+      return true;
+    }
+    let message = '';
+    try {
+      message = (await res?.json())?.error || '';
+    } catch {
+      /* non-JSON error body */
+    }
+    this.showToast(message || `Could not ${action} the session`, 'error');
+    return false;
+  },
+
   openTabRailActionMenu(event, sessionId) {
     event.preventDefault();
     event.stopPropagation();
@@ -345,6 +377,9 @@ Object.assign(CodemanApp.prototype, {
             this.detachedSessions?.has(sessionId)
           ? [{ label: 'Open in a new window', run: () => this.detachSession(sessionId) }]
           : []),
+      // Suspend or resume (session-suspend.ts). Claude sessions only; the server
+      // still refuses busy, docker or foreign remote panes with a reason.
+      ...this._suspendMenuActions(sessionId),
       { label: 'Close session', className: 'danger', run: () => this.requestCloseSession(sessionId) },
     ];
     for (const action of actions) {

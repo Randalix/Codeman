@@ -52,6 +52,7 @@ import { sessionWaits, WaitCapacityError, type InboxWaitResult } from '../sessio
 import { clampWaitMs } from '../../config/agent-wait.js';
 import type { SessionPort } from '../ports/index.js';
 import type { InboxNudger } from '../inbox-nudger.js';
+import { suspendRegistryOf } from '../../session-suspend.js';
 
 /** Per-session counts the summary route reports. */
 export interface InboxSessionSummary {
@@ -106,10 +107,30 @@ export function registerInboxRoutes(
     // After the store, so a parked reader that wakes finds the message.
     sessionWaits.notifyInbox(id);
     // Downstream: an idle receiver that never reads gets one short nudge (web/inbox-nudger).
-    options.nudger?.schedule(id, from ?? 'user', { nudge, messageId: result.message.id, receiverWaiting });
+    const scheduleNudge = () =>
+      options.nudger?.schedule(id, from ?? 'user', { nudge, messageId: result.message.id, receiverWaiting });
+    // Downstream: a post brings a suspended receiver back (session-suspend.ts), then the
+    // nudge tells it to read. Only here, on the post request itself: the nudger's timers
+    // and its boot rearm() never resume (a remote resume wakes the host). `--no-nudge`
+    // opts out of both, the mail then waits for the next input.
+    const suspend = suspendRegistryOf(ctx);
+    const resuming = nudge !== false && !!suspend?.isHolding(session);
+    if (resuming) {
+      void suspend!.resume(session).then((ok) => {
+        if (ok) scheduleNudge();
+      });
+    } else {
+      scheduleNudge();
+    }
     return {
       success: true,
-      data: { sessionId: id, message: result.message, pending: result.pending, unseen: result.unseen },
+      data: {
+        sessionId: id,
+        message: result.message,
+        pending: result.pending,
+        unseen: result.unseen,
+        ...(resuming ? { resuming: true } : {}),
+      },
     };
   });
 

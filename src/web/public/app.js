@@ -6851,6 +6851,8 @@ class CodemanApp {
   }
 
   _renderSessionTabsImmediate() {
+    // Every session update lands here, so the suspended bar follows suspend/resume.
+    this._renderSuspendedBar();
     // Same guard as renderSessionTabs()/_fullRenderSessionTabs(): the incremental
     // branch below rewrites .tab-name's innerHTML, which destroys the inline rename
     // <input> mid-keystroke. Guarding only the scheduler is not enough: a render
@@ -10009,6 +10011,48 @@ class CodemanApp {
    * to the top of this tab's buffer) and never again for a session whose notice
    * the user dismissed on this page.
    */
+  /**
+   * The bar over the terminal of a suspended session (session-suspend.ts): the pane
+   * only shows tmux's exit line, so it says what happened and offers a Wake button.
+   * Typing resumes the session as well. Rebuilt only when the session changes, so a
+   * pressed button keeps its "Waking…" state across the updates of its own resume.
+   */
+  _renderSuspendedBar() {
+    const bar = document.getElementById('suspendedSessionBar');
+    if (!bar) return;
+    const sessionId = this.activeSessionId;
+    const session = sessionId ? this.sessions?.get(sessionId) : null;
+    if (!session?.suspended) {
+      bar.hidden = true;
+      bar.dataset.sessionId = '';
+      return;
+    }
+    if (!bar.hidden && bar.dataset.sessionId === sessionId) return;
+    bar.dataset.sessionId = sessionId;
+    bar.textContent = '';
+    const label = document.createElement('span');
+    label.className = 'suspended-session-text';
+    label.textContent = session.remote
+      ? 'Suspended to free memory on its host. Type to resume it, or'
+      : 'Suspended to free memory. Type to resume it, or';
+    bar.appendChild(label);
+    const wake = document.createElement('button');
+    wake.type = 'button';
+    wake.className = 'suspended-session-wake';
+    wake.textContent = 'Wake';
+    wake.onclick = () => {
+      wake.disabled = true;
+      wake.textContent = 'Waking…';
+      Promise.resolve(this.setSessionSuspended?.(sessionId, false)).finally(() => {
+        // Still suspended (refused or failed): offer the button again.
+        bar.dataset.sessionId = '';
+        this._renderSuspendedBar();
+      });
+    };
+    bar.appendChild(wake);
+    bar.hidden = false;
+  }
+
   _renderHistoryTruncationBanner() {
     const bar = document.getElementById('historyTruncationBar');
     if (!bar) return;
@@ -10178,6 +10222,7 @@ class CodemanApp {
     // live output, so the notice waits for a scroll to the top again.
     this._historyNoticeRevealedFor = null;
     this._renderHistoryTruncationBanner();
+    this._renderSuspendedBar();
     try { localStorage.setItem('codeman-active-session', sessionId); } catch {}
     // Narrow SSE filter to the active session — server stops streaming
     // session:terminal events for other sessions to this client. Cuts

@@ -1919,12 +1919,15 @@ export async function agentPost(
   });
   // 409 = the receiver's inbox is full; nothing was stored. Passed through as an error.
   if (!res.json?.success) return fail(deps, describeFailure(res));
-  const data = res.json.data as { message?: InboxMessageRow; pending?: number; unseen?: number } | undefined;
+  const data = res.json.data as
+    | { message?: InboxMessageRow; pending?: number; unseen?: number; resuming?: boolean }
+    | undefined;
   if (deps.json) emitJson(deps, data ?? {});
   else
     deps.io.out(
       palette.ok(
-        `${GLYPH.ok} posted to ${target.id.slice(0, 8)} (${data?.pending ?? '?'} pending, ${data?.unseen ?? '?'} unseen)`
+        `${GLYPH.ok} posted to ${target.id.slice(0, 8)} (${data?.pending ?? '?'} pending, ${data?.unseen ?? '?'} unseen)` +
+          (data?.resuming ? ' — it was suspended and is resuming to read it' : '')
       )
     );
   return EXIT.ok;

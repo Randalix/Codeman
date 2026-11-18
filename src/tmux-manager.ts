@@ -182,6 +182,9 @@ const TMUX_KILL_WAIT_MS = 200;
 const GRACEFUL_SHUTDOWN_WAIT_MS = 100;
 /** How long a suspend leaves the agent to exit on SIGTERM (flush its transcript) before SIGKILL. */
 const SUSPEND_GRACEFUL_WAIT_MS = 5000;
+/** remain-on-exit-format of a suspended session's pane (no single quotes: shell-quoted). */
+export const SUSPENDED_PANE_NOTICE =
+  'Suspended to free memory (#{t:pane_dead_time}). Type here, or press Wake, to resume.';
 
 /** How long killSession waits for every process it signalled to be gone before it warns. */
 const KILL_VERIFY_TIMEOUT_MS = 2000;
@@ -3353,13 +3356,40 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * reached fails the stop and lifts the lock again. Returns true once the pane reads
    * dead.
    */
+  /**
+   * Replace (or restore) the text tmux writes into a pane when its program exits,
+   * for the pane of a suspended session. Pane-scoped (`-p`), so other sessions keep
+   * the global "Pane is dead" line. Best effort: a failure only costs the wording.
+   */
+  private async setSuspendedPaneNotice(muxName: string, on: boolean): Promise<void> {
+    const cmd = on
+      ? `${this.tmux()} set-option -p -t "${muxName}" remain-on-exit-format '${SUSPENDED_PANE_NOTICE}'`
+      : `${this.tmux()} set-option -p -u -t "${muxName}" remain-on-exit-format`;
+    try {
+      await execAsync(cmd, { timeout: EXEC_TIMEOUT_MS });
+    } catch {
+      // older tmux (< 3.3) or the session is gone
+    }
+  }
+
+  /** The resumed pane runs a live CLI again: a later exit reads as an exit, not a suspend. */
+  async clearSuspendedPaneNotice(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session || !isValidMuxName(session.muxName)) return;
+    await this.setSuspendedPaneNotice(session.muxName, false);
+  }
+
   async stopPaneProcesses(sessionId: string): Promise<boolean> {
     const session = this.sessions.get(sessionId);
     if (!session || session.docker) return false;
     if (IS_TEST_MODE) return false;
     if (!isValidMuxName(session.muxName)) return false;
+    if (session.remote?.owned === false) return false;
+    // tmux prints remain-on-exit-format into the pane at the moment it dies, so the
+    // notice goes on before the stop: "Pane is dead (status 0)" read as final, and
+    // nobody typed into it to resume.
+    await this.setSuspendedPaneNotice(session.muxName, true);
     if (session.remote) {
-      if (session.remote.owned === false) return false;
       this.guardRemoteReconnect(sessionId);
       const { sessionName } = remoteTmuxLocation(session.remote, sessionId);
       console.log(
@@ -3367,6 +3397,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       );
       if (!(await stopRemoteTmuxSession(session.remote, sessionName))) {
         this.reconnectGuard.delete(sessionId);
+        await this.setSuspendedPaneNotice(session.muxName, false);
         console.warn(`[TmuxManager] Remote stop failed for ${session.muxName}; nothing was suspended`);
         return false;
       }
@@ -3377,7 +3408,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // The ssh client lingers: stopped like a local pane below.
     }
     const panePid = await this.getPanePidAsync(session.muxName);
-    if (!panePid || panePid <= 1) return false;
+    if (!panePid || panePid <= 1) {
+      await this.setSuspendedPaneNotice(session.muxName, false);
+      return false;
+    }
 
     const descendants = await this.killableDescendants(session.mode, panePid, await this.getChildPidsFresh(panePid));
     console.log(
