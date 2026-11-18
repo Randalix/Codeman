@@ -606,6 +606,39 @@ function sanitizeUploadStem(filename: string): string {
     .slice(0, 40);
 }
 
+/**
+ * Remove the staging folders a server that died mid-upload left behind (Ark0N in #837):
+ * the `finally` that removes each one never ran. Called once per server start. Only
+ * `remote-*` entries older than the call go, so an upload that started while the sweep
+ * was still listing keeps its folder; a symlink is removed as a link, never followed.
+ * Resolves to how many were removed.
+ */
+export async function sweepRemoteUploadStaging(
+  root: string = dataPath('upload-staging'),
+  startedAt: number = Date.now()
+): Promise<number> {
+  let entries: string[];
+  try {
+    entries = await fs.readdir(root);
+  } catch {
+    return 0; // no staging root yet: nothing was ever staged
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.startsWith('remote-')) continue;
+    try {
+      const st = await fs.lstat(join(root, entry));
+      if (st.mtimeMs >= startedAt) continue;
+      await fs.rm(join(root, entry), { recursive: true, force: true });
+      removed++;
+    } catch (err) {
+      console.warn(`[upload-staging] could not remove ${entry}: ${getErrorMessage(err)}`);
+    }
+  }
+  if (removed > 0) console.log(`[upload-staging] removed ${removed} folder(s) left by an interrupted upload`);
+  return removed;
+}
+
 /** A private, fresh folder a remote session's upload is received into before the ssh copy. */
 async function makeRemoteUploadStaging(): Promise<string> {
   const root = dataPath('upload-staging');
@@ -1143,6 +1176,8 @@ export function registerSessionRoutes(
       },
     });
   attachSuspendRegistry(ctx, suspend);
+  // Leftovers of uploads cut off by a restart. Registration runs once per server.
+  void sweepRemoteUploadStaging();
 
   /**
    * Install the approval hook MODULE a CLI declares (`capabilities.approvalHookFile`,
