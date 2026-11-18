@@ -541,6 +541,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('appSettingsApprovalsInbox').checked = settings.approvalsInboxEnabled === true;
     // Agent inbox snapshot on disk: synced, default OFF.
     document.getElementById('appSettingsAgentInboxPersist').checked = settings.agentInboxPersistEnabled === true;
+    document.getElementById('appSettingsAutoSuspend').checked = settings.autoSuspendEnabled === true;
+    document.getElementById('appSettingsAutoSuspendIdleMinutes').value = settings.autoSuspendIdleMinutes ?? 60;
     // Experimental agent coordination (inspect/stage/submit routes): synced, default OFF.
     document.getElementById('appSettingsAgentCoordination').checked = settings.agentCoordinationEnabled === true;
     // Custom Model Endpoint Profiles: synced, default OFF. The toggle governs both
@@ -3147,6 +3149,12 @@ Object.assign(CodemanApp.prototype, {
       configBackupDir: document.getElementById('appSettingsConfigBackupDir').value.trim(),
       ...this._configBackupRetentionPayload(_prev),
       agentInboxPersistEnabled: document.getElementById('appSettingsAgentInboxPersist').checked,
+      // Clamped to the schema's bounds: a value outside them fails the whole save.
+      autoSuspendEnabled: document.getElementById('appSettingsAutoSuspend').checked,
+      autoSuspendIdleMinutes: Math.min(
+        1440,
+        Math.max(5, parseInt(document.getElementById('appSettingsAutoSuspendIdleMinutes').value, 10) || 60)
+      ),
       agentCoordinationEnabled: document.getElementById('appSettingsAgentCoordination').checked,
       readMyMindEnabled: document.getElementById('appSettingsReadMyMind').checked,
       ultracodeFloatingWindows: document.getElementById('appSettingsUltracodeFloatingWindows').checked,

@@ -131,6 +131,15 @@ memory and a restart empties it; switching it off deletes the file and keeps wha
 memory. Messages expire 12 hours after they were posted either way. See
 [Driving Codeman From An Agent](Driving-Codeman-From-An-Agent#the-codeman-agent-commands).
 
+**Auto-suspend idle sessions** and **Auto-suspend after** (under **Cross-session
+features**, synced, off by default; `autoSuspendEnabled`, `autoSuspendIdleMinutes`, 5 to
+1440, default 60) suspend a local Claude session once it has sat idle that long, the same
+way `codeman agent suspend` does: the CLI stops, the session stays greyed out on the board,
+and typing into it resumes the same conversation. Idle counts from the last real prompt,
+keystroke, finished turn or resume, and from the server start. A session that works, runs
+background work or waits on a dialog is left running and tried again five minutes later.
+SSH sessions are never auto-suspended. Checked once a minute.
+
 **Experimental agent coordination** (under **Cross-session features**, synced, off by
 default) turns on the `codeman agent inspect`, `stage` and `submit` commands: bounded,
 paged reads of another session's output, and typing a prompt into a local Codex composer

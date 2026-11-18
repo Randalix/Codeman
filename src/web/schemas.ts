@@ -1687,6 +1687,13 @@ export const SettingsUpdateSchema = z
      */
     agentInboxPersistEnabled: z.boolean().optional(),
     /**
+     * Auto-suspend (src/session-auto-suspend.ts, downstream): suspend a local claude session that has
+     * sat idle this many minutes (5 to 1440, default 60), through the same checks as a manual suspend
+     * (never while it works, runs background work or waits on a dialog). Default OFF.
+     */
+    autoSuspendEnabled: z.boolean().optional(),
+    autoSuspendIdleMinutes: z.number().int().min(5).max(1440).optional(),
+    /**
      * Experimental agent coordination (src/web/routes/agent-session-routes.ts): bounded
      * inspection and the guarded stage/submit routes behind `codeman agent inspect|stage|submit`.
      * SYNCED, default OFF: the routes are labeled experimental and may change in a minor or

@@ -267,6 +267,19 @@ describe('SessionSuspendRegistry: input wakes the session', () => {
     expect(reg.isHolding(s)).toBe(false);
   });
 
+  it('records when the CLI came back (auto-suspend idle clock) and forgets it with the session', async () => {
+    const s = new FakeSession();
+    const d = deps(s);
+    const reg = new SessionSuspendRegistry(d);
+    expect(reg.lastResumedAt(s.id)).toBe(0);
+    await reg.suspend(s);
+    const relaunchedAt = d.now(); // stamped at the relaunch, before the composer wait moves the clock
+    expect(await reg.resume(s)).toBe(true);
+    expect(reg.lastResumedAt(s.id)).toBe(relaunchedAt);
+    reg.forget(s.id);
+    expect(reg.lastResumedAt(s.id)).toBe(0);
+  });
+
   it('keystrokes go back raw, so a lone space survives; a plain prompt goes through the mux', async () => {
     // Live 2026-11-18: typed in the browser, "Reply with exactly" arrived as
     // "Replywithexactly" because each held keystroke went through writeViaMux, which

@@ -43,6 +43,7 @@ import { readJsonConfig, SETTINGS_PATH } from './web/route-helpers.js';
 import { isNearStalledPath, probePath } from './utils/index.js';
 import { DEFAULT_KEEP_WARM_MAX_HOURS, type KeepWarmSettings } from './prompt-cache-keepwarm.js';
 import { gitFetchSettingsFrom, type GitFetchSettings } from './git-fetch.js';
+import { autoSuspendSettingsFrom, type AutoSuspendSettings } from './session-auto-suspend.js';
 
 /**
  * Existence check for a WRITER. Unlike the bounded read-side probe (`probePath`),
@@ -1192,6 +1193,22 @@ export async function readGitFetchSettings(): Promise<GitFetchSettings> {
     throw err;
   }
   return gitFetchSettingsFrom(parseSettingsText(text));
+}
+
+/**
+ * Auto-suspend (`autoSuspendEnabled`, absent = OFF; `autoSuspendIdleMinutes`, default 60). Read FRESH on
+ * every tick, like the Git fetch settings above, and with the same failure rule: a missing file is the
+ * defaults, any other read or parse failure rejects and that tick suspends nothing.
+ */
+export async function readAutoSuspendSettings(): Promise<AutoSuspendSettings> {
+  let text: string;
+  try {
+    text = await readFile(SETTINGS_PATH, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return autoSuspendSettingsFrom({});
+    throw err;
+  }
+  return autoSuspendSettingsFrom(parseSettingsText(text));
 }
 
 /**

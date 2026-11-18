@@ -36,6 +36,7 @@ import fastifyMultipart from '@fastify/multipart';
 import { pasteImageDirInUseByOtherSession, startPasteImageGc, uploadDirs } from './paste-image-gc.js';
 import { CLEAN_EXIT_CLOSE_REASON, shouldCloseCleanlyExitedSession } from '../pane-exit-sweep.js';
 import { suspendRegistryOf, type SessionSuspendRegistry } from '../session-suspend.js';
+import { AutoSuspendService, AUTO_SUSPEND_TICK_MS } from '../session-auto-suspend.js';
 import { findLiveWorktree, type OutsideWorktreeOptions } from '../live-worktree.js';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -112,6 +113,7 @@ import { clampEnvOverridesForOwner } from '../session-env-clamp.js';
 import {
   applyWorkspaceHooks,
   pruneAgentSessionPreambles,
+  readAutoSuspendSettings,
   readGitFetchSettings,
   readKeepWarmSettingsOrThrow,
   readPlanUsageTelemetryEnabled,
@@ -574,6 +576,8 @@ export class WebServer extends EventEmitter {
   private remoteWake: RemoteWakeRegistry | null = null;
   /** Session suspend registry, hung on the routes' ctx by `registerSessionRoutes` (session-suspend.ts). */
   private sessionSuspend: SessionSuspendRegistry | null = null;
+  /** Downstream: suspends idle local claude sessions when `autoSuspendEnabled` is on. */
+  private autoSuspend: AutoSuspendService | null = null;
   private sse: SseStreamManager;
   private store = getStore();
   private tabLayouts!: TabLayoutService;
@@ -1474,6 +1478,27 @@ export class WebServer extends EventEmitter {
     // routes, whose remote-link (a user request) wakes a sleeping host through it.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
     this.sessionSuspend = suspendRegistryOf(ctx) ?? null;
+    if (this.sessionSuspend) {
+      const registry = this.sessionSuspend;
+      // Reads the setting fresh each tick: off (the default) costs one settings read a minute.
+      const autoSuspend = new AutoSuspendService({
+        sessions: () => this.sessions.values(),
+        registry,
+        readSettings: readAutoSuspendSettings,
+        now: () => Date.now(),
+        log: (message) => console.log(message),
+      });
+      this.autoSuspend = autoSuspend;
+      this.cleanup.setInterval(
+        () => {
+          autoSuspend.tick().catch((err) => {
+            console.error('[AutoSuspend] tick failed:', getErrorMessage(err));
+          });
+        },
+        AUTO_SUSPEND_TICK_MS,
+        { description: 'auto-suspend idle sessions' }
+      );
+    }
     // The routes' ctx is a separate object: take the last-response reader they registered on it (Discord alerts).
     this.lastResponseFor = (ctx as { lastResponseFor?: WebServer['lastResponseFor'] }).lastResponseFor;
     registerCaseRoutes(this.app, ctx, { remoteWake: this.remoteWake });
@@ -2021,6 +2046,7 @@ export class WebServer extends EventEmitter {
     this.remoteWake?.drop(sessionId);
     // Held keystrokes of a suspended session go with it, like the wake buffer.
     this.sessionSuspend?.forget(sessionId);
+    this.autoSuspend?.remove(sessionId);
     // The inbox itself was handled above (dropped on a delete, kept on a detach).
     // Downstream fields, `?.` like `remoteWake`: upstream's wiring tests build the server
     // without its constructor (Object.create) and only stub upstream's own members.

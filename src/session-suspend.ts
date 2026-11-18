@@ -194,6 +194,8 @@ interface SuspendState {
 
 export class SessionSuspendRegistry {
   private readonly states = new Map<string, SuspendState>();
+  /** When each session's CLI last came back from a suspend (epoch ms), for auto-suspend's idle clock. */
+  private readonly resumedAt = new Map<string, number>();
 
   constructor(private readonly deps: SessionSuspendDeps) {}
 
@@ -315,6 +317,12 @@ export class SessionSuspendRegistry {
   /** Drop all state for a session that was closed. */
   forget(sessionId: string): void {
     this.states.delete(sessionId);
+    this.resumedAt.delete(sessionId);
+  }
+
+  /** When this session last resumed in this process (epoch ms), 0 if it has not. */
+  lastResumedAt(sessionId: string): number {
+    return this.resumedAt.get(sessionId) ?? 0;
   }
 
   private state(id: string): SuspendState {
@@ -352,6 +360,7 @@ export class SessionSuspendRegistry {
       return false;
     }
     session.setSuspended(null);
+    this.resumedAt.set(session.id, this.deps.now());
     this.deps.persist(session);
     this.deps.onResumed?.(session);
 

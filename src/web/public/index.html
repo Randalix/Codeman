@@ -2321,6 +2321,23 @@
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsAgentInboxPersist"><span class="slider"></span></label>
                   </div>
+                  <div class="set-row" data-search="auto suspend idle sessions memory ram free stop claude timeout">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Auto-suspend idle sessions <span class="set-scope">synced</span></span>
+                      <span class="set-row-desc">Suspends a local Claude session that has sat idle for the time below, so its CLI stops holding memory. The session stays on the board, greyed out, and typing into it brings the same conversation back. Never while it works, runs background work or waits on a dialog; SSH sessions are left alone. Off by default.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsAutoSuspend"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="auto suspend idle minutes after how long timeout">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Auto-suspend after <span class="set-scope">synced</span></span>
+                      <span class="set-row-desc">Minutes since the last prompt, keystroke, finished turn or resume (5 to 1440, default 60). A server restart starts the clock over.</span>
+                    </div>
+                    <div class="set-row-actions">
+                      <input type="number" id="appSettingsAutoSuspendIdleMinutes" class="set-num set-num-wide" value="60" min="5" max="1440" step="5">
+                      <span class="set-unit">min</span>
+                    </div>
+                  </div>
                   <div class="set-row" data-search="experimental agent coordination inspect stage submit codeman agent guarded input">
                     <div class="set-row-text">
                       <span class="set-row-label">Experimental agent coordination</span>
