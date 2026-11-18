@@ -375,6 +375,34 @@ describe('pinning a conversation onto a relaunch', () => {
     expect(calls[0].resumeSessionId).toBe(CONVERSATION);
   });
 
+  it('a remote suspend records its conversation, and a resume after a server restart still continues it', async () => {
+    // Live 2026-11-18: the adopted remote id lives in memory only, so a restart while
+    // suspended resumed the pre-`/clear` conversation. The suspend now persists it.
+    const remote = { hostId: 'h1', label: 'box', host: 'box', username: 'dev', remotePath: '/tmp' };
+    const before = localSession({ remote });
+    before.adoptClaudeSessionId(CONVERSATION);
+    before.setSuspended(5);
+    const state = before.toState();
+    expect(state.suspendedResumeId).toBe(CONVERSATION);
+
+    // The restarted server builds the session from state.json: no adopted id any more.
+    const { mux, calls } = recordingMux();
+    const after = localSession(
+      { remote, suspendedAt: state.suspendedAt, suspendedResumeId: state.suspendedResumeId },
+      mux
+    );
+    expect(after.claudeSessionId).not.toBe(CONVERSATION);
+    expect(await after.restartCli()).toBe(true);
+    expect(calls[0].resumeSessionId).toBe(CONVERSATION);
+  });
+
+  it('a local suspend records nothing: the local pin reads the transcript on disk', () => {
+    const local = localSession();
+    local.adoptClaudeSessionId(CONVERSATION);
+    local.setSuspended(5);
+    expect(local.toState().suspendedResumeId).toBeUndefined();
+  });
+
   it('pins nothing for a docker case, whose pane execs into the container', async () => {
     giveTranscript(CONVERSATION);
     const { mux, calls } = recordingMux();

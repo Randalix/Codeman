@@ -4413,6 +4413,7 @@ export class WebServer extends EventEmitter {
               // reading (not the stats collector — see `startPaneExitWatcher`).
               paneExit: savedState?.paneExit,
               suspendedAt: savedState?.suspended ? savedState?.suspendedAt : undefined,
+              suspendedResumeId: savedState?.suspended ? savedState?.suspendedResumeId : undefined,
               // The model the CLI last reported (statusline or its own footer), so a
               // tile header keeps naming it until the next report; an idle claude
               // session re-renders its statusline only on its next turn.

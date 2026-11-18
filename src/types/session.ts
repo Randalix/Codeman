@@ -1256,6 +1256,12 @@ export interface SessionState {
   suspended?: boolean;
   /** Epoch ms of the suspend; set together with `suspended`. */
   suspendedAt?: number;
+  /**
+   * Remote claude only: the conversation it was writing when it was suspended, which the
+   * resume continues. Remote ids are adopted at turn end and not otherwise persisted, so
+   * without this a server restart while suspended would resume the launch conversation.
+   */
+  suspendedResumeId?: string;
 }
 
 /**

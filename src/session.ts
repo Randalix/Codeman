@@ -816,6 +816,8 @@ export class Session extends EventEmitter {
    * the dead-pane branch of {@link _setupOrAttachMuxSession} must not relaunch it.
    */
   private _suspendedAt: number | null = null;
+  /** See `SessionState.suspendedResumeId`. */
+  private _suspendedResumeId: string | null = null;
   /**
    * The pane's live directory, from the pane-exit watcher's read. Runtime-only:
    * serialized by toState() but never restored by the constructor.
@@ -1067,6 +1069,8 @@ export class Session extends EventEmitter {
       paneExit?: PaneExit;
       /** Restored suspend time (see `suspendedAt`). */
       suspendedAt?: number;
+      /** Restored with it (see `SessionState.suspendedResumeId`). */
+      suspendedResumeId?: string;
       /** The previous run's `displayModel`; a CLI-reported one is restored (see `displayModel`). */
       displayModel?: DisplayModel;
       /** The previous run's last prompt-cache report, restored so the readout is not blank (see `promptCache`). */
@@ -1269,6 +1273,7 @@ export class Session extends EventEmitter {
     // browser panel arms and disarms — see `startPaneExitWatcher`.
     this.setPaneExit(config.paneExit);
     this._suspendedAt = typeof config.suspendedAt === 'number' && config.suspendedAt > 0 ? config.suspendedAt : null;
+    this._suspendedResumeId = this._suspendedAt !== null ? (config.suspendedResumeId ?? null) : null;
     this._reportedModel = restoredReportedModel(config.displayModel) ?? null;
     // Last prompt-cache report, restored so the Session Options readout is not blank until
     // the pane's next statusline render. The readout is time-aware, so a value whose expiry
@@ -1919,9 +1924,15 @@ export class Session extends EventEmitter {
     return this._suspendedAt ?? undefined;
   }
 
-  /** Mark the session suspended (`at` = epoch ms) or, with null, no longer suspended. */
+  /**
+   * Mark the session suspended (`at` = epoch ms) or, with null, no longer suspended. A
+   * remote claude also records the conversation it is on, for the resume (see
+   * `SessionState.suspendedResumeId`).
+   */
   setSuspended(at: number | null): void {
     this._suspendedAt = at;
+    this._suspendedResumeId =
+      at !== null && this._remote && this.mode === 'claude' && this._claudeSessionId ? this._claudeSessionId : null;
   }
 
   /** What the keep-warm service last published for this session, or null before its first evaluation. */
@@ -2677,6 +2688,7 @@ export class Session extends EventEmitter {
       paneExit: this._paneExit ?? undefined,
       suspended: this._suspendedAt !== null || undefined,
       suspendedAt: this._suspendedAt ?? undefined,
+      suspendedResumeId: this._suspendedResumeId ?? undefined,
       attachmentHistory: this.attachmentHistory.length > 0 ? this.attachmentHistory : undefined,
       lastSubmitAt: this._lastSubmitAt || undefined,
       lastRealPromptAt: this._lastRealPromptAt || undefined,
@@ -2866,6 +2878,7 @@ export class Session extends EventEmitter {
     if (!isRestored && this._suspendedAt !== null) {
       console.log('[Session] Suspended session got a fresh pane; no longer suspended:', this.id);
       this._suspendedAt = null;
+      this._suspendedResumeId = null;
     }
     if (isRestored) {
       console.log('[Session] Attaching to existing mux session:', this._muxSession!.muxName);
@@ -3028,8 +3041,11 @@ export class Session extends EventEmitter {
     // session's resume, whose remote tmux is gone, so `new-session -A` launches claude
     // afresh: it continues THAT conversation, not the launch one. Only here, not in the
     // dead-pane respawn, which also runs at boot for remote panes nobody suspended.
-    if (this._remote && this.mode === 'claude' && this._claudeSessionId && this._claudeSessionId !== this.id) {
-      options.resumeSessionId = this._claudeSessionId;
+    // A suspend recorded its conversation (persisted), which survives a server restart
+    // in between; the in-memory adoption does not.
+    const remoteConversation = this._suspendedResumeId ?? this._claudeSessionId;
+    if (this._remote && this.mode === 'claude' && remoteConversation && remoteConversation !== this.id) {
+      options.resumeSessionId = remoteConversation;
     }
     const newPid = await mux.respawnPane(options);
     if (!newPid) {
