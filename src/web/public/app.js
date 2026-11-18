@@ -1446,6 +1446,12 @@ class CodemanApp {
           this.handleTabRailSearchKeydown(e);
           return;
         }
+        // Same for the phone overview's search box (mobile-overview.js).
+        if (e.target?.id === 'mobileOverviewSearch' && this._mobileOverviewSearch && !e.isComposing) {
+          e.preventDefault();
+          this.clearMobileOverviewSearch?.();
+          return;
+        }
         // The local model window can sit on top of App Settings (it opens from a
         // row there): Escape closes the window alone and leaves Settings open.
         if (this.isLocalModelWindowOpen?.()) {

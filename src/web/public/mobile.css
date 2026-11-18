@@ -2819,6 +2819,48 @@ html.mobile-init .file-browser-panel {
     color: var(--text-muted);
   }
 
+  /* Search box under the header (mobile-overview.js _ensureMobileOverviewSearch).
+     Colors come from .session-sidebar-filter-input (styles.css), the desktop
+     boxes' own tokens; only size is set here. 16px text, not the desktop
+     0.75rem: iOS Safari zooms the page into any focused field under 16px. */
+  .mobile-overview-search {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .mobile-overview-search .mobile-overview-search-input {
+    min-height: 44px;
+    padding: 0.5rem 2.75rem 0.5rem 0.75rem;
+    font-size: 16px;
+  }
+
+  /* The native WebKit clear glyph would sit under ours. */
+  .mobile-overview-search .mobile-overview-search-input::-webkit-search-cancel-button {
+    appearance: none;
+  }
+
+  .mobile-overview-search-clear {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 44px;
+    height: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--text-dim);
+    font-size: 1.25rem;
+    line-height: 1;
+  }
+
+  .mobile-overview-search-clear[hidden] {
+    display: none;
+  }
+
+  .mobile-overview-search-empty {
+    text-align: center;
+  }
+
   /* Row: 56px tap target, dot + two-line body + pill + chevron */
   .mobile-overview-row {
     display: flex;
