@@ -314,6 +314,37 @@ Object.assign(CodemanApp.prototype, {
     };
   },
 
+  /**
+   * The search box's view filter over a built model. Pure, and the matching is
+   * the desktop rail's own (CodemanTabSearch, constants.js): case-insensitive
+   * substring, trimmed.
+   *
+   * - NEEDS YOU is never filtered: a prompt waiting on you is never hidden by a
+   *   view filter (the desktop rail keeps alert rows for the same reason).
+   * - Current rows match on the session NAME, like the rail.
+   * - Past rows match on name or title (the first prompt): a past row often has
+   *   no name, and its title is what the row shows.
+   *
+   * `active` is false for an empty or blank query, and the model comes back as
+   * it was. `matchCount` counts the filtered sections only, so the caller can
+   * say "No sessions match" while NEEDS YOU still shows.
+   */
+  filterMobileOverviewModel(model, query) {
+    const search = window.CodemanTabSearch;
+    const needle = search ? search.needle(query) : '';
+    if (!needle) return { ...model, active: false, matchCount: 0 };
+    const keep = (rows, textOf) => {
+      const result = search.filter(
+        rows.map((row) => ({ key: row, text: textOf(row) })),
+        needle
+      );
+      return rows.filter((row) => !result.hidden.has(row));
+    };
+    const current = keep(model.current, (row) => row.name || '');
+    const past = keep(model.past, (row) => `${row.name || ''}\n${row.title || ''}`);
+    return { ...model, current, past, active: true, matchCount: current.length + past.length };
+  },
+
   // ═══════════════════════════════════════════════════════════════
   // Gate + visibility
   // ═══════════════════════════════════════════════════════════════
@@ -493,7 +524,7 @@ Object.assign(CodemanApp.prototype, {
     const el = document.getElementById('mobileOverview');
     if (!el) return;
 
-    const model = this.buildMobileOverviewModel({
+    const full = this.buildMobileOverviewModel({
       sessions: this.sessions,
       cases: this.cases,
       sessionOrder: this.sessionOrder,
@@ -501,10 +532,27 @@ Object.assign(CodemanApp.prototype, {
       history: this._mobileOverviewHistory,
     });
     // Resume needs the workingDir/claudeSessionId off the row the user tapped.
-    this._mobileOverviewPastRows = model.past;
+    this._mobileOverviewPastRows = full.past;
+    const model = this.filterMobileOverviewModel(full, this._mobileOverviewSearch);
 
-    el.replaceChildren();
-    el.appendChild(this._buildMobileOverviewTop());
+    // Everything is rebuilt EXCEPT the search box: session events re-render this
+    // every 150 ms or so, and a box that left the DOM would drop its focus and
+    // close the phone keyboard mid-word. So it stays put and the rest is
+    // rebuilt around it.
+    const search = this._ensureMobileOverviewSearch();
+    for (const child of [...el.children]) {
+      if (child !== search) child.remove();
+    }
+    if (search.parentNode !== el) el.appendChild(search);
+    el.insertBefore(this._buildMobileOverviewTop(), search);
+
+    if (model.active && model.matchCount === 0) {
+      const empty = document.createElement('p');
+      empty.className = 'mobile-overview-empty mobile-overview-search-empty';
+      empty.setAttribute('role', 'status');
+      empty.textContent = 'No sessions match';
+      el.appendChild(empty);
+    }
 
     if (model.needsYou.length) {
       el.appendChild(
@@ -521,7 +569,9 @@ Object.assign(CodemanApp.prototype, {
         'Current sessions',
         model.current.length,
         model.current.map((r) => this._buildMobileOverviewRow(r)),
-        'Nothing running. Hit Run to start something.'
+        // While searching, an empty section is the filter's doing, not an empty
+        // server: the heading's 0 says it, and the hint to hit Run would mislead.
+        model.active ? '' : 'Nothing running. Hit Run to start something.'
       )
     );
 
@@ -540,7 +590,11 @@ Object.assign(CodemanApp.prototype, {
         'Past sessions',
         model.past.length,
         this._buildMobileOverviewPast(model),
-        this._mobileOverviewHistory ? 'No past conversations yet' : 'Loading…'
+        model.active && this._mobileOverviewHistory
+          ? ''
+          : this._mobileOverviewHistory
+            ? 'No past conversations yet'
+            : 'Loading…'
       )
     );
 
@@ -552,6 +606,9 @@ Object.assign(CodemanApp.prototype, {
    * dozens, and this section sits below the live ones on purpose.
    */
   _buildMobileOverviewPast(model) {
+    // A search shows every past match: the cap exists to keep an unfiltered list
+    // short, and a match hidden behind "Show all" would read as no match.
+    if (model.active) return model.past.map((r) => this._buildMobileOverviewPastRow(r));
     const showAll = !!this._mobileOverviewShowAllPast;
     const visible = showAll ? model.past : model.past.slice(0, MOBILE_OVERVIEW_PAST_LIMIT);
     const children = visible.map((r) => this._buildMobileOverviewPastRow(r));
@@ -574,6 +631,77 @@ Object.assign(CodemanApp.prototype, {
       children.push(toggle);
     }
     return children;
+  },
+
+  /**
+   * The search box, built ONCE and kept across renders (see renderMobileOverview).
+   * Same look and rules as the desktop rail's box: name filter, in memory only,
+   * never persisted or sent anywhere; the × and Escape empty it and keep focus.
+   */
+  _ensureMobileOverviewSearch() {
+    if (this._mobileOverviewSearchEl) return this._mobileOverviewSearchEl;
+    const wrap = document.createElement('div');
+    wrap.className = 'mobile-overview-search';
+
+    const input = document.createElement('input');
+    input.type = 'search';
+    input.id = 'mobileOverviewSearch';
+    input.className = 'session-sidebar-filter-input mobile-overview-search-input';
+    input.placeholder = 'Search sessions';
+    input.setAttribute('aria-label', 'Search sessions');
+    input.setAttribute('autocomplete', 'off');
+    input.setAttribute('autocapitalize', 'off');
+    input.setAttribute('autocorrect', 'off');
+    input.setAttribute('spellcheck', 'false');
+    input.setAttribute('enterkeyhint', 'search');
+    input.value = this._mobileOverviewSearch || '';
+    wrap.appendChild(input);
+
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'mobile-overview-search-clear';
+    clear.setAttribute('aria-label', 'Clear search');
+    clear.title = 'Clear search';
+    clear.textContent = '\u00d7';
+    clear.hidden = !input.value;
+    wrap.appendChild(clear);
+
+    input.addEventListener('input', () => this.setMobileOverviewSearch(input.value));
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.isComposing) {
+        // Enter on a phone keyboard means "done": drop the keyboard, keep the filter.
+        event.preventDefault();
+        input.blur();
+      } else if (event.key === 'Escape' && !event.isComposing && input.value) {
+        event.preventDefault();
+        event.stopPropagation();
+        this.clearMobileOverviewSearch();
+      }
+    });
+    // pointerdown + preventDefault keeps the keyboard up: a tap on the × would
+    // otherwise blur the box first and the keyboard would bounce.
+    clear.addEventListener('pointerdown', (event) => event.preventDefault());
+    clear.addEventListener('click', () => this.clearMobileOverviewSearch());
+
+    this._mobileOverviewSearchEl = wrap;
+    return wrap;
+  },
+
+  /** The search box's input handler: remember the text and redraw the rows. */
+  setMobileOverviewSearch(value) {
+    this._mobileOverviewSearch = typeof value === 'string' ? value : '';
+    const wrap = this._mobileOverviewSearchEl;
+    const clear = wrap && wrap.querySelector('.mobile-overview-search-clear');
+    if (clear) clear.hidden = this._mobileOverviewSearch.length === 0;
+    if (this.isMobileOverviewVisible()) this.renderMobileOverview();
+  },
+
+  /** The × (and Escape): empty the box, show every row again, keep focus in the box. */
+  clearMobileOverviewSearch() {
+    const input = this._mobileOverviewSearchEl && this._mobileOverviewSearchEl.querySelector('input');
+    if (input) input.value = '';
+    this.setMobileOverviewSearch('');
+    if (input) input.focus();
   },
 
   _buildMobileOverviewTop() {

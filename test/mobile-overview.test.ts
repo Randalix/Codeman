@@ -33,13 +33,13 @@ function fakeElement(): any {
   return el;
 }
 
-function loadOverviewApp(overrides: Record<string, any> = {}) {
+function loadOverviewApp(overrides: Record<string, any> = {}, document?: Record<string, any>) {
   const CodemanApp = function CodemanApp(this: any) {};
   const context = vm.createContext({
     CodemanApp,
     console,
     window: {},
-    document: {
+    document: document ?? {
       getElementById: () => null,
       createElement: () => fakeElement(),
       createElementNS: () => fakeElement(),
@@ -591,5 +591,173 @@ describe('mobile overview Run picker, driven by the registry catalogue', () => {
     const { modes, staticTable } = loadRunModes(catalog);
     const byMode = (list: Array<{ mode: string }>) => [...list].sort((a, b) => a.mode.localeCompare(b.mode));
     expect(byMode(modes)).toEqual(byMode(staticTable));
+  });
+});
+
+describe('mobile overview search', () => {
+  const sessions = [
+    session({ id: 'a', name: 'Neon Getaway impl', status: 'busy' }),
+    session({ id: 'b', name: 'house planner', status: 'idle' }),
+    session({ id: 'c', name: 'w3 neon review', status: 'idle' }),
+    // Blocked on a permission prompt: NEEDS YOU, whatever its name.
+    session({ id: 'd', name: 'codeman docs', status: 'idle' }),
+  ];
+  const history = Array.from({ length: 12 }, (_, i) => ({
+    sessionId: `old-${i}`,
+    workingDir: '/home/arkon/default/claudeman',
+    firstPrompt: i === 11 ? 'fix the NEON headlights' : `task ${i}`,
+    lastActivityAt: 1000 - i,
+  }));
+
+  function build(app: any) {
+    return app.buildMobileOverviewModel({
+      sessions,
+      cases: CASES,
+      pendingHooks: new Map([['d', new Set(['permission_prompt'])]]),
+      history,
+    });
+  }
+
+  it('filters current rows by name, case-insensitively, and leaves NEEDS YOU alone', () => {
+    const app = loadOverviewApp();
+    const filtered = app.filterMobileOverviewModel(build(app), '  NEON ');
+    expect(filtered.active).toBe(true);
+    expect(filtered.current.map((r: any) => r.id).sort()).toEqual(['a', 'c']);
+    // A prompt waiting on you is never hidden by a view filter (desktop rule).
+    expect(filtered.needsYou.map((r: any) => r.id)).toEqual(['d']);
+    // Past rows match on their title (the first prompt) too.
+    expect(filtered.past.map((r: any) => r.id)).toEqual(['old-11']);
+    expect(filtered.matchCount).toBe(3);
+  });
+
+  it('is a no-op for an empty or blank query', () => {
+    const app = loadOverviewApp();
+    const model = build(app);
+    for (const query of ['', '   ', undefined]) {
+      const filtered = app.filterMobileOverviewModel(model, query);
+      expect(filtered.active).toBe(false);
+      expect(filtered.current).toBe(model.current);
+      expect(filtered.past).toBe(model.past);
+    }
+  });
+
+  it('reports zero matches so the overview can say so', () => {
+    const app = loadOverviewApp();
+    const filtered = app.filterMobileOverviewModel(build(app), 'zzz');
+    expect(filtered.current).toEqual([]);
+    expect(filtered.past).toEqual([]);
+    expect(filtered.matchCount).toBe(0);
+    expect(filtered.needsYou.length).toBe(1);
+  });
+
+  it('shows every past match while searching instead of capping at the first page', () => {
+    const app = loadOverviewApp();
+    app._buildMobileOverviewPastRow = (row: any) => ({ row });
+    const all = app.filterMobileOverviewModel(build(app), 'task');
+    expect(all.past.length).toBe(11);
+    expect(app._buildMobileOverviewPast(all).length).toBe(11);
+    // Unfiltered, the cap and its toggle are back.
+    const plain = app.filterMobileOverviewModel(build(app), '');
+    const children = app._buildMobileOverviewPast(plain);
+    expect(children.length).toBe(9);
+    expect(children[8].dataset.moAction).toBe('more-past');
+  });
+
+  it('keeps the same search box node across renders so focus and the keyboard survive', () => {
+    // A slightly richer fake DOM than fakeElement(): render() moves real children.
+    function node(): any {
+      const el: any = {
+        className: '',
+        dataset: {},
+        style: {},
+        attrs: {} as Record<string, string>,
+        children: [] as any[],
+        parentNode: null,
+        hidden: false,
+        listeners: {} as Record<string, any[]>,
+        setAttribute(name: string, value: string) {
+          el.attrs[name] = value;
+        },
+        appendChild(child: any) {
+          child.parentNode?.children.splice(child.parentNode.children.indexOf(child), 1);
+          el.children.push(child);
+          child.parentNode = el;
+          return child;
+        },
+        insertBefore(child: any, ref: any) {
+          el.children.splice(el.children.indexOf(ref), 0, child);
+          child.parentNode = el;
+          return child;
+        },
+        remove() {
+          if (!el.parentNode) return;
+          el.parentNode.children.splice(el.parentNode.children.indexOf(el), 1);
+          el.parentNode = null;
+        },
+        addEventListener(type: string, fn: any) {
+          (el.listeners[type] ||= []).push(fn);
+        },
+        querySelector(sel: string) {
+          const cls = sel.replace(/^\./, '');
+          const walk = (n: any): any => {
+            for (const c of n.children) {
+              if (sel === 'input' ? c.tag === 'input' : String(c.className).split(' ').includes(cls)) return c;
+              const hit = walk(c);
+              if (hit) return hit;
+            }
+            return null;
+          };
+          return walk(el);
+        },
+        focus() {},
+      };
+      return el;
+    }
+    const root = node();
+    const app = loadOverviewApp(
+      {
+        sessions: new Map(sessions.map((s) => [s.id, s])),
+        cases: CASES,
+        pendingHooks: new Map(),
+        _mobileOverviewHistory: [],
+        isMobileOverviewVisible: () => true,
+        _startMobileOverviewClock: () => {},
+      },
+      {
+        getElementById: (id: string) => (id === 'mobileOverview' ? root : null),
+        createElement: (tag: string) => Object.assign(node(), { tag }),
+        createElementNS: () => node(),
+      }
+    );
+    app.renderMobileOverview();
+
+    const box = root.children[1];
+    expect(String(root.children[0].className)).toBe('mobile-overview-header');
+    expect(box.className).toBe('mobile-overview-search');
+
+    // Typing re-renders: the box must be the very same node, still second.
+    const input = box.querySelector('input');
+    input.value = 'neon';
+    for (const fn of input.listeners.input) fn();
+    expect(root.children[1]).toBe(box);
+    expect(root.children.filter((c: any) => c.className === 'mobile-overview-search').length).toBe(1);
+    const clear = box.querySelector('.mobile-overview-search-clear');
+    expect(clear.hidden).toBe(false);
+
+    for (const fn of clear.listeners.click) fn();
+    expect(input.value).toBe('');
+    expect(app._mobileOverviewSearch).toBe('');
+    expect(clear.hidden).toBe(true);
+    expect(root.children[1]).toBe(box);
+  });
+
+  it('routes Escape in the box to clearing it, ahead of the close-every-panel handler', () => {
+    const appSrc = readFileSync(resolve(PUBLIC, 'app.js'), 'utf8');
+    expect(appSrc).toMatch(/e\.target\?\.id === 'mobileOverviewSearch' && this\._mobileOverviewSearch/);
+  });
+
+  it('keeps the box at 16px so iOS does not zoom into it', () => {
+    const mobileCss = readFileSync(resolve(PUBLIC, 'mobile.css'), 'utf8');
+    expect(mobileCss).toMatch(/\.mobile-overview-search \.mobile-overview-search-input\s*\{[^}]*font-size:\s*16px/);
   });
 });
