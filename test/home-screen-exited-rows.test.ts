@@ -23,7 +23,7 @@ const PUBLIC = resolve(import.meta.dirname, '../src/web/public');
 /** The shipped `paneExitLabel()` from app.js, as source text. */
 function paneExitLabelSource(): string {
   const appJs = readFileSync(resolve(PUBLIC, 'app.js'), 'utf8');
-  const match = appJs.match(/function paneExitLabel\(paneExit\) \{[\s\S]*?\n\}\n/);
+  const match = appJs.match(/function paneExitLabel\(paneExit(?:, suspended)?\) \{[\s\S]*?\n\}\n/);
   if (!match) throw new Error('paneExitLabel() not found in app.js');
   return match[0];
 }

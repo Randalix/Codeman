@@ -123,6 +123,19 @@ const ALLOWED_BRANCHES: Record<string, Allowance> = {
       'the same mode-agnostic engine local/docker spawns use — only the BRANCH is per-mode'
   ),
 
+  // --- Downstream session suspend: claude's tracked conversation id ---
+  "session-suspend.ts::mode !== 'claude'": allow(
+    1,
+    'suspend relies on resuming the exact conversation, and claude is the only CLI whose ' +
+      'conversation id Codeman tracks (claudeSessionId, adopted after /clear); other CLIs ' +
+      'need the per-CLI resume id first (#630)'
+  ),
+  "session.ts::mode === 'claude'": allow(
+    2,
+    "a remote resume pins claude's adopted conversation (claudeSessionId) into " +
+      'resumeSessionId, and a remote suspend persists it; no other CLI tracks that id (#630)'
+  ),
+
   // --- Per-CLI prose and launch handling not yet generalised ---
   "web/session-wait-registry.ts::mode === 'deepseek'": allow(
     1,
