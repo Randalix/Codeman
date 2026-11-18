@@ -4617,6 +4617,14 @@ export class WebServer extends EventEmitter {
             }
 
             this.sessions.set(session.id, session);
+            // A suspended remote session's agent was stopped on purpose: keep the reconnect
+            // watcher off it, as the stop did before this restart (the lock lives in
+            // memory). The resume lifts it again.
+            if (session.suspended && session.remote) {
+              (this.mux as unknown as { guardRemoteReconnect?: (id: string) => void }).guardRemoteReconnect?.(
+                session.id
+              );
+            }
             caseSessionSettled(session);
             await this.setupSessionListeners(session);
 

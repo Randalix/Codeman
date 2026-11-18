@@ -1100,10 +1100,14 @@ export function registerSessionRoutes(
         const hostId = (s as Session).remote?.hostId;
         const host = hostId ? (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((h) => h.id === hostId) : undefined;
         if (!host) return false;
-        const outcome = await remoteWake.ensureHostAwake(wakeableHost(host), {
-          timeoutMs: REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS,
-        });
-        return outcome !== 'failed';
+        const remote = wakeableHost(host);
+        const outcome = await remoteWake.ensureHostAwake(remote, { timeoutMs: REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS });
+        if (outcome === 'failed') return false;
+        // No wake target: nothing to wake, but a host that is down would take the
+        // relaunch (and the held input) into a pane that dies at once. Ask first;
+        // `null` (a proxied host) cannot tell, so it gets the attempt.
+        if (outcome === 'no-target') return (await remoteWake.checkHostReachable(remote, { force: true })) !== false;
+        return true;
       },
       onResumed: (s) => ctx.mux.unguardRemoteReconnect?.(s.id),
     });
