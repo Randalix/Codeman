@@ -32,7 +32,7 @@ import { promisify } from 'node:util';
 import { PassThrough, type Readable } from 'node:stream';
 import type { SessionRemote } from './types/session.js';
 import { buildSshConnectionArgs, remoteSshTarget, shellescape, withRemoteTmuxPath } from './remote-hosts.js';
-import { runWithRemoteSshLimit } from './remote-ssh-limiter.js';
+import { runWithRemoteSshLimit, runWithRemoteUploadLimit } from './remote-ssh-limiter.js';
 import type { EditSourceReadOptions, EditSourceRequest, EditSources } from './edit-history-local-source.js';
 
 const execAsync = promisify(exec);
@@ -1160,7 +1160,8 @@ export async function remoteWriteUpload(
   // `exec` so a timeout's SIGTERM reaches ssh itself, not just the local `sh -c`.
   const command = `exec ${buildRemoteFileCommand(remote, buildRemoteUploadScript(workspace, name, size))}`;
   const timeoutMs = REMOTE_READ_TIMEOUT_MS + Math.ceil((size / REMOTE_UPLOAD_MIN_BYTES_PER_SEC) * 1000);
-  return runWithRemoteSshLimit(
+  // Its own pool: a large upload holds its slot for as long as the copy runs (Ark0N in #837).
+  return runWithRemoteUploadLimit(
     () =>
       new Promise<string>((resolve, reject) => {
         const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });

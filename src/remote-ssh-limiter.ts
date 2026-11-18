@@ -31,38 +31,16 @@
  * behind a counted probe (the guard re-probe runs first), so their spawn RATE is
  * bounded here even though their concurrency is bounded by the browser.
  *
- * NOT re-entrant: never acquire from inside a task already holding a slot.
+ * Prompt uploads into a remote session (`remoteWriteUpload`) run in a pool of their own
+ * ({@link runWithRemoteUploadLimit}): one copies up to `MAX_PASTE_VIDEO_BYTES` (1 GiB) and
+ * may take an hour on a slow link, which in the shared pool would hold a slot that every
+ * preview, probe and history read waits on (Ark0N in #837). The two caps together (4 + 2
+ * by default) still stay under OpenSSH's ten-handshake default.
+ *
+ * NOT re-entrant: never acquire from inside a task already holding a slot of the same pool.
  */
 
-/**
- * Max remote probes/reads allowed to run concurrently across the whole process.
- * Override with CODEMAN_MAX_REMOTE_FILE_SSH (clamped to >= 1). Four keeps a burst
- * well under OpenSSH's ten-handshake default.
- */
-const MAX_CONCURRENT_REMOTE_SSH = (() => {
-  const raw = Number(process.env.CODEMAN_MAX_REMOTE_FILE_SSH);
-  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 4;
-})();
-
-let active = 0;
-const waiters: Array<() => void> = [];
-
-/** Test/diagnostic hook: remote calls currently holding a slot. */
-export function getActiveRemoteSshCount(): number {
-  return active;
-}
-
-/** Test/diagnostic hook: remote calls queued behind the cap. */
-export function getQueuedRemoteSshCount(): number {
-  return waiters.length;
-}
-
-/** The configured cap, so a test can assert against the real number. */
-export function getRemoteSshLimit(): number {
-  return MAX_CONCURRENT_REMOTE_SSH;
-}
-
-/** Thrown by {@link runWithRemoteSshLimit} when `maxWaitMs` passed before a slot freed up. */
+/** Thrown when `maxWaitMs` passed before a slot freed up. */
 export class RemoteSshSlotTimeoutError extends Error {
   constructor(maxWaitMs: number) {
     super(`No remote ssh slot within ${maxWaitMs} ms`);
@@ -70,37 +48,105 @@ export class RemoteSshSlotTimeoutError extends Error {
   }
 }
 
-function acquire(maxWaitMs?: number): Promise<void> {
-  if (active < MAX_CONCURRENT_REMOTE_SSH) {
-    active++;
-    return Promise.resolve();
+/** A fixed pool of slots with FIFO queueing; a released slot goes straight to the next waiter. */
+export class SshSlotPool {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(readonly limit: number) {}
+
+  get activeCount(): number {
+    return this.active;
   }
-  if (maxWaitMs === undefined) return new Promise<void>((resolve) => waiters.push(resolve));
-  return new Promise<void>((resolve, reject) => {
-    const waiter = () => {
-      clearTimeout(timer);
-      resolve();
-    };
-    // A timed-out waiter leaves the queue and is never handed a slot, so it
-    // owns nothing to give back: `active` is untouched on this path.
-    const timer = setTimeout(() => {
-      const index = waiters.indexOf(waiter);
-      if (index === -1) return; // already handed a slot by release()
-      waiters.splice(index, 1);
-      reject(new RemoteSshSlotTimeoutError(maxWaitMs));
-    }, maxWaitMs);
-    waiters.push(waiter);
-  });
+
+  get queuedCount(): number {
+    return this.waiters.length;
+  }
+
+  private acquire(maxWaitMs?: number): Promise<void> {
+    if (this.active < this.limit) {
+      this.active++;
+      return Promise.resolve();
+    }
+    if (maxWaitMs === undefined) return new Promise<void>((resolve) => this.waiters.push(resolve));
+    return new Promise<void>((resolve, reject) => {
+      const waiter = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      // A timed-out waiter leaves the queue and is never handed a slot, so it
+      // owns nothing to give back: `active` is untouched on this path.
+      const timer = setTimeout(() => {
+        const index = this.waiters.indexOf(waiter);
+        if (index === -1) return; // already handed a slot by release()
+        this.waiters.splice(index, 1);
+        reject(new RemoteSshSlotTimeoutError(maxWaitMs));
+      }, maxWaitMs);
+      this.waiters.push(waiter);
+    });
+  }
+
+  private release(): void {
+    const next = this.waiters.shift();
+    if (next) {
+      // Hand the slot straight to the next waiter; `active` stays at the cap.
+      next();
+    } else {
+      this.active--;
+    }
+  }
+
+  /**
+   * Run `task` once a slot is free, releasing it afterward. With `maxWaitMs`, give up
+   * instead (rejecting with {@link RemoteSshSlotTimeoutError}, `task` never runs).
+   */
+  async run<T>(task: () => Promise<T>, opts: { maxWaitMs?: number } = {}): Promise<T> {
+    await this.acquire(opts.maxWaitMs);
+    try {
+      return await task();
+    } finally {
+      this.release();
+    }
+  }
 }
 
-function release(): void {
-  const next = waiters.shift();
-  if (next) {
-    // Hand the slot straight to the next waiter; `active` stays at the cap.
-    next();
-  } else {
-    active--;
-  }
+function capFromEnv(name: string, fallback: number): number {
+  const raw = Number(process.env[name]);
+  return Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : fallback;
+}
+
+/**
+ * Max remote probes/reads allowed to run concurrently across the whole process.
+ * Override with CODEMAN_MAX_REMOTE_FILE_SSH (clamped to >= 1). Four keeps a burst
+ * well under OpenSSH's ten-handshake default.
+ */
+const sharedPool = new SshSlotPool(capFromEnv('CODEMAN_MAX_REMOTE_FILE_SSH', 4));
+
+/**
+ * Max concurrent prompt uploads into remote sessions. Override with
+ * CODEMAN_MAX_REMOTE_UPLOAD_SSH (clamped to >= 1). The upload route's own rate buckets
+ * bound how fast they start.
+ */
+const uploadPool = new SshSlotPool(capFromEnv('CODEMAN_MAX_REMOTE_UPLOAD_SSH', 2));
+
+/** Test/diagnostic hook: remote calls currently holding a slot. */
+export function getActiveRemoteSshCount(): number {
+  return sharedPool.activeCount;
+}
+
+/** Test/diagnostic hook: remote calls queued behind the cap. */
+export function getQueuedRemoteSshCount(): number {
+  return sharedPool.queuedCount;
+}
+
+/** The configured cap, so a test can assert against the real number. */
+export function getRemoteSshLimit(): number {
+  return sharedPool.limit;
+}
+
+/** Test/diagnostic hook: the upload pool, separate from the shared one. */
+export function getRemoteUploadPool(): SshSlotPool {
+  return uploadPool;
 }
 
 /**
@@ -109,11 +155,11 @@ function release(): void {
  * `task` never runs) when no slot frees up in time: for a caller that has a
  * cheaper answer than waiting behind the queue.
  */
-export async function runWithRemoteSshLimit<T>(task: () => Promise<T>, opts: { maxWaitMs?: number } = {}): Promise<T> {
-  await acquire(opts.maxWaitMs);
-  try {
-    return await task();
-  } finally {
-    release();
-  }
+export function runWithRemoteSshLimit<T>(task: () => Promise<T>, opts: { maxWaitMs?: number } = {}): Promise<T> {
+  return sharedPool.run(task, opts);
+}
+
+/** Run a remote prompt upload in the upload pool, never in the shared one. */
+export function runWithRemoteUploadLimit<T>(task: () => Promise<T>): Promise<T> {
+  return uploadPool.run(task);
 }

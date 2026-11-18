@@ -445,7 +445,8 @@ the first stderr line, the timeout, or the exit code; never Node's `Command fail
 message, which would carry the identity-file path and the probe script into the body.
 
 **Connections are bounded.** Every probe and buffered read runs through a small global
-semaphore (`src/remote-ssh-limiter.ts`, default 4, `CODEMAN_MAX_REMOTE_FILE_SSH`), the
+semaphore (`src/remote-ssh-limiter.ts`, default 4, `CODEMAN_MAX_REMOTE_FILE_SSH`; prompt
+uploads have a pool of their own, default 2, `CODEMAN_MAX_REMOTE_UPLOAD_SSH`), the
 attachment-history list resolves its whole history in one batched probe instead of one
 handshake per entry, and probes are chunked at 40 paths per round trip. Terminal output
 in a remote session is written on the remote host, so a prompt-injected agent printing
