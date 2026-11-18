@@ -27,6 +27,7 @@
  */
 
 import { exec, spawn } from 'node:child_process';
+import { createReadStream } from 'node:fs';
 import { promisify } from 'node:util';
 import { PassThrough, type Readable } from 'node:stream';
 import type { SessionRemote } from './types/session.js';
@@ -1179,6 +1180,156 @@ export function remoteCreateReadStream(
       child.kill('SIGTERM');
     },
   };
+}
+
+/** Names a remote upload may carry: the route's own `paste-<ts>-<hex>[-stem].<ext>`. */
+const REMOTE_UPLOAD_NAME_PATTERN = /^paste-[A-Za-z0-9._-]+$/;
+
+/** Exit status of the upload script when `.codeman-uploads` is not a real directory. */
+export const REMOTE_UPLOAD_DIR_REFUSED_EXIT = 4;
+
+/** Exit status of the upload script when the workspace itself is not a directory. */
+export const REMOTE_UPLOAD_NO_WORKSPACE_EXIT = 5;
+
+/** Exit status of the upload script when the received byte count is not the sent one. */
+const REMOTE_UPLOAD_SHORT_EXIT = 6;
+
+/**
+ * The remote half of a prompt upload into `{workspace}/.codeman-uploads/{name}`: the
+ * same rules as the local `ensureUploadDir` + `openPasteFile`, in `sh`.
+ *
+ * - A symlink (or anything but a directory) at `.codeman-uploads` refuses with
+ *   {@link REMOTE_UPLOAD_DIR_REFUSED_EXIT}, so a planted `.codeman-uploads -> ~/.ssh`
+ *   cannot redirect the write. `mkdir` without `-p` does not follow a leaf symlink.
+ * - The folder ignores itself with a `.gitignore` of `*`, written only when nothing
+ *   is there yet (noclobber), so a user's own file there stays as it is.
+ * - The bytes arrive on stdin and land in `{name}.part` (noclobber = `O_EXCL`), and are
+ *   renamed into place only when their count is exactly `size`. A transfer cut midway
+ *   (the browser or the network left) ends `cat` with a clean EOF, so the count is what
+ *   tells a short file from a whole one; a short one is removed, never left behind.
+ * - A workspace given as `~/…` is the remote user's home, as everywhere else.
+ * - On success the script prints a NUL and then the file's absolute path, so a login
+ *   banner or an rc-file `echo` before it cannot be mistaken for the path.
+ */
+export function buildRemoteUploadScript(workspace: string, name: string, size: number): string {
+  if (!REMOTE_UPLOAD_NAME_PATTERN.test(name)) throw new Error(`invalid upload name: ${name}`);
+  if (!Number.isSafeInteger(size) || size < 0) throw new Error(`invalid upload size: ${size}`);
+  return [
+    `ws=${shellescape(workspace)}`,
+    `case $ws in '~') ws=$HOME ;; '~/'*) ws=$HOME/\${ws#'~/'} ;; esac`,
+    `[ -d "$ws" ] || exit ${REMOTE_UPLOAD_NO_WORKSPACE_EXIT}`,
+    'd=$ws/.codeman-uploads',
+    `if [ -L "$d" ]; then exit ${REMOTE_UPLOAD_DIR_REFUSED_EXIT}; fi`,
+    `if [ ! -d "$d" ]; then mkdir "$d" 2>/dev/null || [ -d "$d" ] || exit ${REMOTE_UPLOAD_DIR_REFUSED_EXIT}; fi`,
+    `if [ -L "$d" ] || [ ! -d "$d" ]; then exit ${REMOTE_UPLOAD_DIR_REFUSED_EXIT}; fi`,
+    'set -C',
+    `if [ ! -e "$d/.gitignore" ] && [ ! -L "$d/.gitignore" ]; then printf '*\\n' > "$d/.gitignore" 2>/dev/null; fi`,
+    `f=$d/${name}`,
+    'cat > "$f.part" || { rm -f "$f.part"; exit 1; }',
+    'n=$(wc -c < "$f.part" | tr -d " ")',
+    `if [ "$n" != ${size} ]; then rm -f "$f.part"; exit ${REMOTE_UPLOAD_SHORT_EXIT}; fi`,
+    'mv "$f.part" "$f" || { rm -f "$f.part"; exit 1; }',
+    `printf '\\0%s' "$f"`,
+  ].join('\n');
+}
+
+/** The minimum transfer rate an upload is given time for (as for edit-history reads). */
+const REMOTE_UPLOAD_MIN_BYTES_PER_SEC = 256 * 1024;
+
+/** Thrown for an upload the remote side refused on purpose (not an ssh failure). */
+export class RemoteUploadRefusedError extends RemoteFileAccessError {
+  constructor(
+    message: string,
+    readonly exitCode: number
+  ) {
+    super(message);
+    this.name = 'RemoteUploadRefusedError';
+  }
+}
+
+/**
+ * Copy a local file to `{workspace}/.codeman-uploads/{name}` on the session's host,
+ * streamed over the ssh child's stdin (nothing buffered in server memory, so a phone
+ * video costs one pipe). Resolves to the remote file's absolute path.
+ *
+ * Throws {@link RemoteUploadRefusedError} for a refusal of the remote script (no
+ * workspace, `.codeman-uploads` not a directory) and {@link RemoteFileAccessError}
+ * for everything else (host unreachable, timeout, short transfer).
+ */
+export async function remoteWriteUpload(
+  remote: SessionRemote,
+  workspace: string,
+  name: string,
+  localPath: string,
+  size: number
+): Promise<string> {
+  assertNotUnderTest();
+  // `exec` so a timeout's SIGTERM reaches ssh itself, not just the local `sh -c`.
+  const command = `exec ${buildRemoteFileCommand(remote, buildRemoteUploadScript(workspace, name, size))}`;
+  const timeoutMs = REMOTE_READ_TIMEOUT_MS + Math.ceil((size / REMOTE_UPLOAD_MIN_BYTES_PER_SEC) * 1000);
+  return runWithRemoteSshLimit(
+    () =>
+      new Promise<string>((resolve, reject) => {
+        const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
+        const stdout: Buffer[] = [];
+        let stderr = '';
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          child.kill('SIGTERM');
+        }, timeoutMs);
+        child.stdout.on('data', (chunk: Buffer) => {
+          if (stdout.length < 64) stdout.push(chunk);
+        });
+        child.stderr.on('data', (chunk: Buffer) => {
+          if (stderr.length < 2000) stderr += chunk.toString();
+        });
+        // An ssh that died early closes its stdin: EPIPE here is reported through `close`.
+        child.stdin.on('error', () => {});
+        const source = createReadStream(localPath);
+        source.on('error', (err) => {
+          child.kill('SIGTERM');
+          reject(new RemoteFileAccessError(`could not read the staged upload: ${err.message}`));
+        });
+        source.pipe(child.stdin);
+        child.on('error', (err: NodeJS.ErrnoException) => {
+          clearTimeout(timer);
+          reject(new RemoteFileAccessError(`ssh could not be started (${err.code ?? 'error'})`));
+        });
+        child.on('close', (code: number | null) => {
+          clearTimeout(timer);
+          source.destroy();
+          const detail = stderr
+            .split('\n')
+            .map((line) => line.trim())
+            .find((line) => line.length > 0);
+          if (timedOut) return reject(new RemoteFileAccessError('remote upload timed out'));
+          if (code === REMOTE_UPLOAD_DIR_REFUSED_EXIT) {
+            return reject(new RemoteUploadRefusedError('.codeman-uploads is not a regular directory', code));
+          }
+          if (code === REMOTE_UPLOAD_NO_WORKSPACE_EXIT) {
+            return reject(new RemoteUploadRefusedError(`Workspace ${workspace} is not a directory on the host`, code));
+          }
+          if (code === REMOTE_UPLOAD_SHORT_EXIT) {
+            return reject(new RemoteFileAccessError('remote upload was cut short'));
+          }
+          if (code !== 0) {
+            return reject(
+              new RemoteFileAccessError(
+                `remote upload failed (ssh exit ${code})${detail ? `: ${detail.slice(0, 300)}` : ''}`
+              )
+            );
+          }
+          const out = Buffer.concat(stdout).toString('utf8');
+          const marker = out.lastIndexOf('\0');
+          const path = marker >= 0 ? out.slice(marker + 1) : '';
+          if (!path.startsWith('/') || !path.endsWith(`/${name}`)) {
+            return reject(new RemoteFileAccessError('remote upload returned no path'));
+          }
+          resolve(path);
+        });
+      })
+  );
 }
 
 /**
