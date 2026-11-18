@@ -240,8 +240,10 @@ js, html) are not accepted, since a prompt upload is something for the agent to 
 something for Codeman to store and serve. A document keeps a trimmed copy of its original
 name, letters, digits, dot, dash and underscore with anything else turned into a dash, so
 `Q3 report.pdf` is findable as `paste-<time>-<id>-Q3-report.pdf`; a name made entirely of
-other characters saves without one. Uploads are refused for remote (SSH) sessions, whose
-working directory is on the other host.
+other characters saves without one. In a remote (SSH) session the upload is checked here
+and then copied over ssh into `.codeman-uploads/` of the case on the other host, so the path
+on the prompt is one the agent there can read; those remote files are not aged out by the
+seven-day cleanup below.
 
 Uploads land in `.codeman-uploads/` inside the case, next to the code the agent is working
 on, because that is the one path a local agent and a Docker case (whose workspace is mounted

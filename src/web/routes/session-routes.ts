@@ -228,6 +228,7 @@ import {
   selectLastAnsweredTurn,
 } from '../response-viewer-transcript.js';
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
+import { RemoteUploadRefusedError, remoteWriteUpload } from '../../remote-files.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
 
@@ -588,6 +589,19 @@ function sanitizeUploadStem(filename: string): string {
     .replace(/[^A-Za-z0-9._-]+/g, '-')
     .replace(/^[-.]+|[-.]+$/g, '')
     .slice(0, 40);
+}
+
+/** A private, fresh folder a remote session's upload is received into before the ssh copy. */
+async function makeRemoteUploadStaging(): Promise<string> {
+  const root = dataPath('upload-staging');
+  await fs.mkdir(root, { recursive: true, mode: 0o700 });
+  return fs.mkdtemp(join(root, 'remote-'));
+}
+
+/** A paste-image success body (`{ path, filename }`), as opposed to an error envelope. */
+function isSavedUpload(value: unknown): value is { path: string; filename: string } {
+  const record = value as { path?: unknown; filename?: unknown } | null;
+  return typeof record?.path === 'string' && typeof record.filename === 'string';
 }
 
 /** Open a fresh, uniquely named paste file for writing. */
@@ -6142,19 +6156,14 @@ export function registerSessionRoutes(
 
     const session = findSessionOrFail(ctx, id, req);
 
-    // The file lands on THIS host under the session's working directory, which
-    // for a remote (SSH) session is the remote path: the agent there could never
-    // read it, and the write would land in a same-named local directory or fail.
-    // An owned Docker case is fine, its workspace is bind-mounted at the same
+    // A remote (SSH) session's workingDir is the REMOTE path, which this host cannot
+    // write into. Its upload is received and checked here exactly like a local one,
+    // into a private staging folder, and then copied over ssh into the remote
+    // `.codeman-uploads` (remoteWriteUpload, same symlink and ignore-file rules), so
+    // the path typed into the prompt is one the agent on that host can read. An
+    // owned Docker case is fine as is, its workspace is bind-mounted at the same
     // absolute path; an adopted container (owned: false) mounts nothing, so its
     // agent reads the file only if the container exposes that host path.
-    if (session.remote) {
-      reply.code(400);
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        'Prompt uploads are not supported for remote (SSH) sessions'
-      );
-    }
     // An adopted session has no workspace of ours: its folder is the neutral `/tmp`, shared with
     // whatever else runs there, and an agent in a container or on an ssh host could not read it.
     // The foreign pane's own folder is not ours to write into either.
@@ -6170,240 +6179,266 @@ export function registerSessionRoutes(
     // upload. Only "unknown" (the mount is not answering) is refused here, the way
     // the create route does; absent / not-a-directory keep ensureUploadDir's own
     // errors, since a live session's workspace should be neither.
-    if ((await probePathKind(session.workingDir, { pastCap: true })) === 'unknown') {
+    if (!session.remote && (await probePathKind(session.workingDir, { pastCap: true })) === 'unknown') {
       return createErrorResponse(
         ApiErrorCode.OPERATION_FAILED,
         describeUnknownPath('Workspace', session.workingDir, { pastCap: true })
       );
     }
 
-    if (!req.isMultipart()) {
-      reply.code(400);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
-    }
-
-    // Read the single file part. @fastify/multipart enforces the per-file size
-    // cap (MAX_PASTE_IMAGE_BYTES) and the 1-file/4-field count limits (server.ts),
-    // replacing a hand-rolled
-    // boundary scanner with several bugs: literal boundary matches anywhere in
-    // body, LF-only clients silently corrupted the last byte (hard-coded \r\n
-    // offsets), no part-count cap.
-    // `?kind=video` (read above for the rate check) is the ONLY way onto the video
-    // path: it selects the larger, disk-streamed budget before the part is seen
-    // (busboy takes its limits up front), and it admits video types alone, so an
-    // image can never ride the video cap through memory. Without it the route is
-    // byte-identical to the image-only version. Truncation is checked on the stream
-    // below rather than thrown, since the file is being written as it arrives.
-    let part: import('@fastify/multipart').MultipartFile | undefined;
+    const remote = session.remote;
+    // Staged on disk under the data dir, not os.tmpdir(): /tmp is often a tmpfs, where
+    // a phone video (up to MAX_PASTE_VIDEO_BYTES) would sit in RAM for the whole copy.
+    const staging = remote ? await makeRemoteUploadStaging() : null;
+    const uploadRoot = staging ?? session.workingDir;
     try {
-      part = await req.file(
-        isVideo ? { limits: { fileSize: MAX_PASTE_VIDEO_BYTES }, throwFileSizeLimit: false } : undefined
-      );
-    } catch (err: unknown) {
-      reply.code(413);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || 'Invalid multipart payload');
-    }
-    if (!part) {
-      reply.code(400);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No image uploaded');
-    }
-    if (part.fieldname !== 'image') {
-      reply.code(400);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unexpected field "${part.fieldname}", expected "image"`);
+      const result = await receiveUpload();
+      if (!remote || reply.statusCode >= 300 || !isSavedUpload(result)) return result;
+      const { size } = await fs.stat(result.path);
+      try {
+        const path = await remoteWriteUpload(remote, session.workingDir, result.filename, result.path, size);
+        return { path, filename: result.filename };
+      } catch (err: unknown) {
+        reply.code(err instanceof RemoteUploadRefusedError ? 403 : 502);
+        return createErrorResponse(
+          ApiErrorCode.OPERATION_FAILED,
+          `Upload to ${remote.label || remote.host} failed: ${getErrorMessage(err)}`
+        );
+      }
+    } finally {
+      if (staging) await fs.rm(staging, { recursive: true, force: true }).catch(() => {});
     }
 
-    if (isVideo) {
-      let ext = '';
-      if (part.filename) {
-        const origExt = extname(part.filename).toLowerCase();
-        if (ALLOWED_VIDEO_EXTS.has(origExt)) ext = origExt;
+    async function receiveUpload() {
+      if (!req.isMultipart()) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Expected multipart/form-data');
       }
-      const videoMime = (part.mimetype || '').toLowerCase().match(/^video\/(mp4|quicktime|x-m4v|webm|ogg)$/);
-      if (videoMime) ext = VIDEO_MIME_EXT[videoMime[1]] ?? ext;
-      if (!ext) {
-        await finished(part.file.resume()).catch(() => {});
+
+      // Read the single file part. @fastify/multipart enforces the per-file size
+      // cap (MAX_PASTE_IMAGE_BYTES) and the 1-file/4-field count limits (server.ts),
+      // replacing a hand-rolled
+      // boundary scanner with several bugs: literal boundary matches anywhere in
+      // body, LF-only clients silently corrupted the last byte (hard-coded \r\n
+      // offsets), no part-count cap.
+      // `?kind=video` (read above for the rate check) is the ONLY way onto the video
+      // path: it selects the larger, disk-streamed budget before the part is seen
+      // (busboy takes its limits up front), and it admits video types alone, so an
+      // image can never ride the video cap through memory. Without it the route is
+      // byte-identical to the image-only version. Truncation is checked on the stream
+      // below rather than thrown, since the file is being written as it arrives.
+      let part: import('@fastify/multipart').MultipartFile | undefined;
+      try {
+        part = await req.file(
+          isVideo ? { limits: { fileSize: MAX_PASTE_VIDEO_BYTES }, throwFileSizeLimit: false } : undefined
+        );
+      } catch (err: unknown) {
+        reply.code(413);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || 'Invalid multipart payload');
+      }
+      if (!part) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No image uploaded');
+      }
+      if (part.fieldname !== 'image') {
         reply.code(400);
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          `Unsupported video type. Allowed: ${[...ALLOWED_VIDEO_EXTS].join(', ')}`
+          `Unexpected field "${part.fieldname}", expected "image"`
         );
       }
-      const uploadDir = await ensureUploadDir(session.workingDir);
-      if (!uploadDir) {
-        await finished(part.file.resume()).catch(() => {});
-        reply.code(403);
-        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
-      }
-      const { filename, filepath, fh } = await openPasteFile(uploadDir, ext);
-      // Written as it arrives: a phone video is far too large to buffer the way an
-      // image is. The container is judged on the first 12 bytes as soon as they are
-      // in, so a mislabeled upload stops touching disk at its first chunk; the rest
-      // of the body is drained unwritten (as busboy does past its own size limit),
-      // which is what lets the answer reach the client. A transfer that dies midway
-      // (the phone left the network) leaves no partial file behind.
-      const head = Buffer.alloc(12);
-      let headLen = 0;
-      let mislabeled = false;
-      try {
-        for await (const chunk of part.file) {
-          if (mislabeled) continue;
-          if (headLen < head.length) {
-            headLen += chunk.copy(head, headLen, 0, head.length - headLen);
-            mislabeled = headLen === head.length && !imageMagicMatchesExt(head, ext);
-            if (mislabeled) continue;
-          }
-          // writeFile loops until the whole chunk is on disk; a bare write() may be short.
-          await fh.writeFile(chunk);
+
+      if (isVideo) {
+        let ext = '';
+        if (part.filename) {
+          const origExt = extname(part.filename).toLowerCase();
+          if (ALLOWED_VIDEO_EXTS.has(origExt)) ext = origExt;
         }
+        const videoMime = (part.mimetype || '').toLowerCase().match(/^video\/(mp4|quicktime|x-m4v|webm|ogg)$/);
+        if (videoMime) ext = VIDEO_MIME_EXT[videoMime[1]] ?? ext;
+        if (!ext) {
+          await finished(part.file.resume()).catch(() => {});
+          reply.code(400);
+          return createErrorResponse(
+            ApiErrorCode.INVALID_INPUT,
+            `Unsupported video type. Allowed: ${[...ALLOWED_VIDEO_EXTS].join(', ')}`
+          );
+        }
+        const uploadDir = await ensureUploadDir(uploadRoot);
+        if (!uploadDir) {
+          await finished(part.file.resume()).catch(() => {});
+          reply.code(403);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
+        }
+        const { filename, filepath, fh } = await openPasteFile(uploadDir, ext);
+        // Written as it arrives: a phone video is far too large to buffer the way an
+        // image is. The container is judged on the first 12 bytes as soon as they are
+        // in, so a mislabeled upload stops touching disk at its first chunk; the rest
+        // of the body is drained unwritten (as busboy does past its own size limit),
+        // which is what lets the answer reach the client. A transfer that dies midway
+        // (the phone left the network) leaves no partial file behind.
+        const head = Buffer.alloc(12);
+        let headLen = 0;
+        let mislabeled = false;
+        try {
+          for await (const chunk of part.file) {
+            if (mislabeled) continue;
+            if (headLen < head.length) {
+              headLen += chunk.copy(head, headLen, 0, head.length - headLen);
+              mislabeled = headLen === head.length && !imageMagicMatchesExt(head, ext);
+              if (mislabeled) continue;
+            }
+            // writeFile loops until the whole chunk is on disk; a bare write() may be short.
+            await fh.writeFile(chunk);
+          }
+        } catch (err: unknown) {
+          await fs.unlink(filepath).catch(() => {});
+          throw err;
+        } finally {
+          await fh.close();
+        }
+        let failure: { status: number; message: string } | null = null;
+        if (headLen === 0) failure = { status: 400, message: 'Empty file' };
+        else if (!imageMagicMatchesExt(head.subarray(0, headLen), ext)) {
+          console.warn(
+            `[paste-image] video magic mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${ext} magic=${head.subarray(0, headLen).toString('hex')}`
+          );
+          failure = { status: 415, message: `Video bytes do not match declared type ${ext}` };
+        } else if (part.file.truncated) {
+          const maxMb = Math.round(MAX_PASTE_VIDEO_BYTES / (1024 * 1024));
+          failure = { status: 413, message: `File too large (max ${maxMb}MB)` };
+        }
+        if (failure) {
+          await fs.unlink(filepath).catch(() => {});
+          reply.code(failure.status);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, failure.message);
+        }
+        return { path: filepath, filename };
+      }
+
+      let imageBytes: Buffer;
+      try {
+        imageBytes = await part.toBuffer();
       } catch (err: unknown) {
-        await fs.unlink(filepath).catch(() => {});
-        throw err;
-      } finally {
-        await fh.close();
-      }
-      let failure: { status: number; message: string } | null = null;
-      if (headLen === 0) failure = { status: 400, message: 'Empty file' };
-      else if (!imageMagicMatchesExt(head.subarray(0, headLen), ext)) {
-        console.warn(
-          `[paste-image] video magic mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${ext} magic=${head.subarray(0, headLen).toString('hex')}`
-        );
-        failure = { status: 415, message: `Video bytes do not match declared type ${ext}` };
-      } else if (part.file.truncated) {
-        const maxMb = Math.round(MAX_PASTE_VIDEO_BYTES / (1024 * 1024));
-        failure = { status: 413, message: `File too large (max ${maxMb}MB)` };
-      }
-      if (failure) {
-        await fs.unlink(filepath).catch(() => {});
-        reply.code(failure.status);
-        return createErrorResponse(ApiErrorCode.INVALID_INPUT, failure.message);
-      }
-      return { path: filepath, filename };
-    }
-
-    let imageBytes: Buffer;
-    try {
-      imageBytes = await part.toBuffer();
-    } catch (err: unknown) {
-      reply.code(413);
-      const maxMb = Math.round(MAX_PASTE_IMAGE_BYTES / (1024 * 1024));
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, getErrorMessage(err) || `File too large (max ${maxMb}MB)`);
-    }
-    if (imageBytes.length === 0) {
-      reply.code(400);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Empty file');
-    }
-
-    // Dispatch mirrors the client's _promptAttachKind: an image MIME type takes
-    // the image path whatever the name says, a document extension (the MIME a
-    // phone gives a .md is anyone's guess) takes the document branch, anything
-    // else the image path exactly as before, HEIC sniff included. See CLAUDE.md.
-    const origExt = part.filename ? extname(part.filename).toLowerCase() : '';
-    const imageMime = /^image\//i.test(part.mimetype || '');
-    if (!imageMime && ALLOWED_DOCUMENT_EXTS.has(origExt)) {
-      if (!imageMagicMatchesExt(imageBytes, origExt)) {
-        // The first bytes of a text file are user content, so for text the log
-        // names the failure and never the bytes; a signature is safe to print.
-        // A text refusal names the encoding, since an Excel or Notepad export
-        // (UTF-16 with a BOM, or Windows-1252) is not a corrupt file.
-        const isText = TEXT_UPLOAD_EXTS.has(origExt);
-        const bom = imageBytes.length >= 2 ? imageBytes.readUInt16BE(0) : 0;
-        const utf16 = bom === 0xfffe || bom === 0xfeff;
-        const detail = isText
-          ? `reason=${utf16 ? 'utf16-bom' : imageBytes.includes(0) ? 'nul-byte' : 'not-utf8'}`
-          : `magic=${imageBytes.subarray(0, 12).toString('hex')}`;
-        console.warn(
-          `[paste-image] document mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${origExt} size=${imageBytes.length} ${detail}`
-        );
-        reply.code(415);
+        reply.code(413);
+        const maxMb = Math.round(MAX_PASTE_IMAGE_BYTES / (1024 * 1024));
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          isText
-            ? `This ${origExt} file is ${utf16 ? 'UTF-16 text, not UTF-8' : 'not UTF-8 text'}; save it as UTF-8 and attach it again`
-            : `File bytes do not match declared type ${origExt}`
+          getErrorMessage(err) || `File too large (max ${maxMb}MB)`
         );
       }
-      const saved = await writeBufferedUpload(
-        session.workingDir,
-        origExt,
-        imageBytes,
-        sanitizeUploadStem(part.filename)
-      );
+      if (imageBytes.length === 0) {
+        reply.code(400);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Empty file');
+      }
+
+      // Dispatch mirrors the client's _promptAttachKind: an image MIME type takes
+      // the image path whatever the name says, a document extension (the MIME a
+      // phone gives a .md is anyone's guess) takes the document branch, anything
+      // else the image path exactly as before, HEIC sniff included. See CLAUDE.md.
+      const origExt = part.filename ? extname(part.filename).toLowerCase() : '';
+      const imageMime = /^image\//i.test(part.mimetype || '');
+      if (!imageMime && ALLOWED_DOCUMENT_EXTS.has(origExt)) {
+        if (!imageMagicMatchesExt(imageBytes, origExt)) {
+          // The first bytes of a text file are user content, so for text the log
+          // names the failure and never the bytes; a signature is safe to print.
+          // A text refusal names the encoding, since an Excel or Notepad export
+          // (UTF-16 with a BOM, or Windows-1252) is not a corrupt file.
+          const isText = TEXT_UPLOAD_EXTS.has(origExt);
+          const bom = imageBytes.length >= 2 ? imageBytes.readUInt16BE(0) : 0;
+          const utf16 = bom === 0xfffe || bom === 0xfeff;
+          const detail = isText
+            ? `reason=${utf16 ? 'utf16-bom' : imageBytes.includes(0) ? 'nul-byte' : 'not-utf8'}`
+            : `magic=${imageBytes.subarray(0, 12).toString('hex')}`;
+          console.warn(
+            `[paste-image] document mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${origExt} size=${imageBytes.length} ${detail}`
+          );
+          reply.code(415);
+          return createErrorResponse(
+            ApiErrorCode.INVALID_INPUT,
+            isText
+              ? `This ${origExt} file is ${utf16 ? 'UTF-16 text, not UTF-8' : 'not UTF-8 text'}; save it as UTF-8 and attach it again`
+              : `File bytes do not match declared type ${origExt}`
+          );
+        }
+        const saved = await writeBufferedUpload(uploadRoot, origExt, imageBytes, sanitizeUploadStem(part.filename));
+        if (!saved) {
+          reply.code(403);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
+        }
+        return saved;
+      }
+
+      // Determine extension from filename or Content-Type.
+      let ext = '.png';
+      if (ALLOWED_IMAGE_EXTS.has(origExt)) ext = origExt;
+      const mimeMatch = (part.mimetype || '').toLowerCase().match(/^image\/(png|jpeg|jpg|webp|gif|bmp|heic|heif)$/);
+      if (mimeMatch) {
+        const map: Record<string, string> = {
+          png: '.png',
+          jpeg: '.jpg',
+          jpg: '.jpg',
+          webp: '.webp',
+          gif: '.gif',
+          bmp: '.bmp',
+          heic: '.heic',
+          heif: '.heif',
+        };
+        ext = map[mimeMatch[1]] ?? ext;
+      }
+
+      if (!ALLOWED_IMAGE_EXTS.has(ext)) {
+        reply.code(400);
+        return createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          `Unsupported image type: ${ext}. Allowed: ${[...ALLOWED_IMAGE_EXTS].join(', ')}`
+        );
+      }
+
+      // Route HEIC on the raw bytes, NOT the declared ext/mime: on some Android
+      // galleries (e.g. MIUI) a HEIF comes back mislabeled as image/jpeg, and
+      // browsers that cannot decode HEIF upload the original file as-is — so a
+      // HEIC payload can arrive under any declared type. Filename and
+      // Content-Type are attacker-supplied anyway; only the bytes are trusted.
+      if (imageMagicMatchesExt(imageBytes, '.heic')) {
+        try {
+          imageBytes = await convertHeicToJpeg(imageBytes);
+          ext = '.jpg';
+        } catch (err: unknown) {
+          console.warn(
+            `[paste-image] HEIC conversion failed: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} error=${getErrorMessage(err)}`
+          );
+          reply.code(415);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Could not convert HEIC image to JPEG');
+        }
+      } else if (!imageMagicMatchesExt(imageBytes, ext)) {
+        // A foreign extension with no image MIME (a script, an HTML page, a video
+        // without its flag) was never going to be an image: say so, rather than
+        // the ".png" the default extension would name. Decided only HERE, after
+        // the sniff, so anything the image path ever accepted by its bytes (a
+        // HEIC under a generic name) still is.
+        if (origExt && !ALLOWED_IMAGE_EXTS.has(origExt) && !imageMime) {
+          reply.code(400);
+          return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unsupported file type: ${origExt}`);
+        }
+        // Sniff actual bytes — a polyglot HTML/PNG would otherwise pass and
+        // serve back with image/png MIME. Log the real header so format
+        // mismatches can be pinned down without a reproduce-and-guess loop. The
+        // client re-encodes images to JPEG/PNG before upload, so this is rare.
+        console.warn(
+          `[paste-image] magic mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${ext} magic=${imageBytes.subarray(0, 12).toString('hex')}`
+        );
+        reply.code(415);
+        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Image bytes do not match declared type ${ext}`);
+      }
+
+      const saved = await writeBufferedUpload(uploadRoot, ext, imageBytes);
       if (!saved) {
         reply.code(403);
         return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
       }
       return saved;
     }
-
-    // Determine extension from filename or Content-Type.
-    let ext = '.png';
-    if (ALLOWED_IMAGE_EXTS.has(origExt)) ext = origExt;
-    const mimeMatch = (part.mimetype || '').toLowerCase().match(/^image\/(png|jpeg|jpg|webp|gif|bmp|heic|heif)$/);
-    if (mimeMatch) {
-      const map: Record<string, string> = {
-        png: '.png',
-        jpeg: '.jpg',
-        jpg: '.jpg',
-        webp: '.webp',
-        gif: '.gif',
-        bmp: '.bmp',
-        heic: '.heic',
-        heif: '.heif',
-      };
-      ext = map[mimeMatch[1]] ?? ext;
-    }
-
-    if (!ALLOWED_IMAGE_EXTS.has(ext)) {
-      reply.code(400);
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        `Unsupported image type: ${ext}. Allowed: ${[...ALLOWED_IMAGE_EXTS].join(', ')}`
-      );
-    }
-
-    // Route HEIC on the raw bytes, NOT the declared ext/mime: on some Android
-    // galleries (e.g. MIUI) a HEIF comes back mislabeled as image/jpeg, and
-    // browsers that cannot decode HEIF upload the original file as-is — so a
-    // HEIC payload can arrive under any declared type. Filename and
-    // Content-Type are attacker-supplied anyway; only the bytes are trusted.
-    if (imageMagicMatchesExt(imageBytes, '.heic')) {
-      try {
-        imageBytes = await convertHeicToJpeg(imageBytes);
-        ext = '.jpg';
-      } catch (err: unknown) {
-        console.warn(
-          `[paste-image] HEIC conversion failed: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} error=${getErrorMessage(err)}`
-        );
-        reply.code(415);
-        return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Could not convert HEIC image to JPEG');
-      }
-    } else if (!imageMagicMatchesExt(imageBytes, ext)) {
-      // A foreign extension with no image MIME (a script, an HTML page, a video
-      // without its flag) was never going to be an image: say so, rather than
-      // the ".png" the default extension would name. Decided only HERE, after
-      // the sniff, so anything the image path ever accepted by its bytes (a
-      // HEIC under a generic name) still is.
-      if (origExt && !ALLOWED_IMAGE_EXTS.has(origExt) && !imageMime) {
-        reply.code(400);
-        return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Unsupported file type: ${origExt}`);
-      }
-      // Sniff actual bytes — a polyglot HTML/PNG would otherwise pass and
-      // serve back with image/png MIME. Log the real header so format
-      // mismatches can be pinned down without a reproduce-and-guess loop. The
-      // client re-encodes images to JPEG/PNG before upload, so this is rare.
-      console.warn(
-        `[paste-image] magic mismatch: filename=${JSON.stringify(part.filename)} mime=${JSON.stringify(part.mimetype)} declaredExt=${ext} magic=${imageBytes.subarray(0, 12).toString('hex')}`
-      );
-      reply.code(415);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Image bytes do not match declared type ${ext}`);
-    }
-
-    const saved = await writeBufferedUpload(session.workingDir, ext, imageBytes);
-    if (!saved) {
-      reply.code(403);
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, `${UPLOADS_DIR} is not a regular directory`);
-    }
-    return saved;
   });
 
   // Returned so the server can own the registry's LIFETIME (drop state when a session is

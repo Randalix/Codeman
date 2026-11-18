@@ -67,6 +67,27 @@ vi.mock('../../src/remote-hosts.js', async (orig) => {
 const remoteScrollback = vi.hoisted(() => vi.fn(async (): Promise<string | null> => null));
 vi.mock('../../src/remote-pane-history.js', () => ({ fetchRemoteScrollback: remoteScrollback }));
 
+// A remote session's upload is copied over ssh; the route stages and checks it, the
+// copy itself (remoteWriteUpload) is covered by test/remote-upload-script.test.ts.
+const remoteUpload = vi.hoisted(() => ({
+  calls: [] as Array<{ workspace: string; name: string; size: number; bytes: Buffer; staged: string }>,
+  failWith: null as Error | null,
+}));
+vi.mock('../../src/remote-files.js', async (orig) => {
+  const actual = await orig<typeof import('../../src/remote-files.js')>();
+  const { readFile: read } = await import('node:fs/promises');
+  return {
+    ...actual,
+    remoteWriteUpload: vi.fn(
+      async (_remote: unknown, workspace: string, name: string, staged: string, size: number) => {
+        remoteUpload.calls.push({ workspace, name, size, bytes: await read(staged), staged });
+        if (remoteUpload.failWith) throw remoteUpload.failWith;
+        return `/home/remote/${workspace.replace(/^\/+/, '')}/.codeman-uploads/${name}`;
+      }
+    ),
+  };
+});
+
 // Bounded path probe: a live session's workspace can sit on a network mount that
 // stopped answering, and the paste-image route probes it before the first disk
 // touch (#516). Default is call-through so the real probe runs for the other
@@ -446,20 +467,74 @@ describe('session-routes', () => {
       }
     });
 
-    it('refuses an upload for a remote session before touching disk', async () => {
-      const workDir = await mkdtemp(join(tmpdir(), 'codeman-uploads-'));
-      harness.ctx._session.workingDir = workDir;
-      // A remote session's workingDir is the REMOTE path: a file written here is unreadable there.
-      (harness.ctx._session as unknown as { remote: unknown }).remote = { hostId: 'gpu-box' };
-      try {
-        const res = await uploadImage('shot.jpg', 'image/jpeg', jpeg);
-        expect(res.statusCode).toBe(400);
-        expect(JSON.parse(res.body).error).toMatch(/remote/);
-        expect(await readdir(workDir)).toEqual([]);
-      } finally {
+    describe('remote (SSH) session', () => {
+      const REMOTE_WS = '/srv/case';
+      let localDir: string;
+      beforeEach(async () => {
+        remoteUpload.calls = [];
+        remoteUpload.failWith = null;
+        // workingDir is the REMOTE path. A same-named local folder must stay untouched:
+        // point it at a real local dir to prove nothing lands there.
+        localDir = await mkdtemp(join(tmpdir(), 'codeman-uploads-'));
+        harness.ctx._session.workingDir = localDir;
+        (harness.ctx._session as unknown as { remote: unknown }).remote = {
+          hostId: 'gpu-box',
+          label: 'gpu',
+          host: 'h',
+        };
+      });
+      afterEach(async () => {
         (harness.ctx._session as unknown as { remote: unknown }).remote = undefined;
-        await rm(workDir, { recursive: true });
-      }
+        await rm(localDir, { recursive: true });
+      });
+
+      it('stages a checked upload and copies it to the remote .codeman-uploads, never writing the local folder', async () => {
+        harness.ctx._session.workingDir = REMOTE_WS;
+        const res = await uploadImage('shot.jpg', 'image/jpeg', jpeg);
+        expect(res.statusCode).toBe(200);
+        expect(remoteUpload.calls).toHaveLength(1);
+        const [call] = remoteUpload.calls;
+        expect(call.workspace).toBe(REMOTE_WS);
+        expect(call.name).toMatch(/^paste-\d+-[0-9a-f]{8}\.jpg$/);
+        expect(call.bytes.equals(jpeg)).toBe(true);
+        expect(call.size).toBe(jpeg.length);
+        expect(JSON.parse(res.body).data).toEqual({
+          path: `/home/remote/srv/case/.codeman-uploads/${call.name}`,
+          filename: call.name,
+        });
+        // The staging folder is gone once the answer is out.
+        expect(existsSync(dirname(dirname(call.staged)))).toBe(false);
+      });
+
+      it('runs the same checks as a local upload before anything goes over ssh', async () => {
+        const res = await uploadImage('shot.jpg', 'image/jpeg', Buffer.from('not a jpeg at all'));
+        expect(res.statusCode).toBe(415);
+        expect(remoteUpload.calls).toEqual([]);
+        expect(await readdir(localDir)).toEqual([]);
+      });
+
+      it('keeps the document name in the remote file', async () => {
+        const res = await uploadImage('Q3 report.md', 'text/markdown', Buffer.from('# hi\n'));
+        expect(res.statusCode).toBe(200);
+        expect(remoteUpload.calls[0].name).toMatch(/-Q3-report\.md$/);
+        expect(await readdir(localDir)).toEqual([]);
+      });
+
+      it('answers 502 with the ssh reason when the copy fails, and 403 when the host refuses the folder', async () => {
+        const { RemoteFileAccessError, RemoteUploadRefusedError } = await import('../../src/remote-files.js');
+        remoteUpload.failWith = new RemoteFileAccessError('remote upload failed (ssh exit 255): Connection refused');
+        let res = await uploadImage('shot.jpg', 'image/jpeg', jpeg);
+        expect(res.statusCode).toBe(502);
+        expect(JSON.parse(res.body).error).toBe(
+          'Upload to gpu failed: remote upload failed (ssh exit 255): Connection refused'
+        );
+        remoteUpload.failWith = new RemoteUploadRefusedError('.codeman-uploads is not a regular directory', 4);
+        res = await uploadImage('shot.jpg', 'image/jpeg', jpeg);
+        expect(res.statusCode).toBe(403);
+        expect(JSON.parse(res.body).error).toMatch(/not a regular directory/);
+        for (const call of remoteUpload.calls) expect(existsSync(dirname(dirname(call.staged)))).toBe(false);
+        expect(await readdir(localDir)).toEqual([]);
+      });
     });
 
     it('returns 415 with the error envelope when HEIC conversion fails', async () => {
@@ -699,32 +774,28 @@ describe('session-routes', () => {
       await rm(workDir, { recursive: true });
     });
 
-    it('refuses an upload for a remote session before touching disk, video or image', async () => {
+    it('copies the video of a remote session over ssh like an image, nothing written locally', async () => {
       const workDir = await mkdtemp(join(tmpdir(), 'codeman-video-'));
       harness.ctx._session.workingDir = workDir;
-      // A remote session's workingDir is the REMOTE path: a file written here is unreadable there.
-      (harness.ctx._session as unknown as { remote: unknown }).remote = { hostId: 'gpu-box' };
-      for (const [url, name, mime, bytes] of [
-        [`/api/sessions/${harness.ctx._sessionId}/paste-image?kind=video`, 'IMG_0001.MOV', 'video/quicktime', qtMov],
-        [
-          `/api/sessions/${harness.ctx._sessionId}/paste-image`,
-          'shot.png',
-          'image/png',
-          Buffer.from('89504e470d0a1a0a00000000', 'hex'),
-        ],
-      ] as const) {
+      remoteUpload.calls = [];
+      remoteUpload.failWith = null;
+      (harness.ctx._session as unknown as { remote: unknown }).remote = { hostId: 'gpu-box', label: 'gpu', host: 'h' };
+      try {
         const res = await harness.app.inject({
           method: 'POST',
-          url,
+          url: `/api/sessions/${harness.ctx._sessionId}/paste-image?kind=video`,
           headers: movHeaders,
-          payload: imageUploadBody(boundary, name, mime, bytes),
+          payload: imageUploadBody(boundary, 'IMG_0001.MOV', 'video/quicktime', qtMov),
         });
-        expect(res.statusCode).toBe(400);
-        expect(JSON.parse(res.body).error).toMatch(/remote/);
+        expect(res.statusCode).toBe(200);
+        expect(remoteUpload.calls).toHaveLength(1);
+        expect(remoteUpload.calls[0].name).toMatch(/\.mov$/);
+        expect(remoteUpload.calls[0].bytes.equals(qtMov)).toBe(true);
+        expect(await readdir(workDir)).toEqual([]);
+      } finally {
+        (harness.ctx._session as unknown as { remote: unknown }).remote = undefined;
+        await rm(workDir, { recursive: true });
       }
-      (harness.ctx._session as unknown as { remote: unknown }).remote = undefined;
-      expect(await readdir(workDir)).toEqual([]);
-      await rm(workDir, { recursive: true });
     });
 
     it('keeps the image path on its own size cap: a valid image past the video cap is accepted without the flag', async () => {
