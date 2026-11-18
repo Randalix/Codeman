@@ -1433,8 +1433,12 @@ export function buildRemoteLaunchCommand(options: {
       modeCommand = remoteLoginShellCommand(cmd);
     } else {
       const rid = resumeSessionId && RESUME_ID_SAFE.test(resumeSessionId) ? resumeSessionId : undefined;
+      // An explicit resume id goes first, also when it is the session id itself: the
+      // caller knows the conversation exists (a suspended session's resume), and
+      // `--session-id` first would print "Session ID … is already in use" into the
+      // pane before the fallback resumes it.
       modeCommand = remoteLoginShellCommand(
-        rid && rid !== sessionId
+        rid
           ? `${cmd} --resume ${rid} || ${cmd} --session-id ${sessionId}`
           : `${cmd} --session-id ${sessionId} || ${cmd} --resume ${sessionId}`
       );

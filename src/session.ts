@@ -3058,8 +3058,10 @@ export class Session extends EventEmitter {
     // dead-pane respawn, which also runs at boot for remote panes nobody suspended.
     // A suspend recorded its conversation (persisted), which survives a server restart
     // in between; the in-memory adoption does not.
-    const remoteConversation = this._suspendedResumeId ?? this._claudeSessionId;
-    if (this._remote && this.mode === 'claude' && remoteConversation && remoteConversation !== this.id) {
+    // Without an adopted id it is the launch conversation, which is the session id; it is
+    // pinned all the same, so the command resumes first (see buildRemoteLaunchCommand).
+    const remoteConversation = this._suspendedResumeId ?? this._claudeSessionId ?? this.id;
+    if (this._remote && this.mode === 'claude') {
       options.resumeSessionId = remoteConversation;
     }
     const newPid = await mux.respawnPane(options);

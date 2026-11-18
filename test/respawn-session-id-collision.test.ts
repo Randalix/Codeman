@@ -375,6 +375,18 @@ describe('pinning a conversation onto a relaunch', () => {
     expect(calls[0].resumeSessionId).toBe(CONVERSATION);
   });
 
+  it('a remote restartCli without an adopted id pins the session id, so the command resumes first', async () => {
+    // Live 2026-11-18: unpinned, the relaunch ran `--session-id <id>` first and printed
+    // "Session ID … is already in use" into the woken pane before `--resume` took over.
+    const { mux, calls } = recordingMux();
+    const session = localSession(
+      { remote: { hostId: 'h1', label: 'box', host: 'box', username: 'dev', remotePath: '/tmp' } },
+      mux
+    );
+    expect(await session.restartCli()).toBe(true);
+    expect(calls[0].resumeSessionId).toBe(session.id);
+  });
+
   it('a remote suspend records its conversation, and a resume after a server restart still continues it', async () => {
     // Live 2026-11-18: the adopted remote id lives in memory only, so a restart while
     // suspended resumed the pre-`/clear` conversation. The suspend now persists it.

@@ -270,6 +270,20 @@ describe('TmuxManager (unit)', () => {
       expect(resumeIdx).toBeLessThan(sessionIdIdx);
     });
 
+    it('resumes first when the explicit resumeSessionId IS the session id (suspend resume)', () => {
+      // Live 2026-11-18: waking a suspended remote session ran `--session-id <id>` first,
+      // which printed "Session ID … is already in use" into the pane before the fallback
+      // resumed it. A caller that pins the id knows the conversation exists.
+      const command = buildRemoteLaunchCommand({
+        mode: 'claude',
+        remote: { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' },
+        sessionId: 'abc123def456',
+        resumeSessionId: 'abc123def456',
+      });
+      expect(command.indexOf('--resume abc123def456')).toBeGreaterThan(-1);
+      expect(command.indexOf('--resume abc123def456')).toBeLessThan(command.indexOf('--session-id abc123def456'));
+    });
+
     describe('remote claude model (Joe, 2026-10-11: model choice did nothing on Hufflepuff cases)', () => {
       const remote = { hostId: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', remotePath: '/w' };
 
