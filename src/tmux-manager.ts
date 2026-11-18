@@ -94,6 +94,7 @@ import {
   remoteLoginShellCommand,
   remoteSshTarget,
   remoteTmuxSessionAlive,
+  stopRemoteTmuxSession,
   withRemoteTmuxPath,
 } from './remote-hosts.js';
 import { installRemoteAgentCli, installRemoteAgentSkill, remoteAgentEnvPrefix } from './remote-agent-cli.js';
@@ -3344,14 +3345,37 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * SIGKILL after `SUSPEND_GRACEFUL_WAIT_MS`, which leaves the agent time to flush
    * its transcript.
    *
-   * Local panes only: a remote pane is an ssh client, and killing it would leave the
-   * remote agent running. Returns true once the pane reads dead.
+   * A remote pane is only the ssh client; the agent runs in the durable remote tmux.
+   * For an owned remote session the remote half goes first (`stopRemoteTmuxSession`:
+   * one ssh round, never a wake), with the auto-reconnect watcher locked out so it
+   * does not reattach the pane that is about to die; then the local ssh client, which
+   * normally exits on its own once its remote session is gone. A host that cannot be
+   * reached fails the stop and lifts the lock again. Returns true once the pane reads
+   * dead.
    */
   async stopPaneProcesses(sessionId: string): Promise<boolean> {
     const session = this.sessions.get(sessionId);
-    if (!session || session.remote || session.docker) return false;
+    if (!session || session.docker) return false;
     if (IS_TEST_MODE) return false;
     if (!isValidMuxName(session.muxName)) return false;
+    if (session.remote) {
+      if (session.remote.owned === false) return false;
+      this.guardRemoteReconnect(sessionId);
+      const { sessionName } = remoteTmuxLocation(session.remote, sessionId);
+      console.log(
+        `[TmuxManager] Stopping remote agent of ${session.muxName} (${sessionName} on ${session.remote.host})`
+      );
+      if (!(await stopRemoteTmuxSession(session.remote, sessionName))) {
+        this.reconnectGuard.delete(sessionId);
+        console.warn(`[TmuxManager] Remote stop failed for ${session.muxName}; nothing was suspended`);
+        return false;
+      }
+      for (let i = 0; i < 30; i++) {
+        if (this.isPaneDead(session.muxName)) return true;
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      // The ssh client lingers: stopped like a local pane below.
+    }
     const panePid = await this.getPanePidAsync(session.muxName);
     if (!panePid || panePid <= 1) return false;
 
@@ -4375,6 +4399,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.reconnectState.delete(sessionId);
     this.remoteAliveCache.delete(sessionId);
     this.remoteAliveInFlight.delete(sessionId);
+  }
+
+  /**
+   * Lift {@link guardRemoteReconnect} for a session whose agent runs again (a
+   * suspended remote session that was resumed), so a later transport drop is
+   * reattached as usual.
+   */
+  unguardRemoteReconnect(sessionId: string): void {
+    this.reconnectGuard.delete(sessionId);
+    this.reconnectState.delete(sessionId);
+    this.remoteAliveCache.delete(sessionId);
   }
 
   /** Clear all per-session reconnect + guard state (e.g. when a session is removed). */

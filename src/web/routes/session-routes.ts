@@ -1092,6 +1092,20 @@ export function registerSessionRoutes(
       now: () => Date.now(),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       log: (message) => console.log(message),
+      // A resume runs only on a user's request (input to the session, `POST /resume`),
+      // which is an explicit wake request in the sense of the rule above `remoteWake`.
+      // Boot recovery and the reconnect watcher never resume a suspended session.
+      // (`remoteWake` is defined below; this runs only once a request is served.)
+      wakeHostForResume: async (s) => {
+        const hostId = (s as Session).remote?.hostId;
+        const host = hostId ? (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((h) => h.id === hostId) : undefined;
+        if (!host) return false;
+        const outcome = await remoteWake.ensureHostAwake(wakeableHost(host), {
+          timeoutMs: REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS,
+        });
+        return outcome !== 'failed';
+      },
+      onResumed: (s) => ctx.mux.unguardRemoteReconnect?.(s.id),
     });
   attachSuspendRegistry(ctx, suspend);
 

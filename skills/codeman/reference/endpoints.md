@@ -475,14 +475,15 @@ this way (`approval-routes.ts:43`).
 
 ### Suspending an idle worker (free its memory)
 
-An idle local claude worker can be suspended: Codeman stops its CLI (the whole pane
-process group, SIGTERM then SIGKILL after 5 s), keeps the session and its dead pane, and
-shows it greyed out. The next input brings the same conversation back
+An idle claude worker can be suspended, local or on an SSH host: Codeman stops its CLI
+(local: the whole pane process group, SIGTERM then SIGKILL after 5 s; remote: the
+worker's tmux session on the host, then the local ssh client), keeps the session and its
+dead pane, and shows it greyed out. The next input brings the same conversation back
 (`claude --resume <id>`), so a coordinator can park workers it does not need right now.
 
 | Task | Call |
 |------|------|
-| suspend an idle session | `POST /api/v1/sessions/:id/suspend` → `{suspended:true, suspendedAt}`; 409 with `reason` (`busy`, `remote`, `docker`, `adopted`, `unsupported-mode`, `already-suspended`, `no-mux`), 500 `stop-failed` |
+| suspend an idle session | `POST /api/v1/sessions/:id/suspend` → `{suspended:true, suspendedAt}`; 409 with `reason` (`busy`, `docker`, `adopted`, `remote-not-owned`, `remote-override`, `unsupported-mode`, `already-suspended`, `no-mux`), 500 `stop-failed` (also: the remote host is not reachable; a suspend never wakes it) |
 | resume it now and wait for the composer | `POST /api/v1/sessions/:id/resume` → `{suspended:false}` (or `alreadyRunning:true`) |
 
 - **Any input resumes it.** `POST .../input` to a suspended session answers
@@ -494,7 +495,10 @@ shows it greyed out. The next input brings the same conversation back
   post waits in its inbox until something resumes it. Send a prompt (or `resume`) when
   it has to act.
 - Session state carries `suspended` / `suspendedAt`, and the suspend survives a server
-  restart. v1: local claude sessions only.
+  restart. claude only; docker and remote panes Codeman did not start are refused.
+- **Remote:** a resume wakes a sleeping host first (wake-on-LAN, when the host has a
+  wake target), then relaunches claude there with the conversation it last wrote
+  (after a `/clear` too). Its memory is freed on the host, not on the Codeman machine.
 
 ### Is it stuck? structured signals
 

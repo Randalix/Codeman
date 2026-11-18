@@ -315,6 +315,8 @@ export interface TerminalMultiplexer extends EventEmitter {
    * it cannot suspend. Resolves true once the pane reads dead.
    */
   stopPaneProcesses?(sessionId: string): Promise<boolean>;
+  /** Re-enable remote auto-reconnect after a suspended remote session was resumed. */
+  unguardRemoteReconnect?(sessionId: string): void;
 
   /** Clean up resources (stop stats collection, etc.) */
   destroy(): void;

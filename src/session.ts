@@ -3021,7 +3021,17 @@ export class Session extends EventEmitter {
     // keeps what runs in it.
     await this._assertLaunchAllowed();
     this._pinOmpRespawnId();
-    const newPid = await mux.respawnPane(await this._buildRespawnPaneOptionsWithResumePin());
+    const options = await this._buildRespawnPaneOptionsWithResumePin();
+    // Remote claude: no transcript to look at here, but the remote model refresher
+    // adopts the conversation claude really writes (after a `/clear`) into
+    // `claudeSessionId` at every turn end. The one remote caller is a suspended
+    // session's resume, whose remote tmux is gone, so `new-session -A` launches claude
+    // afresh: it continues THAT conversation, not the launch one. Only here, not in the
+    // dead-pane respawn, which also runs at boot for remote panes nobody suspended.
+    if (this._remote && this.mode === 'claude' && this._claudeSessionId && this._claudeSessionId !== this.id) {
+      options.resumeSessionId = this._claudeSessionId;
+    }
+    const newPid = await mux.respawnPane(options);
     if (!newPid) {
       console.error('[Session] restartCli: respawnPane failed for', this._muxSession.muxName);
       return false;

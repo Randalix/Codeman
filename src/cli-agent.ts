@@ -1754,7 +1754,7 @@ export async function agentSuspend(deps: AgentDeps, options: { id: string }): Pr
   const res = await deps.request(deps.ctx, {
     method: 'POST',
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}/suspend`,
-    timeoutMs: 30_000,
+    timeoutMs: 60_000,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res), res.status === 409 ? EXIT.refused : EXIT.error);
   if (deps.json) emitJson(deps, res.json.data ?? {});
@@ -1772,7 +1772,7 @@ export async function agentResume(deps: AgentDeps, options: { id: string }): Pro
   const res = await deps.request(deps.ctx, {
     method: 'POST',
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}/resume`,
-    timeoutMs: 90_000,
+    timeoutMs: 150_000,
   });
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as { alreadyRunning?: boolean } | undefined;
@@ -3139,7 +3139,7 @@ export function registerAgentCommands(program: Command): Command {
   agent
     .command('suspend <id>')
     .description(
-      "Stop an idle session's CLI to free its memory; the session stays (greyed out) and the next send or keystroke resumes the same conversation. Local claude sessions only for now"
+      "Stop an idle session's CLI to free its memory; the session stays (greyed out) and the next send or keystroke resumes the same conversation. claude sessions, local or on an SSH host"
     )
     .option('--json', 'Machine-readable output')
     .action((id: string, options: { json?: boolean }) =>

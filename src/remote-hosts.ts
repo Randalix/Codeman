@@ -487,6 +487,76 @@ export async function remoteTmuxSessionAlive(
   }
 }
 
+/** Exit status of the remote suspend script when the remote tmux session is already gone. */
+export const REMOTE_SUSPEND_GONE_EXIT = 3;
+
+/**
+ * Session suspend, remote half: the script that stops the agent inside THIS
+ * Codeman's durable remote tmux session and removes that session.
+ *
+ * Measured on Hufflepuff (2026-11-18): the pane PID is the user's interactive login
+ * shell (zsh), and claude with its MCP children runs in a process group of its own
+ * (job control), all in the shell's session. SIGTERM to the pane's group would hit
+ * only the shell, which ignores it. So: collect every PID of the pane's session
+ * first, then `kill-session` (SIGHUP to the shell and its jobs; the shell is gone,
+ * so the launch's `||` fallback cannot start claude again), then SIGKILL whatever
+ * still runs after 5 s.
+ *
+ * POSIX `sh`, read from stdin by `sh -s`: the login shell never parses it (zsh
+ * expands the `=name` exact-match target as a command path).
+ * Exit 0 = stopped, {@link REMOTE_SUSPEND_GONE_EXIT} = the session was already gone.
+ */
+export function buildRemoteSuspendScript(remoteSessionName: string): string {
+  const name = shellescape(`=${remoteSessionName}`);
+  return [
+    withRemoteTmuxPath(''),
+    `P=$(tmux -L codeman-remote list-panes -t ${name} -F '#{pane_pid}' 2>/dev/null | head -n 1)`,
+    `[ -n "$P" ] || exit ${REMOTE_SUSPEND_GONE_EXIT}`,
+    `PIDS=$(ps -eo pid=,sid= 2>/dev/null | awk -v s="$P" '$2==s{print $1}')`,
+    `[ -n "$PIDS" ] || PIDS=$P`,
+    `tmux -L codeman-remote kill-session -t ${name} 2>/dev/null`,
+    'i=0',
+    'while [ $i -lt 50 ]; do',
+    '  alive=; for p in $PIDS; do kill -0 "$p" 2>/dev/null && alive=1; done',
+    '  [ -z "$alive" ] && exit 0',
+    '  sleep 0.1; i=$((i+1))',
+    'done',
+    'for p in $PIDS; do kill -KILL "$p" 2>/dev/null; done',
+    'exit 0',
+    '',
+  ].join('\n');
+}
+
+/** The ssh command that runs {@link buildRemoteSuspendScript} (fed on stdin). */
+export function buildRemoteSuspendCommand(
+  host: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions
+): string {
+  const [ssh, ...connectionArgs] = buildSshConnectionArgs(host);
+  return [ssh, ...connectionArgs, remoteSshTarget(host), shellescape('sh -s')].join(' ');
+}
+
+/**
+ * Stop the agent in this session's remote tmux and remove that session. True when it
+ * is stopped (or was already gone); false when the host could not be reached or the
+ * script failed. A sleeping host is NOT woken: the ssh just fails.
+ */
+export async function stopRemoteTmuxSession(
+  remote: Pick<RemoteHost, 'username' | 'host' | 'port'> & RemoteSshOptions,
+  remoteSessionName: string
+): Promise<boolean> {
+  if (process.env.VITEST) return false;
+  const command = buildRemoteSuspendCommand(remote);
+  const script = buildRemoteSuspendScript(remoteSessionName);
+  return new Promise((resolve) => {
+    const child = exec(command, { timeout: 30_000 }, (err) => {
+      if (!err) return resolve(true);
+      const code = (err as { code?: unknown }).code;
+      resolve(code === REMOTE_SUSPEND_GONE_EXIT);
+    });
+    child.stdin?.end(script);
+  });
+}
+
 /** One pane on a remote host's `-L codeman-remote` server. */
 export interface RemoteCodemanPane {
   /** The tmux session name, `codeman-ssh-<id8>` for a Codeman launch. */

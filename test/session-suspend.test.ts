@@ -16,6 +16,8 @@
  *
  * Port: none (pure, fake deps)
  */
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   SUSPEND_INPUT_BUFFER_BYTES,
@@ -36,7 +38,7 @@ class FakeSession implements SuspendableSession {
   mode = 'claude';
   status = 'idle';
   isWorking = false;
-  remote: unknown = undefined;
+  remote: SuspendableSession['remote'] = undefined;
   docker: unknown = undefined;
   adopt: unknown = undefined;
   muxName: string | null = 'codeman-11111111';
@@ -102,8 +104,17 @@ describe('suspendRefusal', () => {
     expect(suspendRefusal(new FakeSession())).toBeNull();
   });
 
+  it('accepts an owned remote claude session', () => {
+    const s = new FakeSession();
+    s.remote = { owned: true };
+    expect(suspendRefusal(s)).toBeNull();
+    s.remote = {}; // pre-`owned` records count as owned
+    expect(suspendRefusal(s)).toBeNull();
+  });
+
   it.each([
-    ['remote', (s: FakeSession) => (s.remote = { hostId: 'huff' })],
+    ['remote-not-owned', (s: FakeSession) => (s.remote = { owned: false })],
+    ['remote-override', (s: FakeSession) => (s.remote = { commands: { claude: 'my-claude' } })],
     ['docker', (s: FakeSession) => (s.docker = { container: 'x' })],
     ['adopted', (s: FakeSession) => (s.adopt = { pane: '%1' })],
     ['unsupported-mode', (s: FakeSession) => (s.mode = 'opencode')],
@@ -222,6 +233,56 @@ describe('SessionSuspendRegistry: input wakes the session', () => {
     expect(s.written).toEqual(['x']);
   });
 
+  it('remote: wakes the host before the relaunch, and lifts the reconnect lock after it', async () => {
+    const s = new FakeSession();
+    s.remote = { owned: true };
+    const order: string[] = [];
+    const d = deps(s, {
+      wakeHostForResume: async () => {
+        order.push(`wake(restarts=${s.restarts})`);
+        return true;
+      },
+      onResumed: () => order.push(`resumed(suspended=${s.suspended})`),
+    });
+    const reg = new SessionSuspendRegistry(d);
+    await reg.suspend(s);
+    reg.handleInput(s, 'x');
+    expect(await reg.resume(s)).toBe(true);
+    expect(order).toEqual(['wake(restarts=0)', 'resumed(suspended=false)']);
+    expect(s.written).toEqual(['x']);
+  });
+
+  it('remote: a host that stays unreachable keeps the session suspended and the input held', async () => {
+    const s = new FakeSession();
+    s.remote = { owned: true };
+    let awake = false;
+    const reg = new SessionSuspendRegistry(deps(s, { wakeHostForResume: async () => awake }));
+    await reg.suspend(s);
+    reg.handleInput(s, 'x');
+    expect(await reg.resume(s)).toBe(false);
+    expect(s.restarts).toBe(0);
+    expect(s.suspended).toBe(true);
+    awake = true;
+    expect(await reg.resume(s)).toBe(true);
+    expect(s.written).toEqual(['x']);
+  });
+
+  it('a local session never asks for a host wake', async () => {
+    const s = new FakeSession();
+    let asked = 0;
+    const reg = new SessionSuspendRegistry(
+      deps(s, {
+        wakeHostForResume: async () => {
+          asked++;
+          return false;
+        },
+      })
+    );
+    await reg.suspend(s);
+    expect(await reg.resume(s)).toBe(true);
+    expect(asked).toBe(0);
+  });
+
   it('resume of a running session is a no-op', async () => {
     const s = new FakeSession();
     const reg = new SessionSuspendRegistry(deps(s));
@@ -280,5 +341,33 @@ describe('clean-exit sweep', () => {
     };
     expect(shouldCloseCleanlyExitedSession(base)).toBe(true);
     expect(shouldCloseCleanlyExitedSession({ ...base, suspended: true })).toBe(false);
+  });
+});
+
+describe('suspend wiring guard', () => {
+  // A remote resume wakes the host (`wakeHostForResume`), which is allowed only on a
+  // user's request. The registry is reachable from the HTTP and WebSocket input routes
+  // only; the server holds it for cleanup (`forget`). Boot recovery, the reconnect
+  // watcher, the nudger or a timer must never resume a suspended session.
+  it('only the routes reach the registry, and the server only forgets', () => {
+    const SRC = join(__dirname, '..', 'src');
+    const walk = (dir: string): string[] =>
+      readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+        e.isDirectory() ? walk(join(dir, e.name)) : e.name.endsWith('.ts') ? [join(dir, e.name)] : []
+      );
+    const users = walk(SRC)
+      .filter((f) => /suspendRegistryOf\s*\(|new SessionSuspendRegistry\s*\(/.test(readFileSync(f, 'utf-8')))
+      .map((f) => relative(SRC, f))
+      .sort();
+    expect(users).toEqual(
+      [
+        'session-suspend.ts', // the definition
+        join('web', 'routes', 'session-routes.ts'),
+        join('web', 'routes', 'ws-routes.ts'),
+        join('web', 'server.ts'),
+      ].sort()
+    );
+    const server = readFileSync(join(SRC, 'web', 'server.ts'), 'utf-8');
+    expect(server).not.toMatch(/sessionSuspend\??\.(resume|handleInput|suspend)\s*\(/);
   });
 });

@@ -359,6 +359,22 @@ describe('pinning a conversation onto a relaunch', () => {
     }
   });
 
+  it("a remote restartCli (a suspended session's resume) continues the conversation the remote refresher adopted", async () => {
+    // After a `/clear` on the host, claude writes a new conversation; the remote model
+    // refresher adopts it into `claudeSessionId`. The resume relaunches claude in a
+    // fresh remote tmux and has to continue THAT one, not the launch id.
+    const { mux, calls } = recordingMux();
+    const session = localSession(
+      { remote: { hostId: 'h1', label: 'box', host: 'box', username: 'dev', remotePath: '/tmp' } },
+      mux
+    );
+    session.adoptClaudeSessionId(CONVERSATION);
+
+    expect(await session.restartCli()).toBe(true);
+
+    expect(calls[0].resumeSessionId).toBe(CONVERSATION);
+  });
+
   it('pins nothing for a docker case, whose pane execs into the container', async () => {
     giveTranscript(CONVERSATION);
     const { mux, calls } = recordingMux();

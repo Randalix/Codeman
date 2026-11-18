@@ -1036,7 +1036,7 @@ codeman agent submit "$SID" --stage-id "$STAGE_ID" --confirm-sha "$SHA256" --jso
 codeman agent send "$SID" 'run the tests, then print WORKDONE followed by _4711'   # hook-less modes (opencode, pi, …): ask for the marker in halves …
 codeman agent wait "$SID" --match WORKDONE_4711           # … and wait on the joined form, which the prompt's echo never contains
 codeman agent interrupt "$SID"                            # a bare ESC, conversation intact
-codeman agent suspend "$SID"                              # idle local claude: stop its CLI, keep the session (greyed out)
+codeman agent suspend "$SID"                              # idle claude (local or SSH): stop its CLI, keep the session (greyed out)
 codeman agent resume "$SID"                               # bring it back now; any send or keystroke resumes it too
 codeman agent rm "$SID"                                   # any session except this one
 codeman agent post "$SID" 'when you are done, ping me'    # MAILBOX: stored, never typed; multi-line ok, `-` reads stdin

@@ -16,10 +16,13 @@
  *   here instead of written into a dead pane, where it would vanish, and it triggers
  *   the resume. The pattern is the wake-on-LAN buffer's (`remote-wake.ts`).
  *
- * v1 covers local claude sessions only: claude always knows its conversation id, and
- * `restartCli()` resolves it from the transcript on disk. Remote sessions would need
- * the remote tmux session killed and reattached; other CLIs need the resume-id
- * capture of Ark0N/Codeman#630. Both are refused with a reason.
+ * Covers claude sessions, local and SSH-remote (owned). A remote suspend stops the
+ * agent in the durable remote tmux and removes that session (see
+ * `stopRemoteTmuxSession`); its resume wakes the host first when it has a wake target
+ * (a resume is always a user's request: input or `resume`), then `restartCli()`
+ * re-runs `ssh … new-session -A`, which launches claude again with the conversation
+ * pinned. Other CLIs need the resume-id capture of Ark0N/Codeman#630, docker and
+ * non-owned remote panes are refused with a reason.
  */
 
 /** Cap on input held for one session while it resumes; the oldest chunk goes first. */
@@ -35,7 +38,7 @@ export interface SuspendableSession {
   readonly mode: string;
   readonly status: string;
   readonly isWorking: boolean;
-  readonly remote?: unknown;
+  readonly remote?: { owned?: boolean; commands?: { claude?: string } } | null;
   readonly docker?: unknown;
   readonly adopt?: unknown;
   readonly muxName: string | null;
@@ -70,6 +73,13 @@ export interface SessionSuspendDeps {
   now(): number;
   sleep(ms: number): Promise<void>;
   log(message: string): void;
+  /**
+   * Remote sessions: make sure the host is up before the relaunch, waking it when it
+   * has a wake target. False = it stayed unreachable (the session stays suspended).
+   */
+  wakeHostForResume?(session: SuspendableSession): Promise<boolean>;
+  /** The CLI runs again (remote: lift the auto-reconnect lock taken by the stop). */
+  onResumed?(session: SuspendableSession): void;
   readyTimeoutMs?: number;
   readyPollMs?: number;
 }
@@ -78,7 +88,8 @@ export type SuspendRefusalReason =
   | 'already-suspended'
   | 'busy'
   | 'unsupported-mode'
-  | 'remote'
+  | 'remote-not-owned'
+  | 'remote-override'
   | 'docker'
   | 'adopted'
   | 'no-mux'
@@ -89,11 +100,20 @@ export type SuspendResult = { ok: true } | { ok: false; reason: SuspendRefusalRe
 /** Why this session cannot be suspended, or null when it can. Pure. */
 export function suspendRefusal(session: SuspendableSession): { reason: SuspendRefusalReason; message: string } | null {
   if (session.suspended) return { reason: 'already-suspended', message: 'The session is already suspended.' };
-  if (session.remote) {
-    return { reason: 'remote', message: 'Remote sessions cannot be suspended yet (local claude sessions only).' };
+  if (session.remote && session.remote.owned === false) {
+    return {
+      reason: 'remote-not-owned',
+      message: 'This pane is attached to a remote tmux session Codeman did not start; it cannot be suspended.',
+    };
+  }
+  if (session.remote?.commands?.claude) {
+    return {
+      reason: 'remote-override',
+      message: 'The host runs claude through its own command override, so a resume could not pin the conversation.',
+    };
   }
   if (session.docker) {
-    return { reason: 'docker', message: 'Docker sessions cannot be suspended yet (local claude sessions only).' };
+    return { reason: 'docker', message: 'Docker sessions cannot be suspended yet.' };
   }
   if (session.adopt) return { reason: 'adopted', message: 'Adopted panes cannot be suspended.' };
   if (session.mode !== 'claude') {
@@ -227,6 +247,18 @@ export class SessionSuspendRegistry {
   private async doResume(session: SuspendableSession, state: SuspendState): Promise<boolean> {
     const id8 = session.id.slice(0, 8);
     this.deps.log(`[Suspend] ${id8}: resuming`);
+    if (session.remote && this.deps.wakeHostForResume) {
+      let awake = false;
+      try {
+        awake = await this.deps.wakeHostForResume(session);
+      } catch (err) {
+        this.deps.log(`[Suspend] ${id8}: host wake threw: ${String(err)}`);
+      }
+      if (!awake) {
+        this.deps.log(`[Suspend] ${id8}: host not reachable, session stays suspended`);
+        return false;
+      }
+    }
     let restarted = false;
     try {
       restarted = await session.restartCli();
@@ -239,6 +271,7 @@ export class SessionSuspendRegistry {
     }
     session.setSuspended(null);
     this.deps.persist(session);
+    this.deps.onResumed?.(session);
 
     // Held input goes in only once claude shows its composer: typed into a CLI that
     // is still loading its transcript, keystrokes are lost or land in a dialog.
