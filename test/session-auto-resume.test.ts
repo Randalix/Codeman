@@ -22,6 +22,7 @@ describe('SessionAutoOps auto-resume', () => {
   let writeCommand: ReturnType<typeof vi.fn>;
   let working: boolean;
   let stopped: boolean;
+  let suspended: boolean;
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -31,10 +32,12 @@ describe('SessionAutoOps auto-resume', () => {
     writeCommand = vi.fn(async () => true);
     working = false;
     stopped = false;
+    suspended = false;
     ops = new SessionAutoOps({
       writeCommand,
       isWorking: () => working,
       isStopped: () => stopped,
+      isSuspended: () => suspended,
       getTotalTokens: () => 0,
       getContextReport: () => null,
       getSessionId: () => 'test-session',
@@ -44,6 +47,28 @@ describe('SessionAutoOps auto-resume', () => {
   afterEach(() => {
     ops.destroy();
     vi.useRealTimers();
+  });
+
+  it('leaves a suspended session alone: no Esc, no continue, schedule dropped (#836)', async () => {
+    ops.setAutoResume(true);
+    const cancelled = vi.fn();
+    ops.on('limitResumeCancelled', cancelled);
+    ops.processCleanData(limitLine(60_000));
+    suspended = true;
+    await vi.advanceTimersByTimeAsync(60_000 + BUFFER_MS + ESC_DELAY_MS + 1000);
+    expect(writeCommand).not.toHaveBeenCalled();
+    expect(ops.isLimitPaused).toBe(false);
+    expect(cancelled).toHaveBeenCalledWith({ reason: 'suspended' });
+  });
+
+  it('a suspend between Esc and continue stops the continue (#836)', async () => {
+    ops.setAutoResume(true);
+    ops.processCleanData(limitLine(60_000));
+    await vi.advanceTimersByTimeAsync(60_000 + BUFFER_MS + 10);
+    expect(writeCommand).toHaveBeenCalledWith('\x1b');
+    suspended = true;
+    await vi.advanceTimersByTimeAsync(ESC_DELAY_MS + 100);
+    expect(writeCommand).toHaveBeenCalledTimes(1);
   });
 
   it('does nothing when disabled', () => {

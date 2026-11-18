@@ -109,6 +109,14 @@ export function registerRespawnRoutes(
         'Respawn is not available for adopted sessions: Codeman did not start this agent and must not drive its lifecycle'
       );
     }
+    // A suspended session's CLI is stopped on purpose (session-suspend.ts). Respawn
+    // would only type into its dead pane; start it once the session is resumed.
+    if (session.suspended) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'The session is suspended; resume it before starting respawn'
+      );
+    }
     // Respawn is not supported for external-CLI sessions (opencode/codex)
     if (isExternalCliMode(session.mode)) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
@@ -263,6 +271,14 @@ export function registerRespawnRoutes(
         'Respawn is not available for adopted sessions: Codeman did not start this agent and must not drive its lifecycle'
       );
     }
+    // A suspended session's CLI is stopped on purpose (session-suspend.ts). Respawn
+    // would only type into its dead pane; start it once the session is resumed.
+    if (session.suspended) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'The session is suspended; resume it before starting respawn'
+      );
+    }
     // Respawn is not supported for external-CLI sessions (opencode/codex)
     if (isExternalCliMode(session.mode)) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, `Respawn is not supported for ${session.mode} sessions`);
@@ -341,6 +357,14 @@ export function registerRespawnRoutes(
       return createErrorResponse(
         ApiErrorCode.INVALID_INPUT,
         'Respawn is not available for adopted sessions: Codeman did not start this agent and must not drive its lifecycle'
+      );
+    }
+    // A suspended session's CLI is stopped on purpose (session-suspend.ts). Respawn
+    // would only type into its dead pane; start it once the session is resumed.
+    if (session.suspended) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'The session is suspended; resume it before starting respawn'
       );
     }
     // Respawn is not supported for external-CLI sessions (opencode/codex)

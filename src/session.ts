@@ -1334,6 +1334,7 @@ export class Session extends EventEmitter {
       writeCommand: (cmd) => this.writeViaMux(cmd),
       isWorking: () => this._isWorking,
       isStopped: () => this._isStopped,
+      isSuspended: () => this._suspendedAt !== null,
       getTotalTokens: () => this._totalInputTokens + this._totalOutputTokens,
       getContextReport: () => this._contextReport,
       getSessionId: () => this.id,
@@ -1912,6 +1913,20 @@ export class Session extends EventEmitter {
 
   setKeepWarmEnabled(enabled: boolean | undefined): void {
     this._keepWarmEnabled = enabled;
+  }
+
+  /**
+   * Nothing is written into a suspended session's dead pane. User input never gets
+   * here (the routes hand it to the suspend registry, which resumes first); what does
+   * is automation that types into an idle session on its own: the usage-limit
+   * auto-resume, auto-compact/clear, a respawn cycle, the submit verifier's retry.
+   * Those leave a suspended session alone rather than wake it, and say so. True =
+   * dropped.
+   */
+  private _dropWhileSuspended(data: string): boolean {
+    if (this._suspendedAt === null) return false;
+    console.log(`[Session ${this.id.slice(0, 8)}] suspended, write dropped (${data.length} bytes)`);
+    return true;
   }
 
   /** True while the session is suspended: its CLI was stopped on purpose and resumes on input. */
@@ -5608,6 +5623,7 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
+    if (this._dropWhileSuspended(data)) return false;
     this._observeGuardedKeyboardInput(data);
     // The lease only, not the drain, which writes held input through here (see guardedInputHeld).
     if (this._guardedSubmitInFlight) return false;
@@ -5816,6 +5832,7 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
+    if (this._dropWhileSuspended(data)) return false;
     this._observeGuardedKeyboardInput(data);
     // A guarded submit's lease lasts for its Enter only: wait for it, in arrival order,
     // rather than refusing, so an approval answer or a programmatic prompt is not

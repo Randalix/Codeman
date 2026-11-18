@@ -51,6 +51,8 @@ export interface SuspendableSession {
   restartCli(): Promise<boolean>;
   writeViaMux(data: string, options?: { fromUser?: boolean }): Promise<boolean>;
   write(data: string, options?: { fromUser?: boolean }): boolean;
+  /** Arm the Enter retry for a prompt that went out raw (`Session.verifySubmitted`). */
+  verifySubmitted?(text: string): void;
 }
 
 /**
@@ -82,6 +84,11 @@ export interface SessionSuspendDeps {
    * has a wake target. False = it stayed unreachable (the session stays suspended).
    */
   wakeHostForResume?(session: SuspendableSession): Promise<boolean>;
+  /**
+   * True while a respawn controller drives this session. Its cycle types prompts,
+   * `/clear` and `/init` into the idle session, so a suspend would stall it.
+   */
+  respawnRunning?(sessionId: string): boolean;
   /** The CLI runs again (remote: lift the auto-reconnect lock taken by the stop). */
   onResumed?(session: SuspendableSession): void;
   readyTimeoutMs?: number;
@@ -92,6 +99,7 @@ export type SuspendRefusalReason =
   | 'already-suspended'
   | 'busy'
   | 'background-work'
+  | 'respawn-active'
   | 'unsupported-mode'
   | 'remote-not-owned'
   | 'remote-override'
@@ -148,6 +156,33 @@ export function paneShowsComposer(text: string | null): boolean {
   return rows.slice(-8).some((r) => /^\s*[❯❯]/.test(r));
 }
 
+/**
+ * The text of the last line in `keys` that ended with Enter, as the composer shows
+ * it: escape sequences and other control bytes dropped, backspace applied. Empty
+ * when no Enter was typed or the line was empty.
+ */
+export function lastSubmittedLine(keys: string): string {
+  const end = keys.lastIndexOf('\r');
+  if (end < 0) return '';
+  const before = keys.slice(0, end);
+  const start = before.lastIndexOf('\r') + 1;
+  const line = before
+    .slice(start)
+    // CSI/SS3 sequences (arrows, bracketed-paste markers), then any lone ESC + char.
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1bO./g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b./g, '');
+  const out: string[] = [];
+  for (const ch of line) {
+    if (ch === '\x7f' || ch === '\b') out.pop();
+    else if (ch >= ' ' || ch === '\t') out.push(ch);
+  }
+  return out.join('').trim();
+}
+
 interface SuspendState {
   pending: HeldChunk[];
   pendingBytes: number;
@@ -175,6 +210,15 @@ export class SessionSuspendRegistry {
     if (refusal) return { ok: false, ...refusal };
     if (this.states.get(session.id)?.resuming) {
       return { ok: false, reason: 'busy', message: 'The session is resuming right now.' };
+    }
+    // The respawn controller types into an idle session on its own. It is left alone
+    // rather than woken (a resume wakes a remote host), so it is stopped first.
+    if (this.deps.respawnRunning?.(session.id)) {
+      return {
+        ok: false,
+        reason: 'respawn-active',
+        message: 'Respawn is running for this session; stop it before suspending.',
+      };
     }
     // An idle session can still run monitors, background shells or workflows it started
     // (Ark0N in #836): stopping the CLI ends them. Read off the screen now; the cached
@@ -314,21 +358,31 @@ export class SessionSuspendRegistry {
     }
     if (!ready) this.deps.log(`[Suspend] ${id8}: composer not seen within ${timeout} ms, delivering anyway`);
 
+    let raw = '';
     while (state.pending.length > 0) {
       const chunk = state.pending.shift()!;
       state.pendingBytes -= chunk.data.length;
       let ok = false;
       if (chunk.mode === 'mux') {
         ok = await session.writeViaMux(chunk.data, { fromUser: true }).catch(() => false);
+        // That prompt armed its own retry and is the newest submit; earlier keystrokes
+        // must not re-arm the verifier over it.
+        if (ok) raw = '';
       } else {
         try {
           ok = session.write(chunk.data, { fromUser: true });
         } catch {
           ok = false;
         }
+        if (ok) raw += chunk.data;
       }
       if (!ok) this.deps.log(`[Suspend] ${id8}: held input could not be written (${chunk.data.length} bytes)`);
     }
+    // `mux` chunks arm the Enter retry inside writeViaMux. Raw keystrokes go through
+    // write(), which does not, and Claude Code can still be ignoring Enter right after
+    // the start (#836). Arm it for the last line that was typed and submitted.
+    const submitted = lastSubmittedLine(raw);
+    if (submitted) session.verifySubmitted?.(submitted);
     this.deps.log(`[Suspend] ${id8}: resumed`);
     return true;
   }

@@ -191,6 +191,12 @@ interface AutoOpsCallbacks {
   isWorking: () => boolean;
   /** Check if the session has been stopped */
   isStopped: () => boolean;
+  /**
+   * True while the session is suspended (session-suspend.ts): its CLI is stopped on
+   * purpose. The auto-resume leaves it alone rather than wake it; the user's next
+   * input resumes it, and a limit still in force re-arms from the redrawn footer.
+   */
+  isSuspended?: () => boolean;
   /** Get current total token count (input + output) */
   getTotalTokens: () => number;
   /** The newest statusline context report, or null when none has arrived */
@@ -397,6 +403,11 @@ export class SessionAutoOps extends EventEmitter {
   private async _fireResume(): Promise<void> {
     this._autoResumeTimer = null;
     if (!this._autoResumeEnabled || this.callbacks.isStopped()) return;
+    if (this.callbacks.isSuspended?.()) {
+      console.log(`[SessionAutoOps ${this.callbacks.getSessionId()}] Session is suspended, auto-resume skipped`);
+      this._cancelAutoResume('suspended');
+      return;
+    }
 
     if (this.callbacks.isWorking()) {
       // Session resumed on its own (or via the user) — nothing to do.
@@ -414,13 +425,13 @@ export class SessionAutoOps extends EventEmitter {
     await this.callbacks.writeCommand('\x1b');
     this._resumeFollowupTimer = setTimeout(() => {
       this._resumeFollowupTimer = null;
-      if (this.callbacks.isStopped()) return;
+      if (this.callbacks.isStopped() || this.callbacks.isSuspended?.()) return;
       void this.callbacks.writeCommand(`${RESUME_PROMPT}\r`);
       this.emit('limitResume', { attempt });
     }, RESUME_ESC_DELAY_MS);
   }
 
-  private _cancelAutoResume(reason: 'disabled' | 'working' | 'stopped'): void {
+  private _cancelAutoResume(reason: 'disabled' | 'working' | 'stopped' | 'suspended'): void {
     const wasArmed = this._autoResumeTimer !== null || this._resumeFollowupTimer !== null || this._limitPaused;
     if (this._autoResumeTimer) {
       clearTimeout(this._autoResumeTimer);

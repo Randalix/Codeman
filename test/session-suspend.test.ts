@@ -13,6 +13,10 @@
  *  4. A failed relaunch keeps the session suspended and the held input.
  *  5. The buffer is capped; the oldest chunk goes first, an oversize chunk is dropped.
  *  6. The clean-exit sweep never closes a suspended session.
+ *  7. Held keystrokes that end in Enter arm the submit verifier's Enter retry (#836).
+ *  8. Nothing types into a suspended session on its own: a running respawn refuses the
+ *     suspend, respawn cannot start on it, the usage-limit auto-resume skips it, and
+ *     Session drops any write that still arrives.
  *
  * Port: none (pure, fake deps)
  */
@@ -23,6 +27,7 @@ import {
   SUSPEND_INPUT_BUFFER_BYTES,
   SessionSuspendRegistry,
   attachSuspendRegistry,
+  lastSubmittedLine,
   paneShowsComposer,
   suspendRefusal,
   suspendRegistryOf,
@@ -67,6 +72,10 @@ class FakeSession implements SuspendableSession {
   write(data: string): boolean {
     this.written.push(data);
     return true;
+  }
+  verified: string[] = [];
+  verifySubmitted(text: string): void {
+    this.verified.push(text);
   }
 }
 
@@ -383,6 +392,85 @@ describe('SessionSuspendRegistry: input wakes the session', () => {
     s.restartResult = true;
     await reg.resume(s);
     expect(s.written).toEqual([]);
+  });
+});
+
+describe('Enter retry for held keystrokes (#836)', () => {
+  it('lastSubmittedLine: the last line typed before Enter, as the composer shows it', () => {
+    expect(lastSubmittedLine('hi\r')).toBe('hi');
+    expect(lastSubmittedLine('old\rnew one\r')).toBe('new one');
+    expect(lastSubmittedLine('hex\x7fllo\r')).toBe('hello');
+    expect(lastSubmittedLine('\x1b[Ax\x1b[200~y\x1b[201~\r')).toBe('xy');
+    expect(lastSubmittedLine('typed, no enter')).toBe('');
+    expect(lastSubmittedLine('\r')).toBe('');
+    expect(lastSubmittedLine('done\rhalf')).toBe('done');
+  });
+
+  it('raw keystrokes ending in Enter arm the verifier; mux chunks arm their own', async () => {
+    const s = new FakeSession();
+    const reg = new SessionSuspendRegistry(deps(s));
+    await reg.suspend(s);
+    for (const k of ['g', 'o', '\r']) reg.handleInput(s, k);
+    expect(await reg.resume(s)).toBe(true);
+    expect(s.verified).toEqual(['go']);
+
+    const t = new FakeSession();
+    const reg2 = new SessionSuspendRegistry(deps(t));
+    await reg2.suspend(t);
+    reg2.handleInput(t, 'a prompt\r', 'mux');
+    reg2.handleInput(t, 'draft');
+    expect(await reg2.resume(t)).toBe(true);
+    expect(t.verified).toEqual([]);
+
+    // Keystrokes first, then a prompt through the mux: the prompt is the newest submit.
+    const u = new FakeSession();
+    const reg3 = new SessionSuspendRegistry(deps(u));
+    await reg3.suspend(u);
+    for (const k of ['o', 'k', '\r']) reg3.handleInput(u, k);
+    reg3.handleInput(u, 'then this\r', 'mux');
+    expect(await reg3.resume(u)).toBe(true);
+    expect(u.verified).toEqual([]);
+  });
+});
+
+describe('automation leaves a suspended session alone (#836)', () => {
+  it('a running respawn refuses the suspend and stops nothing', async () => {
+    const s = new FakeSession();
+    const d = deps(s, { respawnRunning: (id) => id === s.id });
+    expect(await new SessionSuspendRegistry(d).suspend(s)).toMatchObject({ ok: false, reason: 'respawn-active' });
+    expect(s.events).toEqual([]);
+  });
+
+  it('respawn routes refuse a suspended session (start, interactive-respawn, enable)', () => {
+    const src = readFileSync(join(import.meta.dirname, '../src/web/routes/respawn-routes.ts'), 'utf-8');
+    expect(src.match(/if \(session\.suspended\) \{/g)?.length).toBe(3);
+    const routes = readFileSync(join(import.meta.dirname, '../src/web/routes/session-routes.ts'), 'utf-8');
+    expect(routes).toMatch(/respawnRunning: \(sessionId\) => ctx\.respawnControllers\?\.get\(sessionId\)\?\.isRunning/);
+  });
+
+  it('Session drops writes while suspended and writes again once resumed', async () => {
+    const sent: string[] = [];
+    const session = new Session({
+      workingDir: '/tmp',
+      mode: 'claude',
+      mux: {
+        isAvailable: () => true,
+        capturePaneText: () => '',
+        sendInput: async (_id: string, data: string) => {
+          sent.push(data);
+          return true;
+        },
+      } as never,
+      muxSession: { muxName: 'codeman-test', sessionId: 'test', createdAt: Date.now() },
+    } as ConstructorParameters<typeof Session>[0]);
+    session.setSuspended(1_000);
+    expect(await session.writeViaMux('continue\r')).toBe(false);
+    expect(session.write('x')).toBe(false);
+    expect(sent).toEqual([]);
+    session.setSuspended(null);
+    expect(await session.writeViaMux('hello\r')).toBe(true);
+    expect(sent).toEqual(['hello\r']);
+    session.setSuspended(null);
   });
 });
 

@@ -184,6 +184,7 @@ import type {
   AuthPort,
   TabLayoutPort,
   KeepWarmPort,
+  RespawnPort,
 } from '../ports/index.js';
 import { RunSummaryTracker } from '../../run-summary.js';
 
@@ -1077,7 +1078,15 @@ function captureHistoryLines(raw: string | undefined, historyLimit: number): num
 
 export function registerSessionRoutes(
   app: FastifyInstance,
-  ctx: SessionPort & EventPort & ConfigPort & InfraPort & AuthPort & TabLayoutPort & KeepWarmPort,
+  ctx: SessionPort &
+    EventPort &
+    ConfigPort &
+    InfraPort &
+    AuthPort &
+    TabLayoutPort &
+    KeepWarmPort &
+    // Only to refuse a suspend while respawn drives the session (session-suspend.ts).
+    Partial<Pick<RespawnPort, 'respawnControllers'>>,
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry; suspend?: SessionSuspendRegistry } = {}
 ): RemoteWakeRegistry {
@@ -1092,6 +1101,7 @@ export function registerSessionRoutes(
       now: () => Date.now(),
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       log: (message) => console.log(message),
+      respawnRunning: (sessionId) => ctx.respawnControllers?.get(sessionId)?.isRunning ?? false,
       // A resume runs only on a user's request (input to the session, `POST /resume`),
       // which is an explicit wake request in the sense of the rule above `remoteWake`.
       // Boot recovery and the reconnect watcher never resume a suspended session.
