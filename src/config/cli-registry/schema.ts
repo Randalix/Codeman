@@ -408,6 +408,7 @@ const capabilitiesSchema = z
         // marker but never the footer. Still bounded, since it is also how much text the
         // pattern runs over.
         blockedLines: z.number().int().min(1).max(24).optional(),
+        optionDialogs: z.boolean().optional(),
         // Same guard again: run over the rows under the composer each time guarded
         // input reads the pane, and ~/.codeman/clis.json can set it.
         composerFooterLine: z

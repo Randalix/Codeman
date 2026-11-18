@@ -1,0 +1,40 @@
+ ▐▛███▛█   Claude Code v2.1.327
+▝▜██████▀  Sonnet 5.5 with medium effort · Claude Ultra
+ ▝▝   ▝▝   /…/00000000-0000-0000-0000-000000000000/scratchpad/perm-probe
+
+
+❯ Use the AskUserQuestion tool right now to ask me which color I prefer, options red and blue, each
+  with a short description. Do nothing else.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Color
+
+Which color do you prefer?
+
+  1. Red
+     A warm, bold color associated with energy and passion.
+❯ 2. Blue
+     A cool, calm color associated with trust and serenity.
+  3. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

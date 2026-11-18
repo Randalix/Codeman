@@ -47,6 +47,8 @@ export interface SuspendableSession {
   readonly watching?: string | null;
   /** Background work read fresh off a pane capture (`Session.backgroundWorkOnScreen`). */
   backgroundWorkOnScreen?(paneText: string): string | null;
+  /** A dialog the CLI waits on, read off a pane capture (`Session.dialogOnScreen`). */
+  dialogOnScreen?(paneText: string): boolean;
   setSuspended(at: number | null): void;
   restartCli(): Promise<boolean>;
   writeViaMux(data: string, options?: { fromUser?: boolean }): Promise<boolean>;
@@ -99,6 +101,7 @@ export type SuspendRefusalReason =
   | 'already-suspended'
   | 'busy'
   | 'background-work'
+  | 'dialog-open'
   | 'respawn-active'
   | 'unsupported-mode'
   | 'remote-not-owned'
@@ -194,8 +197,7 @@ export class SessionSuspendRegistry {
 
   constructor(private readonly deps: SessionSuspendDeps) {}
 
-  private backgroundWork(session: SuspendableSession): string | null {
-    const text = session.muxName ? this.deps.capturePane(session.muxName) : null;
+  private backgroundWork(session: SuspendableSession, text: string | null): string | null {
     if (text !== null && session.backgroundWorkOnScreen) return session.backgroundWorkOnScreen(text);
     return session.watching ?? null;
   }
@@ -220,10 +222,24 @@ export class SessionSuspendRegistry {
         message: 'Respawn is running for this session; stop it before suspending.',
       };
     }
+    // One fresh capture serves both screen checks below.
+    const text = session.muxName ? this.deps.capturePane(session.muxName) : null;
+    // A session sitting on a permission, question or plan dialog reads as idle: the turn
+    // is parked, nothing is being drawn. Stopping the CLI would end the dialog and
+    // whatever the agent asked with it (Ark0N in #836). An unreadable pane is no
+    // evidence of a dialog.
+    if (text !== null && session.dialogOnScreen?.(text)) {
+      return {
+        ok: false,
+        reason: 'dialog-open',
+        message:
+          'The session is waiting on a dialog (a permission, question or plan approval); suspending would end it. Answer it first.',
+      };
+    }
     // An idle session can still run monitors, background shells or workflows it started
     // (Ark0N in #836): stopping the CLI ends them. Read off the screen now; the cached
     // label only stands in when the pane cannot be captured.
-    const work = this.backgroundWork(session);
+    const work = this.backgroundWork(session, text);
     if (work) {
       return {
         ok: false,

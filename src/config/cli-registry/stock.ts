@@ -295,6 +295,11 @@ const CLAUDE: CliEntry = {
       // and never redrawn, which is why only the newest row above the composer counts.
       // Anchored on column 0: Claude's own rows start there, the agent's prose never does.
       awaitingLine: String.raw`^✻ Waiting for \d+ (?:background agents?|dynamic workflows?)\b`,
+      // Approval, AskUserQuestion, plan approval, workspace-trust and notice dialogs all
+      // draw a numbered list with `❯` on the selected option. Measured on 2.1.327
+      // (test/fixtures/claude-dialogs/). Suspend reads it so it never ends an open dialog;
+      // the alerts for these dialogs still come from the hooks.
+      optionDialogs: true,
     },
     requiresMux: false,
     // Claude installs Codeman's own hooks block into every workspace it runs in, so its

@@ -231,6 +231,51 @@ export function isBlockedScreen(
 }
 
 /**
+ * How far below the dialog's cursor row the rest of a numbered-option dialog may reach,
+ * in non-blank rows. Measured on Claude Code 2.1.327: an AskUserQuestion with the cursor
+ * on its first option and a description under each option ends 8 rows below it, a
+ * permission dialog whose second option wraps a long path 6. Bounded so a cursor row far
+ * up the transcript is never read as a live dialog.
+ */
+export const OPTION_DIALOG_TAIL_ROWS = 16;
+
+/**
+ * Whether a pane capture shows a dialog drawn as a numbered option list, with the prompt
+ * glyph as the selection cursor: Claude's approval, question (AskUserQuestion), plan
+ * approval, workspace-trust and notice dialogs (`❯ 1. Yes` / `  2. No`).
+ *
+ * The test is the LAST row that starts with the glyph. At rest that row is the composer
+ * (`❯ ` plus any draft), which sits below every transcript row, so an earlier prompt that
+ * quoted a numbered list (`❯ 1. fix a` / `  2. fix b`) does not count. While a dialog is up
+ * it is the cursor row, because the modal dialogs replace the composer and the notice
+ * dialogs draw below it. A second numbered row within reach is required as well, so a
+ * draft that merely starts with `1. ` is not a dialog. Footers were not used: the plan
+ * approval dialog draws no `Esc to cancel`. Fixtures: `test/fixtures/claude-dialogs/`.
+ */
+export function isOptionDialogOnScreen(paneText: string | null | undefined, promptGlyph: string): boolean {
+  if (!paneText) return false;
+  const rows = stripAnsi(paneText)
+    .split('\n')
+    .map((row) => row.trimEnd().replace(/^[\s│]+/, ''))
+    .filter((row) => row !== '');
+  let cursor = -1;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].startsWith(promptGlyph)) {
+      cursor = i;
+      break;
+    }
+  }
+  if (cursor < 0 || rows.length - 1 - cursor > OPTION_DIALOG_TAIL_ROWS) return false;
+  const option = /^\d{1,2}\.\s/;
+  if (!option.test(rows[cursor].slice(promptGlyph.length).trimStart())) return false;
+  const from = Math.max(0, cursor - OPTION_DIALOG_TAIL_ROWS);
+  for (let i = from; i < rows.length; i++) {
+    if (i !== cursor && option.test(rows[i])) return true;
+  }
+  return false;
+}
+
+/**
  * How many rows above the composer the turn's closing row may sit. Between the two Claude
  * draws only its composer border and, sometimes, a right-aligned hint
  * (`new task? /clear to save 169.1k tokens`), so this leaves room for a blank row or two

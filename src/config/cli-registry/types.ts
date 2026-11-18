@@ -429,6 +429,17 @@ export interface CliCapabilities {
      */
     blockedLine?: string;
     /**
+     * The CLI draws the dialogs it waits on (an approval, a question, a plan approval, a
+     * notice) as a numbered option list whose selected row opens with `promptGlyph`
+     * (`❯ 1. Yes` / `  2. No`). Read only where Codeman must not act on a pane that waits
+     * for an answer: a suspend is refused while such a dialog is up, since stopping the
+     * CLI would end it. Unlike `blockedLine` it raises nothing (no alert, no `blocked`
+     * signal), so a CLI whose hooks report its dialogs can declare it without a second
+     * alert. See `isOptionDialogOnScreen()` in `session-activity.ts`. Absent: no dialog
+     * is ever read off this CLI's screen for that purpose.
+     */
+    optionDialogs?: boolean;
+    /**
      * How many non-blank rows at the foot of the screen `blockedLine` sees. A dialog's
      * options wrap at narrow widths, which is what pushes its markers up the screen, so
      * this is sized for the narrowest pane the CLI was measured at. Default 1.

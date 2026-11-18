@@ -99,6 +99,7 @@ import {
   isPaneQuiet,
   watchingLabel,
   isAwaitingWorkers,
+  isOptionDialogOnScreen,
   isBlockedScreen,
   WATCHING_TAIL_LINES,
   BLOCKED_TAIL_LINES,
@@ -4290,6 +4291,17 @@ export class Session extends EventEmitter {
     const label = pattern ? watchingLabel(paneText, pattern, this._watchingWindow) : null;
     if (label) return label;
     return this._paneAwaitsWorkers(paneText) ? 'workers it is waiting for' : null;
+  }
+
+  /**
+   * Whether this capture shows a dialog the CLI waits on, drawn as a numbered option list
+   * (`workDetect.optionDialogs`). False for a CLI that does not declare it. Read fresh by
+   * suspend, which must not end an open dialog. See `isOptionDialogOnScreen()`.
+   */
+  dialogOnScreen(paneText: string): boolean {
+    const detect = getCli(this.mode)?.capabilities.workDetect;
+    if (!detect?.optionDialogs) return false;
+    return isOptionDialogOnScreen(paneText, detect.promptGlyph);
   }
 
   /**
