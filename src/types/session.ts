@@ -1118,10 +1118,6 @@ export interface SessionState {
   ralphAutoEnableDisabled?: boolean;
   /** Ralph completion phrase (if set) */
   ralphCompletionPhrase?: string;
-  /** Parent agent ID if this session is a spawned agent */
-  parentAgentId?: string;
-  /** Child agent IDs spawned by this session */
-  childAgentIds?: string[];
   /** Nice priority enabled */
   niceEnabled?: boolean;
   /** Nice value (-20 to 19) */

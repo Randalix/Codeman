@@ -1,6 +1,6 @@
 /**
  * @fileoverview Subagent panel (discovery, detail view, kill), subagent parent tracking,
- * agent teams (tasks panel, teammate badges, terminals), project insights (bash tool tracking),
+ * agent teams (teammate badges), project insights (bash tool tracking),
  * file browser (directory tree, preview), log viewer (floating file streamers),
  * image popups (auto-popup for screenshots), mux sessions, monitor panel,
  * token statistics, toast notifications, and system stats.
@@ -188,7 +188,7 @@ Object.assign(CodemanApp.prototype, {
     this.findParentSessionForSubagent(data.agentId);
 
     // Subagent windows are no longer auto-opened on discovery.
-    // Users can open them manually from the monitor panel or via openAllActiveSubagentWindows().
+    // Users open them from the subagents panel.
 
     // Ensure connection lines are updated after window is created and DOM settles
     requestAnimationFrame(() => {
@@ -1399,12 +1399,21 @@ Object.assign(CodemanApp.prototype, {
   },
 
   // ═══════════════════════════════════════════════════════════════
-  // Monitor Panel Detach & Drag
+  // Monitor and Subagents Panel Detach & Drag
   // ═══════════════════════════════════════════════════════════════
 
   toggleMonitorDetach() {
-    const panel = document.getElementById('monitorPanel');
-    const detachBtn = document.getElementById('monitorDetachBtn');
+    this._togglePanelDetach('monitorPanel', 'monitorPanelHeader', 'monitorDetachBtn');
+  },
+
+  toggleSubagentsDetach() {
+    this._togglePanelDetach('subagentsPanel', 'subagentsPanelHeader', 'subagentsDetachBtn');
+  },
+
+  /** Float a bottom panel as a draggable window, or dock it back. */
+  _togglePanelDetach(panelId, headerId, detachBtnId) {
+    const panel = document.getElementById(panelId);
+    const detachBtn = document.getElementById(detachBtnId);
 
     if (panel.classList.contains('detached')) {
       // Re-attach to bottom
@@ -1425,111 +1434,14 @@ Object.assign(CodemanApp.prototype, {
         detachBtn.innerHTML = '&#x229E;'; // Attach icon (squared plus - dock back)
         detachBtn.title = 'Attach panel';
       }
-      // Setup drag functionality
-      this.setupMonitorDrag();
+      this._setupPanelDrag(panelId, headerId);
     }
   },
 
-  setupMonitorDrag() {
-    const panel = document.getElementById('monitorPanel');
-    const header = document.getElementById('monitorPanelHeader');
-
-    if (!panel || !header) return;
-
-    let isDragging = false;
-    let startX, startY, startLeft, startTop;
-
-    const onStart = (e) => {
-      // Only drag from header, not from buttons
-      if (e.target.closest('button')) return;
-      if (!panel.classList.contains('detached')) return;
-
-      isDragging = true;
-      const coords = getEventCoords(e);
-      startX = coords.clientX;
-      startY = coords.clientY;
-      const rect = panel.getBoundingClientRect();
-      startLeft = rect.left;
-      startTop = rect.top;
-
-      document.addEventListener('mousemove', onMove);
-      document.addEventListener('mouseup', onEnd);
-      document.addEventListener('touchmove', onMove, { passive: false });
-      document.addEventListener('touchend', onEnd);
-      e.preventDefault();
-    };
-
-    const onMove = (e) => {
-      if (!isDragging) return;
-
-      const coords = getEventCoords(e);
-      const dx = coords.clientX - startX;
-      const dy = coords.clientY - startY;
-
-      let newLeft = startLeft + dx;
-      let newTop = startTop + dy;
-
-      // Keep within viewport bounds
-      const rect = panel.getBoundingClientRect();
-      newLeft = Math.max(0, Math.min(window.innerWidth - rect.width, newLeft));
-      newTop = Math.max(0, Math.min(window.innerHeight - rect.height, newTop));
-
-      panel.style.left = newLeft + 'px';
-      panel.style.top = newTop + 'px';
-    };
-
-    const onEnd = () => {
-      isDragging = false;
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onEnd);
-      document.removeEventListener('touchmove', onMove);
-      document.removeEventListener('touchend', onEnd);
-    };
-
-    // Remove existing listeners before adding new ones
-    header.removeEventListener('mousedown', header._dragHandler);
-    header.removeEventListener('touchstart', header._touchDragHandler);
-    header._dragHandler = onStart;
-    header._touchDragHandler = onStart;
-    header.addEventListener('mousedown', onStart);
-    header.addEventListener('touchstart', onStart, { passive: false });
-  },
-
-  // ═══════════════════════════════════════════════════════════════
-  // Subagents Panel Detach & Drag
-  // ═══════════════════════════════════════════════════════════════
-
-  toggleSubagentsDetach() {
-    const panel = document.getElementById('subagentsPanel');
-    const detachBtn = document.getElementById('subagentsDetachBtn');
-
-    if (panel.classList.contains('detached')) {
-      // Re-attach to bottom
-      panel.classList.remove('detached');
-      panel.style.top = '';
-      panel.style.left = '';
-      panel.style.width = '';
-      panel.style.height = '';
-      if (detachBtn) {
-        detachBtn.innerHTML = '&#x29C9;'; // Detach icon
-        detachBtn.title = 'Detach panel';
-      }
-    } else {
-      // Detach as floating window
-      panel.classList.add('detached');
-      panel.classList.add('open'); // Ensure it's visible
-      if (detachBtn) {
-        detachBtn.innerHTML = '&#x229E;'; // Attach icon
-        detachBtn.title = 'Attach panel';
-      }
-      // Setup drag functionality
-      this.setupSubagentsDrag();
-    }
-  },
-
-  setupSubagentsDrag() {
-    const panel = document.getElementById('subagentsPanel');
-    const header = document.getElementById('subagentsPanelHeader');
+  /** Let a detached panel be dragged by its header, kept inside the viewport. */
+  _setupPanelDrag(panelId, headerId) {
+    const panel = document.getElementById(panelId);
+    const header = document.getElementById(headerId);
 
     if (!panel || !header) return;
 
@@ -1678,11 +1590,6 @@ Object.assign(CodemanApp.prototype, {
   // ═══════════════════════════════════════════════════════════════
   // Subagent Panel (Claude Code Background Agents)
   // ═══════════════════════════════════════════════════════════════
-
-  // Legacy alias
-  toggleSubagentPanel() {
-    this.toggleSubagentsPanel();
-  },
 
   updateSubagentBadge() {
     const badge = this.$('subagentCountBadge');
@@ -2239,16 +2146,10 @@ Object.assign(CodemanApp.prototype, {
         // Show window (unless it was minimized by user)
         if (!windowInfo.minimized) {
           windowInfo.element.style.display = 'flex';
-          // Lazily re-create teammate terminal if it was disposed when hidden
-          if (windowInfo._lazyTerminal) {
-            this._restoreTeammateTerminalFromLazy(agentId);
-          }
         }
         windowInfo.hidden = false;
       } else {
         // Hide window (but don't close it)
-        // Dispose teammate terminal to free memory while hidden on inactive tab
-        this._disposeTeammateTerminalForMinimize(agentId);
         windowInfo.element.style.display = 'none';
         windowInfo.hidden = true;
       }
@@ -2264,7 +2165,7 @@ Object.assign(CodemanApp.prototype, {
   // If cleanupData is true, also remove activity and toolResults data to prevent memory leaks
   closeSessionSubagentWindows(sessionId, cleanupData = false) {
     const toClose = [];
-    for (const [agentId, _windowData] of this.subagentWindows) {
+    for (const agentId of this.subagentWindows.keys()) {
       const agent = this.subagents.get(agentId);
       // Check both subagent parentSessionId and subagentParentMap
       // (standalone pane windows use subagentParentMap, not subagents map)
@@ -2314,36 +2215,12 @@ Object.assign(CodemanApp.prototype, {
       windowData.element.remove();
       this.subagentWindows.delete(agentId);
     }
-    // Clean up teammate terminal if present
-    const termData = this.teammateTerminals.get(agentId);
-    if (termData) {
-      if (termData.resizeObserver) {
-        termData.resizeObserver.disconnect();
-      }
-      if (termData.terminal) {
-        try { termData.terminal.dispose(); } catch {}
-      }
-      this.teammateTerminals.delete(agentId);
-    }
   },
-
-
-  minimizeSubagentWindow(agentId) {
-    const windowData = this.subagentWindows.get(agentId);
-    if (windowData) {
-      // Dispose teammate terminal on minimize to free DOM/memory (lazy re-creation on restore)
-      this._disposeTeammateTerminalForMinimize(agentId);
-      windowData.element.style.display = 'none';
-      windowData.minimized = true;
-      this.updateConnectionLines();
-    }
-  },
-
 
   // Debounced wrapper — coalesces rapid subagent events (tool_call, progress,
   // message) into a single DOM update per 100ms per agent window.
   scheduleSubagentWindowRender(agentId) {
-    // Skip DOM updates for windows with lazy (disposed) terminals — they're minimized
+    // Skip DOM updates for minimized windows
     const windowData = this.subagentWindows.get(agentId);
     if (windowData?.minimized) return;
 
@@ -2358,12 +2235,6 @@ Object.assign(CodemanApp.prototype, {
   },
 
   renderSubagentWindowContent(agentId) {
-    // Skip if this window has a live terminal (don't overwrite xterm with activity HTML)
-    if (this.teammateTerminals.has(agentId)) return;
-    // Skip if this window has a lazy (disposed) terminal — it will be re-created on restore
-    const windowData = this.subagentWindows.get(agentId);
-    if (windowData?._lazyTerminal) return;
-
     const body = document.getElementById(`subagent-window-body-${agentId}`);
     if (!body) return;
 
@@ -2511,303 +2382,10 @@ Object.assign(CodemanApp.prototype, {
     }
   },
 
-  // Open windows for all active subagents
-  openAllActiveSubagentWindows() {
-    for (const [agentId, agent] of this.subagents) {
-      if (agent.status === 'active' && !this.subagentWindows.has(agentId)) {
-        this.openSubagentWindow(agentId);
-      }
-    }
-  },
-
 
   // ═══════════════════════════════════════════════════════════════
   // Agent Teams
   // ═══════════════════════════════════════════════════════════════
-
-  /** Initialize an xterm.js terminal for a teammate's tmux pane */
-  initTeammateTerminal(agentId, paneInfo, windowElement) {
-    const body = windowElement.querySelector('.subagent-window-body');
-    if (!body) return;
-
-    // Clear the activity log content
-    body.innerHTML = '';
-    body.classList.add('teammate-terminal-body');
-    windowElement.classList.add('has-terminal');
-
-    const sessionId = paneInfo.sessionId;
-
-    // Buffer incoming terminal data until xterm is ready
-    const pendingData = [];
-    this.teammateTerminals.set(agentId, {
-      terminal: null,
-      fitAddon: null,
-      paneTarget: paneInfo.paneTarget,
-      sessionId,
-      resizeObserver: null,
-      pendingData,
-    });
-
-    // Defer terminal creation to next frame so the body element has computed dimensions
-    requestAnimationFrame(() => {
-      // Safety: if window was closed before we got here, bail out
-      if (!document.contains(body)) {
-        this.teammateTerminals.delete(agentId);
-        return;
-      }
-
-      const fontSettings = this.loadAppSettingsFromStorage?.() || {};
-      const terminal = new Terminal({
-        theme: { ...window.codemanCurrentXtermTheme() },
-        minimumContrastRatio: window.codemanCurrentSkinIsLight() ? 4.5 : 1,
-        fontFamily: window.CodemanTerminalFont.resolve(fontSettings.terminalFontFamily),
-        // A pane opened after a weight change must match the main terminal;
-        // one open across the change is repainted by applyTerminalFontWeights().
-        ...window.CodemanTerminalFont.resolveWeights(fontSettings),
-        fontSize: 12,
-        lineHeight: 1.2,
-        cursorBlink: true,
-        cursorStyle: 'block',
-        scrollback: DEFAULT_SCROLLBACK,
-        allowTransparency: true,
-        allowProposedApi: true,
-      });
-
-      const fitAddon = new FitAddon.FitAddon();
-      terminal.loadAddon(fitAddon);
-
-      if (typeof Unicode11Addon !== 'undefined') {
-        try {
-          const unicode11Addon = new Unicode11Addon.Unicode11Addon();
-          terminal.loadAddon(unicode11Addon);
-          terminal.unicode.activeVersion = '11';
-        } catch (_e) { /* Unicode11 addon failed */ }
-      }
-
-      try {
-        terminal.open(body);
-      } catch (err) {
-        console.warn('[TeammateTerminal] Failed to open terminal:', err);
-        this.teammateTerminals.delete(agentId);
-        return;
-      }
-
-      // Ctrl+Z (SIGTSTP/job-control suspend): a teammate/subagent pane is always
-      // running an agent CLI (Task-tool dispatched, never a plain shell), so
-      // unlike the main terminal's mode-gated trap this one is unconditional.
-      // Mirrors the main terminal's guard in terminal-ui.js's
-      // attachCustomKeyEventHandler — case-insensitive so Caps Lock (which
-      // flips ev.key to 'Z' without setting shiftKey) can't slip a suspend past it.
-      terminal.attachCustomKeyEventHandler((ev) => {
-        if (
-          ev.type === 'keydown' &&
-          ev.key.toLowerCase() === 'z' &&
-          ev.ctrlKey &&
-          !ev.altKey &&
-          !ev.metaKey &&
-          !ev.shiftKey
-        ) {
-          ev.preventDefault();
-          return false;
-        }
-        return true;
-      });
-
-      // Wait for terminal renderer to fully initialize before any writes.
-      // xterm.js needs a few frames after open() before write() is safe.
-      setTimeout(() => {
-        try { fitAddon.fit(); } catch {}
-
-        // Fetch initial pane buffer
-        fetch(`/api/sessions/${sessionId}/teammate-pane-buffer/${encodeURIComponent(paneInfo.paneTarget)}`)
-          .then(r => r.json())
-          .then(resp => {
-            if (resp.success && resp.data?.buffer) {
-              try { terminal.write(resp.data.buffer); } catch {}
-            }
-          })
-          .catch(err => console.error('[TeammateTerminal] Failed to fetch buffer:', err));
-
-        // Flush any data that arrived while terminal was initializing
-        for (const chunk of pendingData) {
-          try { terminal.write(chunk); } catch {}
-        }
-        pendingData.length = 0;
-      }, 100);
-
-      // Forward keyboard input to the teammate's pane
-      terminal.onData((data) => {
-        fetch(`/api/sessions/${sessionId}/teammate-pane-input`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ paneTarget: paneInfo.paneTarget, input: data }),
-        }).catch(err => console.error('[TeammateTerminal] Failed to send input:', err));
-      });
-
-      // Resize observer to refit terminal when window is resized
-      const resizeObserver = new ResizeObserver(() => {
-        requestAnimationFrame(() => { try { fitAddon.fit(); } catch {} });
-      });
-      resizeObserver.observe(body);
-
-      // Update the stored entry with the real terminal
-      const entry = this.teammateTerminals.get(agentId);
-      if (entry) {
-        entry.terminal = terminal;
-        entry.fitAddon = fitAddon;
-        entry.resizeObserver = resizeObserver;
-      }
-    });
-  },
-
-  /** Open a standalone terminal window for a tmux-pane teammate (no subagent entry needed) */
-  openTeammateTerminalWindow(paneData) {
-    // Only open if the session has a tab in Codeman
-    if (!this.sessions.has(paneData.sessionId)) return;
-
-    // Use pane target as the unique ID for this window
-    const windowId = `pane-${paneData.paneTarget}`;
-
-    // If window already exists, focus it
-    if (this.subagentWindows.has(windowId)) {
-      const existing = this.subagentWindows.get(windowId);
-      if (existing.hidden) {
-        existing.element.style.display = 'flex';
-        existing.hidden = false;
-      }
-      existing.element.style.zIndex = ++this.subagentWindowZIndex;
-      if (existing.minimized) {
-        this.restoreSubagentWindow(windowId);
-      }
-      return;
-    }
-
-    // Calculate position
-    const windowCount = this.subagentWindows.size;
-    const windowWidth = 550;
-    const windowHeight = 400;
-    const gap = 20;
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const startX = 50;
-    const startY = 120;
-    const maxCols = Math.floor((viewportWidth - startX - 50) / (windowWidth + gap)) || 1;
-    const maxRows = Math.floor((viewportHeight - startY - 50) / (windowHeight + gap)) || 1;
-    const col = windowCount % maxCols;
-    const row = Math.floor(windowCount / maxCols) % maxRows;
-    let finalX = startX + col * (windowWidth + gap);
-    let finalY = startY + row * (windowHeight + gap);
-    finalX = Math.max(10, Math.min(finalX, viewportWidth - windowWidth - 10));
-    finalY = Math.max(10, Math.min(finalY, viewportHeight - windowHeight - 10));
-
-    // Color badge
-    const colorClass = paneData.color || 'blue';
-
-    // Create window element
-    const win = document.createElement('div');
-    win.className = 'subagent-window has-terminal';
-    win.id = `subagent-window-${windowId}`;
-    win.style.zIndex = ++this.subagentWindowZIndex;
-    win.style.left = `${finalX}px`;
-    win.style.top = `${finalY}px`;
-    win.style.width = `${windowWidth}px`;
-    win.style.height = `${windowHeight}px`;
-    win.innerHTML = `
-      <div class="subagent-window-header">
-        <div class="subagent-window-title" title="Teammate terminal: ${escapeHtml(paneData.teammateName)} (pane ${paneData.paneTarget})">
-          <span class="icon" style="color: var(--team-color-${colorClass}, #339af0)">⬤</span>
-          <span class="id">${escapeHtml(paneData.teammateName)}</span>
-          <span class="status running">terminal</span>
-        </div>
-        <div class="subagent-window-actions">
-          <button onclick="app.closeSubagentWindow(${escapeHtml(JSON.stringify(windowId))})" title="Minimize to tab">─</button>
-        </div>
-      </div>
-      <div class="subagent-window-body teammate-terminal-body" id="subagent-window-body-${windowId}">
-      </div>
-    `;
-
-    document.body.appendChild(win);
-
-    // Make draggable
-    const dragListeners = this.makeWindowDraggable(win, win.querySelector('.subagent-window-header'));
-
-    // Make resizable if method exists
-    if (typeof this.makeWindowResizable === 'function') {
-      this.makeWindowResizable(win);
-    }
-
-    // Check visibility based on active session
-    const settings = this.loadAppSettingsFromStorage();
-    const activeTabOnly = settings.subagentActiveTabOnly ?? true;
-    const shouldHide = activeTabOnly && paneData.sessionId !== this.activeSessionId;
-
-    // Store reference
-    this.subagentWindows.set(windowId, {
-      element: win,
-      minimized: false,
-      hidden: shouldHide,
-      dragListeners,
-      description: `Teammate: ${paneData.teammateName}`,
-    });
-
-    // Also add to subagentParentMap for tab-based visibility
-    this.subagentParentMap.set(windowId, paneData.sessionId);
-
-    if (shouldHide) {
-      win.style.display = 'none';
-    }
-
-    // Focus on click
-    win.addEventListener('mousedown', () => {
-      win.style.zIndex = ++this.subagentWindowZIndex;
-    });
-
-    // Resize observer for connection lines
-    const resizeObserver = new ResizeObserver(() => {
-      this.updateConnectionLines();
-    });
-    resizeObserver.observe(win);
-    this.subagentWindows.get(windowId).resizeObserver = resizeObserver;
-
-    // Init the xterm.js terminal (lazy if hidden)
-    if (shouldHide) {
-      // Window starts hidden — defer terminal creation until visible (lazy init)
-      const windowEntry = this.subagentWindows.get(windowId);
-      if (windowEntry) {
-        windowEntry._lazyTerminal = true;
-        windowEntry._lazyPaneTarget = paneData.paneTarget;
-        windowEntry._lazySessionId = paneData.sessionId;
-      }
-    } else {
-      this.initTeammateTerminal(windowId, paneData, win);
-    }
-
-    // Animate in
-    requestAnimationFrame(() => {
-      win.style.transition = 'transform 0.3s ease, opacity 0.3s ease';
-      win.style.transform = 'scale(1)';
-      win.style.opacity = '1';
-    });
-  },
-
-  /** Rebuild the teammate lookup map from all team configs */
-  rebuildTeammateMap() {
-    this.teammateMap.clear();
-    for (const [teamName, team] of this.teams) {
-      for (const member of team.members) {
-        if (member.agentType !== 'team-lead') {
-          // Use name as key prefix for matching subagent descriptions
-          this.teammateMap.set(member.name, {
-            name: member.name,
-            color: member.color || 'blue',
-            teamName,
-            agentId: member.agentId,
-          });
-        }
-      }
-    }
-  },
 
   /** Check if a subagent is a teammate and return its info */
   getTeammateInfo(agent) {
@@ -2818,7 +2396,7 @@ Object.assign(CodemanApp.prototype, {
     const teammateId = match[1];
     // Extract name from teammate_id (format: name@teamName)
     const name = teammateId.split('@')[0];
-    return this.teammateMap.get(name) || { name, color: 'blue', teamName: 'unknown' };
+    return { name, color: 'blue', teamName: 'unknown' };
   },
 
   /** Get teammate badge HTML for a subagent */
@@ -2826,117 +2404,6 @@ Object.assign(CodemanApp.prototype, {
     const info = this.getTeammateInfo(agent);
     if (!info) return '';
     return `<span class="teammate-badge teammate-color-${info.color}" title="Team: ${escapeHtml(info.teamName)}">@${escapeHtml(info.name)}</span>`;
-  },
-
-  /** Render the team tasks panel */
-  renderTeamTasksPanel() {
-    const panel = document.getElementById('teamTasksPanel');
-    if (!panel) return;
-
-    // Find team for active session
-    let activeTeam = null;
-    let activeTeamName = null;
-    if (this.activeSessionId) {
-      for (const [name, team] of this.teams) {
-        if (team.leadSessionId === this.activeSessionId) {
-          activeTeam = team;
-          activeTeamName = name;
-          break;
-        }
-      }
-    }
-
-    if (!activeTeam) {
-      panel.style.display = 'none';
-      return;
-    }
-
-    // Set initial position and make draggable on first show
-    const wasHidden = panel.style.display === 'none';
-    panel.style.display = 'flex';
-
-    if (wasHidden && !this.teamTasksDragListeners) {
-      // Position bottom-right
-      const panelWidth = 360;
-      const panelHeight = 300;
-      panel.style.left = `${Math.max(10, window.innerWidth - panelWidth - 20)}px`;
-      panel.style.top = `${Math.max(10, window.innerHeight - panelHeight - 70)}px`;
-      // Make draggable
-      const header = panel.querySelector('.team-tasks-header');
-      if (header) {
-        this.teamTasksDragListeners = this.makeWindowDraggable(panel, header);
-      }
-    }
-
-    const tasks = this.teamTasks.get(activeTeamName) || [];
-    const completed = tasks.filter(t => t.status === 'completed').length;
-    const total = tasks.length;
-    const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
-
-    const headerEl = panel.querySelector('.team-tasks-header-text');
-    if (headerEl) {
-      const teammateCount = activeTeam.members.filter(m => m.agentType !== 'team-lead').length;
-      headerEl.textContent = `Team Tasks (${teammateCount} teammates)`;
-    }
-
-    const progressEl = panel.querySelector('.team-tasks-progress-fill');
-    if (progressEl) {
-      progressEl.style.width = `${pct}%`;
-    }
-
-    const progressText = panel.querySelector('.team-tasks-progress-text');
-    if (progressText) {
-      progressText.textContent = `${completed}/${total}`;
-    }
-
-    const listEl = panel.querySelector('.team-tasks-list');
-    if (!listEl) return;
-
-    if (tasks.length === 0) {
-      listEl.innerHTML = '<div class="team-task-empty">No tasks yet</div>';
-      return;
-    }
-
-    const html = tasks.map(task => {
-      const statusIcon = task.status === 'completed' ? '✓' : task.status === 'in_progress' ? '◉' : '○';
-      const statusClass = task.status.replace('_', '-');
-      const ownerBadge = task.owner
-        ? `<span class="team-task-owner teammate-color-${this.getTeammateColor(task.owner)}">${escapeHtml(task.owner)}</span>`
-        : '';
-      return `<div class="team-task-item ${statusClass}">
-        <span class="team-task-status">${statusIcon}</span>
-        <span class="team-task-subject">${escapeHtml(task.subject)}</span>
-        ${ownerBadge}
-      </div>`;
-    }).join('');
-
-    listEl.innerHTML = html;
-  },
-
-  /** Hide team tasks panel and clean up drag listeners */
-  hideTeamTasksPanel() {
-    const panel = document.getElementById('teamTasksPanel');
-    if (panel) panel.style.display = 'none';
-    if (this.teamTasksDragListeners) {
-      document.removeEventListener('mousemove', this.teamTasksDragListeners.move);
-      document.removeEventListener('mouseup', this.teamTasksDragListeners.up);
-      if (this.teamTasksDragListeners.touchMove) {
-        document.removeEventListener('touchmove', this.teamTasksDragListeners.touchMove);
-        document.removeEventListener('touchend', this.teamTasksDragListeners.up);
-        document.removeEventListener('touchcancel', this.teamTasksDragListeners.up);
-      }
-      if (this.teamTasksDragListeners.handle) {
-        this.teamTasksDragListeners.handle.removeEventListener('mousedown', this.teamTasksDragListeners.handleMouseDown);
-        this.teamTasksDragListeners.handle.removeEventListener('touchstart', this.teamTasksDragListeners.handleTouchStart);
-      }
-      this.teamTasksDragListeners = null;
-    }
-  },
-
-  /** Get teammate color by name */
-  getTeammateColor(name) {
-    const info = this.teammateMap.get(name);
-    return info?.color || 'blue';
   },
 
 
@@ -3047,37 +2514,6 @@ Object.assign(CodemanApp.prototype, {
     if (shallow2 && inWorkDir1) return true;
 
     return false;
-  },
-
-  /**
-   * Pick the "better" of two paths that resolve to the same file.
-   * Prefers paths inside the case folder, longer/more explicit paths, and absolute paths.
-   */
-  pickBetterPath(path1, path2, workingDir) {
-    // Prefer paths inside the case folder (working directory)
-    if (workingDir) {
-      const inWorkDir1 = this.isPathInWorkingDir(path1, workingDir);
-      const inWorkDir2 = this.isPathInWorkingDir(path2, workingDir);
-      if (inWorkDir1 && !inWorkDir2) return path1;
-      if (inWorkDir2 && !inWorkDir1) return path2;
-    }
-
-    // Prefer absolute paths
-    const abs1 = path1.startsWith('/');
-    const abs2 = path2.startsWith('/');
-    if (abs1 && !abs2) return path1;
-    if (abs2 && !abs1) return path2;
-
-    // Both absolute or both relative - prefer longer (more explicit)
-    if (path1.length !== path2.length) {
-      return path1.length > path2.length ? path1 : path2;
-    }
-
-    // Prefer paths without ~
-    if (!path1.includes('~') && path2.includes('~')) return path1;
-    if (!path2.includes('~') && path1.includes('~')) return path2;
-
-    return path1;
   },
 
   /**

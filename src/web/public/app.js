@@ -11,7 +11,6 @@
  *   panels-ui.js     — Subagent panel, agent teams, project insights, file browser, log viewer,
  *                       image popups, monitor, token stats, toast, system stats
  *   session-ui.js    — Quick start, session options modal, case settings, mobile case picker
- *   ralph-wizard.js  — Ralph Loop wizard modal
  *   api-client.js    — API helper methods (fetch wrappers)
  *   subagent-windows.js — Floating subagent terminal windows
  *
@@ -298,13 +297,6 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.TUNNEL_QR_ROTATED, '_onTunnelQrRotated'],
   [SSE_EVENTS.TUNNEL_QR_REGENERATED, '_onTunnelQrRegenerated'],
   [SSE_EVENTS.TUNNEL_QR_AUTH_USED, '_onTunnelQrAuthUsed'],
-
-  // Plan orchestration
-  [SSE_EVENTS.PLAN_SUBAGENT, '_onPlanSubagent'],
-  [SSE_EVENTS.PLAN_PROGRESS, '_onPlanProgress'],
-  [SSE_EVENTS.PLAN_STARTED, '_onPlanStarted'],
-  [SSE_EVENTS.PLAN_CANCELLED, '_onPlanCancelled'],
-  [SSE_EVENTS.PLAN_COMPLETED, '_onPlanCompleted'],
 
   // Orchestrator loop
   [SSE_EVENTS.ORCHESTRATOR_STATE_CHANGED, '_onOrchestratorStateChanged'],
@@ -878,30 +870,10 @@ class CodemanApp {
     // Once set, never recalculated. Persisted to localStorage and server.
     this.subagentParentMap = new Map();
 
-    // Agent Teams tracking
-    this.teams = new Map(); // Map<teamName, TeamConfig>
-    this.teamTasks = new Map(); // Map<teamName, TeamTask[]>
-    this.teammateMap = new Map(); // Map<agentId-prefix, {name, color, teamName}> for quick lookup
-
-    // Teammate tmux pane terminals (Agent Teams feature)
-    this.teammatePanesByName = new Map(); // Map<name, { paneTarget, sessionId, color }>
-    this.teammateTerminals = new Map(); // Map<agentId, { terminal, fitAddon, paneTarget, sessionId, resizeObserver }>
-
     this.terminalBufferCache = new Map(); // Map<sessionId, string> — client-side cache for instant tab re-visits (max 20)
 
     this.ralphStatePanelCollapsed = true; // Default to collapsed
     this.ralphClosedSessions = new Set(); // Sessions where user explicitly closed Ralph panel
-
-    // Plan subagent windows (visible agents during plan generation)
-    this.planSubagents = new Map(); // Map<agentId, { type, model, status, startTime, element, relativePos }>
-    this.planSubagentWindowZIndex = ZINDEX_PLAN_SUBAGENT_BASE;
-    this.planGenerationStopped = false; // Flag to ignore SSE events after Stop
-    this.planAgentsMinimized = false; // Whether agent windows are minimized to tab
-
-    // Wizard dragging state
-    this.wizardDragState = null; // { startX, startY, startLeft, startTop, isDragging }
-    this.wizardDragListeners = null; // { move, up } for cleanup
-    this.wizardPosition = null; // { left, top } - null means centered
 
     // Project Insights tracking (active Bash tools with clickable file paths)
     this.projectInsights = new Map(); // Map<sessionId, ActiveBashTool[]>
@@ -1841,15 +1813,6 @@ class CodemanApp {
     // A liveness ping (or the popup's own unload) heals the badge if it's gone.
     this._postWindowMessage({ type: 'focus-request', id });
     return true;
-  }
-
-  /** Re-dock a session: close its window (which re-docks via its unload
-   *  announcement) and clear dashboard state now. */
-  redockSession(id) {
-    const win = this.detachedWindows.get(id);
-    if (win && !win.closed) { try { win.close(); } catch {} }
-    this._postWindowMessage({ type: 'close-request', id });
-    this._redock(id);
   }
 
   /** Clear all dashboard-side detached state/timers for a session, and take its
@@ -5001,6 +4964,11 @@ class CodemanApp {
     document.body.classList.toggle('cjk-input-visible', !!showCjk);
     cjkEl.style.display = showCjk ? 'block' : 'none';
     cjkEl.setAttribute('aria-hidden', showCjk ? 'false' : 'true');
+    if (typeof CjkInput !== 'undefined') {
+      CjkInput.setHoldUntilEnter?.(
+        !!(settings.cjkInputHoldUntilEnter ?? defaults.cjkInputHoldUntilEnter ?? false)
+      );
+    }
     if (!showCjk) window.cjkActive = false;
     if (typeof KeyboardHandler !== 'undefined') KeyboardHandler.updateLayoutForKeyboard();
   }
@@ -5024,8 +4992,6 @@ class CodemanApp {
       this._xtermSnapshots?.clear();
     }
     this.projectInsights.clear();
-    this.teams.clear();
-    this.teamTasks.clear();
     // Clear all idle timers to prevent stale timers from firing
     for (const timer of this.idleTimers.values()) {
       clearTimeout(timer);
@@ -5109,10 +5075,6 @@ class CodemanApp {
     // wrapping) clipped xterm's bottom rows behind the toolbar until a tab
     // switch or a window resize.
     // Clear any other orphaned timers
-    if (this.planLoadingTimer) {
-      clearInterval(this.planLoadingTimer);
-      this.planLoadingTimer = null;
-    }
     if (this.timerCountdownInterval) {
       clearInterval(this.timerCountdownInterval);
       this.timerCountdownInterval = null;
@@ -9517,7 +9479,7 @@ class CodemanApp {
 
   // `skipSnapshot`: the tile grid opening on the session it parks
   // (tile-grid.js openTileGrid), whose snapshot closing the grid discards.
-  _cleanupPreviousSession(newSessionId, { skipSnapshot = false } = {}) {
+  _cleanupPreviousSession(newSessionId, { skipSnapshot = false, keepCjkDraft = false } = {}) {
     // Snapshot the OUTGOING session's xterm rendered state (viewport + scrollback +
     // colors/attrs) before the terminal gets cleared/reset. Lets us restore the
     // exact view on switch-back rather than replaying codex's byte stream, which
@@ -9570,8 +9532,16 @@ class CodemanApp {
     // Clear CJK input to prevent sending stale text to the wrong session.
     // Must go through CjkInput.clear() — a raw value wipe leaves the module's
     // pending flush timers armed and drops the phantom char it relies on.
+    // A held Send on Enter draft survives a reload of the same session: nothing
+    // switched, and the answer would be gone. On a real switch it is stashed for
+    // the session being left (selectSession restores it on the way back), so a
+    // stray swipe does not lose it. Live mode still clears, since a pending
+    // debounced flush could fire mid-reconnect.
     if (typeof CjkInput !== 'undefined') {
-      CjkInput.clear();
+      if (!(keepCjkDraft && CjkInput.holdUntilEnter)) {
+        if (this.activeSessionId) CjkInput.stashDraft?.(this.activeSessionId);
+        CjkInput.clear();
+      }
     } else {
       const cjkEl = document.getElementById('cjkInput');
       if (cjkEl) cjkEl.value = '';
@@ -10156,11 +10126,19 @@ class CodemanApp {
       if (this._tileGrid.has(sessionId)) return this._selectTiledSession(sessionId, options);
       if (options?.auto === true && !options?.leaveTiles) return;
       this.closeTileGrid({ keepStored: true, reselect: false });
+      // The focused tile's Send on Enter draft: the null below hides that
+      // session from _cleanupPreviousSession, which would clear it unstashed.
+      if (typeof CjkInput !== 'undefined' && this.activeSessionId) CjkInput.stashDraft?.(this.activeSessionId);
       // The parked terminal still holds what it showed before the grid opened;
       // with no active id, the switch below snapshots none of it.
       this.activeSessionId = null;
     }
+    // A reload of the session already shown (tapping its own tab, the geometry
+    // retry) is not a switch: _cleanupPreviousSession keeps a Send on Enter
+    // draft for it, which it cannot tell on its own once activeSessionId is null.
+    let reloadingSameSession = false;
     if (this.activeSessionId === sessionId && forceReload) {
+      reloadingSameSession = true;
       this.terminalBufferCache?.delete(sessionId);
       this._xtermSnapshots?.delete(sessionId);
       try { localStorage.removeItem(`codeman-xs-${sessionId}`); } catch {}
@@ -10210,9 +10188,10 @@ class CodemanApp {
     // A session tab takes the stage back from any active web tab.
     this._hideWebviewLayer?.();
 
-    this._cleanupPreviousSession(sessionId);
+    this._cleanupPreviousSession(sessionId, { keepCjkDraft: reloadingSameSession });
     this.activeSessionId = sessionId;
     this._activateFileBrowserSession?.(sessionId);
+    if (typeof CjkInput !== 'undefined') CjkInput.restoreDraft?.(sessionId);
     // A keyboard row hold belongs to the session it was taken for: release it here
     // if this one resizes instead (the geometry work below then fits it).
     this._reconcileKeyboardHold?.({ resize: false });
@@ -11009,6 +10988,7 @@ class CodemanApp {
     this._flushedOffsets?.delete(sessionId);
     this._flushedTexts?.delete(sessionId);
     if (typeof KeyboardAccessoryBar !== 'undefined') KeyboardAccessoryBar.discardComposerDraft?.(sessionId);
+    if (typeof CjkInput !== 'undefined') CjkInput.discardDraft?.(sessionId);
     // Drop any durably-queued input for a session that's actually gone (deleted/
     // exited). Not a lost prompt — the target no longer exists. Only reached on
     // real session removal, never on a tab switch.
@@ -11290,6 +11270,9 @@ class CodemanApp {
     this._retireUrlSession();
     // Home is a choice to leave the grid too; it is remembered for Tiles.
     this.closeTileGrid?.({ keepStored: true, reselect: false });
+    // A Send on Enter draft goes with its session: the null below hides that
+    // session from the next _cleanupPreviousSession, which would clear it unstashed.
+    if (typeof CjkInput !== 'undefined' && this.activeSessionId) CjkInput.stashDraft?.(this.activeSessionId);
     // Deselect active session and show welcome screen
     this.activeSessionId = null;
     try { localStorage.removeItem('codeman-active-session'); } catch {}
@@ -11298,28 +11281,6 @@ class CodemanApp {
     this.renderSessionTabs();
     this.renderRalphStatePanel();
   }
-
-  // ═══════════════════════════════════════════════════════════════
-  // Ralph Loop Wizard (methods in ralph-wizard.js)
-  // ═══════════════════════════════════════════════════════════════
-
-  // Wizard state (initialized here, methods loaded from ralph-wizard.js)
-  ralphWizardStep = 1;
-  ralphWizardConfig = {
-    taskDescription: '',
-    completionPhrase: 'COMPLETE',
-    maxIterations: 10,
-    caseName: 'testcase',
-    enableRespawn: false,
-    generatedPlan: null,
-    planGenerated: false,
-    skipPlanGeneration: false,
-    planDetailLevel: 'detailed',
-    existingPlan: null,
-    useExistingPlan: false,
-  };
-  planLoadingTimer = null;
-  planLoadingStartTime = null;
 
   // ═══════════════════════════════════════════════════════════════
   // Kill Sessions
