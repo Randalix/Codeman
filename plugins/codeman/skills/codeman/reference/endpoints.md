@@ -473,6 +473,41 @@ this way (`approval-routes.ts:43`).
 - The interrupted turn is still billed for the work it already did. Interrupt is
   cheaper than respawn, which runs `/clear` and destroys the conversation.
 
+### Suspending an idle worker (free its memory)
+
+An idle claude worker can be suspended, local or on an SSH host: Codeman stops its CLI
+(local: the whole pane process group, SIGTERM then SIGKILL after 5 s; remote: the
+worker's tmux session on the host, then the local ssh client), keeps the session and its
+dead pane, and shows it greyed out. The next input brings the same conversation back
+(`claude --resume <id>`), so a coordinator can park workers it does not need right now.
+
+| Task | Call |
+|------|------|
+| suspend an idle session | `POST /api/v1/sessions/:id/suspend` → `{suspended:true, suspendedAt}`; 409 with `reason` (`busy`, `background-work`, `respawn-active`, `docker`, `adopted`, `remote-not-owned`, `remote-override`, `unsupported-mode`, `already-suspended`, `no-mux`), 500 `stop-failed` (also: the remote host is not reachable; a suspend never wakes it) |
+| resume it now and wait for the composer | `POST /api/v1/sessions/:id/resume` → `{suspended:false}` (or `alreadyRunning:true`) |
+
+- **Any input resumes it.** `POST .../input` to a suspended session answers
+  `{buffered:true, resuming:true}`: the bytes are held (4 KB, oldest dropped first;
+  `dropped:true` = over the cap, gone) and typed once the composer is back. With `wait`,
+  the call awaits the resume, then writes and waits as usual. Browser keystrokes go the
+  same way.
+- **Background work blocks it** (`background-work`): an idle claude that still runs a
+  monitor, a background shell or a workflow it waits for (its footer chip, `✻ Waiting
+  for …`) is refused, because stopping the CLI would end that work. Suspend it later.
+- **Respawn blocks it** (`respawn-active`): stop respawn first. Respawn cannot start
+  on a suspended session either. Automation never types into a suspended session: the
+  usage-limit auto-resume skips it (the next input resumes it), and any other
+  automated write is dropped, not used as a wake.
+- **A mailbox post resumes it** (`POST .../inbox` answers `resuming:true`): the
+  session comes back, then the usual nudge tells it to read its inbox. `nudge:false`
+  (`--no-nudge`) leaves it suspended, the mail waits. Only the post request resumes;
+  the nudger's retries, the boot re-arm and coordinator reports never do.
+- Session state carries `suspended` / `suspendedAt`, and the suspend survives a server
+  restart. claude only; docker and remote panes Codeman did not start are refused.
+- **Remote:** a resume wakes a sleeping host first (wake-on-LAN, when the host has a
+  wake target), then relaunches claude there with the conversation it last wrote
+  (after a `/clear` too). Its memory is freed on the host, not on the Codeman machine.
+
 ### Is it stuck? structured signals
 
 Two reads that answer "is this worker actually doing something" without parsing a
