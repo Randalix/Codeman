@@ -32,7 +32,7 @@ import { promisify } from 'node:util';
 import { PassThrough, type Readable } from 'node:stream';
 import type { SessionRemote } from './types/session.js';
 import { buildSshConnectionArgs, remoteSshTarget, shellescape, withRemoteTmuxPath } from './remote-hosts.js';
-import { runWithRemoteSshLimit, runWithRemoteUploadLimit } from './remote-ssh-limiter.js';
+import { RemoteSshSlotTimeoutError, runWithRemoteSshLimit, runWithRemoteUploadLimit } from './remote-ssh-limiter.js';
 import type { EditSourceReadOptions, EditSourceRequest, EditSources } from './edit-history-local-source.js';
 
 const execAsync = promisify(exec);
@@ -1236,6 +1236,20 @@ export function buildRemoteUploadScript(workspace: string, name: string, size: n
 /** The minimum transfer rate an upload is given time for (as for edit-history reads). */
 const REMOTE_UPLOAD_MIN_BYTES_PER_SEC = 256 * 1024;
 
+/**
+ * How long an upload waits for a slot in the upload pool before it is answered as busy.
+ * Its own timeout starts only once it holds a slot (Ark0N in #837).
+ */
+export const REMOTE_UPLOAD_SLOT_WAIT_MS = 60_000;
+
+/** Thrown when every upload slot stayed busy for {@link REMOTE_UPLOAD_SLOT_WAIT_MS}: nothing was copied. */
+export class RemoteUploadBusyError extends RemoteFileAccessError {
+  constructor(maxWaitMs: number) {
+    super(`other uploads to this host are still running after ${Math.round(maxWaitMs / 1000)} s; try again later`);
+    this.name = 'RemoteUploadBusyError';
+  }
+}
+
 /** Thrown for an upload the remote side refused on purpose (not an ssh failure). */
 export class RemoteUploadRefusedError extends RemoteFileAccessError {
   constructor(
@@ -1253,17 +1267,18 @@ export class RemoteUploadRefusedError extends RemoteFileAccessError {
  * video costs one pipe). Resolves to the remote file's absolute path.
  *
  * Throws {@link RemoteUploadRefusedError} for a refusal of the remote script (no
- * workspace, `.codeman-uploads` not a directory) and {@link RemoteFileAccessError}
- * for everything else (host unreachable, timeout, short transfer).
+ * workspace, `.codeman-uploads` not a directory), {@link RemoteUploadBusyError} when no
+ * upload slot freed up within `slotWaitMs`, and {@link RemoteFileAccessError} for
+ * everything else (host unreachable, timeout, short transfer).
  */
 export async function remoteWriteUpload(
   remote: SessionRemote,
   workspace: string,
   name: string,
   localPath: string,
-  size: number
+  size: number,
+  slotWaitMs: number = REMOTE_UPLOAD_SLOT_WAIT_MS
 ): Promise<string> {
-  assertNotUnderTest();
   // `exec` so a timeout's SIGTERM reaches ssh itself, not just the local `sh -c`.
   const command = `exec ${buildRemoteFileCommand(remote, buildRemoteUploadScript(workspace, name, size))}`;
   const timeoutMs = REMOTE_READ_TIMEOUT_MS + Math.ceil((size / REMOTE_UPLOAD_MIN_BYTES_PER_SEC) * 1000);
@@ -1271,6 +1286,8 @@ export async function remoteWriteUpload(
   return runWithRemoteUploadLimit(
     () =>
       new Promise<string>((resolve, reject) => {
+        // Inside the slot, so a test can drive the slot wait without ever spawning ssh.
+        assertNotUnderTest();
         const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
         const stdout: Buffer[] = [];
         let stderr = '';
@@ -1329,8 +1346,11 @@ export async function remoteWriteUpload(
           }
           resolve(path);
         });
-      })
-  );
+      }),
+    { maxWaitMs: slotWaitMs }
+  ).catch((err: unknown) => {
+    throw err instanceof RemoteSshSlotTimeoutError ? new RemoteUploadBusyError(slotWaitMs) : err;
+  });
 }
 
 /**

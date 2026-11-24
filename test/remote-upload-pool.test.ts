@@ -57,6 +57,31 @@ describe('remote upload pool', () => {
     await Promise.all(reads);
   });
 
+  it('an upload waits for a slot only as long as it is told, then is answered busy without copying', async () => {
+    const { remoteWriteUpload, RemoteUploadBusyError } = await import('../src/remote-files.js');
+    const pool = getRemoteUploadPool();
+    const held = Array.from({ length: pool.limit }, () => gate());
+    const videos = held.map((g) => runWithRemoteUploadLimit(() => g.opened));
+    const remote = { host: 'gpu', label: 'gpu' } as Parameters<typeof remoteWriteUpload>[0];
+    const err = await remoteWriteUpload(remote, '/w', 'paste-1.png', '/nonexistent', 10, 20).catch((e) => e);
+    expect(err).toBeInstanceOf(RemoteUploadBusyError);
+    expect(err.message).toMatch(/still running/);
+    expect(pool.queuedCount).toBe(0); // the timed-out waiter left the queue
+    held.forEach((g) => g.open());
+    await Promise.all(videos);
+    expect(pool.activeCount).toBe(0);
+  });
+
+  it('a free slot is taken at once even with a wait bound, and the copy runs inside it', async () => {
+    const { remoteWriteUpload, RemoteFileAccessError } = await import('../src/remote-files.js');
+    const remote = { host: 'gpu', label: 'gpu' } as Parameters<typeof remoteWriteUpload>[0];
+    // Under test the copy refuses before spawning, which proves it got past the slot wait.
+    const err = await remoteWriteUpload(remote, '/w', 'paste-1.png', '/nonexistent', 10, 20).catch((e) => e);
+    expect(err).toBeInstanceOf(RemoteFileAccessError);
+    expect(err.message).toMatch(/disabled under test/);
+    expect(getRemoteUploadPool().activeCount).toBe(0);
+  });
+
   it('defaults to two upload slots', () => {
     expect(process.env.CODEMAN_MAX_REMOTE_UPLOAD_SSH).toBeUndefined();
     expect(getRemoteUploadPool().limit).toBe(2);

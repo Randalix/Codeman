@@ -535,6 +535,18 @@ describe('session-routes', () => {
         for (const call of remoteUpload.calls) expect(existsSync(dirname(dirname(call.staged)))).toBe(false);
         expect(await readdir(localDir)).toEqual([]);
       });
+
+      it('answers 503 with Retry-After when every upload slot stayed busy, and removes the staging folder', async () => {
+        const { RemoteUploadBusyError } = await import('../../src/remote-files.js');
+        remoteUpload.failWith = new RemoteUploadBusyError(60_000);
+        const res = await uploadImage('shot.jpg', 'image/jpeg', jpeg);
+        expect(res.statusCode).toBe(503);
+        expect(res.headers['retry-after']).toBe('30');
+        expect(JSON.parse(res.body).error).toBe(
+          'Upload to gpu failed: other uploads to this host are still running after 60 s; try again later'
+        );
+        for (const call of remoteUpload.calls) expect(existsSync(dirname(dirname(call.staged)))).toBe(false);
+      });
     });
 
     it('returns 415 with the error envelope when HEIC conversion fails', async () => {
