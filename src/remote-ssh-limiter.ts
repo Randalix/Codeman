@@ -159,7 +159,11 @@ export function runWithRemoteSshLimit<T>(task: () => Promise<T>, opts: { maxWait
   return sharedPool.run(task, opts);
 }
 
-/** Run a remote prompt upload in the upload pool, never in the shared one. */
-export function runWithRemoteUploadLimit<T>(task: () => Promise<T>): Promise<T> {
-  return uploadPool.run(task);
+/**
+ * Run a remote prompt upload in the upload pool, never in the shared one. Callers pass
+ * `maxWaitMs`: an upload's own timeout only starts once it holds a slot, so without a
+ * bound a screenshot would wait, request open, behind two long video copies.
+ */
+export function runWithRemoteUploadLimit<T>(task: () => Promise<T>, opts: { maxWaitMs?: number } = {}): Promise<T> {
+  return uploadPool.run(task, opts);
 }

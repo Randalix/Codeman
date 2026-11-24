@@ -228,7 +228,7 @@ import {
   selectLastAnsweredTurn,
 } from '../response-viewer-transcript.js';
 import { readDeepSeekLastResponse } from '../../deepseek-transcript.js';
-import { RemoteUploadRefusedError, remoteWriteUpload } from '../../remote-files.js';
+import { RemoteUploadBusyError, RemoteUploadRefusedError, remoteWriteUpload } from '../../remote-files.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
 
@@ -6235,7 +6235,8 @@ export function registerSessionRoutes(
         const path = await remoteWriteUpload(remote, session.workingDir, result.filename, result.path, size);
         return { path, filename: result.filename };
       } catch (err: unknown) {
-        reply.code(err instanceof RemoteUploadRefusedError ? 403 : 502);
+        if (err instanceof RemoteUploadBusyError) reply.header('Retry-After', '30');
+        reply.code(err instanceof RemoteUploadRefusedError ? 403 : err instanceof RemoteUploadBusyError ? 503 : 502);
         return createErrorResponse(
           ApiErrorCode.OPERATION_FAILED,
           `Upload to ${remote.label || remote.host} failed: ${getErrorMessage(err)}`
