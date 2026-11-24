@@ -2079,11 +2079,14 @@ class CodemanApp {
     // supersedes the previous attempt, and its deadline must go with it.
     this._clearTimer('_sseConnectTimeout');
 
-    // Check if browser is offline
-    if (!navigator.onLine) {
-      this.setConnectionStatus('offline');
-      return;
-    }
+    // `navigator.onLine === false` is a hint, not a fact: browsers report
+    // offline while the LAN or tailnet that reaches Codeman works (no default
+    // route, a VPN interface they do not count). Bailing here left such a page
+    // without live updates for good. Record the hint so the banner says
+    // "offline", and try anyway: a failed attempt falls into the normal
+    // backoff, and the first frame from the server clears the flag
+    // (_noteServerReached).
+    if (!navigator.onLine) this.isOnline = false;
 
     // Clear any pending reconnect timeout to prevent duplicate connections
     this._clearTimer('sseReconnectTimeout');
@@ -2148,6 +2151,7 @@ class CodemanApp {
     const addListener = (event, handler) => {
       const stamped = (e) => {
         this._sseLastMessageAt = Date.now();
+        this._noteServerReached();
         handler(e);
       };
       this.eventSource.addEventListener(event, stamped);
@@ -2171,6 +2175,7 @@ class CodemanApp {
       // only ever fires while the status is 'connected', and this is the
       // moment that becomes true.
       this._sseLastMessageAt = Date.now();
+      this.isOnline = true;
       this.setConnectionStatus('connected');
     };
     this.eventSource.onerror = () => this._handleSseConnectionFailure(eventSource);
@@ -3973,6 +3978,7 @@ class CodemanApp {
         this._wsReady = true;
         this._wsState = 'connected';
         this._wsReconnectAttempts = 0;
+        this._noteServerReached();
         this._updateConnectionIndicator();
         // Send a typed resize over the fresh socket: syncs PTY dims after
         // (re)connects AND registers the desktop sizing claim server-side —
@@ -4812,6 +4818,26 @@ class CodemanApp {
         tileValue.className = `connection-tile-value ${words.state}`.trim();
       }
     }
+  }
+
+  /**
+   * Something just arrived from the server, so this device has a network,
+   * whatever the browser's online flag says. The flag is only ever reset by an
+   * `online` event; a browser that misses it (frozen background tab, an
+   * interface change it does not report) or never sends it kept the
+   * "No network connection" banner up over a working page. The same holds for
+   * the 'offline' status an `offline` event writes while the EventSource
+   * stays open: no `onopen` follows to replace it.
+   */
+  _noteServerReached() {
+    if (this.isOnline && this._connectionStatus !== 'offline') return;
+    this.isOnline = true;
+    if (this._connectionStatus === 'offline' && this.eventSource && this.eventSource.readyState === EventSource.OPEN) {
+      this.setConnectionStatus('connected');
+      return;
+    }
+    this._updateConnectionIndicator();
+    this._updateConnectionLossUi();
   }
 
   setupOnlineDetection() {
