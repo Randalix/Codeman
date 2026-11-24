@@ -171,6 +171,24 @@ export function paneShowsComposer(text: string | null): boolean {
  * it: escape sequences and other control bytes dropped, backspace applied. Empty
  * when no Enter was typed or the line was empty.
  */
+/**
+ * The pause before a held Enter that follows typed text, the gap the browser itself
+ * leaves in local echo mode (its Enter handler sends the text, then `\r` 80 ms later).
+ * Written back to back, held text and its Enter reach the pane as one burst, and Claude
+ * Code takes a burst of about a hundred characters as a paste whose Enter is a newline
+ * (the comment on `isPlainPromptInput()` in `web/route-helpers.ts`; Ark0N in #836).
+ */
+export const HELD_ENTER_GAP_MS = 80;
+
+/**
+ * A held raw chunk cut so each Enter is its own write. A chunk with a bracketed-paste
+ * frame stays whole: an Enter inside a paste is the paste's own newline.
+ */
+export function splitHeldKeys(data: string): string[] {
+  if (data.includes('\x1b[200~')) return [data];
+  return data.split(/(\r)/).filter((part) => part !== '');
+}
+
 export function lastSubmittedLine(keys: string): string {
   const end = keys.lastIndexOf('\r');
   if (end < 0) return '';
@@ -391,6 +409,8 @@ export class SessionSuspendRegistry {
     if (!ready) this.deps.log(`[Suspend] ${id8}: composer not seen within ${timeout} ms, delivering anyway`);
 
     let raw = '';
+    // Text was written since the last Enter: the next Enter waits out HELD_ENTER_GAP_MS.
+    let typed = false;
     while (state.pending.length > 0) {
       const chunk = state.pending.shift()!;
       state.pendingBytes -= chunk.data.length;
@@ -400,13 +420,19 @@ export class SessionSuspendRegistry {
         // That prompt armed its own retry and is the newest submit; earlier keystrokes
         // must not re-arm the verifier over it.
         if (ok) raw = '';
+        typed = false;
       } else {
-        try {
-          ok = session.write(chunk.data, { fromUser: true });
-        } catch {
-          ok = false;
+        for (const part of splitHeldKeys(chunk.data)) {
+          if (part === '\r' && typed) await this.deps.sleep(HELD_ENTER_GAP_MS);
+          try {
+            ok = session.write(part, { fromUser: true });
+          } catch {
+            ok = false;
+          }
+          if (!ok) break;
+          raw += part;
+          typed = part !== '\r';
         }
-        if (ok) raw += chunk.data;
       }
       if (!ok) this.deps.log(`[Suspend] ${id8}: held input could not be written (${chunk.data.length} bytes)`);
     }

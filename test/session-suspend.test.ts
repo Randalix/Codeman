@@ -28,6 +28,8 @@ import {
   SessionSuspendRegistry,
   attachSuspendRegistry,
   lastSubmittedLine,
+  HELD_ENTER_GAP_MS,
+  splitHeldKeys,
   paneShowsComposer,
   suspendRefusal,
   suspendRegistryOf,
@@ -302,7 +304,7 @@ describe('SessionSuspendRegistry: input wakes the session', () => {
     d.screens.push('loading', 'loading');
     reg.handleInput(s, 'go\r');
     expect(await reg.resume(s)).toBe(true);
-    expect(s.written).toEqual(['go\r']);
+    expect(s.written).toEqual(['go', '\r']); // the Enter is its own write, after HELD_ENTER_GAP_MS
     expect(d.logs.some((l) => l.includes('composer not seen'))).toBe(true);
   });
 
@@ -446,6 +448,51 @@ describe('Enter retry for held keystrokes (#836)', () => {
   });
 });
 
+describe('held Enter after typed text (local echo burst, Ark0N #836)', () => {
+  it('splitHeldKeys gives every Enter its own write, but keeps a paste frame whole', () => {
+    expect(splitHeldKeys('a long prompt\r')).toEqual(['a long prompt', '\r']);
+    expect(splitHeldKeys('one\rtwo\r\r')).toEqual(['one', '\r', 'two', '\r', '\r']);
+    expect(splitHeldKeys('\r')).toEqual(['\r']);
+    expect(splitHeldKeys('\x1b[200~a\rb\x1b[201~\r')).toEqual(['\x1b[200~a\rb\x1b[201~\r']);
+  });
+
+  it('waits HELD_ENTER_GAP_MS between held text and its Enter, as the browser does', async () => {
+    const s = new FakeSession();
+    const sleeps: number[] = [];
+    const d = deps(s);
+    const base = d.sleep;
+    d.sleep = async (ms) => {
+      sleeps.push(ms);
+      await base(ms);
+    };
+    const reg = new SessionSuspendRegistry(d);
+    await reg.suspend(s);
+    const prompt = 'x'.repeat(150);
+    reg.handleInput(s, prompt); // local echo: the text frame ...
+    reg.handleInput(s, '\r'); // ... and its Enter, 80 ms later in the browser
+    reg.handleInput(s, 'and more\r'); // a chunk carrying both is cut as well
+    sleeps.length = 0; // only the delivery's pauses count from here
+    s.written.length = 0;
+    expect(await reg.resume(s)).toBe(true);
+    expect(s.written).toEqual([prompt, '\r', 'and more', '\r']);
+    expect(sleeps.filter((ms) => ms === HELD_ENTER_GAP_MS)).toHaveLength(2);
+    expect(s.verified).toEqual(['and more']);
+  });
+
+  it('an Enter with no text before it is written at once', async () => {
+    const s = new FakeSession();
+    const sleeps: number[] = [];
+    const d = deps(s);
+    d.sleep = async (ms) => void sleeps.push(ms);
+    const reg = new SessionSuspendRegistry(d);
+    await reg.suspend(s);
+    reg.handleInput(s, '\r');
+    sleeps.length = 0;
+    expect(await reg.resume(s)).toBe(true);
+    expect(sleeps).not.toContain(HELD_ENTER_GAP_MS);
+  });
+});
+
 describe('automation leaves a suspended session alone (#836)', () => {
   it('a running respawn refuses the suspend and stops nothing', async () => {
     const s = new FakeSession();
@@ -530,6 +577,7 @@ describe('suspend wiring guard', () => {
       [
         'session-suspend.ts', // the definition
         join('web', 'routes', 'inbox-routes.ts'), // a post resumes the receiver (request only)
+        join('web', 'routes', 'agent-session-routes.ts'), // guarded stage/submit only ask isHolding
         join('web', 'routes', 'session-routes.ts'),
         join('web', 'routes', 'ws-routes.ts'),
         join('web', 'server.ts'),
