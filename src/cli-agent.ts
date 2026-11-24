@@ -2163,11 +2163,11 @@ const defaultRestoreRunner: RestoreRunner = async (id, resume) => {
 };
 
 /**
- * The resume field for the CREATE route, per mode. `RESUME_FIELD_BY_MODE` covers the
- * per-mode config objects quick-start uses; claude's conversation id is a TOP-LEVEL
- * `resumeSessionId` on create (create supports claude, quick-start deliberately does
- * not). A mode in neither map has no resume field at all — restore must refuse rather
- * than send a body the schema would silently strip into a FRESH conversation.
+ * The resume field for the create route and quick-start, per mode (both use the same
+ * names). `RESUME_FIELD_BY_MODE` covers the per-mode config objects; claude's
+ * conversation id is a TOP-LEVEL `resumeSessionId`. A mode in neither map has no resume
+ * field at all — restore must refuse rather than send a body the schema would silently
+ * strip into a FRESH conversation.
  */
 const RESUME_TOP_LEVEL_BY_MODE: Record<string, string> = { claude: 'resumeSessionId' };
 
@@ -2205,7 +2205,7 @@ export interface RestoreOptions {
  *    from the `deleted` lifecycle record, resuming the CLI conversation. The conversation
  *    id comes from `--resume`, else the id the server recorded when it differs from the
  *    Codeman id, else per-mode discovery (claude transcript, codex originator, opencode
- *    session list) — never a guess.
+ *    session list) — never a guess. A deleted REMOTE session goes to `restoreDeletedRemote`.
  */
 export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Promise<number> {
   if (!options.id && !options.last) {
@@ -2271,9 +2271,6 @@ export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Pr
       EXIT.refused
     );
   }
-  if (record.remote) {
-    return fail(deps, `refusing: ${record.id} was a remote session — restore it on its own host`, EXIT.refused);
-  }
   if (!record.workingDir) {
     return fail(
       deps,
@@ -2281,6 +2278,7 @@ export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Pr
       EXIT.refused
     );
   }
+  if (record.remote) return restoreDeletedRemote(deps, { ...record, workingDir: record.workingDir }, options);
   const mode = record.mode ?? 'claude';
   const cliSessionId =
     options.resume ??
@@ -2323,6 +2321,88 @@ export async function agentRestore(deps: AgentDeps, options: RestoreOptions): Pr
     deps.io.out(
       palette.ok(
         `${GLYPH.ok} restored ${record.id.slice(0, 8)} as ${newId.slice(0, 8)} (${mode}, ${record.workingDir})${record.name ? ` — "${record.name} (Restore)"` : ''}`
+      )
+    );
+  return EXIT.ok;
+}
+
+/** The remote case rows of `GET /api/v1/cases` that restore needs. */
+interface RemoteCaseRow {
+  name: string;
+  location?: string;
+  remote?: { hostId?: string; path?: string };
+}
+
+/**
+ * Restore a deleted REMOTE session: start a new session in the remote case that still
+ * points at its host and path (`quick-start`, which wakes a sleeping host and launches
+ * the pane), continuing its conversation.
+ *
+ * Nothing here can look at the conversation: its transcripts live on the host. claude's
+ * is the recorded id (a fresh pane runs `--session-id <codeman id>`), and the remote
+ * launch falls back to a fresh conversation when the host has no transcript for it.
+ * Other modes need an explicit `--resume`. Records written before `hostId` was logged
+ * name the case by path alone; a path two hosts share is refused as ambiguous.
+ */
+async function restoreDeletedRemote(
+  deps: AgentDeps,
+  record: DeletedSessionRecord & { workingDir: string },
+  options: RestoreOptions
+): Promise<number> {
+  const mode = record.mode ?? 'claude';
+  const ownId =
+    getCli(mode)?.capabilities.transcript === 'claude-jsonl' ? (record.cliSessionId ?? record.id) : undefined;
+  const cliSessionId = options.resume ?? ownId;
+  if (!cliSessionId) {
+    return fail(
+      deps,
+      `no CLI conversation id for ${record.id} (${mode}, remote: its conversations live on the host) — pass --resume <cli-session-id>`,
+      EXIT.refused
+    );
+  }
+  const resumeBody = buildRestoreBody(mode, cliSessionId);
+  if (!resumeBody) {
+    return fail(
+      deps,
+      `mode "${mode}" has no resume field, so a deleted ${mode} session cannot continue its conversation`,
+      EXIT.refused
+    );
+  }
+  const where = `${record.hostId ?? '<host>'}:${record.workingDir}`;
+  const list = await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/cases' });
+  if (!list.json?.success) return fail(deps, describeFailure(list));
+  const matches = ((list.json.data as RemoteCaseRow[] | undefined) ?? []).filter(
+    (c) =>
+      c.location === 'remote' &&
+      c.remote?.path === record.workingDir &&
+      (record.hostId === undefined || c.remote.hostId === record.hostId)
+  );
+  if (matches.length === 0) {
+    return fail(
+      deps,
+      `no remote case points at ${where} any more — add it again (codeman agent spawn --host <id> --cwd ${record.workingDir} --resume ${cliSessionId})`,
+      EXIT.refused
+    );
+  }
+  if (matches.length > 1) {
+    return fail(
+      deps,
+      `${where} is ambiguous: cases ${matches.map((c) => `${c.name} (${c.remote?.hostId})`).join(', ')} — spawn the right one with --resume ${cliSessionId}`,
+      EXIT.refused
+    );
+  }
+  const caseName = matches[0].name;
+  const body: Record<string, unknown> = { caseName, mode, ...resumeBody };
+  if (record.name) body.sessionName = `${record.name} (Restore)`.slice(0, 100);
+  if (deps.ctx.selfId) body.parentSessionId = deps.ctx.selfId;
+  const res = await deps.request(deps.ctx, { method: 'POST', path: '/api/v1/quick-start', body });
+  const newId = (res.json?.data as { sessionId?: string } | undefined)?.sessionId;
+  if (!res.json?.success || !newId) return fail(deps, describeFailure(res));
+  if (deps.json) emitJson(deps, { sessionId: newId, restored: true, from: record.id, cliSessionId, caseName });
+  else
+    deps.io.out(
+      palette.ok(
+        `${GLYPH.ok} restored ${record.id.slice(0, 8)} as ${newId.slice(0, 8)} (${mode}, remote case ${caseName}: ${where})${record.name ? ` — "${record.name} (Restore)"` : ''}`
       )
     );
   return EXIT.ok;

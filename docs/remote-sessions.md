@@ -302,6 +302,10 @@ claude --resume <id>` (see `buildRemoteLaunchCommand`'s claude branch). The
   <id>`). It is passed through unchecked for a remote case; a local one must have
   its transcript on this machine (refused otherwise), a docker case is refused (it
   resumes its own last conversation).
+  **Restoring a deleted one:** `codeman agent restore --last` (or `<id>`) reads
+  the `deleted` lifecycle record (`workingDir` = the remote path, `hostId`, the
+  conversation id), finds the remote case for that host and path, and does the
+  quick-start above. Records from before `hostId` was logged match by path alone.
 - **OMP**: `omp` has no equivalent idempotent single-line form, so
   `Session._pinOmpRespawnId()` resolves and pins an explicit `--resume <id>`
   before a respawn (mirroring the local/docker builders, rendered through the

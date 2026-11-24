@@ -9,7 +9,7 @@
  *    conversation that stands for is per mode — see `DISCOVERY_BY_MODE`. Modes without
  *    a discovery must be handed an explicit `--resume <cli-id>`.
  * 2. **What the deleted session looked like.** The server writes `deleted` entries to
- *    `~/.codeman/session-lifecycle.jsonl` with `workingDir`/`cliSessionId`/`remote` in
+ *    `~/.codeman/session-lifecycle.jsonl` with `workingDir`/`cliSessionId`/`remote`/`hostId` in
  *    `extra` (see `WebServer._doCleanupSession`); the CLI reads that file back.
  *
  * Pure host-local IO — no HTTP, no dependency on `cli-agent`, so both callers can share
@@ -162,8 +162,10 @@ export interface DeletedSessionRecord {
   workingDir?: string;
   /** The real CLI conversation id, when the server knew it (claude/codex; opencode = its own id). */
   cliSessionId?: string;
-  /** A remote (SSH) session — restore belongs on its host, not here. */
+  /** A remote (SSH) session: `workingDir` is the path on its host, and its transcripts live there. */
   remote?: boolean;
+  /** The remote host's id (records written before 2026-11-24 lack it; the path alone then names the case). */
+  hostId?: string;
   ts: number;
 }
 
@@ -199,6 +201,7 @@ export function readDeletedSessions(filePath: string = dataPath('session-lifecyc
       workingDir: typeof extra.workingDir === 'string' ? extra.workingDir : undefined,
       cliSessionId: typeof extra.cliSessionId === 'string' ? extra.cliSessionId : undefined,
       remote: extra.remote === true,
+      hostId: typeof extra.hostId === 'string' ? extra.hostId : undefined,
       ts: typeof entry.ts === 'number' ? entry.ts : 0,
     });
   }

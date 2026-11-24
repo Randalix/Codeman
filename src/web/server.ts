@@ -1877,6 +1877,9 @@ export class WebServer extends EventEmitter {
             workingDir: session.workingDir,
             cliSessionId: session.claudeSessionId ?? undefined,
             remote: Boolean(session.remote),
+            // With `workingDir` (the remote path) this names the remote case a deleted
+            // remote session is restored into: the restore finds the case by host + path.
+            ...(session.remote ? { hostId: session.remote.hostId } : {}),
           }
         : undefined,
     });

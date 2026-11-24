@@ -1565,7 +1565,7 @@ describe('agent restore / ls --alive', () => {
     });
   });
 
-  it('restore refuses a deleted session it cannot resume: no conversation id, remote, or no workingDir', async () => {
+  it('restore refuses a deleted session it cannot resume: no conversation id, or no workingDir', async () => {
     const noId = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
     expect(
       await agentRestore(noId, {
@@ -1576,20 +1576,119 @@ describe('agent restore / ls --alive', () => {
     ).toBe(EXIT.refused);
     expect(noId.err.join('')).toMatch(/no CLI conversation id .* pass --resume/);
 
-    const remote = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
-    expect(
-      await agentRestore(remote, {
-        id: '2fa5c528',
-        deleted: () => [{ id: '2fa5c528', mode: 'opencode', workingDir: '/cases/A', remote: true, ts: 1 }],
-      })
-    ).toBe(EXIT.refused);
-    expect(remote.err.join('')).toMatch(/remote session/);
-
     const noDir = fakeDeps((o) => (o.method === 'GET' ? ok([]) : ok({ session: { id: OTHER } })));
     expect(
       await agentRestore(noDir, { id: '2fa5c528', deleted: () => [{ id: '2fa5c528', mode: 'opencode', ts: 1 }] })
     ).toBe(EXIT.refused);
     expect(noDir.err.join('')).toMatch(/no workingDir/);
+  });
+
+  describe('restore of a deleted REMOTE session', () => {
+    const CONV = 'd5cfef48-103c-4f55-82a8-ba3f539903ad';
+    const kartenplan = {
+      id: CONV,
+      name: 'kartenplan (Huff, Opus)',
+      mode: 'claude',
+      workingDir: '/mnt/build/neon_getaway-kartenplan',
+      cliSessionId: CONV,
+      remote: true,
+      hostId: 'hufflepuff',
+      ts: 1,
+    };
+    const cases = [
+      { name: 'local-same-path', location: 'local', path: '/mnt/build/neon_getaway-kartenplan' },
+      {
+        name: 'other-host',
+        location: 'remote',
+        remote: { hostId: 'gpu', path: '/mnt/build/neon_getaway-kartenplan' },
+      },
+      {
+        name: 'hufflepuff-neon_getaway-kartenplan',
+        location: 'remote',
+        remote: { hostId: 'hufflepuff', path: '/mnt/build/neon_getaway-kartenplan' },
+      },
+      { name: 'hufflepuff-other', location: 'remote', remote: { hostId: 'hufflepuff', path: '/mnt/build/x' } },
+    ];
+    const server = (caseRows: unknown[]) =>
+      fakeDeps((o) => {
+        if (o.path === '/api/v1/sessions' && o.method === 'GET') return ok([]);
+        if (o.path === '/api/v1/cases') return ok(caseRows);
+        if (o.path === '/api/v1/quick-start') return ok({ sessionId: OTHER, caseName: 'x' });
+        return apiError(500, 'OPERATION_FAILED', `unexpected ${o.method} ${o.path}`);
+      });
+
+    it('--last starts the remote case of its host and path via quick-start, continuing the conversation', async () => {
+      const deps = server(cases);
+      let discovered = false;
+      expect(
+        await agentRestore(deps, {
+          last: true,
+          deleted: () => [kartenplan],
+          discover: async () => ((discovered = true), null),
+        })
+      ).toBe(EXIT.ok);
+      // The transcripts are on the host: nothing on this machine is asked.
+      expect(discovered).toBe(false);
+      const start = deps.calls.find((c) => c.method === 'POST');
+      expect(start?.path).toBe('/api/v1/quick-start');
+      expect(start?.body).toEqual({
+        caseName: 'hufflepuff-neon_getaway-kartenplan',
+        mode: 'claude',
+        resumeSessionId: CONV,
+        sessionName: 'kartenplan (Huff, Opus) (Restore)',
+        parentSessionId: SELF,
+      });
+      // quick-start launches the pane itself; there is no create + /interactive here.
+      expect(deps.calls.some((c) => c.path.endsWith('/interactive'))).toBe(false);
+      expect(deps.out.join('')).toMatch(
+        /restored d5cfef48 as 94990c6d .*remote case hufflepuff-neon_getaway-kartenplan/
+      );
+    });
+
+    it('a record from before the host was logged is matched by its path, if only one remote case has it', async () => {
+      const old = { ...kartenplan, hostId: undefined };
+      const unique = server(cases.filter((c) => c.name !== 'other-host'));
+      expect(await agentRestore(unique, { last: true, deleted: () => [old] })).toBe(EXIT.ok);
+      expect(unique.calls.find((c) => c.method === 'POST')?.body).toMatchObject({
+        caseName: 'hufflepuff-neon_getaway-kartenplan',
+      });
+
+      const shared = server(cases);
+      expect(await agentRestore(shared, { last: true, deleted: () => [old] })).toBe(EXIT.refused);
+      expect(shared.err.join('')).toMatch(/ambiguous: cases other-host \(gpu\), hufflepuff-neon_getaway-kartenplan/);
+      expect(shared.calls.some((c) => c.method === 'POST')).toBe(false);
+    });
+
+    it('refuses when no remote case points at the host and path any more, and says how to rebuild it', async () => {
+      const deps = server(cases.filter((c) => c.name !== 'hufflepuff-neon_getaway-kartenplan'));
+      expect(await agentRestore(deps, { last: true, deleted: () => [kartenplan] })).toBe(EXIT.refused);
+      expect(deps.err.join('')).toMatch(
+        /no remote case points at hufflepuff:\/mnt\/build\/neon_getaway-kartenplan .*spawn --host <id> --cwd \/mnt\/build\/neon_getaway-kartenplan --resume d5cfef48/
+      );
+      expect(deps.calls.some((c) => c.method === 'POST')).toBe(false);
+    });
+
+    it('a fresh claude pane records no conversation id: its own Codeman id is the conversation', async () => {
+      const deps = server(cases);
+      expect(
+        await agentRestore(deps, { last: true, deleted: () => [{ ...kartenplan, cliSessionId: undefined }] })
+      ).toBe(EXIT.ok);
+      expect(deps.calls.find((c) => c.method === 'POST')?.body).toMatchObject({ resumeSessionId: CONV });
+    });
+
+    it('another mode needs an explicit --resume (its conversations cannot be discovered from here)', async () => {
+      const opencode = { ...kartenplan, mode: 'opencode', cliSessionId: undefined };
+      const refused = server(cases);
+      expect(await agentRestore(refused, { last: true, deleted: () => [opencode] })).toBe(EXIT.refused);
+      expect(refused.err.join('')).toMatch(/remote: its conversations live on the host\) — pass --resume/);
+
+      const resumed = server(cases);
+      expect(await agentRestore(resumed, { last: true, resume: 'ses_abc', deleted: () => [opencode] })).toBe(EXIT.ok);
+      expect(resumed.calls.find((c) => c.method === 'POST')?.body).toMatchObject({
+        mode: 'opencode',
+        openCodeConfig: { continueSession: 'ses_abc' },
+      });
+    });
   });
 
   it('ls --alive adds a PANE column and marks a dead worker', async () => {

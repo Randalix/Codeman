@@ -198,6 +198,23 @@ describe('readDeletedSessions / findDeletedSession', () => {
     expect(records[1]).toMatchObject({ name: 'w35', mode: 'opencode', workingDir: '/cases/A', cliSessionId: 'a' });
   });
 
+  it('reads the host of a deleted remote session', () => {
+    const file = writeLog([
+      {
+        ts: 1,
+        event: 'deleted',
+        sessionId: 'r',
+        mode: 'claude',
+        extra: { workingDir: '/mnt/build/x', cliSessionId: 'r', remote: true, hostId: 'hufflepuff' },
+      },
+      { ts: 2, event: 'deleted', sessionId: 'old', mode: 'claude', extra: { workingDir: '/mnt/y', remote: true } },
+    ]);
+    const [old, recent] = readDeletedSessions(file);
+    expect(recent).toMatchObject({ id: 'r', remote: true, hostId: 'hufflepuff', workingDir: '/mnt/build/x' });
+    // Records written before the host was logged: the path alone names the case.
+    expect(old).toMatchObject({ id: 'old', remote: true, hostId: undefined });
+  });
+
   it('is an empty list for a missing file and skips malformed lines', () => {
     expect(readDeletedSessions('/nonexistent/nope.jsonl')).toEqual([]);
     const dir = mkdtempSync(join(tmpdir(), 'codeman-lifecycle-'));
