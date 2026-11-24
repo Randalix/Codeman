@@ -4570,7 +4570,8 @@ export function registerSessionRoutes(
         'model applies to claude sessions only; other CLIs take their model in their own config object, such as codexConfig.model'
       );
     }
-    if (resumeSessionId && mode !== 'claude') {
+    // A claude conversation id: only the CLI that writes claude transcripts takes one here.
+    if (resumeSessionId && getCli(mode)?.capabilities.transcript !== 'claude-jsonl') {
       return createErrorResponse(
         ApiErrorCode.INVALID_INPUT,
         'resumeSessionId applies to claude sessions only; other CLIs take their resume id in their own config object, such as codexConfig.resumeSessionId'

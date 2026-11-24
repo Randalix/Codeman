@@ -798,7 +798,7 @@ export function buildSpawnExtras(options: SpawnOptions): Record<string, unknown>
     env[slot.name] = slot.value(options.permission);
   }
   if (Object.keys(env).length > 0) extras.envOverrides = env;
-  if (options.resume && options.mode === 'claude') {
+  if (options.resume && getCli(options.mode)?.capabilities.transcript === 'claude-jsonl') {
     extras[CLAUDE_RESUME_FIELD] = options.resume;
   } else if (options.resume) {
     const slot = RESUME_FIELD_BY_MODE[options.mode];

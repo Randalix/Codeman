@@ -3050,7 +3050,7 @@ export class Session extends EventEmitter {
    * reattached by `new-session -A` and runs no command.
    */
   private _relaunchResumeId(): string | undefined {
-    if (!this._remote || this.mode !== 'claude') return this._resumeSessionId;
+    if (!this._remote || getCli(this.mode)?.capabilities.transcript !== 'claude-jsonl') return this._resumeSessionId;
     const chainTail = this._claudeSessionChain[this._claudeSessionChain.length - 1];
     return this._suspendedResumeId ?? chainTail ?? this._resumeSessionId;
   }
