@@ -249,7 +249,13 @@ export const OPTION_DIALOG_TAIL_ROWS = 16;
  * quoted a numbered list (`❯ 1. fix a` / `  2. fix b`) does not count. While a dialog is up
  * it is the cursor row, because the modal dialogs replace the composer and the notice
  * dialogs draw below it. A second numbered row within reach is required as well, so a
- * draft that merely starts with `1. ` is not a dialog. Footers were not used: the plan
+ * draft that merely starts with `1. ` is not a dialog. That row must sit in the same
+ * block as the cursor: the walk stops at a solid `───` rule, which is what frames the
+ * composer, so a draft `❯ 1. go with the rename` under an answer that ends in a numbered
+ * list does not count (Ark0N in #836; the list is above the composer's top rule). A
+ * dialog's options are never split from their cursor by such a rule. A multi-line draft
+ * that is itself a numbered list (`❯ 1. a` / `  2. b`) still reads as a dialog: that
+ * fails safe (a refused suspend, not a lost dialog). Footers were not used: the plan
  * approval dialog draws no `Esc to cancel`. Fixtures: `test/fixtures/claude-dialogs/`.
  */
 export function isOptionDialogOnScreen(paneText: string | null | undefined, promptGlyph: string): boolean {
@@ -268,9 +274,13 @@ export function isOptionDialogOnScreen(paneText: string | null | undefined, prom
   if (cursor < 0 || rows.length - 1 - cursor > OPTION_DIALOG_TAIL_ROWS) return false;
   const option = /^\d{1,2}\.\s/;
   if (!option.test(rows[cursor].slice(promptGlyph.length).trimStart())) return false;
+  const rule = /^─{8,}/;
   const from = Math.max(0, cursor - OPTION_DIALOG_TAIL_ROWS);
-  for (let i = from; i < rows.length; i++) {
-    if (i !== cursor && option.test(rows[i])) return true;
+  for (let i = cursor - 1; i >= from && !rule.test(rows[i]); i--) {
+    if (option.test(rows[i])) return true;
+  }
+  for (let i = cursor + 1; i < rows.length && !rule.test(rows[i]); i++) {
+    if (option.test(rows[i])) return true;
   }
   return false;
 }

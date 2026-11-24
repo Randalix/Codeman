@@ -57,6 +57,18 @@ describe('isOptionDialogOnScreen', () => {
     expect(isOptionDialogOnScreen(idle('● Done.', '❯ 1. next step'), '❯')).toBe(false);
   });
 
+  it('a draft starting with "1. " under an answer that ends in a numbered list is no dialog (Ark0N, #836)', () => {
+    const screen = idle(
+      ['● Two ways to go:', '  1. rename the module', '  2. keep the old name and re-export'].join('\n'),
+      '❯ 1. go with the rename'
+    );
+    expect(isOptionDialogOnScreen(screen, '❯')).toBe(false);
+  });
+
+  it('a draft that is itself a numbered list still reads as one: fails safe, a refused suspend', () => {
+    expect(isOptionDialogOnScreen(idle('● Done.', '❯ 1. first\n  2. second'), '❯')).toBe(true);
+  });
+
   it('a cursor row further up than the dialog can reach is not read as live', () => {
     const tail = Array.from({ length: OPTION_DIALOG_TAIL_ROWS + 1 }, (_v, i) => `output line ${i}`);
     expect(isOptionDialogOnScreen(['❯ 1. Yes', '  2. No', ...tail].join('\n'), '❯')).toBe(false);
@@ -152,6 +164,13 @@ describe('suspend with a dialog open', () => {
     const s = new FakeSession();
     expect((await new SessionSuspendRegistry(deps(s, idle('● Done.'))).suspend(s)).ok).toBe(true);
     expect(s.stops).toBe(1);
+  });
+
+  it('refuses on a dialog the approvals inbox still holds, even when the screen check misses it', async () => {
+    const s = new FakeSession();
+    const registry = new SessionSuspendRegistry({ ...deps(s, idle('● Done.')), pendingDialog: (id) => id === s.id });
+    expect(await registry.suspend(s)).toMatchObject({ ok: false, reason: 'dialog-open' });
+    expect(s.stops).toBe(0);
   });
 
   it('an unreadable pane is no evidence of a dialog', async () => {

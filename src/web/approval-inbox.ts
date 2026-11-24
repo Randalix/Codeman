@@ -410,6 +410,19 @@ export class ApprovalInbox {
     this.verifyStillAnswerable(item.id);
   }
 
+  /**
+   * Whether a permission or question dialog is pending for the session AND still on its
+   * pane (re-checked now, as an answer would be). Session suspend asks this beside its
+   * own screen check. Only an item whose options parse off the current pane counts: one
+   * the inbox could never read stays "answerable" until its TTL, and must not hold a
+   * session awake that long.
+   */
+  hasLiveDialog(sessionId: string): boolean {
+    const item = this.getForSession(sessionId);
+    if (!item || item.kind === 'idle') return false;
+    return this.verifyStillAnswerable(item.id) && !!this.getById(item.id)?.options;
+  }
+
   /** Pending item for a session, TTL-checked. */
   getForSession(sessionId: string): ApprovalItem | undefined {
     const item = this.items.get(sessionId);

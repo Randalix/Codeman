@@ -91,6 +91,13 @@ export interface SessionSuspendDeps {
    * `/clear` and `/init` into the idle session, so a suspend would stall it.
    */
   respawnRunning?(sessionId: string): boolean;
+  /**
+   * True while the approvals inbox holds a permission or question item for this session
+   * that its own re-check still finds on the pane. The hook knows a dialog is up before
+   * anything reads the screen; the screen check covers what the inbox cannot (its items
+   * live in memory only, and only exist where Codeman's workspace hooks are installed).
+   */
+  pendingDialog?(sessionId: string): boolean;
   /** The CLI runs again (remote: lift the auto-reconnect lock taken by the stop). */
   onResumed?(session: SuspendableSession): void;
   readyTimeoutMs?: number;
@@ -230,7 +237,7 @@ export class SessionSuspendRegistry {
     // is parked, nothing is being drawn. Stopping the CLI would end the dialog and
     // whatever the agent asked with it (Ark0N in #836). An unreadable pane is no
     // evidence of a dialog.
-    if (text !== null && session.dialogOnScreen?.(text)) {
+    if ((text !== null && session.dialogOnScreen?.(text)) || this.deps.pendingDialog?.(session.id)) {
       return {
         ok: false,
         reason: 'dialog-open',

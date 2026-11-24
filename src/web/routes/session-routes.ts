@@ -237,6 +237,7 @@ import {
   remoteWriteUpload,
 } from '../../remote-files.js';
 import { remoteTmuxLocation } from '../../tmux-manager.js';
+import { approvalInbox } from '../approval-inbox.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { DEFAULT_SCREEN_TAIL_BYTES, MAX_SCREEN_HISTORY_LINES, screenTail } from '../../utils/screen-text.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
@@ -1155,6 +1156,7 @@ export function registerSessionRoutes(
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
       log: (message) => console.log(message),
       respawnRunning: (sessionId) => ctx.respawnControllers?.get(sessionId)?.isRunning ?? false,
+      pendingDialog: (sessionId) => approvalInbox.hasLiveDialog(sessionId),
       // A resume runs only on a user's request (input to the session, `POST /resume`),
       // which is an explicit wake request in the sense of the rule above `remoteWake`.
       // Boot recovery and the reconnect watcher never resume a suspended session.

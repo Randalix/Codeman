@@ -181,6 +181,24 @@ describe('ApprovalInbox', () => {
     vi.useRealTimers();
   });
 
+  it('hasLiveDialog: only a permission or question item whose options are still on the pane', () => {
+    let frame: string | null = PERMISSION_FRAME;
+    inbox.notePrompt({ sessionId: 's1', sessionName: 'w1', kind: 'permission', capture: () => frame });
+    expect(inbox.hasLiveDialog('s1')).toBe(true);
+    expect(inbox.hasLiveDialog('nobody')).toBe(false);
+    // Answered in the terminal: the next check finds no options, resolves it, and says no.
+    frame = '✻ Working… (esc to interrupt)';
+    expect(inbox.hasLiveDialog('s1')).toBe(false);
+    expect(inbox.getForSession('s1')).toBeUndefined();
+    // An item the inbox could never parse stays pending, but does not count as a live dialog.
+    inbox.notePrompt({ sessionId: 's2', sessionName: 'w2', kind: 'question', capture: () => null });
+    expect(inbox.hasLiveDialog('s2')).toBe(false);
+    expect(inbox.getForSession('s2')).toBeDefined();
+    // An idle item is not a dialog.
+    inbox.notePrompt({ sessionId: 's3', sessionName: 'w3', kind: 'idle', capture: () => PERMISSION_FRAME });
+    expect(inbox.hasLiveDialog('s3')).toBe(false);
+  });
+
   it('notePrompt creates a pending item with parsed options and emits onPending', () => {
     const { pending } = collect(inbox);
     const item = inbox.notePrompt({
