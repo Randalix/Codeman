@@ -353,3 +353,27 @@ it('refuses a stale launch-resume cursor once a new managed rollout conflicts wi
     await rm(root, { recursive: true, force: true });
   }
 });
+
+it('stage and submit refuse a suspended session with a clear answer and type nothing (Ark0N, #836)', async () => {
+  const { SUSPENDED_STAGE_MESSAGE } = await import('../../src/web/routes/agent-session-routes.js');
+  harness = await createRouteTestHarness(registerAgentSessionRoutes);
+  const session = [...harness.ctx.sessions.values()][0] as unknown as {
+    id: string;
+    setSuspended(at: number | null): void;
+    writeBuffer: string[];
+  };
+  session.setSuspended(1);
+  for (const request of [
+    { method: 'POST' as const, url: `/api/sessions/${session.id}/stage`, payload: { message: 'hello' } },
+    {
+      method: 'POST' as const,
+      url: `/api/sessions/${session.id}/submit`,
+      payload: { stageId: '11111111-1111-4111-8111-111111111111', confirmSha: 'a'.repeat(64) },
+    },
+  ]) {
+    const result = await harness.app.inject(request);
+    expect(result.statusCode).toBe(409);
+    expect(result.json()).toEqual({ success: false, error: SUSPENDED_STAGE_MESSAGE, errorCode: 'CONFLICT' });
+  }
+  expect(session.writeBuffer).toEqual([]);
+});

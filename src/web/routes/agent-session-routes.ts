@@ -24,6 +24,7 @@ import {
 import { ApiErrorCode, createErrorResponse, type ApiResponse } from '../../types.js';
 import { findSessionOrFail, getAuthUser, parseBody, readJsonConfig, SETTINGS_PATH } from '../route-helpers.js';
 import { AgentInspectQuerySchema, AgentStageSchema, AgentSubmitSchema } from '../schemas.js';
+import { suspendRegistryOf } from '../../session-suspend.js';
 
 /** Default OFF, same shape as `readMcpSyncEnabled`: read fresh so a toggle applies at once. */
 export async function readAgentCoordinationEnabled(): Promise<boolean> {
@@ -47,6 +48,16 @@ export function errorCode(error: unknown): string {
   return error instanceof Error ? error.constructor.name : 'unknown';
 }
 
+/**
+ * Stage and submit refuse a suspended (or resuming) session with a clear answer (Ark0N
+ * in #836). They do not wake it: a guarded stage is checked against the composer as it
+ * is, and a freshly resumed CLI is a different composer, so the caller resumes first and
+ * stages again. Without this the answer was the misleading "An empty, verifiable
+ * composer is required".
+ */
+export const SUSPENDED_STAGE_MESSAGE =
+  'The session is suspended. Resume it first (POST /api/sessions/:id/resume or `codeman agent resume`), then stage again.';
+
 export function registerAgentSessionRoutes(app: FastifyInstance, ctx: SessionPort & InfraPort): void {
   const reader = new InspectionReader();
   const stages = new GuardedStageStore();
@@ -55,6 +66,7 @@ export function registerAgentSessionRoutes(app: FastifyInstance, ctx: SessionPor
     stages.clear();
   });
   const generation = (session: Session) => session.inspectionGeneration;
+  const isSuspended = (session: Session) => suspendRegistryOf(ctx)?.isHolding(session) ?? session.suspended;
   const target = (session: Session): GuardedInputTarget => ({
     id: session.id,
     chrome: () => guardedComposerChrome(getCli(session.mode)),
@@ -147,6 +159,8 @@ export function registerAgentSessionRoutes(app: FastifyInstance, ctx: SessionPor
     if (refused) return reply.code(403).send(refused);
     const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req);
     const { message } = parseBody(AgentStageSchema, req.body);
+    if (isSuspended(session))
+      return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, SUSPENDED_STAGE_MESSAGE));
     try {
       const receipt = await stages.stage(target(session), getAuthUser(req).username, message);
       return { success: true, data: receipt };
@@ -170,6 +184,8 @@ export function registerAgentSessionRoutes(app: FastifyInstance, ctx: SessionPor
     if (refused) return reply.code(403).send(refused);
     const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req);
     const { stageId, confirmSha } = parseBody(AgentSubmitSchema, req.body);
+    if (isSuspended(session))
+      return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, SUSPENDED_STAGE_MESSAGE));
     try {
       return {
         success: true,
