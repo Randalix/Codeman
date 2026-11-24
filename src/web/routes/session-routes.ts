@@ -4898,6 +4898,22 @@ export function registerSessionRoutes(
       workspacePath = managed.path;
     }
 
+    // claude resume, checked before anything is written for the case. A docker case
+    // resumes its own last conversation (dockerResumeId) and is refused an explicit
+    // one rather than have one of the two win silently. A
+    // local id must have its transcript here, or claude would print "No conversation
+    // found" and exit. A remote transcript lives on the host: passed through, and the
+    // remote command falls back to a fresh conversation (see buildRemoteLaunchCommand).
+    if (resumeSessionId && docker) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'resumeSessionId is not supported for docker cases; they resume their last conversation themselves'
+      );
+    }
+    if (resumeSessionId && !remote && !(await claudeTranscriptExists(resumeSessionId))) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, `No claude conversation ${resumeSessionId} on this machine`);
+    }
+
     // Create case folder and CLAUDE.md if it doesn't exist (only for non-linked, non-remote,
     // non-docker cases — docker workspaces are scaffolded in their own block below)
     if (localCaseState === 'absent') {
@@ -5234,21 +5250,6 @@ export function registerSessionRoutes(
       if (qsCustomModelSwapInProgress) {
         triggerLlamaSwapLoad(cmEndpoint, customModel.modelId);
       }
-    }
-
-    // claude resume: a docker case resumes its own last conversation (dockerResumeId)
-    // and is refused an explicit one rather than have one of the two win silently. A
-    // local id must have its transcript here, or claude would print "No conversation
-    // found" and exit. A remote transcript lives on the host: passed through, and the
-    // remote command falls back to a fresh conversation (see buildRemoteLaunchCommand).
-    if (resumeSessionId && docker) {
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        'resumeSessionId is not supported for docker cases; they resume their last conversation themselves'
-      );
-    }
-    if (resumeSessionId && !remote && !(await claudeTranscriptExists(resumeSessionId))) {
-      return createErrorResponse(ApiErrorCode.NOT_FOUND, `No claude conversation ${resumeSessionId} on this machine`);
     }
 
     const qsSessionOptions: ConstructorParameters<typeof Session>[0] = {

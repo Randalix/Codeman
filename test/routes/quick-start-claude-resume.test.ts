@@ -9,6 +9,7 @@
  * unknown id prints "No conversation found" and exits.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { existsSync } from 'node:fs';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -83,7 +84,10 @@ describe('quick-start resumeSessionId (claude)', () => {
     const res = await quickStart({ caseName: 'resume-test', mode: 'claude', resumeSessionId: CONV });
     expect(res.json()).toMatchObject({ success: false });
     expect(res.body).toContain('No claude conversation');
-    expect(harness.ctx.sessions.size).toBe(before);
+    expect(harness.ctx.sessions.size).toBe(before); // Not even the case folder: a refused request leaves no scaffold behind.
+    const fresh = await quickStart({ caseName: 'resume-test-new', mode: 'claude', resumeSessionId: CONV });
+    expect(fresh.json()).toMatchObject({ success: false });
+    expect(existsSync(join(CASES_DIR, 'resume-test-new'))).toBe(false);
   });
 
   it('refuses it for another CLI, whose resume id lives in its own config object', async () => {
