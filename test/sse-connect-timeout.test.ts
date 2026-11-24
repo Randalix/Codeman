@@ -28,7 +28,10 @@ class FakeEventSource {
   constructor(public url: string) {
     FakeEventSource.all.push(this);
   }
-  addEventListener() {}
+  listeners = new Map<string, (e: unknown) => void>();
+  addEventListener(event: string, fn: (e: unknown) => void) {
+    this.listeners.set(event, fn);
+  }
   removeEventListener() {}
   close() {
     this.closed = true;
@@ -214,15 +217,35 @@ describe('SSE connect timeout', () => {
     expect(app.reconnectAttempts).toBe(1);
   });
 
-  it('connectSSE() while offline cancels the pending timer (the online event reconnects)', () => {
+  // Was: "connectSSE() while offline cancels the pending timer (the online event
+  // reconnects)". A browser that reports offline over a working LAN/tailnet
+  // never sends that `online` event, so the page stayed without live updates
+  // and under a "No network connection" banner for good (Joe, 2026-11-24).
+  it('connectSSE() still tries when the browser claims offline, and an open clears the flag', () => {
     const app = makeApp();
+    app.isOnline = true;
     app.connectSSE();
     navigatorStub.onLine = false;
     app.connectSSE();
-    expect(app.statuses.at(-1)).toBe('offline');
-    vi.advanceTimersByTime(TIMEOUT * 4);
-    expect(app.reconnectAttempts).toBe(0);
-    expect(app.statuses.at(-1)).toBe('offline');
+    expect(app.isOnline).toBe(false); // the hint is recorded for the banner
+    expect(FakeEventSource.all).toHaveLength(2);
+    expect(FakeEventSource.all[0].closed).toBe(true);
+    const second = FakeEventSource.all[1];
+    expect(second.closed).toBe(false);
+    second.open();
+    expect(app.isOnline).toBe(true);
+    expect(app.statuses.at(-1)).toBe('connected');
+  });
+
+  it('a real offline still fails into the normal backoff, with the offline flag kept', () => {
+    const app = makeApp();
+    navigatorStub.onLine = false;
+    app.connectSSE();
+    FakeEventSource.all[0].fail();
+    expect(app.isOnline).toBe(false);
+    expect(app.reconnectAttempts).toBe(1);
+    vi.advanceTimersByTime(200);
+    expect(FakeEventSource.all).toHaveLength(2);
   });
 
   it('does not retry a connection that opened but whose open callback has not run yet', () => {
@@ -240,5 +263,57 @@ describe('SSE connect timeout', () => {
     app.connectSSE();
     vi.advanceTimersByTime(500);
     expect(FakeEventSource.all[0].closed).toBe(true);
+  });
+});
+
+describe('a frame from the server clears a stale offline flag', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeEventSource.all = [];
+    navigatorStub.onLine = true;
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  // An `offline` event writes isOnline=false and status 'offline' while the
+  // open EventSource survives; no `onopen` follows, and a browser that misses
+  // the `online` event kept the banner over a working page.
+  it('an SSE frame after an offline event clears the flag and the status', () => {
+    const app = makeApp();
+    app._updateConnectionIndicator = vi.fn();
+    app.connectSSE();
+    const es = FakeEventSource.all[0];
+    es.open();
+    app.isOnline = false;
+    app._connectionStatus = 'offline';
+    es.listeners.get('sse:heartbeat')?.({ data: '{}' });
+    expect(app.isOnline).toBe(true);
+    expect(app.statuses.at(-1)).toBe('connected');
+  });
+
+  it('a frame on a healthy stream changes nothing', () => {
+    const app = makeApp();
+    app._updateConnectionIndicator = vi.fn();
+    app.connectSSE();
+    const es = FakeEventSource.all[0];
+    es.open();
+    app.isOnline = true;
+    app._connectionStatus = 'connected';
+    const before = app.statuses.length;
+    es.listeners.get('sse:heartbeat')?.({ data: '{}' });
+    expect(app.statuses.length).toBe(before);
+  });
+
+  it('with no open stream (terminal socket only) the flag clears and the UI is redrawn, the status is left to SSE', () => {
+    const app = makeApp();
+    app._updateConnectionIndicator = vi.fn();
+    app.isOnline = false;
+    app._connectionStatus = 'reconnecting';
+    app._noteServerReached();
+    expect(app.isOnline).toBe(true);
+    expect(app.setConnectionStatus).not.toHaveBeenCalled();
+    expect(app._updateConnectionLossUi).toHaveBeenCalled();
   });
 });

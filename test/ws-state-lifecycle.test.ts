@@ -169,6 +169,20 @@ describe('WS state lifecycle — real _connectWs/onopen/onclose transitions', ()
     expect(els.connectionDot.className).toBe('connection-dot connected');
   });
 
+  it('a terminal socket that opens clears a stale browser offline flag', () => {
+    // The browser can report offline over a working LAN/tailnet; data from the
+    // server proves otherwise, so the "No network connection" banner goes.
+    const { CodemanApp } = loadHarness();
+    const { app, els } = makeApp(CodemanApp, { isOnline: false });
+    app._connectWs('s1');
+    expect(els.connectionText.textContent).toBe('Offline');
+    const ws = FakeWebSocket.instances[0];
+    ws.readyState = 1;
+    ws.onopen?.();
+    expect((app as unknown as { isOnline: boolean }).isOnline).toBe(true);
+    expect(els.connectionText.textContent).toBe('WS');
+  });
+
   it("_disconnectWs resets the state machine to 'disconnected' and closes the socket", () => {
     const { CodemanApp } = loadHarness();
     const { app } = makeApp(CodemanApp);
