@@ -284,6 +284,24 @@ claude --resume <id>` (see `buildRemoteLaunchCommand`'s claude branch). The
   (`envOverrides`, `effort`, `advisorModel`, per-CLI configs, custom model
   endpoints) is still refused for remote cases: it is applied by the LOCAL
   wrapper and never crosses ssh.
+  **Continuing another conversation.** The id above is the launch conversation.
+  After a `/clear` (or when the session was created to continue an older one)
+  the pane is on a different conversation, and a relaunch into a remote tmux that
+  is gone must resume THAT one, so the command becomes `claude --resume <conv>
+  || claude --session-id <id>`. Which `<conv>`: a suspend's recorded id, else the
+  tail of `claudeSessionChain`, else quick-start's `resumeSessionId`
+  (`Session._relaunchResumeId()`). The chain holds only ids seen on the host: the
+  remote claude's own hooks, and the conversation the claude in the pane writes
+  now as read off the host by the transcript readers (`adoptClaudeSessionId(id,
+  { observedInPane: true })`; no remote hook reports a `/clear`). The chain is
+  persisted, so a server restart keeps it. This machine's transcripts are never
+  consulted for a remote session. An id with no transcript on the host falls back
+  to `--session-id` and a fresh conversation.
+  **Creating one on an old conversation:** `POST /api/quick-start` with
+  `resumeSessionId` (claude only; `codeman agent spawn <remote-case> --resume
+  <id>`). It is passed through unchecked for a remote case; a local one must have
+  its transcript on this machine (refused otherwise), a docker case is refused (it
+  resumes its own last conversation).
 - **OMP**: `omp` has no equivalent idempotent single-line form, so
   `Session._pinOmpRespawnId()` resolves and pins an explicit `--resume <id>`
   before a respawn (mirroring the local/docker builders, rendered through the

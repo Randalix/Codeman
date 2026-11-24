@@ -1322,7 +1322,7 @@ describe('spawn --env / --permission / --resume', () => {
     ).toThrow(/conflicts with --env/);
   });
 
-  it("--resume lands in the mode's config field; claude refuses via quick-start", () => {
+  it("--resume lands in the mode's config field; claude's in quick-start's top-level resumeSessionId", () => {
     expect(buildSpawnExtras({ ...base, resume: 'ses_abc' })).toEqual({
       openCodeConfig: { continueSession: 'ses_abc' },
     });
@@ -1337,7 +1337,9 @@ describe('spawn --env / --permission / --resume', () => {
     expect(buildSpawnExtras({ ...base, mode: 'antigravity', resume: 'a1' })).toEqual({
       antigravityConfig: { resumeConversationId: 'a1' },
     });
-    expect(() => buildSpawnExtras({ ...base, mode: 'claude', resume: 'x' })).toThrow(/not available for mode "claude"/);
+    expect(buildSpawnExtras({ ...base, mode: 'claude', resume: 'd5cfef48-103c' })).toEqual({
+      resumeSessionId: 'd5cfef48-103c',
+    });
   });
 
   it("agentSpawn merges extras into the quick-start body, keeping deepseek's permission posture", async () => {
@@ -1356,8 +1358,13 @@ describe('spawn --env / --permission / --resume', () => {
       deepSeekConfig: { permissionMode: 'danger-full-access', resumeSessionId: 'd1' },
       envOverrides: { DSH_X: '1' },
     });
+    // claude resumes through quick-start's top-level field (remote cases included).
+    const claude = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' })]);
+    expect(await agentSpawn(claude, { ...base, mode: 'claude', resume: 'd5cfef48' })).toBe(EXIT.ok);
+    expect(claude.calls[0].body).toMatchObject({ mode: 'claude', resumeSessionId: 'd5cfef48' });
+    // A mode with no resume field at all is still refused before any request.
     const refused = fakeDeps([]);
-    expect(await agentSpawn(refused, { ...base, mode: 'claude', resume: 'x' })).toBe(EXIT.refused);
+    expect(await agentSpawn(refused, { ...base, mode: 'copilot', resume: 'x' })).toBe(EXIT.refused);
     expect(refused.calls).toEqual([]);
     // A bad --permission takes the same refused path (exit 4 + JSON envelope), not a thrown error.
     const badPerm = fakeDeps([], true);

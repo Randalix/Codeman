@@ -35,7 +35,8 @@ describe('RemoteModelRefresher', () => {
     const session = fakeSession();
     await new RemoteModelRefresher(deps(readTail)).refresh(session);
 
-    expect(session.adoptClaudeSessionId).toHaveBeenCalledWith('conv-2');
+    // Read off the claude running in the pane: recorded in the chain, so it survives a restart.
+    expect(session.adoptClaudeSessionId).toHaveBeenCalledWith('conv-2', { observedInPane: true });
     expect(persist).toHaveBeenCalledWith('sess-1');
     expect(session.noteReportedModel).toHaveBeenCalledWith('transcript', 'Opus 5.5');
   });

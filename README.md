@@ -1045,6 +1045,7 @@ codeman agent inbox --wait 60000                          # read my own mailbox;
 codeman agent ack                                         # ack what I read (all of it, or `ack <id…>`); --peek to read unmarked
 codeman agent spawn worker-2 --mode opencode --permission allow --env OPENCODE_MODEL=deepseek/deepseek-v4-flash
 codeman agent spawn worker-2 --mode opencode --resume ses_abc   # continue that opencode conversation (codex: `resume`, …)
+codeman agent spawn huff-case --resume <claude-session-id>     # claude too; on a remote case an id the host lacks starts fresh
 codeman agent ls --alive                                  # PANE column: DEAD = the worker exited (status lies)
 codeman agent ls                                          # INBOX = unread posts, WAIT = parked on `inbox --wait` since; footer names a stalled pair
 codeman agent restore "$SID"                              # respawn a dead pane with its conversation; refuses a live one

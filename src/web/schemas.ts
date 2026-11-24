@@ -1281,6 +1281,18 @@ export const QuickStartSchema = z.object({
   /** Tab group to place the new session in: see tabGroupIdSchema. */
   tabGroupId: tabGroupIdSchema,
   /**
+   * claude only: continue this conversation instead of starting a new one. Other CLIs
+   * carry their resume id in their own config object (`codexConfig.resumeSessionId`, …).
+   * Local: checked against the transcripts on this machine (missing → refused). Remote:
+   * the transcript is on the host, so it is passed through; the remote command tries
+   * `--resume` first and falls back to a fresh `--session-id`.
+   */
+  resumeSessionId: z
+    .string()
+    .max(100)
+    .regex(/^[a-f0-9-]+$/, 'resumeSessionId must be a valid UUID')
+    .optional(),
+  /**
    * Start the session in this git worktree of the case (`<case>/.claude/worktrees/<worktree>`,
    * created through POST /api/cases/:name/worktrees) instead of the case folder. Local cases
    * only: refused (400) for remote and Docker cases. The worktree must be a registered worktree

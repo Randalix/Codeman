@@ -36,7 +36,7 @@ export interface RemoteModelSession {
   remote: SessionRemote | undefined;
   claudeSessionId: string | null;
   noteReportedModel(source: 'transcript', raw: unknown): boolean;
-  adoptClaudeSessionId(newId: string): void;
+  adoptClaudeSessionId(newId: string, options?: { observedInPane?: boolean }): void;
 }
 
 export interface RemoteModelRefresherDeps {
@@ -72,7 +72,7 @@ export class RemoteModelRefresher {
       const ids = [session.claudeSessionId || session.id, session.id];
       const tail = await this.deps.readTail(remote, ids, REMOTE_MODEL_TAIL_BYTES, session.id);
       if (tail && !ids.includes(tail.sessionId)) {
-        session.adoptClaudeSessionId(tail.sessionId);
+        session.adoptClaudeSessionId(tail.sessionId, { observedInPane: true });
         this.deps.persist(session.id);
       }
       const model = tail ? lastAssistantModel(tail.content) : undefined;

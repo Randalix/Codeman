@@ -1515,10 +1515,19 @@ export class Session extends EventEmitter {
   // payload whose delivery was keyed on this pane's $CODEMAN_SESSION_ID. Only
   // those extend the chain: a history-correlated guess must never be able to
   // write a foreign conversation into this pane's permanent record.
-  adoptClaudeSessionId(newId: string, options: { firstHand?: boolean } = {}): void {
+  //
+  // `observedInPane` is the remote counterpart: the id of the transcript the claude
+  // in this session's remote pane is writing now (read off the host, see
+  // `liveClaudeIdLines`). No remote hook reports a `/clear`, so this is how a remote
+  // conversation switch is learned. It is a fact about this pane, so it extends the
+  // chain (which persists, so a server restart keeps it), but it is not the CLI's own
+  // report, so the first-hand flag stays as it was.
+  adoptClaudeSessionId(newId: string, options: { firstHand?: boolean; observedInPane?: boolean } = {}): void {
     if (!newId) return;
     if (options.firstHand) {
       this._claudeSessionIdIsFirstHand = true;
+      this._recordClaudeSessionInChain(newId);
+    } else if (options.observedInPane) {
       this._recordClaudeSessionInChain(newId);
     }
     if (newId === this._claudeSessionId) return;
@@ -2998,8 +3007,9 @@ export class Session extends EventEmitter {
     // adopts the conversation claude really writes (after a `/clear`) into
     // `claudeSessionId` at every turn end. The one remote caller is a suspended
     // session's resume, whose remote tmux is gone, so `new-session -A` launches claude
-    // afresh: it continues THAT conversation, not the launch one. Only here, not in the
-    // dead-pane respawn, which also runs at boot for remote panes nobody suspended.
+    // afresh: it continues THAT conversation, not the launch one. The other respawn
+    // paths take the chain tail instead (see `_relaunchResumeId`), which holds only ids
+    // seen in the pane; this one also trusts the in-memory id, as it always did.
     // A suspend recorded its conversation (persisted), which survives a server restart
     // in between; the in-memory adoption does not.
     // Without an adopted id it is the launch conversation, which is the session id; it is
@@ -3028,6 +3038,23 @@ export class Session extends EventEmitter {
    * {@link reattachRemote}, and {@link restartCli} so no respawn path can drift from
    * the spawn path.
    */
+  /**
+   * The conversation a relaunch of this pane resumes. Local CLIs keep the launch seed
+   * here; `_buildRespawnPaneOptionsWithResumePin()` checks their transcripts on disk.
+   * A remote claude has no transcript on this machine to check, so it resumes what its
+   * pane was last seen on: the conversation a suspend recorded, else the chain tail
+   * (first-hand hooks and pane observations only, never a guess), else the seed. The
+   * remote command tries `--resume` first and falls back to `--session-id`, so an id
+   * with no transcript on the host starts fresh instead of failing.
+   * Only reaches claude when the remote tmux session is gone: an existing one is
+   * reattached by `new-session -A` and runs no command.
+   */
+  private _relaunchResumeId(): string | undefined {
+    if (!this._remote || this.mode !== 'claude') return this._resumeSessionId;
+    const chainTail = this._claudeSessionChain[this._claudeSessionChain.length - 1];
+    return this._suspendedResumeId ?? chainTail ?? this._resumeSessionId;
+  }
+
   private _buildRespawnPaneOptions(): import('./mux-interface.js').RespawnPaneOptions {
     const options: import('./mux-interface.js').RespawnPaneOptions = {
       sessionId: this.id,
@@ -3058,7 +3085,7 @@ export class Session extends EventEmitter {
       // real pin now happens in `_pinOmpRespawnId()`, called by callers ONLY
       // once they've confirmed an actual respawn is about to happen.
       ompConfig: this._ompConfig,
-      resumeSessionId: this._resumeSessionId,
+      resumeSessionId: this._relaunchResumeId(),
       envOverrides: this._envOverrides,
       unsetEnvKeys: this._pendingEnvUnsets.size > 0 ? [...this._pendingEnvUnsets] : undefined,
       effort: this._effort,

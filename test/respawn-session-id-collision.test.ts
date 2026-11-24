@@ -336,18 +336,39 @@ describe('pinning a conversation onto a relaunch', () => {
     }
   });
 
-  it('pins nothing for a remote session, whose conversation lives elsewhere', async () => {
-    // The dead-pane respawn is reached by every session shape, unlike
-    // `restartCli()` whose route refuses remote. A local id pinned onto a
-    // remote pane resolves to nothing there, and the `--session-id` fallback
-    // then collides with the transcript the remote host really does hold.
-    giveTranscript(CONVERSATION);
+  it('resumes the chain tail for a remote session, never a local transcript check', async () => {
+    // The dead-pane respawn is reached by every session shape. A remote conversation
+    // lives on the host, so this machine's transcripts decide nothing: a remote
+    // session's chain holds only ids seen there (the remote claude's own hooks and
+    // pane observations), and its tail is what the pane was last on. The remote
+    // command tries `--resume <tail>` first and falls back to `--session-id`.
+    // Before 2026-11-24 this pinned nothing, and a remote pane whose tmux was gone
+    // relaunched on the launch id, i.e. an empty conversation.
     const { mux, calls } = recordingMux();
     const session = localSession(
       {
         remote: { hostId: 'h1', label: 'box', host: 'box', username: 'dev', remotePath: '/tmp' },
         claudeSessionChain: [CONVERSATION],
       },
+      mux
+    );
+
+    await session.startInteractive();
+    try {
+      expect(calls[0].resumeSessionId).toBe(CONVERSATION);
+    } finally {
+      await session.stop();
+    }
+  });
+
+  it('a remote session with no chain is not pinned by a local transcript of its id', async () => {
+    // A local transcript under the session's own id would make the local pin choose
+    // it; a remote session must not even look.
+    const ownId = '7e5d0c11-aaaa-bbbb-cccc-ddddeeeeffff';
+    giveTranscript(ownId);
+    const { mux, calls } = recordingMux();
+    const session = localSession(
+      { id: ownId, remote: { hostId: 'h1', label: 'box', host: 'box', username: 'dev', remotePath: '/tmp' } },
       mux
     );
 
@@ -445,14 +466,11 @@ describe('pinning a conversation onto a relaunch', () => {
     expect(calls[0].resumeSessionId).toBeUndefined();
   });
 
-  it('documents that a remote reattach carries no pin', async () => {
-    // `reattachRemote()` re-runs the remote session command, which attaches to
-    // the durable remote tmux with the agent still running inside it.
-    // ⚠️ Documentation, not a regression guard: `reattachRemote()` only runs for
-    // a remote session, and the pin builder refuses remote sessions on its own,
-    // so this would still pass if `reattachRemote()` were switched to the pinned
-    // builder. The builder's remote guard is what the test above pins.
-    giveTranscript(CONVERSATION);
+  it('a remote reattach carries the chain tail, for a remote tmux that is gone', async () => {
+    // `reattachRemote()` re-runs the remote session command. With the durable remote
+    // tmux still there, `new-session -A` attaches and runs no command, so the resume id
+    // is inert. With it gone, claude starts afresh and must continue the conversation
+    // the pane was on, not the launch id.
     const { mux, calls } = recordingMux();
     const session = localSession(
       {
@@ -464,7 +482,7 @@ describe('pinning a conversation onto a relaunch', () => {
 
     expect(await session.reattachRemote()).toBe(true);
 
-    expect(calls[0].resumeSessionId).toBeUndefined();
+    expect(calls[0].resumeSessionId).toBe(CONVERSATION);
   });
 });
 

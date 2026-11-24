@@ -217,7 +217,7 @@ import {
 import { resolveCaseRepository, resolveManagedWorktree } from '../../git-worktrees.js';
 import { LRUMap } from '../../utils/lru-map.js';
 import { describeUnknownPath, probePathKind, type PathProbeOptions } from '../../utils/index.js';
-import { claudeProjectsDir } from '../../utils/claude-transcript.js';
+import { claudeProjectsDir, claudeTranscriptExists } from '../../utils/claude-transcript.js';
 import { findLatestOmpSessionId } from '../../utils/omp-session-resolver.js';
 import { scanOmpSessionsHistory } from '../../omp-transcript.js';
 import { scanCodexSessionsHistory, codexThreadBySessionId, codemanOwnerOfRollout } from '../../codex-transcript.js';
@@ -3457,7 +3457,7 @@ export function registerSessionRoutes(
       // An id we did not ask for is the conversation the pane's claude writes now (after a
       // `/clear`, which no remote hook reports): adopt it like the local branch below does.
       if (!remoteIds.includes(remoteTranscript.sessionId)) {
-        session.adoptClaudeSessionId(remoteTranscript.sessionId);
+        session.adoptClaudeSessionId(remoteTranscript.sessionId, { observedInPane: true });
         ctx.persistSessionState(session);
       }
       const parsed = parseClaudeResponseTranscript(remoteTranscript.content, wantsRemoteMessages);
@@ -4560,6 +4560,7 @@ export function registerSessionRoutes(
       customModel,
       tabGroupId,
       worktree,
+      resumeSessionId,
     } = parseBody(QuickStartSchema, req.body);
     // Same rule as the create path: only claude takes a session `model`; any other CLI
     // would drop it without a word (its model lives in its own config object).
@@ -4567,6 +4568,12 @@ export function registerSessionRoutes(
       return createErrorResponse(
         ApiErrorCode.INVALID_INPUT,
         'model applies to claude sessions only; other CLIs take their model in their own config object, such as codexConfig.model'
+      );
+    }
+    if (resumeSessionId && mode !== 'claude') {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'resumeSessionId applies to claude sessions only; other CLIs take their resume id in their own config object, such as codexConfig.resumeSessionId'
       );
     }
 
@@ -5229,6 +5236,21 @@ export function registerSessionRoutes(
       }
     }
 
+    // claude resume: a docker case resumes its own last conversation (dockerResumeId)
+    // and is refused an explicit one rather than have one of the two win silently. A
+    // local id must have its transcript here, or claude would print "No conversation
+    // found" and exit. A remote transcript lives on the host: passed through, and the
+    // remote command falls back to a fresh conversation (see buildRemoteLaunchCommand).
+    if (resumeSessionId && docker) {
+      return createErrorResponse(
+        ApiErrorCode.INVALID_INPUT,
+        'resumeSessionId is not supported for docker cases; they resume their last conversation themselves'
+      );
+    }
+    if (resumeSessionId && !remote && !(await claudeTranscriptExists(resumeSessionId))) {
+      return createErrorResponse(ApiErrorCode.NOT_FOUND, `No claude conversation ${resumeSessionId} on this machine`);
+    }
+
     const qsSessionOptions: ConstructorParameters<typeof Session>[0] = {
       id: qsCustomModelSessionId,
       workingDir: workspacePath,
@@ -5256,7 +5278,7 @@ export function registerSessionRoutes(
       advisorModel,
       remote,
       docker,
-      resumeSessionId: dockerResumeId,
+      resumeSessionId: resumeSessionId ?? dockerResumeId,
       tmuxHistoryLimit: qsTerminalHistoryConfig.tmuxHistoryLimit,
       parentSessionId: qsParentSessionId,
     };

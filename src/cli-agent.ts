@@ -724,8 +724,8 @@ export interface SpawnOptions {
  * to know the field — and it has to match `schemas.ts` EXACTLY: the config schemas are
  * plain `z.object`s that STRIP unknown keys, so a misspelled field is not a 400, it is a
  * worker that silently starts a fresh conversation (gemini is `resumeSession`,
- * antigravity `resumeConversationId`). claude is absent on purpose: quick-start has no resume field for
- * it (the create path does, via `POST /api/sessions`), so `--resume` refuses there.
+ * antigravity `resumeConversationId`). claude is absent: its resume id is quick-start's
+ * top-level `resumeSessionId` (see `CLAUDE_RESUME_FIELD`), not a config object's field.
  */
 export const RESUME_FIELD_BY_MODE: Record<string, { config: string; field: string }> = {
   opencode: { config: 'openCodeConfig', field: 'continueSession' },
@@ -737,6 +737,9 @@ export const RESUME_FIELD_BY_MODE: Record<string, { config: string; field: strin
   deepseek: { config: 'deepSeekConfig', field: 'resumeSessionId' },
   omp: { config: 'ompConfig', field: 'resumeSessionId' },
 };
+
+/** claude's quick-start resume field: top level, like its `model` (see `QuickStartSchema`). */
+export const CLAUDE_RESUME_FIELD = 'resumeSessionId';
 
 /** `KEY=VALUE` list → object; a pair without `=` or with an empty key is an error, not a silent drop. */
 export function parseEnvPairs(pairs: readonly string[] | undefined): Record<string, string> {
@@ -795,12 +798,12 @@ export function buildSpawnExtras(options: SpawnOptions): Record<string, unknown>
     env[slot.name] = slot.value(options.permission);
   }
   if (Object.keys(env).length > 0) extras.envOverrides = env;
-  if (options.resume) {
+  if (options.resume && options.mode === 'claude') {
+    extras[CLAUDE_RESUME_FIELD] = options.resume;
+  } else if (options.resume) {
     const slot = RESUME_FIELD_BY_MODE[options.mode];
     if (!slot) {
-      throw new Error(
-        `--resume is not available for mode "${options.mode}" via quick-start (claude: run \`claude --resume <id>\` in the case, or POST /api/v1/sessions with resumeSessionId)`
-      );
+      throw new Error(`--resume is not available for mode "${options.mode}" via quick-start`);
     }
     extras[slot.config] = {
       ...((extras[slot.config] as Record<string, unknown> | undefined) ?? {}),
@@ -2893,7 +2896,7 @@ export function registerAgentCommands(program: Command): Command {
     )
     .option(
       '--resume <cli-session-id>',
-      'Continue that CLI conversation (opencode --session, codex resume, …); claude is not supported here'
+      'Continue that CLI conversation (claude --resume, opencode --session, codex resume, …)'
     )
     .option(
       '--subscribe',
