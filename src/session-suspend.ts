@@ -167,11 +167,6 @@ export function paneShowsComposer(text: string | null): boolean {
 }
 
 /**
- * The text of the last line in `keys` that ended with Enter, as the composer shows
- * it: escape sequences and other control bytes dropped, backspace applied. Empty
- * when no Enter was typed or the line was empty.
- */
-/**
  * The pause before a held Enter that follows typed text, the gap the browser itself
  * leaves in local echo mode (its Enter handler sends the text, then `\r` 80 ms later).
  * Written back to back, held text and its Enter reach the pane as one burst, and Claude
@@ -189,6 +184,11 @@ export function splitHeldKeys(data: string): string[] {
   return data.split(/(\r)/).filter((part) => part !== '');
 }
 
+/**
+ * The text of the last line in `keys` that ended with Enter, as the composer shows
+ * it: escape sequences and other control bytes dropped, backspace applied. Empty
+ * when no Enter was typed or the line was empty.
+ */
 export function lastSubmittedLine(keys: string): string {
   const end = keys.lastIndexOf('\r');
   if (end < 0) return '';

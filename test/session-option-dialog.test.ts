@@ -65,6 +65,27 @@ describe('isOptionDialogOnScreen', () => {
     expect(isOptionDialogOnScreen(screen, '❯')).toBe(false);
   });
 
+  it('the cursor on "4. Chat about this", past the rule AskUserQuestion draws above it, is a dialog', () => {
+    // The live frame with the cursor moved down to the last entry.
+    const screen = fixture('ask-user-question-v2.1.327.txt')
+      .replace('❯ 1. Red', '  1. Red')
+      .replace('  4. Chat about this', '❯ 4. Chat about this');
+    expect(isOptionDialogOnScreen(screen, '❯')).toBe(true);
+  });
+
+  it('a draft starting with "1. " right under a rule with a list above it is still no dialog', () => {
+    const screen = [
+      '● Two ways to go:',
+      '  1. rename the module',
+      '  2. keep the old name',
+      '──────────────────────────────────────────',
+      '❯ 1. go with the rename',
+      '──────────────────────────────────────────',
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n');
+    expect(isOptionDialogOnScreen(screen, '❯')).toBe(false);
+  });
+
   it('a draft that is itself a numbered list still reads as one: fails safe, a refused suspend', () => {
     expect(isOptionDialogOnScreen(idle('● Done.', '❯ 1. first\n  2. second'), '❯')).toBe(true);
   });

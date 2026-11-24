@@ -253,7 +253,9 @@ export const OPTION_DIALOG_TAIL_ROWS = 16;
  * block as the cursor: the walk stops at a solid `───` rule, which is what frames the
  * composer, so a draft `❯ 1. go with the rename` under an answer that ends in a numbered
  * list does not count (Ark0N in #836; the list is above the composer's top rule). A
- * dialog's options are never split from their cursor by such a rule. A multi-line draft
+ * rule is crossed only when the row right past it is the cursor's neighbouring option
+ * (AskUserQuestion draws one above `4. Chat about this`, so with the cursor there `3.`
+ * sits just above the rule). A multi-line draft
  * that is itself a numbered list (`❯ 1. a` / `  2. b`) still reads as a dialog: that
  * fails safe (a refused suspend, not a lost dialog). Footers were not used: the plan
  * approval dialog draws no `Esc to cancel`. Fixtures: `test/fixtures/claude-dialogs/`.
@@ -272,14 +274,25 @@ export function isOptionDialogOnScreen(paneText: string | null | undefined, prom
     }
   }
   if (cursor < 0 || rows.length - 1 - cursor > OPTION_DIALOG_TAIL_ROWS) return false;
-  const option = /^\d{1,2}\.\s/;
-  if (!option.test(rows[cursor].slice(promptGlyph.length).trimStart())) return false;
+  const option = /^(\d{1,2})\.\s/;
+  const own = option.exec(rows[cursor].slice(promptGlyph.length).trimStart());
+  if (!own) return false;
+  const n = Number(own[1]);
   const rule = /^─{8,}/;
+  const numberAt = (i: number) => {
+    const m = i >= 0 && i < rows.length ? option.exec(rows[i]) : null;
+    return m ? Number(m[1]) : NaN;
+  };
   const from = Math.max(0, cursor - OPTION_DIALOG_TAIL_ROWS);
-  for (let i = cursor - 1; i >= from && !rule.test(rows[i]); i--) {
+  for (let i = cursor - 1; i >= from; i--) {
+    if (rule.test(rows[i])) {
+      if (numberAt(i - 1) === n - 1) return true;
+      break;
+    }
     if (option.test(rows[i])) return true;
   }
-  for (let i = cursor + 1; i < rows.length && !rule.test(rows[i]); i++) {
+  for (let i = cursor + 1; i < rows.length; i++) {
+    if (rule.test(rows[i])) return numberAt(i + 1) === n + 1;
     if (option.test(rows[i])) return true;
   }
   return false;
