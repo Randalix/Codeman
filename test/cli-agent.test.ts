@@ -22,6 +22,7 @@ import {
   agentLs,
   stalledPairLines,
   agentPost,
+  agentRmSafe,
   agentRead,
   agentPull,
   modelCell,
@@ -1156,6 +1157,60 @@ describe('agent spawn: where it starts and which model it runs', () => {
     const deps = fakeDeps([created(), ok({}), ok({ wait: { matched: true } })]);
     expect(await agentSpawn(deps, { ...base, ready: true })).toBe(EXIT.ok);
     expect(deps.calls[2]).toMatchObject({ path: `/api/v1/sessions/${OTHER}/wait-output` });
+  });
+});
+
+describe('agent rm --safe (downstream)', () => {
+  const green = [
+    { key: 'git', ok: true, message: 'git sauber+gepusht' },
+    { key: 'lock', ok: true, message: 'keine Sperre' },
+    { key: 'inbox', ok: true, message: 'inbox 0' },
+    { key: 'composer', ok: true, message: 'composer leer' },
+    { key: 'idle', ok: true, message: 'idle' },
+  ];
+  const server = (answer: (id: string, body: unknown) => unknown) => (o: RequestOptions) => {
+    if (o.method === 'GET') return ok([{ id: OTHER }, { id: SELF }]);
+    const id = o.path.split('/')[4];
+    return ok(answer(id, o.body));
+  };
+
+  it('deleted: one summary line with the archive path', async () => {
+    const deps = fakeDeps(server(() => ({ deleted: true, checks: green, archive: '/a/94990c6d.txt' })));
+    expect(await agentRmSafe(deps, { ids: [OTHER] })).toBe(EXIT.ok);
+    const post = deps.calls.find((c) => c.method === 'POST');
+    expect(post).toMatchObject({ path: `/api/v1/sessions/${OTHER}/safe-delete`, body: {} });
+    expect(deps.out.join('\n')).toContain(
+      `deleted ${OTHER} (geprüft: git sauber+gepusht, inbox 0, composer leer, idle; Archiv /a/94990c6d.txt)`
+    );
+  });
+
+  it('blocked: one line per red check, exit 4', async () => {
+    const checks = green.map((c) =>
+      c.key === 'inbox'
+        ? { ...c, ok: false, message: 'ungelesene Post (2)' }
+        : c.key === 'git'
+          ? { ...c, ok: false, message: 'ungepushte Commits (3, Branch x)' }
+          : c
+    );
+    const deps = fakeDeps(server(() => ({ deleted: false, checks })));
+    expect(await agentRmSafe(deps, { ids: [OTHER] })).toBe(EXIT.refused);
+    expect(deps.err.join('\n')).toContain('ungepushte Commits (3, Branch x)');
+    expect(deps.err.join('\n')).toContain('ungelesene Post (2)');
+  });
+
+  it('--dry-run sends dryRun and deletes nothing', async () => {
+    const deps = fakeDeps(server(() => ({ deleted: false, dryRun: true, checks: green })));
+    expect(await agentRmSafe(deps, { ids: [OTHER], dryRun: true })).toBe(EXIT.ok);
+    expect(deps.calls.find((c) => c.method === 'POST')?.body).toEqual({ dryRun: true });
+    expect(deps.out.join('\n')).toMatch(/dry run, nichts gelöscht/);
+  });
+
+  it('--all: one row per id; my own id is refused without a request', async () => {
+    const deps = fakeDeps(server(() => ({ deleted: true, checks: green, archive: '/a/x.txt' })));
+    expect(await agentRmSafe(deps, { ids: [OTHER, SELF] })).toBe(EXIT.refused);
+    expect(deps.out[0]).toMatch(/^94990c6d {2}entfernt/);
+    expect(deps.out[1]).toMatch(/^058ee7b5 {2}blockiert/);
+    expect(deps.calls.filter((c) => c.method === 'POST')).toHaveLength(1);
   });
 });
 

@@ -770,6 +770,17 @@ with workers, so the user knows exactly what to sweep; the deletion is still the
 ask for by name. Only a directory Codeman **created** is ever labelled, so a linked
 case, a cloned repo or a worktree never appears there.
 
+**Downstream: `codeman agent rm --safe <id> [--dry-run]`** deletes only when nothing is
+lost with the session. The server checks, on the session's host (over ssh for a remote
+case): git in its working dir (no uncommitted tracked change, HEAD on some remote
+branch; untracked files are a hint), no `.agent-lock` it holds (a lock with
+`session=<id>` counts for that session; one without counts while younger than 6 h), no
+unacknowledged mail, nothing typed in its composer, no running turn, background shell,
+monitor or open dialog. Any red check: one line each, exit 4, nothing deleted. All green:
+the pane's last 4000 bytes go to `~/.codeman/archive/<id8>-<date>.txt` on the server
+host, then the session is deleted. `rm --safe --all <id> <id> …` prints one row per id.
+It never removes a worktree or branch, breaks a lock or pushes.
+
 Confirm cleanup with `GET /api/v1/sessions`, never with `/api/v1/sessions/unified`
 (that one folds in transcript history from the whole machine and will keep showing
 your worker forever).

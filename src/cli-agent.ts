@@ -1821,6 +1821,115 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
   return EXIT.ok;
 }
 
+interface SafeDeleteCheckRow {
+  key: string;
+  ok: boolean;
+  message: string;
+  hint?: string;
+}
+
+/** One `rm --safe` target: the outcome and the lines to print. */
+interface SafeRmOutcome {
+  id: string;
+  code: number;
+  deleted: boolean;
+  /** Blocking reasons; empty when deleted or (dry run) when it would be. */
+  reasons: string[];
+  data?: Record<string, unknown>;
+}
+
+async function safeRmOne(deps: AgentDeps, id: string, dryRun: boolean): Promise<SafeRmOutcome> {
+  const refusal = deleteRefusal(deps.ctx.selfId, id);
+  if (refusal) return { id, code: EXIT.refused, deleted: false, reasons: [refusal] };
+  const target = await resolveSessionId(deps, id);
+  if ('error' in target) return { id, code: target.code, deleted: false, reasons: [target.error] };
+  const resolvedRefusal = deleteRefusal(deps.ctx.selfId, target.id);
+  if (resolvedRefusal) return { id: target.id, code: EXIT.refused, deleted: false, reasons: [resolvedRefusal] };
+  const before = dryRun ? null : await deps.request(deps.ctx, { method: 'GET', path: '/api/v1/sessions' });
+  const rows = before?.json?.success ? ((before.json.data as SessionRow[] | undefined) ?? []) : [];
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/safe-delete`,
+    body: dryRun ? { dryRun: true } : {},
+    // git status over ssh on a large worktree takes a while.
+    timeoutMs: 60_000,
+  });
+  if (!res.json?.success) return { id: target.id, code: EXIT.error, deleted: false, reasons: [describeFailure(res)] };
+  const data = (res.json.data ?? {}) as {
+    deleted?: boolean;
+    checks?: SafeDeleteCheckRow[];
+    archive?: string | null;
+  };
+  const checks = data.checks ?? [];
+  const reasons = checks.filter((c) => !c.ok).map((c) => c.message);
+  if (data.deleted) {
+    // As plain `rm`: from here on nothing turns the delete into a failure.
+    const unlinked = await unlinkTempCase(deps, rows, target.id).catch(() => undefined);
+    return {
+      id: target.id,
+      code: EXIT.ok,
+      deleted: true,
+      reasons: [],
+      data: { ...data, ...(unlinked ? { unlinkedCase: unlinked } : {}) },
+    };
+  }
+  return { id: target.id, code: reasons.length ? EXIT.refused : EXIT.ok, deleted: false, reasons, data };
+}
+
+/** Passed checks as `rm --safe` prints them after a delete. */
+function safeRmSummary(checks: SafeDeleteCheckRow[]): string {
+  const msg = (key: string) => checks.find((c) => c.key === key)?.message;
+  return [msg('git'), msg('inbox'), msg('composer'), msg('idle')].filter(Boolean).join(', ');
+}
+
+/**
+ * Downstream: `agent rm --safe <id> [--dry-run]`, and `--all <id> <id> …` for several.
+ * Deletes only when nothing would be lost: the server checks git on the session's host,
+ * its agent lock, inbox, composer and idleness (`src/safe-delete.ts`) and archives the
+ * pane's tail first. Blocked: one line per red check, exit 4, nothing deleted.
+ */
+export async function agentRmSafe(deps: AgentDeps, options: { ids: string[]; dryRun?: boolean }): Promise<number> {
+  const dryRun = Boolean(options.dryRun);
+  const outcomes: SafeRmOutcome[] = [];
+  for (const id of options.ids) outcomes.push(await safeRmOne(deps, id, dryRun));
+  if (deps.json) {
+    emitJson(
+      deps,
+      outcomes.map((o) => ({ id: o.id, deleted: o.deleted, reasons: o.reasons, ...(o.data ?? {}) }))
+    );
+  } else if (outcomes.length === 1) {
+    const o = outcomes[0];
+    const checks = (o.data?.checks as SafeDeleteCheckRow[] | undefined) ?? [];
+    if (o.deleted) {
+      deps.io.out(
+        palette.ok(
+          `${GLYPH.ok} deleted ${o.id} (geprüft: ${safeRmSummary(checks)}; Archiv ${String(o.data?.archive ?? '-')})`
+        )
+      );
+    } else if (o.reasons.length === 0) {
+      deps.io.out(
+        palette.ok(`${GLYPH.ok} ${o.id}: alle Prüfungen grün (${safeRmSummary(checks)}) — dry run, nichts gelöscht`)
+      );
+    } else {
+      for (const r of o.reasons) deps.io.err(palette.err(`${GLYPH.fail} ${o.id.slice(0, 8)}: ${r}`));
+    }
+    for (const c of checks) if (c.hint) deps.io.err(palette.muted(`  Hinweis ${c.key}: ${c.hint}`));
+  } else {
+    for (const o of outcomes) {
+      const status = o.deleted
+        ? 'entfernt'
+        : o.reasons.length === 0
+          ? 'grün (dry run)'
+          : `blockiert (${o.reasons.join('; ')})`;
+      deps.io.out(
+        `${o.id.slice(0, 8)}  ${status}${o.deleted && o.data?.archive ? `  Archiv ${String(o.data.archive)}` : ''}`
+      );
+    }
+  }
+  const worst = outcomes.find((o) => o.code !== EXIT.ok);
+  return worst ? worst.code : EXIT.ok;
+}
+
 /** The `{ hostId, remotePath }` a session row carries for a remote session, else undefined. */
 function remoteOf(row: SessionRow): { hostId: string; remotePath: string } | undefined {
   const r = row.remote as { hostId?: unknown; remotePath?: unknown } | undefined;
@@ -3255,10 +3364,29 @@ export function registerAgentCommands(program: Command): Command {
     );
 
   agent
-    .command('rm <id>')
-    .description('Delete any session except this one (refuses your own id)')
+    .command('rm <id> [more...]')
+    .description(
+      'Delete any session except this one (refuses your own id). --safe: only when git is clean and pushed, inbox, composer empty, idle and no agent lock held (archives the last output first)'
+    )
+    .option('--safe', 'Check first; delete only when every check passes (one line per red check, exit 4)')
+    .option('--dry-run', 'With --safe: report the checks, delete nothing')
+    .option('--all', 'With --safe: several ids, one result row each')
     .option('--json', 'Machine-readable output')
-    .action((id: string, options: { json?: boolean }) => run(Boolean(options.json), (deps) => agentRm(deps, { id })));
+    .action(
+      (id: string, more: string[], options: { json?: boolean; safe?: boolean; dryRun?: boolean; all?: boolean }) =>
+        run(Boolean(options.json), async (deps) => {
+          if (!options.safe) {
+            if (more.length || options.dryRun || options.all) {
+              return fail(deps, 'refusing: several ids, --dry-run and --all only go with --safe', EXIT.refused);
+            }
+            return agentRm(deps, { id });
+          }
+          if (more.length && !options.all) {
+            return fail(deps, 'refusing: several ids need --all (rm --safe --all <id> <id> …)', EXIT.refused);
+          }
+          return agentRmSafe(deps, { ids: [id, ...more], dryRun: options.dryRun });
+        })
+    );
 
   agent
     .command('post <id> [text...]')

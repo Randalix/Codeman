@@ -2044,6 +2044,9 @@ export const InboxPostSchema = z
   })
   .strict();
 
+/** Downstream: body of `POST /api/sessions/:id/safe-delete` (`agent rm --safe`). */
+export const SafeDeleteSchema = z.object({ dryRun: z.boolean().optional() }).strict();
+
 /** Query for `GET /api/sessions/:id/inbox`. `wait` follows the wait routes' `timeout`: clamped, never a 400 for size. */
 export const InboxReadQuerySchema = z.object({
   wait: z.coerce.number().int().positive().optional(),

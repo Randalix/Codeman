@@ -33,7 +33,7 @@ import {
   type DeepSeekConfig,
   type OmpConfig,
 } from '../../types.js';
-import { AdoptForeignSessionSchema } from '../schemas.js';
+import { AdoptForeignSessionSchema, SafeDeleteSchema } from '../schemas.js';
 import {
   discoverForeignSessions,
   invalidateForeignCache,
@@ -238,6 +238,14 @@ import {
 } from '../../remote-files.js';
 import { remoteTmuxLocation } from '../../tmux-manager.js';
 import { approvalInbox } from '../approval-inbox.js';
+import { stripAnsi } from '../../utils/regex-patterns.js';
+import {
+  composerDraftText,
+  evaluateHostFacts,
+  readHostFacts,
+  shortDraft,
+  type SafeDeleteCheck,
+} from '../../safe-delete.js';
 import { appendClaudeCustomTitle } from '../../claude-session-title.js';
 import { DEFAULT_SCREEN_TAIL_BYTES, MAX_SCREEN_HISTORY_LINES, screenTail } from '../../utils/screen-text.js';
 import { UPLOADS_DIR } from '../paste-image-gc.js';
@@ -2234,6 +2242,80 @@ export function registerSessionRoutes(
       });
     }
     return { suspended: true, suspendedAt: session.suspendedAt };
+  });
+
+  // Downstream (Randalix fork): `codeman agent rm --safe` (src/safe-delete.ts). Checks
+  // git (on the session's host), its agent lock, inbox, composer and idleness; deletes
+  // only when every check passes, after archiving the pane's last 4000 bytes. Never
+  // removes a worktree or branch, breaks a lock or pushes. `dryRun` only reports.
+  app.post('/api/sessions/:id/safe-delete', async (req) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    const { dryRun } = parseBody(SafeDeleteSchema, req.body ?? {}, 'Invalid safe-delete request');
+    const checks: SafeDeleteCheck[] = [];
+
+    const facts = await readHostFacts(session.workingDir, session.remote);
+    checks.push(...evaluateHostFacts(facts, session.id));
+
+    const mail = agentInbox.read(session.id, { receiver: false }).messages;
+    const loud = mail.filter((m) => !m.quiet).length;
+    const quiet = mail.length - loud;
+    checks.push({
+      key: 'inbox',
+      ok: loud === 0,
+      message: loud === 0 ? 'inbox 0' : `ungelesene Post (${loud})`,
+      ...(quiet ? { hint: `${quiet} Statuszeile(n)` } : {}),
+    });
+
+    // A suspended CLI has no composer and runs nothing; its pane shows a notice.
+    const screen =
+      session.muxName && !session.suspended
+        ? (ctx.mux.capturePaneText?.(session.muxName, undefined, { styles: true }) ?? null)
+        : null;
+    if (session.suspended) {
+      checks.push({ key: 'composer', ok: true, message: 'composer leer (suspendiert)' });
+    } else {
+      const draft = screen === null ? null : composerDraftText(screen, getCli(session.mode));
+      if (draft) checks.push({ key: 'composer', ok: false, message: `ungesendete Eingabe: ${shortDraft(draft)}` });
+      else if (draft === '') checks.push({ key: 'composer', ok: true, message: 'composer leer' });
+      // Not readable (no pane, a CLI without a known composer): the keystroke latch decides.
+      else if (session.hasDraft())
+        checks.push({ key: 'composer', ok: false, message: 'ungesendete Eingabe (getippt, Zeile nicht lesbar)' });
+      else checks.push({ key: 'composer', ok: true, message: 'composer leer', hint: 'Eingabezeile nicht lesbar' });
+    }
+
+    const busy: string[] = [];
+    if (!session.suspended) {
+      if (session.isWorking || session.status === 'busy') busy.push('Turn läuft');
+      const plain = screen === null ? null : stripAnsi(screen);
+      const work = (plain !== null ? session.backgroundWorkOnScreen(plain) : null) ?? session.watching;
+      if (work) busy.push(`Hintergrundarbeit (${work})`);
+      if ((plain !== null && session.dialogOnScreen(plain)) || approvalInbox.hasLiveDialog(session.id)) {
+        busy.push('offener Dialog');
+      }
+    }
+    checks.push({ key: 'idle', ok: busy.length === 0, message: busy.length === 0 ? 'idle' : busy.join('; ') });
+
+    if (dryRun || checks.some((c) => !c.ok)) return { deleted: false, dryRun: Boolean(dryRun), checks };
+
+    let archive: string | null = null;
+    try {
+      const text = session.muxName
+        ? (ctx.mux.capturePaneText?.(session.muxName, undefined, { historyLines: 2000 }) ?? '')
+        : '';
+      const tail = Buffer.from(text, 'utf-8').subarray(-4000).toString('utf-8');
+      const dir = dataPath('archive');
+      mkdirSync(dir, { recursive: true });
+      const day = new Date().toISOString().slice(0, 10);
+      archive = join(dir, `${session.id.slice(0, 8)}-${day}.txt`);
+      // Same day twice (a restored session deleted again): keep both.
+      if (existsSync(archive)) archive = join(dir, `${session.id.slice(0, 8)}-${day}-${Date.now()}.txt`);
+      writeFileSync(archive, `${session.name || session.id}\n${session.workingDir}\n\n${tail}`);
+    } catch (err) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, `Archive failed, nothing deleted: ${String(err)}`);
+    }
+    await ctx.cleanupSession(session.id, true, 'user_delete');
+    return { deleted: true, dryRun: false, checks, archive };
   });
 
   app.post('/api/sessions/:id/resume', async (req, reply) => {
