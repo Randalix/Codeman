@@ -16,7 +16,9 @@ import {
   AGENT_LOCK_TTL_SECONDS,
   composerDraftText,
   evaluateHostFacts,
+  loadGitHintOnly,
   parseHostCheck,
+  underAnyPrefix,
   readHostFacts,
   shortDraft,
   type HostFacts,
@@ -130,7 +132,11 @@ describe('host check script (real git, local sh)', () => {
     });
     expect(evaluateHostFacts(await readHostFacts(dir), 'otherses-2222-4222-8222-222222222222')[1].ok).toBe(true);
     writeFileSync(lock, 'agent=car-pickup\npid=1\n');
-    expect(evaluateHostFacts(await readHostFacts(dir), SID)[1]).toMatchObject({ ok: false });
+    expect(evaluateHostFacts(await readHostFacts(dir), SID)[1]).toMatchObject({
+      ok: true,
+      message: 'Sperre ohne Halter-ID',
+      hint: 'Sperre ohne Halter-ID: agent=car-pickup, pid=1',
+    });
     const old = Date.now() / 1000 - AGENT_LOCK_TTL_SECONDS - 60;
     utimesSync(lock, old, old);
     expect(evaluateHostFacts(await readHostFacts(dir), SID)[1]).toMatchObject({
@@ -142,8 +148,27 @@ describe('host check script (real git, local sh)', () => {
   it('a lock in the repo root counts for a session in a subdirectory', async () => {
     const dir = pushedRepo();
     mkdirSync(join(dir, 'sub'));
-    writeFileSync(join(dir, '.agent-lock'), 'agent=x\n');
+    writeFileSync(join(dir, '.agent-lock'), `agent=x\nsession=${SID}\n`);
     expect(evaluateHostFacts(await readHostFacts(join(dir, 'sub')), SID)[1].ok).toBe(false);
+  });
+
+  it('git_hint_only: red git turns into a hint; prefix match on path boundaries; file loading', async () => {
+    const dir = pushedRepo();
+    writeFileSync(join(dir, 'a.txt'), 'changed\n');
+    const facts = await readHostFacts(dir);
+    expect(evaluateHostFacts(facts, SID)[0].ok).toBe(false);
+    expect(evaluateHostFacts(facts, SID, { gitHintOnly: true })[0]).toMatchObject({
+      ok: true,
+      message: 'git nur Hinweis (rm-safe.json)',
+      hint: 'uncommittete Änderungen (1 Dateien)',
+    });
+    expect(underAnyPrefix('/home/joe/wiki', ['/home/joe/wiki'])).toBe(true);
+    expect(underAnyPrefix('/home/joe/wiki/Coding Projects', ['/home/joe/wiki/'])).toBe(true);
+    expect(underAnyPrefix('/home/joe/wiki-old', ['/home/joe/wiki'])).toBe(false);
+    const file = join(root, 'rm-safe.json');
+    expect(loadGitHintOnly(file)).toEqual([]);
+    writeFileSync(file, JSON.stringify({ git_hint_only: ['/home/joe/wiki', 'relative', 3] }));
+    expect(loadGitHintOnly(file)).toEqual(['/home/joe/wiki']);
   });
 
   it('output that is not the script, or a failing runner, means: not checkable (both red)', async () => {

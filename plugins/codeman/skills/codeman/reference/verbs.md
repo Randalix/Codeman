@@ -773,10 +773,12 @@ case, a cloned repo or a worktree never appears there.
 **Downstream: `codeman agent rm --safe <id> [--dry-run]`** deletes only when nothing is
 lost with the session. The server checks, on the session's host (over ssh for a remote
 case): git in its working dir (no uncommitted tracked change, HEAD on some remote
-branch; untracked files are a hint), no `.agent-lock` it holds (a lock with
-`session=<id>` counts for that session; one without counts while younger than 6 h), no
+branch; untracked files are a hint), no `.agent-lock` it holds (`session=<id>` in the
+file names the holder), no
 unacknowledged mail, nothing typed in its composer, no running turn, background shell,
-monitor or open dialog. Any red check: one line each, exit 4, nothing deleted. All green:
+monitor or open dialog. A fresh lock without `session=` names no holder and is only a hint.
+`~/.codeman/rm-safe.json` `{ "git_hint_only": ["/abs/path", …] }` turns the git check into
+a hint for working dirs at or below those paths (a folder synced another way). Any red check: one line each, exit 4, nothing deleted. All green:
 the pane's last 4000 bytes go to `~/.codeman/archive/<id8>-<date>.txt` on the server
 host, then the session is deleted. `rm --safe --all <id> <id> …` prints one row per id.
 It never removes a worktree or branch, breaks a lock or pushes.

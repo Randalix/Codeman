@@ -242,7 +242,9 @@ import { stripAnsi } from '../../utils/regex-patterns.js';
 import {
   composerDraftText,
   evaluateHostFacts,
+  loadGitHintOnly,
   readHostFacts,
+  underAnyPrefix,
   shortDraft,
   type SafeDeleteCheck,
 } from '../../safe-delete.js';
@@ -2255,7 +2257,11 @@ export function registerSessionRoutes(
     const checks: SafeDeleteCheck[] = [];
 
     const facts = await readHostFacts(session.workingDir, session.remote);
-    checks.push(...evaluateHostFacts(facts, session.id));
+    checks.push(
+      ...evaluateHostFacts(facts, session.id, {
+        gitHintOnly: underAnyPrefix(session.workingDir, loadGitHintOnly()),
+      })
+    );
 
     const mail = agentInbox.read(session.id, { receiver: false }).messages;
     const loud = mail.filter((m) => !m.quiet).length;

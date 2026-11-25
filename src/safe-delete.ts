@@ -7,9 +7,11 @@
  *   case) has no uncommitted tracked changes, and HEAD is on some remote branch
  *   (`git rev-list HEAD --not --remotes` is empty). Untracked files are only a hint.
  * - `lock`: no `.agent-lock` (Neon's tools/agent-lock.sh) held by this session in the
- *   working dir or its repo root. A lock with `session=<id>` counts only for that
- *   session; one without it (the script did not record a holder) counts while it is
- *   younger than the script's TTL, since its holder cannot be told apart.
+ *   working dir or its repo root. Only a lock with `session=<id>` names its holder; a
+ *   fresh one without it is a hint (`Sperre ohne Halter-ID`), never a block.
+ * - `rm-safe.json` in the data dir: `{ "git_hint_only": ["/abs/path", …] }` turns the
+ *   git check into a hint for working dirs at or below those paths (a folder synced
+ *   another way, where uncommitted is normal).
  * - `inbox`: no unacknowledged mail (quiet status lines are only a hint).
  * - `composer`: nothing typed and unsent in the input row.
  * - `idle`: no turn running, no background shells/monitors, no open dialog (as suspend
@@ -23,11 +25,13 @@
  */
 
 import { exec } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { COMPOSER_FRAME_ROW } from './session-activity.js';
 import { guardedComposerChrome, readGuardedComposer } from './agent-staging.js';
 import { buildSshConnectionArgs, remoteSshTarget, shellescape } from './remote-hosts.js';
 import { stripAnsi } from './utils/regex-patterns.js';
+import { dataPath } from './config/instance.js';
 import type { CliEntry } from './config/cli-registry/types.js';
 import type { SessionRemote } from './types/session.js';
 
@@ -141,7 +145,11 @@ function sameSession(a: string, b: string): boolean {
 }
 
 /** The `git` and `lock` checks from the host's facts; null facts = host not readable. */
-export function evaluateHostFacts(facts: HostFacts | null, sessionId: string): SafeDeleteCheck[] {
+export function evaluateHostFacts(
+  facts: HostFacts | null,
+  sessionId: string,
+  options: { gitHintOnly?: boolean } = {}
+): SafeDeleteCheck[] {
   if (!facts) {
     const message = 'Host nicht prüfbar (ssh/sh fehlgeschlagen)';
     return [
@@ -163,12 +171,23 @@ export function evaluateHostFacts(facts: HostFacts | null, sessionId: string): S
     if (facts.remotes === 0) problems.push('Repo ohne Remote, nichts gepusht');
     else if (facts.ahead === null) problems.push(`ungepushte Commits (nicht prüfbar, ${where})`);
     else if (facts.ahead > 0) problems.push(`ungepushte Commits (${facts.ahead}, ${where})`);
-    checks.push({
-      key: 'git',
-      ok: problems.length === 0,
-      message: problems.length === 0 ? 'git sauber+gepusht' : problems.join('; '),
-      ...(hints.length ? { hint: hints.join(', ') } : {}),
-    });
+    if (problems.length > 0 && options.gitHintOnly) {
+      // rm-safe.json `git_hint_only`: a folder synced some other way (the wiki over
+      // LiveSync), where uncommitted is the normal state.
+      checks.push({
+        key: 'git',
+        ok: true,
+        message: 'git nur Hinweis (rm-safe.json)',
+        hint: [...problems, ...hints].join(', '),
+      });
+    } else {
+      checks.push({
+        key: 'git',
+        ok: problems.length === 0,
+        message: problems.length === 0 ? 'git sauber+gepusht' : problems.join('; '),
+        ...(hints.length ? { hint: hints.join(', ') } : {}),
+      });
+    }
   }
   const lock = facts.lock;
   if (!lock) {
@@ -184,16 +203,42 @@ export function evaluateHostFacts(facts: HostFacts | null, sessionId: string): S
         message: mine ? `hält Sperre „${label}"` : `Sperre gehört ${holder.slice(0, 8)}`,
       });
     } else if (lock.ageSeconds < AGENT_LOCK_TTL_SECONDS) {
+      // No holder recorded (agent-lock.sh before `session=`): it cannot be told whose it
+      // is, and blocking on it would block every session in that worktree. A hint only.
+      const content = Object.entries(lock.fields)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(', ');
       checks.push({
         key: 'lock',
-        ok: false,
-        message: `aktive Sperre „${label}"${lock.fields.since ? ` seit ${lock.fields.since}` : ''} (ohne session=, Halter unklar)`,
+        ok: true,
+        message: 'Sperre ohne Halter-ID',
+        hint: `Sperre ohne Halter-ID: ${content}`,
       });
     } else {
       checks.push({ key: 'lock', ok: true, message: 'Sperre abgelaufen', hint: `alte Sperre „${label}"` });
     }
   }
   return checks;
+}
+
+/** Absolute path prefixes from `rm-safe.json`'s `git_hint_only`; [] when missing or broken. */
+export function loadGitHintOnly(path: string = dataPath('rm-safe.json')): string[] {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8')) as { git_hint_only?: unknown };
+    return Array.isArray(raw.git_hint_only)
+      ? raw.git_hint_only.filter((p): p is string => typeof p === 'string' && p.startsWith('/'))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** `dir` is one of the prefixes or below one (a path boundary, not a string prefix). */
+export function underAnyPrefix(dir: string, prefixes: readonly string[]): boolean {
+  return prefixes.some((p) => {
+    const base = p.length > 1 ? p.replace(/\/+$/, '') : p;
+    return dir === base || dir.startsWith(base === '/' ? '/' : `${base}/`);
+  });
 }
 
 /** Runs a shell command line and resolves its stdout. */
