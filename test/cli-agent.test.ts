@@ -1187,6 +1187,17 @@ describe('agent post / inbox (mailbox)', () => {
     expect(quiet.calls[0].body).toMatchObject({ text: 'x', nudge: false });
   });
 
+  it('post prints the routing hint from the server; --direct sends direct:true', async () => {
+    const hinted = fakeDeps([ok({ pending: 1, routing: { lead: 'llllllll' } })]);
+    expect(await agentPost(hinted, { id: OTHER, text: 'x' })).toBe(EXIT.ok);
+    expect(hinted.calls[0].body).not.toHaveProperty('direct');
+    expect(hinted.out.join('\n')).toContain('zuständig ist llllllll; direkt bewusst: --direct');
+    const direct = fakeDeps([ok({ pending: 1 })]);
+    await agentPost(direct, { id: OTHER, text: 'x', direct: true });
+    expect(direct.calls[0].body).toMatchObject({ text: 'x', direct: true });
+    expect(direct.out.join('\n')).not.toContain('zuständig');
+  });
+
   it('post refuses self and empty text before any request', async () => {
     const self = fakeDeps([]);
     expect(await agentPost(self, { id: SELF.slice(0, 8), text: 'note' })).toBe(EXIT.refused);

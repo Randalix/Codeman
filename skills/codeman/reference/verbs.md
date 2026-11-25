@@ -820,6 +820,11 @@ Rules that matter:
   `inbox --wait` gets one short line typed into its composer
   (`[codeman inbox] 1 new message from …`), never over a draft or an open dialog.
   `post --no-nudge` stores only; then `send` it one line yourself if it should look now.
+- **Downstream: the coordinator may point you to your lead.** If `~/.codeman/routing.json`
+  on the server lists a lead for you (`{ "koordinator": "<id>", "lead_of": { "<you>": "<lead>" } }`),
+  a `post` to the coordinator is still delivered, and `post` prints
+  `zuständig ist <lead>; direkt bewusst: --direct`. Post to that lead next time;
+  `post --direct` is for when you mean the coordinator.
 - **Lifetime.** An inbox goes with its session on delete. A server restart empties all
   inboxes unless the user turned on *Keep agent inbox across restarts* in Settings.
 

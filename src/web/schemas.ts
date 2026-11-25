@@ -2032,6 +2032,8 @@ export const InboxPostSchema = z
       .max(4 * MAX_MESSAGE_BYTES),
     /** Downstream: false stores only, never types a nudge into the receiver (web/inbox-nudger). */
     nudge: z.boolean().optional(),
+    /** Downstream: true = posting to the coordinator on purpose, no routing hint (web/inbox-routing). */
+    direct: z.boolean().optional(),
     /**
      * Downstream: accepted and IGNORED. The pre-1.47 downstream CLI sent its own id here;
      * a remote host keeps that CLI until its next spawn re-installs it, and `.strict()`

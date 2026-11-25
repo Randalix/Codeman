@@ -1905,7 +1905,7 @@ export function postTextFromArgs(words: readonly string[]): { text: string } | {
  */
 export async function agentPost(
   deps: AgentDeps,
-  options: { id: string; text: string; nudge?: boolean }
+  options: { id: string; text: string; nudge?: boolean; direct?: boolean }
 ): Promise<number> {
   if (isSelfSession(deps.ctx.selfId, options.id)) {
     return fail(deps, `refusing: ${options.id} is me — a note to self goes in a file, not the inbox`, EXIT.refused);
@@ -1918,21 +1918,35 @@ export async function agentPost(
     path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
     // `nudge` only when opting out: the schema is strict, and a server without the
     // downstream field would refuse it on every ordinary post.
-    body: { text: options.text, ...(options.nudge === false ? { nudge: false } : {}) },
+    body: {
+      text: options.text,
+      ...(options.nudge === false ? { nudge: false } : {}),
+      ...(options.direct ? { direct: true } : {}),
+    },
   });
   // 409 = the receiver's inbox is full; nothing was stored. Passed through as an error.
   if (!res.json?.success) return fail(deps, describeFailure(res));
   const data = res.json.data as
-    | { message?: InboxMessageRow; pending?: number; unseen?: number; resuming?: boolean }
+    | {
+        message?: InboxMessageRow;
+        pending?: number;
+        unseen?: number;
+        resuming?: boolean;
+        routing?: { lead?: string };
+      }
     | undefined;
   if (deps.json) emitJson(deps, data ?? {});
-  else
+  else {
     deps.io.out(
       palette.ok(
         `${GLYPH.ok} posted to ${target.id.slice(0, 8)} (${data?.pending ?? '?'} pending, ${data?.unseen ?? '?'} unseen)` +
           (data?.resuming ? ' — it was suspended and is resuming to read it' : '')
       )
     );
+    // Downstream: delivered anyway; the server says who is in charge (web/inbox-routing).
+    const lead = data?.routing?.lead;
+    if (lead) deps.io.out(`zuständig ist ${lead}; direkt bewusst: --direct`);
+  }
   return EXIT.ok;
 }
 
@@ -3252,12 +3266,13 @@ export function registerAgentCommands(program: Command): Command {
       "Leave a message in another session's mailbox; it reads it with `agent inbox`. An idle receiver that would never look gets one short nudge typed into its pane (--no-nudge: never). Text from stdin when omitted or `-`"
     )
     .option('--no-nudge', 'Store only; never type a nudge into the receiver')
+    .option('--direct', 'Posting to the coordinator on purpose: no "zuständig ist <lead>" hint (routing.json)')
     .option('--json', 'Machine-readable output')
     // A message is often a file (`"$(cat task.md)"`) and markdown starts with `- ` or
     // `---` often enough; without this commander takes it for an unknown option.
     // `--json`, `--no-nudge` and `-h` are still options: text that is exactly one goes after `--`.
     .allowUnknownOption()
-    .action(async (id: string, words: string[], options: { json?: boolean; nudge?: boolean }) => {
+    .action(async (id: string, words: string[], options: { json?: boolean; nudge?: boolean; direct?: boolean }) => {
       const fromStdin = words.length === 0 || (words.length === 1 && words[0] === '-');
       // An agent's shell tool has a TTY on stdin: waiting for EOF there hangs the tool
       // until its own timeout. Only read stdin when something is actually piped in.
@@ -3271,7 +3286,9 @@ export function registerAgentCommands(program: Command): Command {
         return;
       }
       const text = fromStdin ? await readStdin() : words.join(' ');
-      await run(Boolean(options.json), (deps) => agentPost(deps, { id, text, nudge: options.nudge }));
+      await run(Boolean(options.json), (deps) =>
+        agentPost(deps, { id, text, nudge: options.nudge, direct: options.direct })
+      );
     });
 
   agent

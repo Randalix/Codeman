@@ -29,7 +29,9 @@
  * post schedules the inbox nudger (`nudge: false` opts out; the nudger types one short
  * prompt into an idle receiver), `?peek=1` reads as a peek even for the receiver, an ack
  * without ids acknowledges everything a receiver read handed out, and
- * `DELETE /api/sessions/:id/inbox` empties the inbox (receiver only, like ack).
+ * `DELETE /api/sessions/:id/inbox` empties the inbox (receiver only, like ack). A post
+ * to the coordinator from a session with a lead in `routing.json` answers with
+ * `routing: { lead }` (`direct: true` skips it; web/inbox-routing).
  *
  * @module web/routes/inbox-routes
  */
@@ -53,6 +55,7 @@ import { clampWaitMs } from '../../config/agent-wait.js';
 import type { SessionPort } from '../ports/index.js';
 import type { InboxNudger } from '../inbox-nudger.js';
 import { suspendRegistryOf } from '../../session-suspend.js';
+import { loadInboxRouting, routingLeadFor, type InboxRouting } from '../inbox-routing.js';
 
 /** Per-session counts the summary route reports. */
 export interface InboxSessionSummary {
@@ -68,8 +71,9 @@ export interface InboxSessionSummary {
 export function registerInboxRoutes(
   app: FastifyInstance,
   ctx: SessionPort,
-  options: { nudger?: Pick<InboxNudger, 'schedule'> } = {}
+  options: { nudger?: Pick<InboxNudger, 'schedule'>; routing?: () => InboxRouting | null } = {}
 ): void {
+  const loadRouting = options.routing ?? (() => loadInboxRouting());
   /** The resolved caller is the receiving session itself. */
   const callerIsReceiver = (req: Parameters<typeof resolveParentSessionId>[1], id: string, owner?: string) =>
     resolveParentSessionId(ctx, req, undefined, owner) === id;
@@ -77,7 +81,7 @@ export function registerInboxRoutes(
   app.post('/api/sessions/:id/inbox', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
-    const { text, nudge } = parseBody(InboxPostSchema, req.body, 'Invalid inbox message');
+    const { text, nudge, direct } = parseBody(InboxPostSchema, req.body, 'Invalid inbox message');
     const from = resolveParentSessionId(ctx, req, undefined, session.owner) ?? null;
     // Downstream: read before posting, the post releases a parked receiver.
     const receiverWaiting = sessionWaits.inboxWaiterCount(id, true) > 0;
@@ -127,6 +131,9 @@ export function registerInboxRoutes(
     } else {
       scheduleNudge();
     }
+    // Downstream: delivered as asked, but tell the sender its lead is the right address
+    // (web/inbox-routing). `direct` = posting to the coordinator on purpose.
+    const lead = direct ? null : routingLeadFor(loadRouting(), from, id);
     return {
       success: true,
       data: {
@@ -135,6 +142,7 @@ export function registerInboxRoutes(
         pending: result.pending,
         unseen: result.unseen,
         ...(resuming ? { resuming: true } : {}),
+        ...(lead ? { routing: { lead } } : {}),
       },
     };
   });
