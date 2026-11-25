@@ -21,6 +21,7 @@ import {
   agentResume,
   agentLs,
   stalledPairLines,
+  statusCell,
   agentPost,
   agentRmSafe,
   agentRead,
@@ -468,6 +469,14 @@ describe('agent ls', () => {
     });
   });
 
+  it('statusCell: idle with background work reads bg (…), busy and suspended stay as they are (downstream)', () => {
+    expect(statusCell({ status: 'idle', watching: '2 monitors' })).toBe('bg (2 monitors)');
+    expect(statusCell({ status: 'idle', watching: null })).toBe('idle');
+    expect(statusCell({ status: 'busy', watching: '1 shell' })).toBe('busy');
+    expect(statusCell({ status: 'idle', suspended: true, watching: '1 shell' })).toBe('suspended');
+    expect(statusCell({})).toBe('?');
+  });
+
   describe('stalledPairLines', () => {
     const since = new Date(2026, 8, 19, 8, 43).toISOString();
     const waiting = { pending: 0, unseen: 0, oldestUnseenAt: null, parked: true, parkedSince: Date.parse(since) };
@@ -495,6 +504,12 @@ describe('agent ls', () => {
       const lines = stalledPairLines([parent, child], new Map([[OTHER, waiting]]));
       expect(lines).toHaveLength(1);
       expect(lines[0]).toMatch(/94990c6d \(builder\) waits for mail since 08:43; 058ee7b5 \(planner\) is idle/);
+    });
+
+    it('a peer whose shells or monitors still run is waiting on them, not stalled (downstream)', () => {
+      const a = { id: SELF, status: 'idle', parentSessionId: null };
+      const bgChild = { id: OTHER, status: 'idle', parentSessionId: SELF, watching: '2 monitors' };
+      expect(stalledPairLines([a, bgChild], new Map([[SELF, waiting]]))).toEqual([]);
     });
 
     it('ignores unrelated sessions: only parent and children count as peers', () => {

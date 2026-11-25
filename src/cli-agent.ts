@@ -438,6 +438,8 @@ interface SessionRow {
   name?: string;
   mode?: string;
   status?: string;
+  /** What the CLI's footer says still runs in the background (`2 monitors`, `1 shell`); null when nothing. */
+  watching?: string | null;
   workingDir?: string;
   /** Present only for a session that runs on another host / in a container. */
   remote?: unknown;
@@ -585,7 +587,8 @@ function clockTime(iso: string): string {
 export function stalledPairLines(sessions: SessionRow[], summary: Map<string, InboxSummaryRow>): string[] {
   const byId = new Map(sessions.map((s) => [s.id, s]));
   const label = (s: SessionRow) => `${s.id.slice(0, 8)}${s.name ? ` (${s.name})` : ''}`;
-  const idleAndEmpty = (s: SessionRow) => s.status === 'idle' && (summary.get(s.id)?.pending ?? 0) === 0;
+  // A session whose shells or monitors still run is waiting on them, not owing a post.
+  const idleAndEmpty = (s: SessionRow) => s.status === 'idle' && !s.watching && (summary.get(s.id)?.pending ?? 0) === 0;
   const lines: Array<{ since: number; text: string }> = [];
   for (const s of sessions) {
     const entry = summary.get(s.id);
@@ -606,6 +609,17 @@ export function stalledPairLines(sessions: SessionRow[], summary: Map<string, In
     });
   }
   return lines.sort((a, b) => a.since - b.since).map((l) => l.text);
+}
+
+/**
+ * The STATUS column. Downstream: `idle` with shells or monitors still running (the CLI's
+ * footer, `watching`) reads `bg (2 monitors)`: the turn is over, but a test run or a
+ * monitor it started is not, so it is not free (Joe read those as idle workers).
+ */
+export function statusCell(s: Pick<SessionRow, 'status' | 'suspended' | 'watching'>): string {
+  if (s.suspended) return 'suspended';
+  if (s.status === 'idle' && s.watching) return `bg (${s.watching})`;
+  return s.status ?? '?';
 }
 
 /** The SUB column: `me`, `me+2`, `2` (others only), `-` nobody; `?` on a server without subscriptions. */
@@ -655,7 +669,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
       s.mode ?? '?',
       modelCell(s),
       hostCell(s),
-      s.suspended ? 'suspended' : (s.status ?? '?'),
+      statusCell(s),
       ...(options.alive ? [alive.get(s.id) === 'dead' ? 'DEAD' : (alive.get(s.id) ?? '?')] : []),
       inbox ? inboxCell(inbox) : '?',
       inbox ? waitCell(inbox) : '?',
@@ -683,7 +697,7 @@ export async function agentLs(deps: AgentDeps, options: { alive?: boolean } = {}
   deps.io.out(table([header, ...rows], { gap: 2 }));
   deps.io.out(
     palette.muted(
-      `* = this session (${deps.ctx.selfId.slice(0, 8)}). MODEL = what the CLI reports (follows /model); * = only the start value, nothing reported yet; - = unknown. HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list. SUB = who gets its IDLE/BLOCKED/EXITED reports: me (+n others), n others, - nobody (\`agent subscribe <id>\` / \`unsubscribe <id>\`).`
+      `* = this session (${deps.ctx.selfId.slice(0, 8)}). MODEL = what the CLI reports (follows /model); * = only the start value, nothing reported yet; - = unknown. HOST = where the worker runs (\`agent hosts\`). status is a UI hint, never a sync signal; bg = turn over, but shells/monitors it started still run. INBOX = unread posts, WAIT = parked on \`inbox --wait\` since, ENDED = last turn over at (- = a turn runs), TODO = open/total on its \`agent todo\` list. SUB = who gets its IDLE/BLOCKED/EXITED reports: me (+n others), n others, - nobody (\`agent subscribe <id>\` / \`unsubscribe <id>\`).`
     )
   );
   if (summary) for (const line of stalledPairLines(sessions, summary)) deps.io.out(palette.warn(line));
