@@ -45,7 +45,8 @@ import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
-import { statSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, writeFileSync } from 'node:fs';
+import { MAX_MESSAGE_BYTES } from './web/agent-inbox.js';
 import { join as joinPath, posix as posixPath, resolve as resolvePath } from 'node:path';
 import { isUtf8 } from 'node:buffer';
 import { STAGE_MAX_BYTES } from './agent-staging.js';
@@ -730,6 +731,39 @@ export interface SpawnOptions {
   resume?: string;
   /** Subscribe this session to the worker's reports right after the spawn (reports are opt-in). */
   subscribe?: boolean;
+  /** Downstream: a file read on THIS machine and posted to the new worker's inbox once its composer is up. */
+  brief?: string;
+}
+
+/** What `spawn --brief` read: the text and its UTF-8 size. */
+interface SpawnBrief {
+  file: string;
+  text: string;
+  bytes: number;
+}
+
+/**
+ * `spawn --brief <file>`: read and validate before any request, so a refusal never leaves
+ * a worker behind. The file is read where `spawn` runs, also with `--host`.
+ */
+function readBrief(options: SpawnOptions): SpawnBrief | { refused: string } | undefined {
+  if (options.brief === undefined) return undefined;
+  if (!options.ready) return { refused: 'refusing: --brief needs the readiness wait; drop --no-ready' };
+  const file = options.brief;
+  let text: string;
+  try {
+    text = readFileSync(resolvePath(file), 'utf8');
+  } catch (err) {
+    return { refused: `refusing: cannot read --brief ${file}: ${getErrorMessage(err)}` };
+  }
+  if (text.trim().length === 0) return { refused: `refusing: --brief ${file} is empty` };
+  const bytes = Buffer.byteLength(text, 'utf8');
+  if (bytes > MAX_MESSAGE_BYTES) {
+    return {
+      refused: `refusing: --brief ${file} is ${bytes} bytes, an inbox message holds at most ${MAX_MESSAGE_BYTES} — post a pointer to the file instead`,
+    };
+  }
+  return { file, text, bytes };
 }
 
 /**
@@ -983,6 +1017,8 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
       EXIT.refused
     );
   }
+  const brief = readBrief(options);
+  if (brief && 'refused' in brief) return fail(deps, brief.refused, EXIT.refused);
   let extras: Record<string, unknown>;
   try {
     extras = buildSpawnExtras(options);
@@ -1036,7 +1072,7 @@ export async function agentSpawn(deps: AgentDeps, options: SpawnOptions): Promis
     data = quick.data;
     where = `case ${(quick.data.caseName as string | undefined) ?? options.caseName}`;
   }
-  return finishSpawn(deps, options, sid, data, where);
+  return finishSpawn(deps, options, sid, data, where, brief);
 }
 
 /** The directory flag as the caller spelled it (`--working-dir` is upstream's, `--cwd` ours). */
@@ -1253,7 +1289,8 @@ async function finishSpawn(
   options: SpawnOptions,
   sid: string,
   data: Record<string, unknown>,
-  where: string
+  where: string,
+  brief?: SpawnBrief
 ): Promise<number> {
   // Before the readiness wait, so a startup dialog already reaches the mailbox.
   const subscription = options.subscribe ? await setSubscription(deps, sid, true) : undefined;
@@ -1284,6 +1321,17 @@ async function finishSpawn(
     }
   }
 
+  // The brief goes out only to a worker that can take it: never after a failed or dead
+  // readiness wait. A mode without a readiness mark (ready undefined) gets it right away;
+  // the inbox stores it and the nudge waits for idle.
+  let briefResult: { posted: true; bytes: number } | { posted: false; error: string } | undefined;
+  if (brief && !readinessError && !dead && ready !== false) {
+    const posted = await postToInbox(deps, sid, { text: brief.text }).catch((error) => ({
+      error: describeRequestError(error),
+    }));
+    briefResult = 'error' in posted ? { posted: false, error: posted.error } : { posted: true, bytes: brief.bytes };
+  }
+
   const subscribeError = subscription && 'error' in subscription ? subscription.error : undefined;
   if (deps.json) {
     emitJson(deps, {
@@ -1292,6 +1340,7 @@ async function finishSpawn(
       readinessError,
       subscribed: subscription !== undefined && !subscribeError,
       ...(subscribeError ? { subscribeError } : {}),
+      ...(briefResult ? { brief: briefResult } : {}),
     });
   } else {
     // Human lines go to stderr so `SID=$(codeman agent spawn …)` captures the id alone.
@@ -1317,10 +1366,18 @@ async function finishSpawn(
         )
       );
     }
+    if (briefResult?.posted) {
+      say(
+        palette.ok(`${GLYPH.ok} brief posted to ${sid.slice(0, 8)} (${briefResult.bytes} bytes from ${brief?.file})`)
+      );
+    } else if (briefResult) {
+      say(palette.err(`${GLYPH.fail} brief not posted (the worker ${sid.slice(0, 8)} is kept): ${briefResult.error}`));
+    }
     deps.io.out(sid);
   }
   if (readinessError) return EXIT.error;
   if (dead) return EXIT.dead;
+  if (briefResult && !briefResult.posted) return EXIT.error;
   return ready === false ? EXIT.timeout : EXIT.ok;
 }
 
@@ -2019,6 +2076,36 @@ export function postTextFromArgs(words: readonly string[]): { text: string } | {
   return { error: `refusing: the message must be ONE argument, got ${words.length} — quote it` };
 }
 
+interface InboxPostData {
+  message?: InboxMessageRow;
+  pending?: number;
+  unseen?: number;
+  resuming?: boolean;
+  routing?: { lead?: string };
+}
+
+/** The `POST …/inbox` request shared by `agent post` and `spawn --brief`; prints nothing. */
+async function postToInbox(
+  deps: AgentDeps,
+  id: string,
+  options: { text: string; nudge?: boolean; direct?: boolean }
+): Promise<{ data: InboxPostData | undefined } | { error: string }> {
+  const res = await deps.request(deps.ctx, {
+    method: 'POST',
+    path: `/api/v1/sessions/${encodeURIComponent(id)}/inbox`,
+    // `nudge` only when opting out: the schema is strict, and a server without the
+    // downstream field would refuse it on every ordinary post.
+    body: {
+      text: options.text,
+      ...(options.nudge === false ? { nudge: false } : {}),
+      ...(options.direct ? { direct: true } : {}),
+    },
+  });
+  // 409 = the receiver's inbox is full; nothing was stored. Passed through as an error.
+  if (!res.json?.success) return { error: describeFailure(res) };
+  return { data: res.json.data as InboxPostData | undefined };
+}
+
 /**
  * `agent post` — store a message in another session's inbox. Never types it into the
  * pane: the receiver reads it with `agent inbox`. Downstream: a receiver that would never
@@ -2036,28 +2123,9 @@ export async function agentPost(
   if (options.text.trim().length === 0) return fail(deps, 'refusing: empty message', EXIT.refused);
   const target = await resolveSessionId(deps, options.id);
   if ('error' in target) return fail(deps, target.error, target.code);
-  const res = await deps.request(deps.ctx, {
-    method: 'POST',
-    path: `/api/v1/sessions/${encodeURIComponent(target.id)}/inbox`,
-    // `nudge` only when opting out: the schema is strict, and a server without the
-    // downstream field would refuse it on every ordinary post.
-    body: {
-      text: options.text,
-      ...(options.nudge === false ? { nudge: false } : {}),
-      ...(options.direct ? { direct: true } : {}),
-    },
-  });
-  // 409 = the receiver's inbox is full; nothing was stored. Passed through as an error.
-  if (!res.json?.success) return fail(deps, describeFailure(res));
-  const data = res.json.data as
-    | {
-        message?: InboxMessageRow;
-        pending?: number;
-        unseen?: number;
-        resuming?: boolean;
-        routing?: { lead?: string };
-      }
-    | undefined;
+  const posted = await postToInbox(deps, target.id, options);
+  if ('error' in posted) return fail(deps, posted.error);
+  const data = posted.data;
   if (deps.json) emitJson(deps, data ?? {});
   else {
     deps.io.out(
@@ -3119,6 +3187,10 @@ export function registerAgentCommands(program: Command): Command {
       '--subscribe',
       "Get the worker's IDLE/BLOCKED/EXITED reports in your mailbox (reports are opt-in; later: agent subscribe/unsubscribe)"
     )
+    .option(
+      '--brief <file>',
+      "Downstream: read this file HERE and post it to the new worker's inbox once its composer is up (≤ 16 KiB; needs the readiness wait, not --no-ready)"
+    )
     .option('--json', 'Machine-readable output')
     .action(
       (
@@ -3137,6 +3209,7 @@ export function registerAgentCommands(program: Command): Command {
           permission?: string;
           resume?: string;
           subscribe?: boolean;
+          brief?: string;
           json?: boolean;
         }
       ) =>
@@ -3156,6 +3229,7 @@ export function registerAgentCommands(program: Command): Command {
             permission: options.permission,
             resume: options.resume,
             subscribe: options.subscribe,
+            brief: options.brief,
           });
         })
     );

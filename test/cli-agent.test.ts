@@ -1021,6 +1021,90 @@ describe('describeRequestError', () => {
   });
 });
 
+describe('agent spawn --brief', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'brief-'));
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+  const file = (name: string, content: string) => {
+    const path = join(dir, name);
+    writeFileSync(path, content);
+    return path;
+  };
+  const base = { caseName: 'c', mode: 'claude', ready: true, timeoutMs: 1000 };
+
+  it('posts the file to the new worker after the composer is up, and says so once', async () => {
+    const brief = file('ok.md', 'Do the thing\nsecond line');
+    const deps = fakeDeps([
+      ok({ sessionId: OTHER, caseName: 'c' }),
+      ok({ wait: { matched: true } }),
+      ok({ message: { id: 'm1' }, pending: 1, unseen: 1 }),
+    ]);
+    expect(await agentSpawn(deps, { ...base, brief })).toBe(EXIT.ok);
+    expect(deps.calls.map((c) => c.path)).toEqual([
+      '/api/v1/quick-start',
+      `/api/v1/sessions/${OTHER}/wait-output`,
+      `/api/v1/sessions/${OTHER}/inbox`,
+    ]);
+    expect(deps.calls[2]).toMatchObject({ method: 'POST', body: { text: 'Do the thing\nsecond line' } });
+    expect(deps.calls[2].body).not.toHaveProperty('nudge');
+    expect(deps.out).toEqual([OTHER]);
+    expect(deps.err.join('')).toMatch(/brief posted to .* \(24 bytes from .*ok\.md\)/);
+  });
+
+  it('refuses an empty, missing, oversized file, or --no-ready, before any request', async () => {
+    const cases: [object, RegExp][] = [
+      [{ brief: file('empty.md', ' \n\t') }, /empty/],
+      [{ brief: join(dir, 'nope.md') }, /cannot read/],
+      [{ brief: file('big.md', 'x'.repeat(16_385)) }, /16384/],
+      [{ brief: file('ok2.md', 'hi'), ready: false }, /--no-ready/],
+    ];
+    for (const [extra, re] of cases) {
+      const deps = fakeDeps([]);
+      expect(await agentSpawn(deps, { ...base, ...extra })).toBe(EXIT.refused);
+      expect(deps.calls).toEqual([]);
+      expect(deps.err.join('')).toMatch(re);
+    }
+  });
+
+  it('counts bytes, not characters', async () => {
+    const deps = fakeDeps([]);
+    // 8200 two-byte characters = 16400 bytes > 16384
+    expect(await agentSpawn(deps, { ...base, brief: file('utf.md', 'ä'.repeat(8200)) })).toBe(EXIT.refused);
+    expect(deps.calls).toEqual([]);
+  });
+
+  it('keeps the worker and exits 1 when the post fails; --json carries brief.error', async () => {
+    const brief = file('fail.md', 'hello');
+    const deps = fakeDeps(
+      [
+        ok({ sessionId: OTHER, caseName: 'c' }),
+        ok({ wait: { matched: true } }),
+        apiError(409, 'INBOX_FULL', 'inbox full'),
+      ],
+      true
+    );
+    expect(await agentSpawn(deps, { ...base, brief })).toBe(EXIT.error);
+    expect(deps.calls.some((c) => c.method === 'DELETE')).toBe(false);
+    const json = JSON.parse(deps.out.join(''));
+    expect(json).toMatchObject({ sessionId: OTHER, brief: { posted: false } });
+    expect(json.brief.error).toMatch(/inbox full/);
+  });
+
+  it('--json reports brief.posted and bytes on success', async () => {
+    const deps = fakeDeps(
+      [ok({ sessionId: OTHER, caseName: 'c' }), ok({ wait: { matched: true } }), ok({ pending: 1 })],
+      true
+    );
+    expect(await agentSpawn(deps, { ...base, brief: file('j.md', 'abc') })).toBe(EXIT.ok);
+    expect(JSON.parse(deps.out.join(''))).toMatchObject({ brief: { posted: true, bytes: 3 } });
+  });
+
+  it('does not post when the composer never showed up', async () => {
+    const deps = fakeDeps([ok({ sessionId: OTHER, caseName: 'c' }), ok({ wait: { matched: false, timedOut: true } })]);
+    expect(await agentSpawn(deps, { ...base, brief: file('t.md', 'abc') })).toBe(EXIT.timeout);
+    expect(deps.calls).toHaveLength(2);
+  });
+});
+
 describe('agent spawn: where it starts and which model it runs', () => {
   // Real directories: a local worker directory must exist (checked before any request).
   const ROOT = mkdtempSync(join(tmpdir(), 'agent-spawn-dirs-'));

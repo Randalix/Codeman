@@ -33,6 +33,8 @@ wrong directory.** `quick-start` with a new `caseName` does not find your repo: 
 | a linked case (a real repo in the linked-cases registry) | same call with the linked name | **hooks installed at session create**, so `stop` fires here too. Not guaranteed: the operator can turn it off. Check |
 | any other absolute path, e.g. a git worktree you made | `POST /api/v1/sessions {"workingDir":"/abs/path","mode":"claude"}` then `POST /api/v1/sessions/:id/interactive` (what `codeman agent spawn --working-dir /abs/path` sends) | same: **hooks installed at session create**, subject to the same setting. Check |
 
+`codeman agent spawn --brief <file>` reads the file on the machine where `spawn` runs (non-empty, at most 16 KiB; not with `--no-ready`) and, once the composer is up, posts it to the new worker's inbox as `codeman agent post <id>` would, so the nudge tells the idle worker to read it; a failed post keeps the worker and exits 1.
+
 Read `.data.casePath` back from the `quick-start` response and check it is where you
 meant. `caseName` accepts letters, digits, `-` and `_` only, and it resolves through
 the linked-cases registry **first**, so a name that collides with something the user
